@@ -64,9 +64,8 @@ test("loads each scan's matching findings once across historical batches", async
   });
 });
 
-test("resolves missing findings only inside a complete later scope", () => {
-  const python = Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
-  expect(python).not.toBeNull();
+test("resolves missing findings only inside a complete later scope", async () => {
+  const python = await resolvePluginPython();
   const probe = [
     "import argparse, json, sqlite3, sys",
     "sys.path.insert(0, sys.argv[1])",
@@ -94,12 +93,15 @@ test("resolves missing findings only inside a complete later scope", () => {
     "coverage['completeness'] = 'partial'",
     "print(json.dumps({'complete': complete, 'partial': compare()}))",
   ].join("\n");
-  const result = spawnSync(
-    python!,
-    ["-I", "-B", "-c", probe, join(PLUGIN_ROOT, "scripts")],
-    { encoding: "utf8" },
+  const result = await runCodexCommand(
+    { command: python },
+    ["-I", "-B", "-", join(PLUGIN_ROOT, "scripts")],
+    process.env,
+    probe,
+    AbortSignal.timeout(10_000),
   );
-  expect(result.status, result.stderr).toBe(0);
+  expect(result.exitCode, result.stderr).toBe(0);
+  expect(result.stderr).toBe("");
   const output = JSON.parse(result.stdout);
   expect(output.complete).toEqual({
     "src/parser/input.ts": "resolved",
