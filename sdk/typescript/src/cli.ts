@@ -5719,6 +5719,20 @@ function scanFailureMessage(
   // errors can name the organization or project, which must not reach stderr or
   // the JSON error field.
   if (isLocalScanFailure(error)) return diagnosticValue(error);
+  if (
+    /\b(?:access token|authentication session) could not be refreshed\b/iu.test(
+      errorMessage(error),
+    )
+  ) {
+    return (
+      "Codex could not refresh the saved ChatGPT sign-in. " +
+      (authentication?.method === "api_key"
+        ? "An API key was selected, but Codex can still use the saved ChatGPT sign-in to load workspace settings. "
+        : "") +
+      "Run Codex Security's 'logout' command, then 'login', and retry. " +
+      "Codex Security stores its sign-in separately from your normal Codex login."
+    );
+  }
   switch (classifyConnectionFailure(error)) {
     case "unauthorized":
       if (authentication?.method === "aws_credentials") {
@@ -5729,7 +5743,6 @@ function scanFailureMessage(
       }
       return authentication?.method === "api_key"
         ? `Authentication failed using ${authentication.source}. ` +
-            "Your ChatGPT sign-in was not used. " +
             "Retry with '--auth chatgpt' or provide a valid API key."
         : "Authentication failed using stored ChatGPT credentials. " +
             "Sign in again with 'codex-security login' or provide a valid API key.";

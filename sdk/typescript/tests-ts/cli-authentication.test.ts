@@ -884,6 +884,58 @@ describe("CLI authentication", () => {
     }
   });
 
+  test("explains how to recover the scanner login after token refresh fails", async () => {
+    for (const environment of [
+      {},
+      { OPENAI_API_KEY: "synthetic-api-key" },
+      { OPENAI_API_KEY: "synthetic-api-key", npm_command: "exec" },
+    ]) {
+      for (const detail of [
+        "Codex Exec exited with code 1: Error: Your access token could not be refreshed. Please log out and sign in again.",
+        "Your access token could not be refreshed because your refresh token was already used.",
+        "Your authentication session could not be refreshed automatically. 401 for org-private.",
+      ]) {
+        for (const json of [false, true]) {
+          const stdout = capture();
+          const stderr = capture(false);
+          const deps = dependencies({ environment });
+          deps.createSecurity = () => ({
+            run: async () => {
+              throw new CodexSecurityError(detail);
+            },
+            preflight: async () => fakePreflight(),
+            close: async () => {},
+          });
+
+          expect(
+            await main(
+              ["scan", ...(json ? ["--json"] : [])],
+              stdout.stream,
+              stderr.stream,
+              deps,
+            ),
+          ).toBe(2);
+          expect(stdout.text()).toBe("");
+          expect(stderr.text()).toContain("Codex Security's 'logout' command");
+          expect(stderr.text()).toContain("then 'login'");
+          expect(stderr.text()).not.toContain("npx");
+          expect(stderr.text()).toContain(
+            "separately from your normal Codex login",
+          );
+          expect(stderr.text().includes("load workspace settings")).toBe(
+            "OPENAI_API_KEY" in environment,
+          );
+          expect(stderr.text()).not.toContain("provide a valid API key");
+          expect(stderr.text()).not.toContain(
+            "Your ChatGPT sign-in was not used",
+          );
+          expect(stderr.text()).not.toContain("org-private");
+          expect(stderr.text()).not.toContain("synthetic-api-key");
+        }
+      }
+    }
+  });
+
   test("prints the ChatGPT recovery hint on noninteractive scan output", async () => {
     const stdout = capture();
     const stderr = capture(false);

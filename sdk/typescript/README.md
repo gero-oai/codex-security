@@ -164,7 +164,8 @@ when the dedicated home does not already contain stored credentials. Logging
 out prevents later scans from automatically reimporting that ambient sign-in
 until you explicitly log in again.
 
-An environment API key takes precedence over a stored sign-in by default.
+By default, an environment API key takes precedence over a stored sign-in for
+model requests.
 When both a stored ChatGPT sign-in and an environment API key are available, an
 interactive scan asks which credential to use. JSON output, dry runs, CI, and
 other noninteractive scans never prompt and retain automatic API-key
@@ -190,6 +191,13 @@ unset OPENAI_API_KEY CODEX_API_KEY
 ```
 
 The interactive choice applies only to the current scan and is not persisted.
+
+If Codex cannot refresh a saved ChatGPT sign-in, run
+`npx @openai/codex-security logout`, then `npx @openai/codex-security login`.
+Signing in to the normal Codex CLI does not update an existing Codex Security
+sign-in. This error can also occur when you select an API key: Codex can still
+use the saved ChatGPT sign-in to load workspace settings before sending model
+requests with the key.
 
 When an environment key is configured, ChatGPT login and
 `codex-security login status` identify the effective scan credential source
