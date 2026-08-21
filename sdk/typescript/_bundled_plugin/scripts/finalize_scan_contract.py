@@ -2291,26 +2291,24 @@ def build_sarif_projection(
     manifest, findings, coverage, _ = _read_sealed_scan(scan_dir, schema_dir, "SARIF projection")
     sarif = build_sarif(manifest, findings, source_root)
     run = sarif["runs"][0]
+    completeness = coverage["completeness"]
     run["properties"].update(
         {
             "codexSecurityCoverageMode": coverage["mode"],
-            "codexSecurityCoverageCompleteness": coverage["completeness"],
+            "codexSecurityCoverageCompleteness": completeness,
             "codexSecurityIncludePaths": coverage["includePaths"],
             "codexSecurityExcludePaths": coverage["excludePaths"],
             "codexSecurityExplicitExclusions": coverage["explicitExclusions"],
         }
     )
-    if coverage["completeness"] != "complete":
-        if coverage["deferred"]:
-            run["invocations"] = [
-                {
-                    "executionSuccessful": True,
-                    "toolExecutionNotifications": [
-                        {"level": "warning", "message": {"text": item["reason"]}}
-                        for item in coverage["deferred"]
-                    ],
-                }
-            ]
+    run["invocations"] = [{"executionSuccessful": completeness == "complete"}]
+    if completeness != "complete":
+        reasons = [item["reason"] for item in coverage["deferred"]] or [
+            f"Scan coverage is {completeness}; results may be incomplete."
+        ]
+        run["invocations"][0]["toolExecutionNotifications"] = [
+            {"level": "warning", "message": {"text": reason}} for reason in reasons
+        ]
     _validate_sarif(sarif)
     return sarif
 

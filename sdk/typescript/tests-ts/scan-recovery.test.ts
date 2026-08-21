@@ -74,7 +74,7 @@ type SarifDocument = {
     results: Array<{ properties: { severity: string } }>;
     invocations?: Array<{
       executionSuccessful: boolean;
-      toolExecutionNotifications: Array<{
+      toolExecutionNotifications?: Array<{
         level: string;
         message: { text: string };
       }>;
@@ -313,7 +313,7 @@ describe("malformed scan artifact recovery", () => {
         codexSecurityExplicitExclusions: coverage.explicitExclusions,
       },
     });
-    expect(sarif.runs[0]?.invocations).toBeUndefined();
+    expect(sarif.runs[0]?.invocations).toEqual([{ executionSuccessful: true }]);
 
     const history = await workbench(fixture, [
       "get-scan",
@@ -1287,7 +1287,7 @@ describe("malformed scan artifact recovery", () => {
     );
     expect(sarif.runs[0]?.invocations).toEqual([
       {
-        executionSuccessful: true,
+        executionSuccessful: false,
         toolExecutionNotifications: [
           { level: "warning", message: { text: completed.warnings[0]! } },
         ],
