@@ -81,20 +81,22 @@ describe("coverage scope presentation", () => {
     expect(formatScopePath("src/generated/**")).toBe("src/generated/**");
   });
 
-  test("escapes default-ignorable characters in terminal and Markdown paths", () => {
+  test("escapes invisible Unicode controls in terminal and Markdown paths", () => {
     const controls =
       "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b\u180e\u180f" +
       "\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e" +
       "\u2060\u2061\u2066\u2067\u2068\u2069\u206f\u3164\ufe00\ufe0f" +
       "\ufeff\uffa0\ufff0\ufff8\u{1bca0}\u{1bca3}\u{1d173}\u{1d17a}" +
-      "\u{e0000}\u{e0100}\u{e0fff}";
+      "\u{e0000}\u{e0100}\u{e0fff}" +
+      "\u0600\u06dd\u070f\u0890\u08e2\ufff9\ufffa\ufffb" +
+      "\u{110bd}\u{110cd}\u{13430}\u{1343f}";
     const paths = [...controls].flatMap((control) => [
       `src/${control}name`,
       `src/a ${control}name`,
     ]);
     for (const path of paths) {
       const encoded = formatScopePath(path);
-      expect(encoded).not.toMatch(/\p{Default_Ignorable_Code_Point}/u);
+      expect(encoded).not.toMatch(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/u);
       expect(JSON.parse(encoded)).toBe(path);
     }
     const report = projectScope({
@@ -102,7 +104,7 @@ describe("coverage scope presentation", () => {
       excludePaths: [],
       explicitExclusions: [],
     });
-    expect(report).not.toMatch(/\p{Default_Ignorable_Code_Point}/u);
+    expect(report).not.toMatch(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/u);
     const includedLine =
       report.split("\n").find((line) => line.startsWith("- Included paths:")) ??
       "";
@@ -148,7 +150,7 @@ describe("coverage scope presentation", () => {
       'Excluded ``"generated/\\u2066[omitted]*`"``: Synthetic exclusion.',
     );
     expect(report).not.toMatch(
-      /[\u007f-\u009f\u2028\u2029\p{Default_Ignorable_Code_Point}]/u,
+      /[\u007f-\u009f\u2028\u2029\p{Cf}\p{Default_Ignorable_Code_Point}]/u,
     );
   });
 });

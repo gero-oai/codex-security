@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import unicodedata
 from collections import Counter
 from typing import Any
 
@@ -29,6 +30,13 @@ SCOPE_PATH_CONTROLS_RE = re.compile(
     r"\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
     r"\U000e0000-\U000e0fff]"
 )
+
+
+def _is_scope_path_control(character: str) -> bool:
+    return (
+        unicodedata.category(character) == "Cf"
+        or SCOPE_PATH_CONTROLS_RE.fullmatch(character) is not None
+    )
 
 
 class ReportProjectionError(ValueError):
@@ -72,10 +80,16 @@ def _strings(value: Any) -> list[str]:
 def _scope_path(value: Any, fallback: str = "unspecified") -> str:
     path = value if isinstance(value, str) else fallback
     rendered = path
-    if not path or SCOPE_PATH_QUOTING_RE.search(path) or SCOPE_PATH_CONTROLS_RE.search(path):
-        rendered = SCOPE_PATH_CONTROLS_RE.sub(
-            lambda match: json.dumps(match.group(0))[1:-1],
-            json.dumps(path, ensure_ascii=False),
+    if (
+        not path
+        or SCOPE_PATH_QUOTING_RE.search(path)
+        or any(_is_scope_path_control(character) for character in path)
+    ):
+        rendered = "".join(
+            json.dumps(character)[1:-1]
+            if _is_scope_path_control(character)
+            else character
+            for character in json.dumps(path, ensure_ascii=False)
         )
     longest_run = max(
         (len(match.group(0)) for match in re.finditer(r"`+", rendered)), default=0
