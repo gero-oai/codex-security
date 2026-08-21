@@ -661,13 +661,9 @@ matched, updated, or reused.
 Connected-app publication checks recorded issue-creation arguments against the
 prepared payload. If a completed mutation cannot be verified, publication keeps
 any verified successes in local history, retains its private recovery handoff
-and available event log, and exits with the recovery path. Inspect the existing
-Linear issues before retrying. A failure to save the auxiliary event log does
-not discard verified issue records; event logs are written only when recovery
-is needed, after verified history persistence has been attempted. Indeterminate
-receipts include an explicit status and the private recovery path, even when
-every planned issue was created. This checks the submitted arguments; it is not
-a fresh readback of the remote issues.
+and available event evidence, and exits with the recovery path. Inspect the
+existing Linear issues before retrying. This checks the submitted arguments; it
+is not a fresh readback of the remote issues.
 
 Issue descriptions contain source code and vulnerability details. Select a
 Linear destination authorized to receive that information. Publication receipts

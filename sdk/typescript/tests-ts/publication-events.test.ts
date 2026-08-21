@@ -468,6 +468,28 @@ describe("Codex Linear publication events", () => {
     expect(result.indeterminate).toBeUndefined();
   });
 
+  test("keeps one verified mutation when another attempt is rejected", () => {
+    const prepared = publication();
+    const completed = event(prepared);
+    const rejected = event(prepared, 0, {
+      id: "call_retry",
+      status: "failed",
+      error: { message: "Linear rejected the retry." },
+      result: undefined,
+    });
+
+    for (const output of [
+      `${completed}\n${rejected}`,
+      `${rejected}\n${completed}`,
+    ]) {
+      const result = collectPublicationEvents(output, prepared, "missing");
+      expect(result.created[0]?.issueIdentifier).toBe("SEC-1");
+      expect(result.failed).toEqual([]);
+      expect(result.indeterminate).toBeUndefined();
+      expect(result.completedEvents).toEqual([completed]);
+    }
+  });
+
   test("accepts team-only informational issues without optional arguments", () => {
     const prepared = publication();
     delete prepared.destination.projectId;

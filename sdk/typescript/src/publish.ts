@@ -32,6 +32,7 @@ import {
   collectPublicationEvents,
   hasExpectedPublicationArguments,
   matchPublicationIssue,
+  publicationIssueReferences,
 } from "./publication-events.js";
 import {
   preparePublicationStore,
@@ -309,12 +310,43 @@ export async function publishScanInternal(
   );
   result.failed = handoffResults.failed;
   result.counts.failed = result.failed.length;
+  if (progressObserver !== undefined) {
+    for (const issue of [...handoffResults.created, ...handoffResults.failed]) {
+      if (completedFindings.has(issue.findingId)) continue;
+      completedFindings.add(issue.findingId);
+      reportPublicationProgress(progressObserver, {
+        type: "issue_completed",
+        findingId: issue.findingId,
+        ...("issueIdentifier" in issue
+          ? { issueIdentifier: issue.issueIdentifier }
+          : { error: issue.error }),
+        completed: completedFindings.size,
+        total: prepared.issues.length,
+      });
+    }
+  }
   const recoveryMessage = `The publication handoff remains at ${handoff.file}; recover it before retrying to avoid creating duplicate issues.`;
+  let eventLogNotice: string | undefined;
+  const preserveCompletedEvents = async (): Promise<void> => {
+    if (eventLogNotice !== undefined || events.completedEvents === undefined)
+      return;
+    try {
+      const file = await (dependencies.writeEvents ?? writePublicationEvents)(
+        handoff.directory,
+        events.completedEvents,
+      );
+      eventLogNotice = `Completed Linear publication events remain at ${file}.`;
+    } catch (error) {
+      eventLogNotice = `Could not preserve unverified Linear publication events: ${safeErrorMessage(error)}.`;
+    }
+  };
   if (handoffResults.indeterminate) {
     result.indeterminate = true;
     result.warnings = [
       `The Linear publication outcome is indeterminate; local history may not include every created issue. ${recoveryMessage}`,
     ];
+    await preserveCompletedEvents();
+    if (eventLogNotice !== undefined) result.warnings.push(eventLogNotice);
     try {
       await saveReceipt(result, environment);
     } catch (error) {
@@ -344,17 +376,11 @@ export async function publishScanInternal(
     options.signal?.aborted ||
     handoffResults.indeterminate
   ) {
-    if (events.completedEvents !== undefined) {
-      let eventLogNotice: string;
-      try {
-        const file = await (dependencies.writeEvents ?? writePublicationEvents)(
-          handoff.directory,
-          events.completedEvents,
-        );
-        eventLogNotice = `Completed Linear publication events remain at ${file}.`;
-      } catch (error) {
-        eventLogNotice = `Could not preserve unverified Linear publication events: ${safeErrorMessage(error)}.`;
-      }
+    await preserveCompletedEvents();
+    if (
+      eventLogNotice !== undefined &&
+      !result.warnings?.includes(eventLogNotice)
+    ) {
       result.warnings = [
         ...(result.warnings ?? [recoveryMessage]),
         eventLogNotice,
@@ -386,21 +412,6 @@ export async function publishScanInternal(
   await rm(handoff.directory, { recursive: true, force: true }).catch(
     () => undefined,
   );
-  if (progressObserver !== undefined) {
-    for (const issue of [...result.created, ...result.failed]) {
-      if (completedFindings.has(issue.findingId)) continue;
-      completedFindings.add(issue.findingId);
-      reportPublicationProgress(progressObserver, {
-        type: "issue_completed",
-        findingId: issue.findingId,
-        ...("issueIdentifier" in issue
-          ? { issueIdentifier: issue.issueIdentifier }
-          : { error: issue.error }),
-        completed: completedFindings.size,
-        total: prepared.issues.length,
-      });
-    }
-  }
   try {
     await saveReceipt(result, environment);
   } catch (error) {
@@ -541,22 +552,12 @@ function reportCompletedIssue(
     "Linear issue creation failed.",
   );
   const created = verified.created[0];
-  const failed = verified.failed[0];
-  if (created === undefined && failed === undefined) return;
-  if (
-    created === undefined &&
-    failed?.error ===
-      "The connected Linear app did not return a created issue identifier."
-  ) {
-    return;
-  }
+  if (created === undefined) return;
   completed.add(issue.findingId);
   reportPublicationProgress(observer, {
     type: "issue_completed",
     findingId: issue.findingId,
-    ...(created === undefined
-      ? { error: failed!.error }
-      : { issueIdentifier: created.issueIdentifier }),
+    issueIdentifier: created.issueIdentifier,
     completed: completed.size,
     total: publication.issues.length,
   });
@@ -699,14 +700,11 @@ async function collectPublicationHandoff(
       continue;
     }
     if (isRecord(record)) {
-      for (const key of ["issueIdentifier", "identifier", "id"]) {
-        const identifier = record[key];
-        if (typeof identifier === "string" && identifier.trim().length > 0) {
-          claimedIssues.push({
-            findingId: record["findingId"],
-            issueIdentifier: identifier,
-          });
-        }
+      for (const claimed of publicationIssueReferences(record)) {
+        claimedIssues.push({
+          findingId: record["findingId"],
+          issueIdentifier: claimed.issueIdentifier,
+        });
       }
     }
     if (!isRecord(record) || typeof record["findingId"] !== "string") {

@@ -32,6 +32,7 @@ export function collectPublicationEvents(
     findingId: string | undefined;
     line: string;
   }> = [];
+  const completedFindings = new Set<string>();
   const indeterminateFindings = new Set<string>();
   const unresolvedCompletions = new Set<string>();
 
@@ -59,22 +60,27 @@ export function collectPublicationEvents(
     const issue = isRecord(args)
       ? matchPublicationIssue(publication, args)
       : undefined;
-    if (item["status"] === "completed") {
+    const completed = item["status"] === "completed";
+    if (completed) {
       completedEvents.push({ findingId: issue?.findingId, line });
     }
     if (issue === undefined) {
       unexpected.push("Codex attempted to create an unexpected Linear issue.");
       continue;
     }
+    if (!completed && completedFindings.has(issue.findingId)) continue;
+    const repeatedCompletion =
+      completed && completedFindings.has(issue.findingId);
+    if (completed) completedFindings.add(issue.findingId);
     if (!hasExpectedPublicationArguments(publication, issue, args)) {
-      indeterminateFindings.add(issue.findingId);
+      if (completed) indeterminateFindings.add(issue.findingId);
       failed.set(
         issue.findingId,
         "Codex attempted to create a Linear issue with unexpected arguments or destination.",
       );
       continue;
     }
-    if (failed.has(issue.findingId) || created.has(issue.findingId)) {
+    if (repeatedCompletion) {
       indeterminateFindings.add(issue.findingId);
       failed.set(
         issue.findingId,
@@ -82,7 +88,7 @@ export function collectPublicationEvents(
       );
       continue;
     }
-    if (item["status"] !== "completed") {
+    if (!completed) {
       const error = item["error"];
       failed.set(
         issue.findingId,
@@ -92,6 +98,7 @@ export function collectPublicationEvents(
       );
       continue;
     }
+    failed.delete(issue.findingId);
 
     const saved = savedIssue(item["result"]);
     if (saved === undefined) {
@@ -210,29 +217,64 @@ function savedIssue(
     }
   }
 
-  for (const candidate of candidates) {
-    if (!isRecord(candidate)) continue;
-    const nested = candidate["issue"];
-    const data = candidate["data"];
-    for (const value of [
-      candidate,
-      nested,
+  return resolvePublicationIssueReference(
+    candidates.flatMap(publicationIssueReferences),
+  );
+}
+
+export function publicationIssueReferences(
+  value: unknown,
+): Array<{ issueIdentifier: string; url?: string }> {
+  if (!isRecord(value)) return [];
+  const references: Array<{ issueIdentifier: string; url?: string }> = [];
+  for (const container of [
+    value,
+    value["structured_content"],
+    value["structuredContent"],
+  ]) {
+    if (!isRecord(container)) continue;
+    const data = container["data"];
+    for (const candidate of [
+      container,
+      container["issue"],
       isRecord(data) ? data["issue"] : undefined,
     ]) {
-      if (!isRecord(value)) continue;
-      const identifier =
-        value["identifier"] ?? value["issueIdentifier"] ?? value["id"];
-      if (typeof identifier !== "string" || identifier.trim().length === 0) {
-        continue;
+      if (!isRecord(candidate)) continue;
+      for (const identifier of [
+        candidate["identifier"],
+        candidate["issueIdentifier"],
+        candidate["id"],
+      ]) {
+        if (typeof identifier !== "string" || identifier.trim().length === 0) {
+          continue;
+        }
+        const url = candidate["url"];
+        references.push({
+          issueIdentifier: identifier,
+          ...(typeof url !== "string" || url.trim().length === 0
+            ? {}
+            : { url }),
+        });
       }
-      const url = value["url"];
-      return {
-        issueIdentifier: identifier,
-        ...(typeof url !== "string" || url.trim().length === 0 ? {} : { url }),
-      };
     }
   }
-  return undefined;
+  return references;
+}
+
+function resolvePublicationIssueReference(
+  references: Array<{ issueIdentifier: string; url?: string }>,
+): { issueIdentifier: string; url?: string } | undefined {
+  const identifiers = new Set(
+    references.map(({ issueIdentifier }) => issueIdentifier),
+  );
+  const urls = new Set(
+    references.flatMap(({ url }) => (url === undefined ? [] : [url])),
+  );
+  if (identifiers.size !== 1 || urls.size > 1) return undefined;
+  return {
+    issueIdentifier: identifiers.values().next().value!,
+    ...(urls.size === 0 ? {} : { url: urls.values().next().value! }),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

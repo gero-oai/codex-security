@@ -996,6 +996,13 @@ describe("connected Linear publication", () => {
       content: [],
       structured_content: { nested_connector_response: "unrecognized" },
     };
+    const rejectedRetry = JSON.parse(
+      issueEvent(publication.issues[0]!, {
+        status: "failed",
+        error: "Linear rejected the retry.",
+      }),
+    );
+    rejectedRetry.item.id = "tool-finding-1-retry";
 
     const result = await publishScanInternal(
       publication.scanDirectory,
@@ -1006,6 +1013,7 @@ describe("connected Linear publication", () => {
         {
           runCodex: async (_command, _args, input, _environment, onEvent) => {
             onEvent?.(event);
+            onEvent?.(rejectedRetry);
             await writeHandoff(input, [
               handoffRecord(publication, publication.issues[0]!, {
                 identifier: "SEC-808",
@@ -1013,7 +1021,9 @@ describe("connected Linear publication", () => {
             ]);
             return {
               exitCode: 0,
-              stdout: JSON.stringify(event),
+              stdout: [event, rejectedRetry]
+                .map((item) => JSON.stringify(item))
+                .join("\n"),
               stderr: "",
             };
           },
@@ -1645,6 +1655,42 @@ describe("connected Linear publication", () => {
         name: "an invalid URL",
         mutate: (record) => [{ ...record, url: "" }],
       },
+      {
+        name: "conflicting identity aliases",
+        mutate: (record) => [{ ...record, identifier: "" }],
+      },
+      {
+        name: "conflicting nested identity",
+        mutate: (record) => {
+          const changed: Record<string, unknown> = {
+            ...record,
+            id: record["issueIdentifier"],
+            issue: { identifier: "SEC-OTHER" },
+          };
+          delete changed["issueIdentifier"];
+          delete changed["arguments"];
+          return [changed];
+        },
+      },
+      {
+        name: "a nested success result",
+        mutate: (record) => {
+          const { issueIdentifier, ...rest } = record;
+          return [{ ...rest, issue: { identifier: issueIdentifier } }];
+        },
+      },
+      {
+        name: "a structured success result",
+        mutate: (record) => {
+          const { issueIdentifier, ...rest } = record;
+          return [
+            {
+              ...rest,
+              structured_content: { issue: { identifier: issueIdentifier } },
+            },
+          ];
+        },
+      },
     ];
 
     for (const scenario of scenarios) {
@@ -1876,14 +1922,9 @@ describe("connected Linear publication", () => {
     expect(result.counts).toEqual({ findings: 2, created: 2, failed: 0 });
   });
 
-  test.each([
-    ["none", false],
-    ["both", false],
-    ["final", false],
-    ["none", true],
-  ] as const)(
-    "retains mutation evidence when payload verification fails (receipt failure: %s, existing event log: %s)",
-    async (receiptFailure, eventLogExists) => {
+  test.each(["none", "both", "final"] as const)(
+    "retains mutation evidence when payload verification fails (receipt failure: %s)",
+    async (receiptFailure) => {
       const publication = preparedPublication(2);
       const changed = JSON.parse(issueEvent(publication.issues[1]!));
       changed.item.arguments.team = "different-team";
@@ -1917,13 +1958,6 @@ describe("connected Linear publication", () => {
                 onEvent,
               ) => {
                 handoffFile = publicationData(input).handoffFile;
-                if (eventLogExists) {
-                  await writeFile(
-                    join(dirname(handoffFile), "events.jsonl"),
-                    "Existing event log\n",
-                    { flag: "wx", mode: 0o600 },
-                  );
-                }
                 onEvent?.(changed);
                 return { exitCode: 0, stdout: output, stderr: "" };
               },
@@ -1932,7 +1966,7 @@ describe("connected Linear publication", () => {
                   (await readdir(dirname(handoffFile!))).filter((name) =>
                     name.startsWith("events-"),
                   ),
-                ).toEqual([]);
+                ).toHaveLength(1);
                 persisted = issues.map((issue) => issue.issueIdentifier);
                 return [...issues];
               },
@@ -1967,11 +2001,6 @@ describe("connected Linear publication", () => {
       expect(await readFile(eventsFile, "utf8")).toBe(
         `${issueEvent(publication.issues[0]!)}\n${JSON.stringify(changed)}\n`,
       );
-      if (eventLogExists) {
-        expect(
-          await readFile(join(dirname(handoffFile!), "events.jsonl"), "utf8"),
-        ).toBe("Existing event log\n");
-      }
       expect(receipt).toMatchObject({
         warnings: expect.arrayContaining([expect.stringContaining(eventsFile)]),
       });
@@ -1989,7 +2018,7 @@ describe("connected Linear publication", () => {
     },
   );
 
-  test("keeps optional recovery-write failures after verified history persistence", async () => {
+  test("keeps recovery-write failures from blocking verified history persistence", async () => {
     const publication = preparedPublication(2);
     const changed = JSON.parse(issueEvent(publication.issues[1]!));
     changed.item.arguments.team = "different-team";
@@ -2028,7 +2057,7 @@ describe("connected Linear publication", () => {
       /could not verify every completed mutation.*Could not preserve unverified Linear publication events/u,
     );
 
-    expect(phases).toEqual(["initial", "history", "events", "final"]);
+    expect(phases).toEqual(["events", "initial", "history", "final"]);
     expect(receipt).toMatchObject({
       indeterminate: true,
       created: [{ findingId: "finding-1", issueIdentifier: "SEC-1" }],
@@ -2086,7 +2115,7 @@ describe("connected Linear publication", () => {
               (await readdir(dirname(handoffFile))).filter((name) =>
                 name.startsWith("events-"),
               ),
-            ).toEqual([]);
+            ).toHaveLength(1);
             expect(await readReceipt()).toMatchObject({
               indeterminate: true,
               created: [],
