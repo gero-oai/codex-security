@@ -17,14 +17,32 @@ Node.js 26.x; Python 3.10 or later; and access to Codex Security.
 npm install @openai/codex-security
 npx @openai/codex-security login
 npx @openai/codex-security scan .
+npx @openai/codex-security scan . --patch
+npx @openai/codex-security scan . --patch --patch-severity high --json
+npx @openai/codex-security scan . --patch --patch-severity high --create-pr
 npx @openai/codex-security scan . --model gpt-5.6-terra --effort high
 npx @openai/codex-security scan . --scan-prompt-file scan.md --post-scan-prompt-file follow-up.md
+npx @openai/codex-security scan . --validation-prompt-file validation.md
 npx @openai/codex-security scan . --mode deep --workers 2 --subagents 0 --stop-after-no-new 3 --max-discovery-runs 10 --max-time-hours 1.5
 ```
 
 For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY` instead of signing in.
+
+Use `--validation-prompt-file` to replace final validation with your own setup,
+testing, and cleanup instructions. This works for standard and diff scans;
+Deep scans do not support it. See [custom validation](sdk/typescript/README.md#custom-validation).
+For a runnable local example, see the [custom validation demo](examples/custom-validation/README.md).
 Environment API keys are passed directly to the current scan and are never
 stored in Codex's credential home or system keyring.
+
+After showing the findings summary, interactive scans with findings ask whether
+to open a finding browser where you can inspect full details, choose a severity
+threshold, select individual findings, and add patch instructions for each one.
+Each selected finding runs in its own saved Codex desktop task.
+Use `--patch --patch-severity high` to fix high and critical findings. Add
+`--create-pr`, or enable the pull request option during review, to commit the
+verified files and open a draft GitHub pull request. Ordinary scans do not
+change repository files.
 
 Deep-scan discovery stops after 96 hours by default. Set `--max-time-hours` to
 any positive number of hours, including fractional hours, up to 96. Completed
@@ -74,6 +92,17 @@ directory outside the repository.
 `findings list [repository]` shows open findings across a repository's scans
 and identifies findings not confirmed in its latest scan.
 
+Use `patch OCCURRENCE_ID` to fix one saved finding, or
+`patch --scan SCAN_ID --severity high` to fix selected findings from a saved
+scan. Add `--json` for structured results or `--create-pr` to open a draft
+GitHub pull request after verification. If publication fails, use the printed
+`patch --resume-pr BRANCH` command to retry without running Codex again.
+
+Use `patch --linear-issue SEC-123` to import and fix a Linear issue, or
+`patch --linear-project "Security backlog" --linear-filter '{"labels":{"name":{"eq":"security"}}}'`
+to fix matching open issues from a project. Set
+`CODEX_SECURITY_LINEAR_API_KEY` to authorize read-only Linear access.
+
 `scans compare BEFORE_SCAN_ID AFTER_SCAN_ID` automatically matches findings by
 root cause, reuses saved matches, and identifies new, persisting, reopened,
 resolved, or unknown findings. Missing findings remain unknown when coverage is
@@ -89,8 +118,9 @@ npx @openai/codex-security publish scan /path/to/scan \
   --linear-team TEAM_ID
 ```
 
-Add `--project PROJECT_ID` to place the issues in a Linear project, or omit it
-to create issues directly in the team. Omit the scan directory to select a
+Add `--linear-project PROJECT_ID` to place the issues in a Linear project, or
+omit it to create issues directly in the team. The existing `--project` flag
+remains an alias. Omit the scan directory to select a
 completed scan interactively. You can also set `CODEX_SECURITY_LINEAR_TEAM` and
 the optional `CODEX_SECURITY_LINEAR_PROJECT` instead of passing the destination
 flags. Add `--dry-run` to preview the issues or `--json` to return
@@ -107,7 +137,7 @@ export CODEX_SECURITY_LINEAR_API_KEY=YOUR_LINEAR_PERSONAL_API_KEY
 npx @openai/codex-security publish scan /path/to/scan \
   --to linear \
   --linear-team TEAM_ID \
-  --project PROJECT_ID \
+  --linear-project PROJECT_ID \
   --linear-assignee teammate@example.com
 ```
 
@@ -133,11 +163,13 @@ npx @openai/codex-security scan . --verbose
 `LOG_LEVEL=debug` is its fallback. JSON results remain on stdout.
 
 Verbose diagnostics may contain sensitive data. Review local logs before
-sharing them. Saved failure summaries, bulk-scan receipts, and the interactive
-dashboard omit messages that contain recognizable credentials.
+sharing them. Saved failure summaries, bulk-scan receipts, and the normal
+activity feed omit messages that contain recognizable credentials.
 
 Use `npx @openai/codex-security scans logs SCAN_ID` to inspect saved session
-events from a scan and its workers.
+events from a scan and its workers. Press `d` during a scan to inspect
+unredacted details; `a`, `m`, and `1`–`9` select all, main, or worker
+sessions. These events can contain credentials.
 
 ## TypeScript SDK
 
