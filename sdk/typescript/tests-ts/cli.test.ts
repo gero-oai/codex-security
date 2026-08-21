@@ -134,6 +134,7 @@ describe("CLI", () => {
           failOnSeverity: { enum: ["critical", "high", "medium", "low"] },
           patch: { type: "boolean" },
           patchSeverity: { enum: ["critical", "high", "medium", "low"] },
+          reviewMinimality: { type: "boolean" },
           createPr: { type: "boolean" },
           headless: { type: "boolean" },
         },

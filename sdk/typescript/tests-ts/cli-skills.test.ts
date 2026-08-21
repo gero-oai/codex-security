@@ -125,6 +125,49 @@ describe("CLI skill commands", () => {
     }
   });
 
+  test("requests only selected patch review stages in their fixed order", async () => {
+    for (const [flags, expected] of [
+      [[], []],
+      [["--review-minimality"], ["minimality"]],
+    ] as const) {
+      let prompt = "";
+      expect(
+        await main(
+          ["patch", "Synthetic security issue", ...flags],
+          capture().stream,
+          capture().stream,
+          dependencies({
+            onCodex: (_args, output) => {
+              prompt = output!.appServer!.prompt;
+              return 0;
+            },
+          }),
+        ),
+      ).toBe(0);
+
+      const lines = prompt.split("\n");
+      const stageLine = lines.findIndex((line) =>
+        line.startsWith("After the existing security review"),
+      );
+      if (expected.length === 0) {
+        expect(stageLine).toBe(-1);
+      } else {
+        expect(JSON.parse(lines[stageLine + 1]!)).toEqual(expected);
+      }
+    }
+
+    const help = capture();
+    expect(
+      await main(
+        ["patch", "--help"],
+        help.stream,
+        capture().stream,
+        dependencies(),
+      ),
+    ).toBe(0);
+    expect(help.text()).toContain("--review-minimality");
+  });
+
   test("imports selected Linear issues without exposing its credential to Codex", async () => {
     const requests: string[] = [];
     let inputs: string[] = [];
