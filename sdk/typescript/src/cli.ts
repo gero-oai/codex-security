@@ -266,7 +266,7 @@ const PROVIDER_OPTION = z
 const CREATE_PR_OPTION = z
   .boolean()
   .default(false)
-  .describe("Create a GitHub pull request after verified patches.");
+  .describe("Create a draft GitHub pull request after verified patches.");
 
 function optionValue(flag: string) {
   return z.string().min(1, `${flag} must not be empty.`);
@@ -978,7 +978,7 @@ interface CliDependencies {
   ): Promise<string>;
   bulkScan?: BulkScanDiscoveryDependencies;
   linearClient?: LinearClientFactory;
-  runWorkbench(args: readonly string[]): Promise<JsonObject>;
+  runWorkbench(args: readonly string[], input?: string): Promise<JsonObject>;
   matchFindings: typeof matchScanFindings;
   checkForUpdate(signal: AbortSignal): Promise<UpdateNotice | undefined>;
 }
@@ -1123,7 +1123,7 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
     }
     return undefined;
   },
-  runWorkbench: async (args) => {
+  runWorkbench: async (args, input) => {
     const environment = {
       ...exportEnvironment(),
       CODEX_SECURITY_STATE_DIR: codexSecurityStateDirectory(),
@@ -1137,6 +1137,7 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
         failureMessage: "Could not read Codex Security scan history",
       },
       args,
+      input,
     );
   },
   matchFindings: (input, options) =>
@@ -1447,19 +1448,21 @@ export async function main(
       ],
       async ({ matchingCached, matchingInputs, ...comparison }) => {
         if (matchingCached && !force) return comparison;
-        return await dependencies.runWorkbench([
-          "save-scan-comparison",
-          "--before-scan-id",
-          beforeId,
-          "--after-scan-id",
-          afterId,
-          "--matches-json",
+        return await dependencies.runWorkbench(
+          [
+            "save-scan-comparison",
+            "--before-scan-id",
+            beforeId,
+            "--after-scan-id",
+            afterId,
+            "--matches-json-stdin",
+          ],
           JSON.stringify(
             await dependencies.matchFindings(
               matchingInputs as JsonObject & ScanComparisonInput,
             ),
           ),
-        ]);
+        );
       },
     );
   const presentHistory = (
@@ -3782,15 +3785,17 @@ async function matchAllScans(
       return { scanId, matches, uncertain };
     });
     for (const { scanId, matches, uncertain } of comparisons) {
-      await dependencies.runWorkbench([
-        "save-scan-comparison",
-        "--before-scan-id",
-        scanId,
-        "--after-scan-id",
-        afterScanId,
-        "--matches-json",
+      await dependencies.runWorkbench(
+        [
+          "save-scan-comparison",
+          "--before-scan-id",
+          scanId,
+          "--after-scan-id",
+          afterScanId,
+          "--matches-json-stdin",
+        ],
         JSON.stringify({ matches, uncertain }),
-      ]);
+      );
       matchedPairs += 1;
       findingMatches += matches.reduce(
         (count, { beforeOccurrenceIds, afterOccurrenceIds }) =>
@@ -4015,6 +4020,7 @@ async function publishPatchBranch(
       url = await run("gh", [
         "pr",
         "create",
+        "--draft",
         "--head",
         branch,
         "--title",
@@ -4095,7 +4101,9 @@ async function createPatchPullRequest(
   const branch = `codex-security/patch-${selected.scanId.replaceAll(/[^a-z\d._-]/giu, "-")}`;
   const run = (command: "git" | "gh", args: string[]) =>
     dependencies.runRepositoryCommand(command, args, selected.repository);
-  stderr.write("Creating a GitHub pull request for verified patches...\n");
+  stderr.write(
+    "Creating a draft GitHub pull request for verified patches...\n",
+  );
   await run("git", ["switch", "-c", branch]);
   await run("git", ["--literal-pathspecs", "add", "--", ...files]);
   await run("git", [

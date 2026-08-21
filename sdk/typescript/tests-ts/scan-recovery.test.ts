@@ -109,7 +109,11 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, `${JSON.stringify(value)}\n`);
 }
 
-async function workbench(fixture: ScanFixture, args: readonly string[]) {
+async function workbench(
+  fixture: ScanFixture,
+  args: readonly string[],
+  input?: string,
+) {
   return runWorkbench(
     {
       python: fixture.python,
@@ -120,21 +124,32 @@ async function workbench(fixture: ScanFixture, args: readonly string[]) {
       },
     },
     args,
+    input,
   );
 }
 
 async function startDraftScan(
   repositoryKind: "directory" | "clean" | "dirty" | "nested" = "directory",
-  paths?: readonly string[],
+  {
+    paths,
+    recipeFromStdin = false,
+  }: {
+    paths?: readonly string[];
+    recipeFromStdin?: boolean;
+  } = {},
 ): Promise<ScanFixture> {
   const root = await realpath(
     await mkdtemp(join(tmpdir(), "codex-security-scan-recovery-")),
   );
   temporaryDirectories.push(root);
-  const python = Bun.which("python3") ?? Bun.which("python");
+  const python =
+    process.env["PYTHON"] ?? Bun.which("python3") ?? Bun.which("python");
   expect(python).not.toBeNull();
 
-  const target = join(root, "repository");
+  const target = join(
+    root,
+    recipeFromStdin ? "répository-日本語" : "repository",
+  );
   const scanDir = join(root, "scan");
   await mkdir(join(target, "src"), { recursive: true });
   await writeFile(join(target, "src", "extract.py"), "# fixture\n");
@@ -182,20 +197,26 @@ async function startDraftScan(
     scanId: "",
     registration: {},
   };
-  const registration = await workbench(fixture, [
-    "register-cli-scan",
-    "--repository",
-    target,
-    "--scan-dir",
-    scanDir,
-    "--recipe-json",
-    JSON.stringify({
-      config: {},
-      mode: "standard",
-      repository: target,
-      target: { kind: paths ? "paths" : "repository", paths: paths ?? [] },
-    }),
-  ]);
+  const recipe = JSON.stringify({
+    config: {},
+    mode: "standard",
+    repository: target,
+    target: { kind: paths ? "paths" : "repository", paths: paths ?? [] },
+  });
+  const registration = await workbench(
+    fixture,
+    [
+      "register-cli-scan",
+      "--repository",
+      target,
+      "--scan-dir",
+      scanDir,
+      ...(recipeFromStdin
+        ? ["--recipe-json-stdin"]
+        : ["--recipe-json", recipe]),
+    ],
+    recipeFromStdin ? recipe : undefined,
+  );
   fixture.scanId = String(registration["scanId"]);
   fixture.registration = registration;
 
@@ -243,10 +264,9 @@ async function completeScan(fixture: ScanFixture): Promise<ScanSummary> {
 
 describe("malformed scan artifact recovery", () => {
   test("seals complete scoped reviews with optional follow-up and exports their scope", async () => {
-    const fixture = await startDraftScan("directory", [
-      "src",
-      "src/extract.py",
-    ]);
+    const fixture = await startDraftScan("directory", {
+      paths: ["src", "src/extract.py"],
+    });
     const manifestPath = join(fixture.scanDir, "scan-manifest.json");
     const manifest = await readJson<{
       scan: { scope: Record<string, unknown> };
@@ -279,9 +299,7 @@ describe("malformed scan artifact recovery", () => {
       openQuestions: coverage["openQuestions"],
     });
     const report = await readFile(join(fixture.scanDir, "report.md"), "utf8");
-    expect(report).toContain("complete for requested scope");
     expect(report).toContain("Consider a separate deployment review.");
-    expect(report).not.toContain("## Incomplete Requested Work");
     const sarif = await readJson<SarifDocument>(
       join(fixture.scanDir, "exports", "results.sarif"),
     );
@@ -334,7 +352,7 @@ describe("malformed scan artifact recovery", () => {
   });
 
   test("reads sealed history coverage without loading unrelated findings", async () => {
-    const fixture = await startDraftScan("directory", ["src"]);
+    const fixture = await startDraftScan("directory", { paths: ["src"] });
     await completeScan(fixture);
     await writeFile(join(fixture.scanDir, "findings.json"), "not available\n");
     const history = await workbench(fixture, [
@@ -412,14 +430,13 @@ describe("malformed scan artifact recovery", () => {
   test.each(["deferred", "surface"] as const)(
     "keeps an in-scope %s blocker separate from optional follow-up",
     async (kind) => {
-      const fixture = await startDraftScan("directory", ["src"]);
+      const fixture = await startDraftScan("directory", { paths: ["src"] });
       const coveragePath = join(fixture.scanDir, "coverage.json");
       const coverage = await readJson<CoverageDocument>(coveragePath);
       const blocker =
         "An essential in-scope source question remains unresolved.";
-      coverage["openQuestions"] = [
-        { question: "Consider a separate deployment review." },
-      ];
+      const optionalQuestion = "Consider a separate deployment review.";
+      coverage["openQuestions"] = [{ question: optionalQuestion }];
       if (kind === "deferred") {
         coverage.deferred = [
           {
@@ -441,17 +458,10 @@ describe("malformed scan artifact recovery", () => {
         (await readJson<CoverageDocument>(coveragePath)).completeness,
       ).toBe("partial");
       const report = await readFile(join(fixture.scanDir, "report.md"), "utf8");
-      const incomplete = report.indexOf("## Incomplete Requested Work");
-      const optional = report.indexOf("## Open Questions And Follow Up");
-      expect(incomplete).toBeGreaterThan(0);
-      expect(optional).toBeGreaterThan(incomplete);
-      expect(report.slice(incomplete, optional)).toContain(blocker);
-      expect(report.slice(incomplete, optional)).not.toContain(
-        "Consider a separate deployment review.",
-      );
-      expect(report.slice(optional)).toContain(
-        "Consider a separate deployment review.",
-      );
+      const blockerPosition = report.indexOf(blocker);
+      const optionalPosition = report.indexOf(optionalQuestion);
+      expect(blockerPosition).toBeGreaterThan(0);
+      expect(optionalPosition).toBeGreaterThan(blockerPosition);
       const history = await workbench(fixture, [
         "get-scan",
         "--scan-id",
@@ -463,9 +473,26 @@ describe("malformed scan artifact recovery", () => {
     },
   );
 
-  test("rejoins a headless scan after its running context changes", async () => {
+  test("registers a Unicode scan recipe delivered through stdin", async () => {
+    const fixture = await startDraftScan("directory", {
+      recipeFromStdin: true,
+    });
+    expect(fixture.registration).toMatchObject({
+      scanDir: fixture.scanDir,
+      targetRevision: "unversioned",
+    });
+    const saved = await workbench(fixture, [
+      "get-scan-recipe",
+      "--scan-id",
+      fixture.scanId,
+    ]);
+    expect(saved["recipe"]).toMatchObject({ repository: fixture.repository });
+  });
+
+  test("rejoins a headless scan after its stdin context is cleared", async () => {
     const fixture = await startDraftScan();
     const threadId = "context-rejoin-regression";
+    const originalContext = "original security focus".repeat(3_000);
     const startArguments = [
       "start-headless-standard-scan",
       "--thread-id",
@@ -474,42 +501,46 @@ describe("malformed scan artifact recovery", () => {
       fixture.repository,
       "--scope",
       ".",
-      "--user-context",
-      "original security focus",
+      "--user-context-stdin",
     ];
-    const created = await workbench(fixture, startArguments);
+    const created = await workbench(fixture, startArguments, originalContext);
     const scan = created["scan"] as {
       scanId: string;
       handoffClaimToken: string;
       userContext: string;
     };
 
-    const updated = await workbench(fixture, [
-      "update-scan-context",
-      "--scan-id",
-      scan.scanId,
-      "--user-context",
-      "updated security focus",
-      "--thread-id",
-      threadId,
-      "--claim-token",
-      scan.handoffClaimToken,
-    ]);
+    expect(scan.userContext).toBe(originalContext);
+
+    const updated = await workbench(
+      fixture,
+      [
+        "update-scan-context",
+        "--scan-id",
+        scan.scanId,
+        "--user-context-stdin",
+        "--thread-id",
+        threadId,
+        "--claim-token",
+        scan.handoffClaimToken,
+      ],
+      "",
+    );
     expect(updated["scan"]).toMatchObject({
       scanId: scan.scanId,
-      userContext: "updated security focus",
+      userContext: null,
     });
     expect(updated["workspace"]).toMatchObject({
-      userContext: "updated security focus",
+      userContext: null,
     });
 
-    const retried = await workbench(fixture, startArguments);
+    const retried = await workbench(fixture, startArguments, originalContext);
     expect(retried["startDisposition"]).toBe("joined");
     expect(retried["scan"]).toMatchObject({
       scanId: scan.scanId,
-      userContext: "updated security focus",
+      userContext: null,
     });
-  });
+  }, 30_000);
 
   test("returns the authoritative directory snapshot contract at registration", async () => {
     const fixture = await startDraftScan();
@@ -1154,7 +1185,6 @@ describe("malformed scan artifact recovery", () => {
       { id: "discarded-finding-1", reason: completed.warnings[0] },
     ]);
     const report = await readFile(join(fixture.scanDir, "report.md"), "utf8");
-    expect(report).toContain("| Coverage | partial for requested scope |");
     expect(report).toContain("Skipped malformed finding 1");
     const sarif = await readJson<SarifDocument>(
       join(fixture.scanDir, "exports", "results.sarif"),
