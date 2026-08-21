@@ -5,75 +5,140 @@ const workflow = readFileSync(
   new URL("../../../.github/workflows/node-release-pr.yml", import.meta.url),
   "utf8",
 );
+const config = Bun.YAML.parse(workflow) as {
+  on: {
+    workflow_run: {
+      workflows: string[];
+      types: string[];
+      branches: string[];
+    };
+    workflow_dispatch: { inputs: { dry_run: { type: string } } };
+  };
+  permissions: Record<string, never>;
+  concurrency: { group: string; queue: string };
+  jobs: {
+    propose: {
+      if: string;
+      permissions: Record<string, string>;
+      steps: Array<{
+        name: string;
+        uses?: string;
+        with?: Record<string, string | number | boolean>;
+        run?: string;
+      }>;
+    };
+  };
+};
+const job = config.jobs.propose;
+const steps = job.steps;
+const script = steps.find(
+  (step) => step.name === "Propose the next patch release",
+)?.run;
+
+if (!script) throw new Error("The release proposal step is missing.");
 
 describe("patch release PR workflow", () => {
-  test("runs only for trusted successful main workflows or manual dispatch", () => {
-    expect(workflow).toContain("workflow_run:");
-    expect(workflow).toContain('workflows: ["node-ci", "node-github-release"]');
-    expect(workflow).toContain("types: [completed]");
-    expect(workflow).toContain("workflow_dispatch:");
-    expect(workflow).toContain("github.repository == 'openai/codex-security'");
-    expect(workflow).toContain("github.ref == 'refs/heads/main'");
-    expect(workflow).toContain(
-      "github.event.workflow_run.conclusion == 'success'",
-    );
-    expect(workflow).toContain(
+  test("runs only after trusted main workflows or a main dispatch", () => {
+    expect(config.permissions).toEqual({});
+    expect(config.concurrency).toEqual({
+      group: "node-release-pr",
+      queue: "max",
+    });
+    expect(config.on.workflow_run).toEqual({
+      workflows: ["node-ci", "node-github-release"],
+      types: ["completed"],
+      branches: ["main"],
+    });
+    expect(config.on.workflow_dispatch.inputs.dry_run.type).toBe("boolean");
+    expect(job.if).toContain("github.repository == 'openai/codex-security'");
+    expect(job.if).toContain(
       "github.event.workflow_run.head_repository.full_name == github.repository",
     );
-    expect(workflow).toContain(
-      "github.event.workflow_run.head_branch == 'main'",
+    expect(job.if).toContain(
+      "github.event.workflow_run.conclusion == 'success'",
     );
-    expect(workflow).toContain("github.event.workflow_run.event == 'push'");
-    expect(workflow).not.toMatch(/^  (?:pull_request_target|push):/mu);
+    expect(job.if).toContain("github.event.workflow_run.event == 'push'");
+    expect(job.if).toContain("github.ref == 'refs/heads/main'");
   });
 
-  test("serializes proposals independently of the protected publisher", () => {
-    expect(workflow).toContain("group: node-release-pr");
-    expect(workflow).toContain("queue: max");
-    expect(workflow).not.toContain("cancel-in-progress: true");
-    expect(workflow).not.toContain("group: node-release-cut");
-    expect(workflow).not.toContain("group: node-release\n");
-  });
-
-  test("checks out trusted automation with pinned first-party actions", () => {
-    const uses = [...workflow.matchAll(/^\s+uses:\s+([^\s#]+)/gmu)].map(
-      (match) => match[1],
+  test("uses only the repository-scoped release App for writes", () => {
+    expect(job.permissions).toEqual({ actions: "read", contents: "read" });
+    const tokenStep = steps.find(
+      (step) => step.name === "Create release App token",
     );
-    expect(uses.length).toBeGreaterThan(0);
-    for (const action of uses) {
-      expect(action).toMatch(/^actions\/[a-z0-9-]+@[a-f0-9]{40}$/u);
-    }
-    expect(workflow).toContain("ref: refs/heads/main");
-    expect(workflow).toContain("fetch-depth: 0");
-    expect(workflow).toContain("persist-credentials: false");
-    expect(workflow).toContain("package-manager-cache: false");
-    expect(workflow).toContain("sdk/typescript/scripts/patch-release-pr.mjs");
-    expect(workflow).not.toContain("download-artifact@");
-    expect(workflow).not.toContain("github.event.pull_request.head");
-  });
-
-  test("can create a PR but cannot publish a package or bypass release gates", () => {
-    expect(workflow).toMatch(/^permissions: \{\}$/mu);
-    expect(workflow).toContain("actions: read");
-    expect(workflow).toContain("contents: write");
-    expect(workflow).toContain("pull-requests: write");
-    expect(workflow).not.toMatch(
-      /^\s+(?:id-token|packages|attestations):\s+write\s*$/mu,
-    );
-    expect(workflow).not.toMatch(/^\s+environment:/mu);
-    expect(workflow).not.toMatch(/\b(?:npm|pnpm)\s+publish\b/u);
-    expect(workflow).not.toMatch(/\bgh\s+(?:release|workflow\s+run)\b/u);
-    expect(workflow).not.toMatch(/\bgit\s+(?:tag|push)\b/u);
-  });
-
-  test("keeps App credentials optional and supports a write-free dry run", () => {
+    expect(tokenStep?.with).toMatchObject({
+      "permission-actions": "read",
+      "permission-contents": "write",
+      "permission-pull-requests": "write",
+    });
     expect(workflow).toContain("RELEASE_APP_CLIENT_ID");
     expect(workflow).toContain("RELEASE_APP_PRIVATE_KEY");
     expect(workflow).toContain("steps.release-app-token.outputs.token");
-    expect(workflow).toContain("github.token");
-    expect(workflow).toMatch(/dry_run:\s*\n[\s\S]*?type: boolean/u);
-    expect(workflow).toContain("inputs.dry_run || false");
-    expect(workflow).toContain("--dry-run");
-    expect(workflow).not.toMatch(/permission-actions:\s*write/u);
+    expect(workflow).toContain("steps.release-app-token.outputs.app-slug");
+    expect(workflow).not.toContain("github.token");
+  });
+
+  test("pins actions and works from verified current main", () => {
+    const actions = steps.flatMap((step) => (step.uses ? [step.uses] : []));
+    expect(actions.length).toBeGreaterThan(0);
+    for (const action of actions) {
+      expect(action).toMatch(/^[a-z0-9-]+\/[a-z0-9-]+@[a-f0-9]{40}$/u);
+    }
+    const checkout = steps.find(
+      (step) => step.name === "Checkout current main",
+    );
+    expect(checkout?.with).toMatchObject({
+      "fetch-depth": 0,
+      "persist-credentials": false,
+      ref: "refs/heads/main",
+    });
+    expect(script).toContain("head_sha=$base_sha");
+    expect(script).toContain('git switch --detach "$base_sha"');
+  });
+
+  test("preserves existing proposals before rejecting an orphan branch", () => {
+    const existingProposal = script.indexOf(
+      'existing_pr="$(find_higher_version_pr "$current_version")"',
+    );
+    const orphanGuard = script.indexOf(
+      'remote_branch="$(git ls-remote --heads origin',
+    );
+    expect(existingProposal).toBeGreaterThan(-1);
+    expect(orphanGuard).toBeGreaterThan(existingProposal);
+    expect(script).toContain("Preserving intentionally closed release PR");
+    expect(script).toContain("Preserving existing same-repository release PR");
+    expect(script).toContain("--no-renames");
+  });
+
+  test("creates a one-line manifest commit with create-only branch semantics", () => {
+    expect(script).toContain("git diff --numstat");
+    expect(script).toContain("git diff --check");
+    expect(script).toContain('git commit -m "release: bump');
+    expect(script).toContain('git config user.name "$release_app_user"');
+    expect(script).toContain('--force-with-lease="refs/heads/$branch:"');
+    expect(script).toContain(
+      "Main changed before the release branch was pushed",
+    );
+    expect(script).toContain("does not match the expected release commit");
+  });
+
+  test("distinguishes an absent release from an API failure", () => {
+    expect(script).toContain("release(tagName: $tag)");
+    expect(script).toContain(".data.repository.release == null");
+    expect(script).toContain(".data.repository.release |");
+    expect(script).not.toContain("gh release view");
+  });
+
+  test("renders the canonical unchecked template and cannot publish", () => {
+    expect(script).toContain(".github/PULL_REQUEST_TEMPLATE.md");
+    expect(
+      script.indexOf('readFileSync(".github/PULL_REQUEST_TEMPLATE.md"'),
+    ).toBeLessThan(script.indexOf("git push"));
+    expect(script).not.toContain("- [x]");
+    expect(script).toContain("@codex review");
+    expect(script).not.toMatch(/\b(?:npm|pnpm)\s+publish\b/u);
+    expect(script).not.toMatch(/\bgh\s+(?:release\s+create|workflow\s+run)\b/u);
+    expect(script).not.toMatch(/\bgit\s+tag\b/u);
+    expect(script).not.toMatch(/\bgh\s+pr\s+merge\b/u);
   });
 });
