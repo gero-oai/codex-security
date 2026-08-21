@@ -100,9 +100,14 @@ Run the following stages only when the calling workflow explicitly requests them
    - Explain why each changed file, production change, regression test, dependency, helper, and abstraction is necessary to close or prove the reported security boundary.
    - Identify unrelated refactoring, formatting, new dependencies, avoidable helper-signature or data-type changes, unnecessary control-flow or error-semantics changes, and broader fixes when an equally complete narrower change exists.
    - Report only concrete, source-backed simplifications. The parent confirms them and removes only unnecessary candidate changes while preserving security closure, legitimate behavior, meaningful regression coverage, and unrelated pre-existing user changes.
+2. **Local coding-style review**, when `local-coding-style` is requested.
+   - Inspect the nearest applicable repository instructions, organization- or project-specific style guides, existing helpers, and representative nearby code.
+   - Check changed code for established naming, types, ownership, control flow, error handling, testing conventions, and formatter or linter requirements. Introduce exceptions or other uncommon mechanisms only when required and supported by local precedent.
+   - Distinguish documented requirements and consistent local conventions from personal preferences. Suggest only the smallest in-scope correction; never request broad formatting, cleanup, redesign, or unrelated refactoring.
+   - The parent confirms each observation and applies at most one bounded, repository-native revision before rerunning the relevant checks.
 
 
-Never weaken a security invariant, compatibility guarantee, or focused proof merely to make the patch smaller. Keep all optional review and revision inside the Generate stage, before recording a canonical patch or digest; Apply and Verify retain their existing write boundaries.
+Never weaken a security invariant, compatibility guarantee, or focused proof merely to make the patch smaller or more stylistically uniform. Keep all optional review and revision inside the Generate stage, before recording a canonical patch or digest; Apply and Verify retain their existing write boundaries.
 
 ## Workbench Remediation Stages
 

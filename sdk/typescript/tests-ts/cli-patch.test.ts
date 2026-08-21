@@ -162,7 +162,7 @@ describe("scan and patch workflow", () => {
       const result = resultWithFindings(["high"]);
       let prompt = "";
       const outcome = await runWorkflow(
-        [...arguments_, "--review-minimality"],
+        [...arguments_, "--review-style", "--review-minimality"],
         {
           result,
           onWorkbench: () => savedScan(result),
@@ -179,7 +179,10 @@ describe("scan and patch workflow", () => {
       const stageLine = lines.findIndex((line) =>
         line.startsWith("After the existing security review"),
       );
-      expect(JSON.parse(lines[stageLine + 1]!)).toEqual(["minimality"]);
+      expect(JSON.parse(lines[stageLine + 1]!)).toEqual([
+        "minimality",
+        "local-coding-style",
+      ]);
     }
   });
 
@@ -520,6 +523,7 @@ describe("scan and patch workflow", () => {
       ["--linear-issue", "SEC-123"],
       ["--create-pr"],
       ["--review-minimality"],
+      ["--review-style"],
       ["occ_1"],
     ]) {
       let commandStarted = false;
@@ -1078,7 +1082,7 @@ describe("scan and patch workflow", () => {
   });
 
   test("rejects optional patch reviews without an explicit patch request", async () => {
-    for (const flag of ["--review-minimality"]) {
+    for (const flag of ["--review-minimality", "--review-style"]) {
       let started = false;
       const outcome = await runWorkflow(["scan", flag], {
         onCodex: () => {

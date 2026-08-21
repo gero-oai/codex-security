@@ -266,6 +266,10 @@ const REVIEW_MINIMALITY_OPTION = z
   .boolean()
   .default(false)
   .describe("Review generated patches for unnecessary or unrelated changes.");
+const REVIEW_STYLE_OPTION = z
+  .boolean()
+  .default(false)
+  .describe("Review generated patches against local coding standards.");
 
 function optionValue(flag: string) {
   return z.string().min(1, `${flag} must not be empty.`);
@@ -830,6 +834,7 @@ export function resolveCliPath(directory: string, value: string): string {
 
 interface PatchReviewOptions {
   reviewMinimality?: boolean;
+  reviewStyle?: boolean;
 }
 
 interface ScanArguments extends DeepScanOptions, PatchReviewOptions {
@@ -2284,6 +2289,7 @@ export async function main(
             .optional()
             .describe("Patch findings at or above LEVEL; requires --patch."),
           reviewMinimality: REVIEW_MINIMALITY_OPTION,
+          reviewStyle: REVIEW_STYLE_OPTION,
           createPr: CREATE_PR_OPTION,
           maxCost: z
             .number()
@@ -2333,9 +2339,12 @@ export async function main(
             message: "--patch-severity requires --patch.",
           },
         )
-        .refine((options) => options.patch || !options.reviewMinimality, {
-          message: "Patch review options require --patch.",
-        })
+        .refine(
+          (options) =>
+            options.patch ||
+            (!options.reviewMinimality && !options.reviewStyle),
+          { message: "Patch review options require --patch." },
+        )
         .refine((options) => !options.createPr || options.patch, {
           message: "--create-pr requires --patch.",
         })
@@ -2410,6 +2419,7 @@ export async function main(
             patch: options.patch,
             patchSeverity: options.patchSeverity,
             reviewMinimality: options.reviewMinimality,
+            reviewStyle: options.reviewStyle,
             createPr: options.createPr,
             maxCostUsd: options.maxCost,
             headless: options.headless,
@@ -3050,6 +3060,7 @@ export async function main(
           .describe("JSON Linear issue filter for --linear-project."),
         linearApiKey: linearApiKeyOption(),
         reviewMinimality: REVIEW_MINIMALITY_OPTION,
+        reviewStyle: REVIEW_STYLE_OPTION,
         createPr: CREATE_PR_OPTION,
         resumePr: optionValue("--resume-pr")
           .optional()
@@ -3078,6 +3089,7 @@ export async function main(
               options.linearFilter !== undefined ||
               options.linearApiKey !== undefined ||
               options.reviewMinimality ||
+              options.reviewStyle ||
               options.effort !== undefined ||
               options.codex.length > 0
             ) {
@@ -3134,6 +3146,7 @@ export async function main(
               dependencies,
               {
                 reviewMinimality: options.reviewMinimality,
+                reviewStyle: options.reviewStyle,
               },
             );
             exitCode = patchExitCode(patches);
@@ -3209,6 +3222,7 @@ export async function main(
             {
               environment,
               reviewMinimality: options.reviewMinimality,
+              reviewStyle: options.reviewStyle,
             },
           );
         } catch (error) {
@@ -4348,6 +4362,7 @@ async function runSkill(
   const inputLabel = skill === "validation" || verify ? "Findings" : "Issues";
   const patchReviewStages = [
     ...(options.reviewMinimality ? ["minimality"] : []),
+    ...(options.reviewStyle ? ["local-coding-style"] : []),
   ];
   const prompt = [
     ...(verify
@@ -5659,6 +5674,7 @@ async function executeScan(
           environment,
           findingInstructions: patchSelection?.instructions,
           reviewMinimality: arguments_.reviewMinimality,
+          reviewStyle: arguments_.reviewStyle,
         },
       );
       scanData = { ...scanData, patchSeverity: patchThreshold, patches };

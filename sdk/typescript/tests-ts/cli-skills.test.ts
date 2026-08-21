@@ -129,6 +129,11 @@ describe("CLI skill commands", () => {
     for (const [flags, expected] of [
       [[], []],
       [["--review-minimality"], ["minimality"]],
+      [["--review-style"], ["local-coding-style"]],
+      [
+        ["--review-style", "--review-minimality"],
+        ["minimality", "local-coding-style"],
+      ],
     ] as const) {
       let prompt = "";
       expect(
@@ -166,6 +171,7 @@ describe("CLI skill commands", () => {
       ),
     ).toBe(0);
     expect(help.text()).toContain("--review-minimality");
+    expect(help.text()).toContain("--review-style");
   });
 
   test("imports selected Linear issues without exposing its credential to Codex", async () => {
