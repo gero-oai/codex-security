@@ -136,6 +136,7 @@ describe("CLI", () => {
           patchSeverity: { enum: ["critical", "high", "medium", "low"] },
           reviewMinimality: { type: "boolean" },
           reviewStyle: { type: "boolean" },
+          assessPatchRisk: { type: "boolean" },
           createPr: { type: "boolean" },
           headless: { type: "boolean" },
         },

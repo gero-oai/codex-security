@@ -130,9 +130,14 @@ describe("CLI skill commands", () => {
       [[], []],
       [["--review-minimality"], ["minimality"]],
       [["--review-style"], ["local-coding-style"]],
+      [["--assess-patch-risk"], ["patch-risk-assessment"]],
       [
-        ["--review-style", "--review-minimality"],
-        ["minimality", "local-coding-style"],
+        ["--assess-patch-risk", "--review-minimality"],
+        ["minimality", "patch-risk-assessment"],
+      ],
+      [
+        ["--assess-patch-risk", "--review-style", "--review-minimality"],
+        ["minimality", "local-coding-style", "patch-risk-assessment"],
       ],
     ] as const) {
       let prompt = "";
@@ -159,6 +164,14 @@ describe("CLI skill commands", () => {
       } else {
         expect(JSON.parse(lines[stageLine + 1]!)).toEqual(expected);
       }
+      expect(
+        prompt.includes(
+          JSON.stringify(join("skills", "assess-patch-risk", "SKILL.md")).slice(
+            1,
+            -1,
+          ),
+        ),
+      ).toBe(expected.some((stage) => stage === "patch-risk-assessment"));
     }
 
     const help = capture();
@@ -172,6 +185,7 @@ describe("CLI skill commands", () => {
     ).toBe(0);
     expect(help.text()).toContain("--review-minimality");
     expect(help.text()).toContain("--review-style");
+    expect(help.text()).toContain("--assess-patch-risk");
   });
 
   test("imports selected Linear issues without exposing its credential to Codex", async () => {

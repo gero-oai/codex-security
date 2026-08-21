@@ -105,7 +105,11 @@ Run the following stages only when the calling workflow explicitly requests them
    - Check changed code for established naming, types, ownership, control flow, error handling, testing conventions, and formatter or linter requirements. Introduce exceptions or other uncommon mechanisms only when required and supported by local precedent.
    - Distinguish documented requirements and consistent local conventions from personal preferences. Suggest only the smallest in-scope correction; never request broad formatting, cleanup, redesign, or unrelated refactoring.
    - The parent confirms each observation and applies at most one bounded, repository-native revision before rerunning the relevant checks.
-
+3. **Patch-risk assessment**, when `patch-risk-assessment` is requested.
+   - Finish the ordered verification gates first, then ask a fresh read-only assessor to use the bundled `assess-patch-risk` skill specified by the calling workflow.
+   - Bind the assessment to the exact final candidate patch and finding; do not silently assess unrelated pre-existing working-tree changes. Assess applicability, production reachability, threat-model assumptions, blast radius, preserved behavior, regression protection, recoverability, and source-backed uncertainty.
+   - Report the assessment's recommendation and strongest supporting evidence with the patch outcome. If source evidence establishes that the patch is unnecessary or unsafe, do not report it as verified; return `no_change` after safely removing only candidate changes, or `blocked` when safe removal or the required decision is unresolved.
+   - The assessment must not edit, apply, commit, push, or merge the patch. Never treat its recommendation as permission to merge.
 
 Never weaken a security invariant, compatibility guarantee, or focused proof merely to make the patch smaller or more stylistically uniform. Keep all optional review and revision inside the Generate stage, before recording a canonical patch or digest; Apply and Verify retain their existing write boundaries.
 
