@@ -1,8 +1,7 @@
-import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { resolvePluginPython } from "../src/runtime.js";
+import { resolvePluginPython, runCodexCommand } from "../src/runtime.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 async function runPythonProbe(
@@ -10,12 +9,14 @@ async function runPythonProbe(
   ...args: string[]
 ): Promise<Record<string, unknown>> {
   const python = await resolvePluginPython();
-  const result = spawnSync(
-    python,
-    ["-I", "-B", "-", join(PLUGIN_ROOT, "scripts"), ...args],
-    { input: program, encoding: "utf8", timeout: 10_000, windowsHide: true },
+  const result = await runCodexCommand(
+    { command: python },
+    ["-I", "-X", "utf8", "-B", "-", join(PLUGIN_ROOT, "scripts"), ...args],
+    process.env,
+    program,
+    AbortSignal.timeout(10_000),
   );
-  expect(result.status, result.stderr || result.error?.message).toBe(0);
+  expect(result.exitCode, result.stderr).toBe(0);
   expect(result.stderr).toBe("");
   return JSON.parse(result.stdout) as Record<string, unknown>;
 }
@@ -27,7 +28,7 @@ test("keeps inline and stdin comparison transports compatible", async () => {
     "sys.path.insert(0, sys.argv.pop(1))",
     "from workbench_cli import parse_args",
     "args = parse_args('Synthetic comparison transport')",
-    "print(json.dumps(json.loads(args.matches_json)))",
+    "print(json.dumps({'matchesJson': args.matches_json, 'matchesJsonStdin': args.matches_json_stdin}))",
   ].join("\n");
   const args = [
     "-I",
@@ -53,24 +54,33 @@ test("keeps inline and stdin comparison transports compatible", async () => {
     uncertain: [],
   });
   for (const transport of [
-    ["--matches-json", payload],
-    ["--matches-json-stdin"],
+    {
+      args: ["--matches-json", payload],
+      expected: { matchesJson: payload, matchesJsonStdin: false },
+    },
+    {
+      args: ["--matches-json-stdin"],
+      expected: { matchesJson: null, matchesJsonStdin: true },
+    },
   ]) {
-    const result = spawnSync(python, [...args, ...transport], {
-      input: payload,
-      encoding: "utf8",
-      timeout: 10_000,
-      windowsHide: true,
-    });
-    expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual(JSON.parse(payload));
+    const result = await runCodexCommand(
+      { command: python },
+      [...args, ...transport.args],
+      process.env,
+      undefined,
+      AbortSignal.timeout(10_000),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(transport.expected);
   }
-  const conflicting = spawnSync(
-    python,
+  const conflicting = await runCodexCommand(
+    { command: python },
     [...args, "--matches-json", payload, "--matches-json-stdin"],
-    { input: payload, encoding: "utf8", timeout: 10_000, windowsHide: true },
+    process.env,
+    payload,
+    AbortSignal.timeout(10_000),
   );
-  expect(conflicting.status).toBe(2);
+  expect(conflicting.exitCode).toBe(2);
   expect(conflicting.stderr).toContain("not allowed with argument");
 });
 
@@ -187,7 +197,7 @@ for value in invalid:
     assert snapshot() == original
 print(json.dumps({'summary': accepted['summary'],
                   'related': [(item['beforeOccurrenceId'], item['afterOccurrenceId']) for item in accepted['related']],
-                  'savedPairs': len(original[1]), 'rejected': len(invalid)}))
+                  'savedPairs': len(original[1])}))
 `;
   expect(
     await runPythonProbe(
@@ -201,7 +211,6 @@ print(json.dumps({'summary': accepted['summary'],
       ["c", "z"],
     ],
     savedPairs: 5,
-    rejected: 8,
   });
 });
 
@@ -635,4 +644,51 @@ print(json.dumps({
     legacyQueries: 2,
   });
   expect(observed["batchedQueries"]).toBe(observed["expectedBatchedQueries"]);
+});
+
+test("loads oversized comparison matches from stdin", async () => {
+  const python = await resolvePluginPython();
+
+  const probe = [
+    "import argparse, io, json, sqlite3, sys",
+    "sys.path.insert(0, sys.argv[1])",
+    "import workbench_scan_history as history",
+    "connection = sqlite3.connect(':memory:')",
+    "connection.row_factory = sqlite3.Row",
+    "connection.executescript('''",
+    "CREATE TABLE scan_comparisons (before_scan_id TEXT, after_scan_id TEXT, result_json TEXT, created_at TEXT, updated_at TEXT);",
+    "CREATE TABLE scan_comparison_matches (before_scan_id TEXT, after_scan_id TEXT, before_occurrence_id TEXT, after_occurrence_id TEXT, reason TEXT);",
+    "''')",
+    "scans = {'before': {'id': 'before', 'status': 'complete', 'target_id': 'target', 'target_path': '/repo'}, 'after': {'id': 'after', 'status': 'complete', 'target_id': 'target', 'target_path': '/repo'}}",
+    "findings = {'before': {'old': {'id': 'old'}}, 'after': {'new': {'id': 'new'}}}",
+    "history._scan_findings = lambda _connection, scan_id: findings[scan_id]",
+    "history.compare_scans = lambda *_args, **_kwargs: {'saved': True}",
+    "payload = sys.stdin.read()",
+    "sys.stdin = io.StringIO(payload)",
+    "result = history.save_scan_comparison(connection, argparse.Namespace(before_scan_id='before', after_scan_id='after', matches_json=None, matches_json_stdin=True), now=lambda: 'now', require_scan=lambda _connection, scan_id: scans[scan_id], read_coverage=lambda _scan: {})",
+    "print(json.dumps(result))",
+  ].join("\n");
+  const payload = JSON.stringify({
+    matches: [
+      {
+        beforeOccurrenceIds: ["old"],
+        afterOccurrenceIds: ["new"],
+        confidence: "high",
+        reason: "x".repeat(64 * 1024),
+      },
+    ],
+    uncertain: [],
+  });
+
+  const result = await runCodexCommand(
+    { command: python },
+    ["-I", "-B", "-c", probe, join(PLUGIN_ROOT, "scripts")],
+    process.env,
+    payload,
+    AbortSignal.timeout(10_000),
+  );
+
+  expect(result.exitCode, result.stderr).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(JSON.parse(result.stdout)).toEqual({ saved: true });
 });

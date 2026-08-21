@@ -257,7 +257,7 @@ def list_unmatched_scan_pairs(
         for scan in connection.execute(
             "SELECT * FROM scans WHERE status = 'complete' ORDER BY started_at, id"
         )
-        if Path(scan["target_path"]).resolve() == repository or _same_repository(scan, requested)
+        if _same_repository(scan, requested)
     ]
 
     available = []
@@ -454,8 +454,6 @@ def compare_scans(
             else None
         )
         selected = current if current is not None else previous
-        if selected is None:
-            continue
         item = {
             "findingId": selected["finding_id"],
             "path": selected["relative_path"],
@@ -592,8 +590,11 @@ def save_scan_comparison(
     read_coverage(after)
     before_findings = _scan_findings(connection, before["id"])
     after_findings = _scan_findings(connection, after["id"])
+    matches_json = (
+        sys.stdin.read() if getattr(args, "matches_json_stdin", False) else args.matches_json
+    )
     try:
-        payload = json.loads(args.matches_json)
+        payload = json.loads(matches_json)
     except (TypeError, ValueError) as exc:
         raise SystemExit("Scan comparison matches must be a valid JSON object.") from exc
     if (

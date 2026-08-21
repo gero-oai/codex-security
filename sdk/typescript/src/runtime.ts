@@ -860,6 +860,8 @@ async function secureWindowsCredentialHome(path: string): Promise<void> {
     "$path = $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH",
     "while ($true) { $parent = Microsoft.PowerShell.Management\\Split-Path -Path $path -Parent; if (-not $parent -or $parent -eq $path) { break }; Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $parent | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl; $path = $parent }",
     "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+    // A temporary descendant can disappear after enumeration. Its missing
+    // descriptor reduces the count and retries the stable snapshot.
     "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH -Recurse -Force | Microsoft.PowerShell.Core\\ForEach-Object { try { Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $_.FullName | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl } catch { if ($_.FullyQualifiedErrorId -notlike 'GetAcl_PathNotFound,*') { throw } } }",
   ].join("; ");
   const resolvePrincipalScript = [
@@ -1389,8 +1391,8 @@ export async function runWorkbench(
   ): Promise<string> => {
     const result = await runCodexCommand(
       { command: options.python },
-      ["-I", "-B", script, ...arguments_],
-      environment,
+      ["-I", "-X", "utf8", "-B", script, ...arguments_],
+      pythonUtf8Environment(environment),
       input,
       options.signal,
     );
@@ -1406,10 +1408,12 @@ export async function runWorkbench(
   let stdout: string;
   try {
     const arguments_ = [...args];
-    const matchesIndex = arguments_.indexOf("--matches-json");
-    const matches =
-      matchesIndex === -1 ? undefined : arguments_[matchesIndex + 1];
-    if (arguments_[0] === "save-scan-comparison" && matches !== undefined) {
+    const matchesStdinIndex = arguments_.indexOf("--matches-json-stdin");
+    if (
+      arguments_[0] === "save-scan-comparison" &&
+      matchesStdinIndex !== -1 &&
+      input !== undefined
+    ) {
       const key = JSON.stringify([options.python, script]);
       let supportsStdin = workbenchComparisonStdinSupport.get(key);
       if (supportsStdin === undefined) {
@@ -1418,16 +1422,19 @@ export async function runWorkbench(
         supportsStdin = help.includes("--matches-json-stdin");
         workbenchComparisonStdinSupport.set(key, supportsStdin);
       }
-      if (supportsStdin) {
-        input = matches;
-        arguments_.splice(matchesIndex, 2, "--matches-json-stdin");
-      } else {
+      if (!supportsStdin) {
         // Older custom plugins accept only the original comparison format.
-        const comparison: unknown = JSON.parse(matches);
+        const comparison: unknown = JSON.parse(input);
         if (isRecord(comparison) && "related" in comparison) {
           delete comparison["related"];
-          arguments_[matchesIndex + 1] = JSON.stringify(comparison);
         }
+        arguments_.splice(
+          matchesStdinIndex,
+          1,
+          "--matches-json",
+          JSON.stringify(comparison),
+        );
+        input = undefined;
       }
     }
     stdout = await run(arguments_, input);
@@ -2368,10 +2375,21 @@ export function pluginExecutionEnvironment(
   environment: ProcessEnvironment = process.env,
 ): ProcessEnvironment {
   return {
-    ...environment,
+    ...pythonUtf8Environment(environment),
     PYTHON: python,
     CODEX_CLI_PATH: resolveCodexCommand(environment).command,
   };
+}
+
+export function pythonUtf8Environment(
+  environment: ProcessEnvironment,
+): ProcessEnvironment {
+  const normalized = { ...environment };
+  for (const name of Object.keys(normalized)) {
+    if (name.toUpperCase() === "PYTHONUTF8") delete normalized[name];
+  }
+  normalized["PYTHONUTF8"] = "1";
+  return normalized;
 }
 
 export async function cleanupSdkDirectory(path: string): Promise<void> {

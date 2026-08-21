@@ -418,6 +418,7 @@ describe("CLI workbench", () => {
       ["compare", ["baseline-scan"], "baseline-scan", "latest-scan"],
     ] as const) {
       const calls: Array<readonly string[]> = [];
+      let comparisonInput: string | undefined;
       const stdout = capture();
 
       expect(
@@ -426,15 +427,23 @@ describe("CLI workbench", () => {
           stdout.stream,
           capture().stream,
           dependencies({
-            onWorkbench: (args): JsonObject => {
+            onWorkbench: (args, input): JsonObject => {
               calls.push(args);
               if (args[0] === "list-scans") {
                 return {
                   scans: [{ scanId: "latest-scan" }, { scanId: "older-scan" }],
                 };
               }
+              if (args[0] === "save-scan-comparison") comparisonInput = input;
               return args[0] === "compare-scans"
-                ? { matchingCached: false, matchingInputs: { before, after } }
+                ? {
+                    matchingCached: false,
+                    matchingInputs: {
+                      before,
+                      after,
+                      knownFindingGroups: [["known-a", "known-b"]],
+                    },
+                  }
                 : { summary: { persisting: 1 } };
             },
             onMatch: async (input) => {
@@ -452,7 +461,9 @@ describe("CLI workbench", () => {
       const comparison = calls.find((args) => args[0] === "compare-scans")!;
       expect(comparison[2]).toBe(expectedBefore);
       expect(comparison[4]).toBe(expectedAfter);
-      expect(JSON.parse(calls.at(-1)![6]!)).toEqual(matching);
+      const save = calls.find((args) => args[0] === "save-scan-comparison")!;
+      expect(save.at(-1)).toBe("--matches-json-stdin");
+      expect(JSON.parse(comparisonInput!)).toEqual(matching);
       expect(JSON.parse(stdout.text())).toEqual({ summary: { persisting: 1 } });
     }
   });
@@ -521,6 +532,7 @@ describe("CLI workbench", () => {
       },
     ];
     const calls: Array<readonly string[]> = [];
+    const inputs: Array<string | undefined> = [];
     let matcherCalls = 0;
     const stdout = capture();
 
@@ -530,8 +542,9 @@ describe("CLI workbench", () => {
         stdout.stream,
         capture().stream,
         dependencies({
-          onWorkbench: (args): JsonObject => {
+          onWorkbench: (args, input): JsonObject => {
             calls.push(args);
+            inputs.push(input);
             return args[0] === "list-unmatched-scan-pairs"
               ? {
                   repository: "/current/repository",
@@ -591,10 +604,10 @@ describe("CLI workbench", () => {
       "--force",
     ]);
     expect(
-      calls.slice(1).map((args) => ({
+      calls.slice(1).map((args, index) => ({
         before: args[2],
         after: args[4],
-        result: JSON.parse(args[6]!),
+        result: JSON.parse(inputs[index + 1]!),
       })),
     ).toMatchObject([
       { before: "scan-a", after: "scan-b" },
@@ -630,9 +643,11 @@ describe("CLI workbench", () => {
 
   test("saves empty comparisons without starting Codex", async () => {
     const calls: Array<readonly string[]> = [];
+    let comparisonInput: string | undefined;
     const deps = dependencies({
-      onWorkbench: (args): JsonObject => {
+      onWorkbench: (args, input): JsonObject => {
         calls.push(args);
+        if (args[0] === "save-scan-comparison") comparisonInput = input;
         return args[0] === "list-unmatched-scan-pairs"
           ? {
               repository: "/repo",
@@ -667,7 +682,11 @@ describe("CLI workbench", () => {
         deps,
       ),
     ).toBe(0);
-    expect(JSON.parse(calls[1]![6]!)).toEqual({ matches: [], uncertain: [] });
+    expect(calls[1]!.at(-1)).toBe("--matches-json-stdin");
+    expect(JSON.parse(comparisonInput!)).toEqual({
+      matches: [],
+      uncertain: [],
+    });
   });
 
   test("does not save conflicting confirmed and uncertain matches", async () => {
