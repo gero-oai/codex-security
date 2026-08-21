@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import unicodedata
 from collections import Counter
 from typing import Any
 
@@ -23,20 +22,16 @@ DISPOSITION_LABELS = {
 WRITEUP_REPORT_PATH_RE = re.compile(r"^findings/([a-z0-9][a-z0-9._-]*)/\1\.md$")
 
 SCOPE_PATH_QUOTING_RE = re.compile(r"""[\s,;'"\\\x00-\x1f]""")
-# Default_Ignorable_Code_Point, C1 controls, and line separators.
+# Unicode 17 General_Category=Format, Default_Ignorable_Code_Point, C1 controls,
+# and line separators.
 SCOPE_PATH_CONTROLS_RE = re.compile(
-    r"[\x7f-\x9f\u2028\u2029\u00ad\u034f\u061c\u115f-\u1160\u17b4-\u17b5"
+    r"[\x7f-\x9f\u2028\u2029\u00ad\u034f\u0600-\u0605\u061c\u06dd\u070f"
+    r"\u0890-\u0891\u08e2\u115f-\u1160\u17b4-\u17b5"
     r"\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f"
-    r"\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
+    r"\ufeff\uffa0\ufff0-\ufffb\U000110bd\U000110cd\U00013430-\U0001343f"
+    r"\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
     r"\U000e0000-\U000e0fff]"
 )
-
-
-def _is_scope_path_control(character: str) -> bool:
-    return (
-        unicodedata.category(character) == "Cf"
-        or SCOPE_PATH_CONTROLS_RE.fullmatch(character) is not None
-    )
 
 
 class ReportProjectionError(ValueError):
@@ -80,16 +75,10 @@ def _strings(value: Any) -> list[str]:
 def _scope_path(value: Any, fallback: str = "unspecified") -> str:
     path = value if isinstance(value, str) else fallback
     rendered = path
-    if (
-        not path
-        or SCOPE_PATH_QUOTING_RE.search(path)
-        or any(_is_scope_path_control(character) for character in path)
-    ):
-        rendered = "".join(
-            json.dumps(character)[1:-1]
-            if _is_scope_path_control(character)
-            else character
-            for character in json.dumps(path, ensure_ascii=False)
+    if not path or SCOPE_PATH_QUOTING_RE.search(path) or SCOPE_PATH_CONTROLS_RE.search(path):
+        rendered = SCOPE_PATH_CONTROLS_RE.sub(
+            lambda match: json.dumps(match.group(0))[1:-1],
+            json.dumps(path, ensure_ascii=False),
         )
     longest_run = max(
         (len(match.group(0)) for match in re.finditer(r"`+", rendered)), default=0

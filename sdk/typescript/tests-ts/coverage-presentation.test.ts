@@ -13,7 +13,7 @@ function projectScope(scope: {
   const python = Bun.which("python3") ?? Bun.which("python");
   expect(python).not.toBeNull();
   const script = [
-    "import json, pathlib, runpy, sys",
+    "import json, pathlib, runpy, sys, unicodedata",
     "plugin = pathlib.Path(sys.argv[1])",
     "examples = plugin / 'examples' / 'completed-scan'",
     "manifest, findings, coverage = [json.loads((examples / name).read_text()) for name in ('scan-manifest.json', 'findings.json', 'coverage.json')]",
@@ -23,6 +23,7 @@ function projectScope(scope: {
     "coverage.update(scope)",
     "coverage.update({'mode': 'scoped_path', 'completeness': 'partial', 'surfaces': [], 'deferred': [{'id': 'source-review', 'reason': 'Source review remains unfinished.', 'paths': scope['includePaths']}]})",
     "findings['findings'] = []",
+    "unicodedata.category = lambda _character: 'Cn'",
     "projection = runpy.run_path(str(plugin / 'scripts' / 'report_projection.py'))",
     "sys.stdout.buffer.write(projection['generate_report_markdown'](manifest, findings, coverage))",
   ].join("\n");
@@ -81,16 +82,43 @@ describe("coverage scope presentation", () => {
     expect(formatScopePath("src/generated/**")).toBe("src/generated/**");
   });
 
-  test("escapes invisible Unicode controls in terminal and Markdown paths", () => {
-    const controls =
-      "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b\u180e\u180f" +
-      "\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e" +
-      "\u2060\u2061\u2066\u2067\u2068\u2069\u206f\u3164\ufe00\ufe0f" +
-      "\ufeff\uffa0\ufff0\ufff8\u{1bca0}\u{1bca3}\u{1d173}\u{1d17a}" +
-      "\u{e0000}\u{e0100}\u{e0fff}" +
-      "\u0600\u06dd\u070f\u0890\u08e2\ufff9\ufffa\ufffb" +
-      "\u{110bd}\u{110cd}\u{13430}\u{1343f}";
-    const paths = [...controls].flatMap((control) => [
+  test("escapes invisible Unicode controls independently of Python's Unicode database", () => {
+    // Unicode 17 DerivedGeneralCategory.txt, General_Category=Format.
+    const formatControls = (
+      [
+        [0x00ad, 0x00ad],
+        [0x0600, 0x0605],
+        [0x061c, 0x061c],
+        [0x06dd, 0x06dd],
+        [0x070f, 0x070f],
+        [0x0890, 0x0891],
+        [0x08e2, 0x08e2],
+        [0x180e, 0x180e],
+        [0x200b, 0x200f],
+        [0x202a, 0x202e],
+        [0x2060, 0x2064],
+        [0x2066, 0x206f],
+        [0xfeff, 0xfeff],
+        [0xfff9, 0xfffb],
+        [0x110bd, 0x110bd],
+        [0x110cd, 0x110cd],
+        [0x13430, 0x1343f],
+        [0x1bca0, 0x1bca3],
+        [0x1d173, 0x1d17a],
+        [0xe0001, 0xe0001],
+        [0xe0020, 0xe007f],
+      ] as const
+    ).flatMap(([start, end]) =>
+      Array.from({ length: end - start + 1 }, (_, offset) =>
+        String.fromCodePoint(start + offset),
+      ),
+    );
+    expect(formatControls).toHaveLength(170);
+    const representativeNonFormatIgnorables =
+      "\u034f\u115f\u1160\u17b4\u17b5\u180b\u180f\u3164\ufe00\ufe0f" +
+      "\uffa0\ufff0\ufff8\u{e0000}\u{e0100}\u{e0fff}";
+    const controls = [...formatControls, ...representativeNonFormatIgnorables];
+    const paths = controls.flatMap((control) => [
       `src/${control}name`,
       `src/a ${control}name`,
     ]);
