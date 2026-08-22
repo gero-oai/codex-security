@@ -265,6 +265,25 @@ describe("shared security-policy inputs", () => {
     }
   });
 
+  test("keeps directory links out of read-only inventories", async () => {
+    const { root, repository } = await fixture();
+    const outside = join(root, "outside");
+    await mkdir(outside);
+    await symlink(
+      outside,
+      join(repository, "SECURITY.md"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const inventory = run(repository, "--list");
+    expect(inventory.status, inventory.stderr).toBe(0);
+    expect(JSON.parse(inventory.stdout)).toEqual([]);
+
+    const inspection = run(repository, "--inspect", "--scope", ".");
+    expect(inspection.status).toBe(2);
+    expect(inspection.stdout).toBe("");
+  });
+
   test("reads hard-linked policies but rejects a hard-linked destination", async () => {
     const { repository } = await fixture();
     await mkdir(join(repository, "component", "child"), { recursive: true });

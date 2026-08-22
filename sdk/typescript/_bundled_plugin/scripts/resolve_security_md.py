@@ -132,7 +132,7 @@ def list_security_md(
         raise ResolutionError(f"policy scope is inside Git metadata: {selected}")
     # The starting scope is checked above; pruning each metadata root excludes its descendants.
     git_stats = tuple(directory.stat() for directory in git_dirs)
-    for directory, subdirectories, _filenames in os.walk(
+    for directory, subdirectories, filenames in os.walk(
         selected, onerror=raise_walk_error, followlinks=False
     ):
         safe_subdirectories: list[str] = []
@@ -150,6 +150,8 @@ def list_security_md(
                 continue
             safe_subdirectories.append(name)
         subdirectories[:] = safe_subdirectories
+        if "SECURITY.md" not in filenames:
+            continue
         policy = Path(directory) / "SECURITY.md"
         if policy.is_file() or policy.is_symlink():
             policies.append(policy.relative_to(root).as_posix())
