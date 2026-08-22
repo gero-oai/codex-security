@@ -171,6 +171,8 @@ const distFiles = new Set(
     "cost",
     "cost-model",
     "coverage-presentation",
+    "custom-validation",
+    "custom-validation-prompt",
     "errors",
     "index",
     "knowledge-base",
