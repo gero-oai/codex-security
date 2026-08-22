@@ -1491,18 +1491,38 @@ describe("security policy review and application", () => {
         process.env["SystemRoot"] ?? "C:\\Windows",
         "System32",
       );
-      execFileSync(
-        join(systemDirectory, "icacls.exe"),
-        [target, "/inheritance:d"],
-        { windowsHide: true },
-      );
       const powershell = join(
         systemDirectory,
         "WindowsPowerShell",
         "v1.0",
         "powershell.exe",
       );
-      const descriptor = () =>
+      execFileSync(
+        powershell,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          [
+            "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()",
+            "$acl = [System.Security.AccessControl.FileSecurity]::new()",
+            "$acl.SetOwner($identity.User)",
+            "$acl.SetAccessRuleProtection($true, $false)",
+            "$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($identity.User, 'Read', 'Allow')",
+            "$acl.AddAccessRule($rule)",
+            "Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -AclObject $acl",
+          ].join("; "),
+        ],
+        {
+          env: {
+            ...process.env,
+            CODEX_SECURITY_TEST_ACL_PATH: target,
+          },
+          windowsHide: true,
+        },
+      );
+      const descriptor = (path = target) =>
         execFileSync(
           powershell,
           [
@@ -1516,7 +1536,7 @@ describe("security policy review and application", () => {
             encoding: "utf8",
             env: {
               ...process.env,
-              CODEX_SECURITY_TEST_ACL_PATH: target,
+              CODEX_SECURITY_TEST_ACL_PATH: path,
             },
             windowsHide: true,
           },
@@ -1525,6 +1545,8 @@ describe("security policy review and application", () => {
       expect(before).toContain("D:P");
       const draft = await f.generate();
       const originalLink = fsPromises.link;
+      const originalRename = fsPromises.rename;
+      let inspectedTemporary = false;
       mock.module("node:fs/promises", () => ({
         ...fsPromises,
         link: async () => {
@@ -1532,15 +1554,43 @@ describe("security policy review and application", () => {
             code: "ENOTSUP",
           });
         },
+        rename: async (...args: Parameters<typeof originalRename>) => {
+          if (args[0] === target) {
+            const temporaryName = (await readdir(f.repository)).find(
+              (name) =>
+                name.startsWith(".SECURITY.md.") && name.endsWith(".tmp"),
+            );
+            expect(temporaryName).toBeDefined();
+            const temporary = join(f.repository, temporaryName!);
+            expect(await readFile(temporary, "utf8")).toBe(POLICY);
+            expect(descriptor(temporary)).toBe(before);
+            const reopenError = await open(temporary, "r+").then(
+              async (handle) => {
+                await handle.close();
+                return null;
+              },
+              (error: unknown) => error,
+            );
+            expect(reopenError).toBeInstanceOf(Error);
+            const reopenCode = (reopenError as NodeJS.ErrnoException).code;
+            expect(reopenCode === "EACCES" || reopenCode === "EPERM").toBe(
+              true,
+            );
+            inspectedTemporary = true;
+          }
+          return originalRename(...args);
+        },
       }));
       try {
         await applySecurityPolicy(draft);
+        expect(inspectedTemporary).toBe(true);
         expect(await readFile(target, "utf8")).toBe(POLICY);
         expect(descriptor()).toBe(before);
       } finally {
         mock.module("node:fs/promises", () => ({
           ...fsPromises,
           link: originalLink,
+          rename: originalRename,
         }));
       }
     },
@@ -1551,7 +1601,7 @@ describe("security policy review and application", () => {
       "preserves read-only mode when temporary cleanup changes permissions";
     if (runTestInSubprocess(import.meta.path, name)) return;
     const originalRm = fsPromises.rm;
-    const originalWriteFile = fsPromises.writeFile;
+    const originalStat = fsPromises.stat;
     for (const existing of [false, true]) {
       const f = await fixture();
       const target = join(f.repository, "SECURITY.md");
@@ -1562,11 +1612,11 @@ describe("security policy review and application", () => {
       const draft = await f.generate();
       mock.module("node:fs/promises", () => ({
         ...fsPromises,
-        writeFile: async (...args: Parameters<typeof originalWriteFile>) => {
-          await originalWriteFile(...args);
+        stat: async (...args: Parameters<typeof originalStat>) => {
           const path = args[0];
           if (!existing && typeof path === "string" && path.endsWith(".tmp"))
             await chmod(path, 0o444);
+          return originalStat(...args);
         },
         rm: async (path: string, options: Parameters<typeof originalRm>[1]) => {
           if (path.endsWith(".tmp")) await chmod(path, 0o666);
@@ -1582,7 +1632,7 @@ describe("security policy review and application", () => {
         mock.module("node:fs/promises", () => ({
           ...fsPromises,
           rm: originalRm,
-          writeFile: originalWriteFile,
+          stat: originalStat,
         }));
         await chmod(target, 0o644).catch(() => undefined);
       }

@@ -1186,11 +1186,25 @@ export async function applySecurityPolicy(
         `.SECURITY.md.${randomUUID()}.tmp`,
       );
       try {
-        await writeFile(temporary, draft.content, {
-          flag: "wx",
-          mode: draft.previousContent === null ? 0o644 : 0o600,
-          signal: options.signal,
-        });
+        const temporaryHandle = await open(
+          temporary,
+          "wx",
+          draft.previousContent === null ? 0o644 : 0o600,
+        );
+        try {
+          if (draft.previousContent !== null && process.platform === "win32")
+            await copyWindowsSecurityDescriptor(
+              target.targetPath,
+              temporary,
+              options.signal,
+            );
+          await temporaryHandle.writeFile(draft.content, {
+            encoding: "utf8",
+            signal: options.signal,
+          });
+        } finally {
+          await temporaryHandle.close();
+        }
         if (
           (await realpath(dirname(target.targetPath))) !==
           dirname(target.targetPath)
