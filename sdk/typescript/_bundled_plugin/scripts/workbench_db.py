@@ -97,20 +97,22 @@ from workbench_schema import (
 from workbench_schema import (
     sql_statements as sql_statements,
 )
-from workbench_source_excerpt import finding_source_excerpt, safe_source_path
-from workbench_source_scopes import capture_source_scopes
+from workbench_source_excerpt import finding_source_excerpt
+from workbench_source_scopes import capture_source_scopes, safe_source_path
 from workbench_target import (
     clean_worktree_content_digest,
     copy_directory_excluding,
     copy_git_worktree_files,
     directory_content_digest,
     directory_snapshot_regular_file_count,
+    git_bytes,
     git_command,
     git_output,
     git_revision,
     git_submodule_paths,
     git_target_metadata,
     git_worktree_context,
+    remediation_checkout_snapshot,
     require_git_worktree_head,
     require_remediation_target,
     require_scan_target_identity,
@@ -128,7 +130,7 @@ from workbench_validation import (
     require_occurrence,
     require_uuid,
     sqlite_busy,
-    user_text,
+    user_context_argument,
 )
 
 FINDING_ARTIFACT_DIRECTORIES_LIMIT = 80
@@ -315,11 +317,11 @@ def require_diff_target(
         }
     if kind == "commit":
         head = resolve_git_commit(target, head_revision or "", "Commit")
-        commit = git_output(target, "cat-file", "-p", head)
+        commit = git_bytes(target, "cat-file", "-p", head)
         if commit is None:
             raise SystemExit(f"Commit is not available in the local checkout: {head}")
         parent_line = next(
-            (line for line in commit.splitlines() if line.startswith("parent ")),
+            (line for line in commit.splitlines() if line.startswith(b"parent ")),
             None,
         )
         if parent_line is None:
@@ -327,7 +329,7 @@ def require_diff_target(
         else:
             parent = resolve_git_commit(
                 target,
-                parent_line.removeprefix("parent ").strip(),
+                parent_line.removeprefix(b"parent ").decode("ascii").strip(),
                 "Commit parent",
             )
         if base_revision and base_revision != parent:
@@ -609,17 +611,15 @@ def verify_manifest_binding(scan: sqlite3.Row, manifest: dict[str, Any]) -> None
 
 def require_scope(scope: str, mode: str, target: Path) -> str:
     value = scope.strip() or "."
-    if "\\" in value:
+    requested_scope = Path(value)
+    if "\\" in value and (os.name != "nt" or not requested_scope.is_absolute()):
         raise SystemExit("Scan scope must use repository-relative POSIX paths.")
-    parsed = PurePosixPath(value)
-    if ".." in parsed.parts:
+    if ".." in requested_scope.parts:
         raise SystemExit("Scan scope must stay inside the scanned target.")
     try:
         resolved_scope = (
-            Path(parsed.as_posix()).resolve()
-            if parsed.is_absolute()
-            else (target / parsed.as_posix()).resolve()
-        )
+            requested_scope if requested_scope.is_absolute() else target / requested_scope
+        ).resolve()
         relative_scope = resolved_scope.relative_to(target)
     except (RuntimeError, ValueError) as exc:
         raise SystemExit("Scan scope must stay inside the scanned target.") from exc
@@ -723,7 +723,7 @@ def create_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -
                 optional_text(args.target_summary, maximum=2400),
                 default_scope,
                 args.mode,
-                user_text(args.user_context),
+                user_context_argument(args),
                 diff_target_kind,
                 diff_base_revision,
                 diff_head_revision,
@@ -782,7 +782,7 @@ def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> 
                 target_summary,
                 scope,
                 args.mode,
-                user_text(args.user_context),
+                user_context_argument(args),
                 diff_target["kind"] if diff_target else None,
                 diff_target["baseRevision"] if diff_target else None,
                 diff_target["headRevision"] if diff_target else None,
@@ -852,7 +852,12 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
             diff_target,
             metadata=target_metadata,
         )
-        source_scopes = capture_source_scopes(target, target_identity, [scope])
+        source_scopes = capture_source_scopes(
+            target,
+            target_identity,
+            [scope],
+            diff_target_kind=diff_target["kind"] if diff_target is not None else None,
+        )
         target_root = scan_target_root(args.scan_root, target)
         target_root.mkdir(parents=True, exist_ok=True)
         if manages_transaction:
@@ -949,7 +954,7 @@ def _start_prompt_driven_scan(
     target_path = str(target)
     scope = inspected["scope"]
     diff_target = inspected["diffTarget"]
-    user_context = user_text(args.user_context)
+    user_context = user_context_argument(args)
     target_summary = optional_text(args.target_summary, maximum=2400)
     if diff_target is not None and not target_summary:
         target_summary = diff_target_summary(diff_target)
@@ -958,7 +963,12 @@ def _start_prompt_driven_scan(
     )
     diff_identity = scan_diff_identity(diff_target)
     target_identity = scan_target_identity(target, diff_target)
-    source_scopes = capture_source_scopes(target, target_identity, [scope])
+    source_scopes = capture_source_scopes(
+        target,
+        target_identity,
+        [scope],
+        diff_target_kind=diff_target["kind"] if diff_target is not None else None,
+    )
     target_root = scan_target_root(args.scan_root, target)
 
     connection.execute("BEGIN IMMEDIATE")
@@ -1617,7 +1627,14 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
     if next(scan_dir.iterdir(), None) is not None:
         raise SystemExit("The scan artifact directory must be empty before the scan starts.")
 
-    recipe = parse_scan_recipe(args.recipe_json, repository)
+    user_context = None
+    if args.registration_json_stdin:
+        registration = json.load(sys.stdin)
+        recipe_json = json.dumps(registration["recipe"], ensure_ascii=False, separators=(",", ":"))
+        user_context = registration.get("userContext")
+    else:
+        recipe_json = sys.stdin.read() if args.recipe_json_stdin else args.recipe_json
+    recipe = parse_scan_recipe(recipe_json, repository)
     requested_target = recipe["target"]
     paths = requested_target["paths"]
     recipe.pop("_codexSecurityFileScopes", None)
@@ -1638,7 +1655,12 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
             diff_target["contentDigest"] = worktree_content_digest(repository)
     mode = "diff" if diff_target is not None else recipe["mode"]
     target_identity = scan_target_identity(repository, diff_target)
-    source_scopes = capture_source_scopes(repository, target_identity, paths or ["."])
+    source_scopes = capture_source_scopes(
+        repository,
+        target_identity,
+        paths or ["."],
+        diff_target_kind=diff_target["kind"] if diff_target is not None else None,
+    )
     scope_file_count = (
         directory_snapshot_regular_file_count(repository)
         if not paths
@@ -1705,12 +1727,13 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
             scan_dir=scan_dir,
         )
         connection.execute(
-            "UPDATE scans SET recipe_json = ?, parent_scan_id = ? WHERE id = ?",
+            "UPDATE scans SET recipe_json = ?, parent_scan_id = ?, user_context = ? WHERE id = ?",
             (
                 json.dumps(
                     recipe, allow_nan=False, separators=(",", ":"), sort_keys=True
                 ),
                 parent_scan_id,
+                user_context,
                 scan_id,
             ),
         )
@@ -2858,24 +2881,6 @@ def require_pending_remediation_action(current: sqlite3.Row, requested: str) -> 
         )
 
 
-def remediation_checkout_snapshot(
-    scan: sqlite3.Row, *, expected_revision: str | None = None
-) -> tuple[str, str | None]:
-    target = require_scan_target_identity(scan)
-    revision = git_revision(target)
-    required_revision = expected_revision or scan["target_revision"]
-    if revision != required_revision:
-        raise SystemExit(
-            "Repository HEAD changed. Regenerate the remediation patch against the current checkout."
-        )
-    content_digest = (
-        worktree_content_digest(target)
-        if revision != "unversioned"
-        else directory_content_digest(target, excluded=(Path(scan["scan_dir"]),))
-    )
-    return revision, content_digest
-
-
 def require_reviewed_patch_applied(
     scan: sqlite3.Row, remediation: sqlite3.Row, patch_path: str
 ) -> str | None:
@@ -2922,7 +2927,7 @@ def require_reviewed_patch_applied(
         applied = git_command(
             checkout if unversioned else checkout_root,
             *arguments,
-            text=True,
+            text=False,
             git_dir=Path(git_dir) if git_dir is not None else None,
             work_tree=checkout_root if git_dir is not None else None,
         )
@@ -2940,6 +2945,14 @@ def require_reviewed_patch_applied(
                 work_tree=checkout_root,
             )
         )
+        if reverted_digest != remediation["base_content_digest"] and unversioned:
+            checkout = Path(temporary) / "checkout-lf"
+            copy_directory_excluding(target, checkout, excluded)
+            applied_without_conversion = git_command(
+                checkout, "-c", "core.autocrlf=input", *arguments, text=True
+            )
+            if applied_without_conversion.returncode == 0:
+                reverted_digest = directory_content_digest(checkout)
         if reverted_digest != remediation["base_content_digest"]:
             raise SystemExit(
                 "The selected checkout contains changes outside the reviewed patch. Remove them before recording the patch as applied."
@@ -3466,8 +3479,7 @@ def finding_result(
     scan: sqlite3.Row,
     occurrence: sqlite3.Row,
 ) -> dict[str, Any]:
-    stored_details = read_finding_details(occurrence["details_json"])
-    details = bounded_finding_details(stored_details)
+    details = bounded_finding_details(read_finding_details(occurrence["details_json"]))
     confidence = details.get("confidence")
     confidence = confidence if isinstance(confidence, dict) else {}
     severity = details.get("severity")
@@ -3846,6 +3858,8 @@ def reject_non_finite_json(value: str) -> None:
 
 
 def main() -> None:
+    # Workbench callers send UTF-8 even when Windows uses a legacy code page.
+    sys.stdin.reconfigure(encoding="utf-8")
     args = parse_args(__doc__)
     deep_scan.configure(
         deep_scan.DeepScanDependencies(

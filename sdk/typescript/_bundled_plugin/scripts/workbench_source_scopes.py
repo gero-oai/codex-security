@@ -199,9 +199,14 @@ def capture_source_scopes(
     target: Path,
     target_identity: tuple[str, str | None, int | str, int | str],
     paths: list[str],
+    *,
+    diff_target_kind: str | None = None,
 ) -> dict[str, Any]:
     revision, snapshot = target_identity[:2]
     result: dict[str, Any] = {"version": 1, "revision": revision, "scopes": []}
+    # HEAD cannot represent the uncommitted bytes reviewed by a working-tree scan.
+    if diff_target_kind == "working_tree":
+        return result
     if revision == "unversioned" or (
         snapshot is not None and snapshot != clean_worktree_content_digest()
     ):
@@ -247,6 +252,8 @@ def capture_source_scopes(
 def load_source_scopes(
     scan: sqlite3.Row, target: Path, requested: list[str]
 ) -> tuple[Path, str, list[dict[str, str]]] | None:
+    if "diff_target_kind" in scan.keys() and scan["diff_target_kind"] == "working_tree":
+        return None
     saved = scan["source_scopes_json"] if "source_scopes_json" in scan.keys() else None
     paths = {PurePosixPath(path).as_posix() for path in requested}
     if saved is not None:

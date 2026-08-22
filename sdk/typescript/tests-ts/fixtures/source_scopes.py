@@ -382,6 +382,47 @@ def selected_redirects(repository: Path) -> dict:
     }
 
 
+def working_tree_excerpt(repository: Path) -> dict:
+    write(repository, "source.py", "old committed source\n")
+    revision = commit(repository)
+    write(repository, "source.py", "new working-tree source\n")
+    recipe = {
+        "config": {},
+        "mode": "standard",
+        "repository": str(repository),
+        "target": {
+            "kind": "working_tree",
+            "paths": [],
+            "base": revision,
+            "head": revision,
+        },
+    }
+    _, record = register_recipe(repository, recipe)
+    metadata = json.loads(record["source_scopes_json"])
+    historical = {**record, "source_scopes_json": None}
+    range_recipe = {
+        **recipe,
+        "target": {
+            "kind": "refs",
+            "paths": [],
+            "base": revision,
+            "head": revision,
+        },
+    }
+    _, range_record = register_recipe(repository, range_recipe)
+    return {
+        "authorityOmitted": metadata["scopes"] == [],
+        "currentExcerptOmitted": excerpt(record, repository, "source.py", ["."])
+        is None,
+        "legacyExcerptOmitted": excerpt(historical, repository, "source.py", ["."])
+        is None,
+        "rangeExcerptPreserved": excerpt(
+            range_record, repository, "source.py", ["."]
+        )
+        == "1  old committed source",
+    }
+
+
 def unsafe_locations(repository: Path) -> dict:
     write(repository, "source.py", "selected source\n")
     record = scan(repository, commit(repository), ["."])
@@ -849,9 +890,9 @@ def migration(_: Path) -> dict:
     for conflict in (False, True):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
-        apply = lambda migrations: apply_migrations(
-            connection, migrations, lambda: timestamp, lambda _: None
-        )
+        def apply(migrations: tuple[tuple[int, str, str], ...]) -> None:
+            apply_migrations(connection, migrations, lambda: timestamp, lambda _: None)
+
         apply(historical)
         connection.executemany(
             "INSERT INTO schema_migrations VALUES (?, ?, ?)",
@@ -947,6 +988,7 @@ with tempfile.TemporaryDirectory(prefix="codex-security-source-scopes-") as temp
             "replacements": replacements,
             "replacement_filters": replacement_filters,
             "replacement_snapshot": replacement_snapshot,
+            "working_tree_excerpt": working_tree_excerpt,
             "indexed_scopes": indexed_scopes,
             "display_locations": display_locations,
             "selected_redirects": selected_redirects,

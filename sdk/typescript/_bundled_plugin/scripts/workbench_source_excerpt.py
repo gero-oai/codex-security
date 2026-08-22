@@ -14,9 +14,9 @@ from workbench_source_scopes import (
     normalized_path_component,
     offline_git_bytes,
     relative_path,
+    safe_source_path,
     source_object_for_path,
 )
-from workbench_source_scopes import safe_source_path as safe_source_path
 from workbench_target import clean_worktree_content_digest
 
 CONTEXT_LINES = 3
