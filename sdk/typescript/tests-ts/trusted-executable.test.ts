@@ -1,8 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { constants } from "node:fs";
 import {
   chmod,
-  link,
   mkdir,
   mkdtemp,
   realpath,
@@ -10,16 +8,14 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join, relative, sep } from "node:path";
+import { basename, delimiter, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   inspectTrustedExecutable,
   resolveTrustedExecutable,
 } from "../src/trusted-executable.js";
-import { runMockInSubprocess } from "./support/isolated-mock.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -84,129 +80,6 @@ async function resolveWindowsExecutable(
 }
 
 describe("trusted executable resolution", () => {
-  test("requires fully qualified Windows paths for explicit tool bindings", () => {
-    const cases: [string, string | null][] = [
-      [String.raw`\tools\git.exe`, null],
-      ["/tools/git.exe", null],
-      [String.raw`C:tools\git.exe`, null],
-      [String.raw`\\server`, null],
-      [String.raw`C:\tools\git.exe`, String.raw`C:\tools\git.exe`],
-      ["C:/tools/git.exe", "C:/tools/git.exe"],
-      [String.raw`\\server\share\git.exe`, String.raw`\\server\share\git.exe`],
-      ["//server/share/git.exe", "//server/share/git.exe"],
-      [String.raw`\\?\C:\tools\git.exe`, String.raw`\\?\C:\tools\git.exe`],
-    ];
-    const script = `
-      import { mock } from "bun:test";
-      import * as originalPromises from "node:fs/promises";
-      import * as originalPath from "node:path";
-      const [modulePath, values, repository] = process.argv.slice(1);
-      const windows = originalPath.win32;
-      const canonical = (path) => windows.resolve(windows.parse(repository).root, path);
-      const identities = new Map();
-      const identity = (path) => {
-        const key = canonical(path).toLowerCase();
-        if (!identities.has(key)) identities.set(key, BigInt(identities.size + 1));
-        return identities.get(key);
-      };
-      Object.defineProperty(process, "platform", { value: "win32" });
-      mock.module("node:path", () => ({ ...originalPath, ...windows }));
-      mock.module("node:fs/promises", () => ({
-        ...originalPromises,
-        realpath: async (path) => canonical(path),
-        access: async () => {},
-        stat: async (path) => ({ dev: 1n, ino: identity(path), isFile: () => true }),
-      }));
-      const { inspectTrustedExecutable } = await import(modulePath);
-      const results = [];
-      for (const value of JSON.parse(values)) {
-        const result = await inspectTrustedExecutable(value, { PATH: "" }, repository, {
-          preserveInvocation: true,
-        });
-        results.push(result.executable);
-      }
-      console.log(JSON.stringify(results));
-    `;
-    const result = spawnSync(
-      process.execPath,
-      [
-        "-e",
-        script,
-        fileURLToPath(new URL("../src/trusted-executable.ts", import.meta.url)),
-        JSON.stringify(cases.map(([value]) => value)),
-        String.raw`C:\repository`,
-      ],
-      { encoding: "utf8" },
-    );
-    expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual(
-      cases.map(([, executable]) => executable),
-    );
-  });
-
-  test("excludes every protected root before selecting an executable", async () => {
-    const root = await temporaryDirectory();
-    const repositories = [join(root, "working"), join(root, "source")];
-    const unsafe = repositories.map((repository) => join(repository, "bin"));
-    const trusted = join(root, "trusted");
-    const name = process.platform === "win32" ? "git.exe" : "git";
-    for (const directory of [...unsafe, trusted]) {
-      await mkdir(directory, { recursive: true });
-      await writeFile(join(directory, name), "synthetic executable\n", {
-        mode: 0o700,
-      });
-    }
-    const linked = join(repositories[1]!, "host-tools");
-    await symlink(
-      trusted,
-      linked,
-      process.platform === "win32" ? "junction" : "dir",
-    );
-
-    expect(
-      await resolveTrustedExecutable(
-        "git",
-        { PATH: [...unsafe, trusted].join(delimiter), KEEP: "ok" },
-        repositories,
-      ),
-    ).toEqual({
-      executable: join(trusted, name),
-      environment: { PATH: trusted, KEEP: "ok" },
-    });
-    for (const path of [...unsafe, linked]) {
-      const inspected = await inspectTrustedExecutable(
-        join(path, name),
-        { PATH: trusted },
-        repositories,
-        { preserveInvocation: true },
-      );
-      expect(inspected.executable).toBeNull();
-    }
-    expect(
-      (
-        await inspectTrustedExecutable(
-          join(trusted, name),
-          { PATH: trusted },
-          repositories,
-          { preserveInvocation: true },
-        )
-      ).executable,
-    ).toBe(join(trusted, name));
-
-    const sourceFile = join(root, "source-file");
-    await link(join(trusted, name), sourceFile);
-    expect(
-      (
-        await inspectTrustedExecutable(
-          join(trusted, name),
-          { PATH: "" },
-          [repositories[0]!, sourceFile],
-          { preserveInvocation: true },
-        )
-      ).executable,
-    ).toBeNull();
-  });
-
   test("accepts safe relative PATH entries without trusting repository links", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
@@ -243,6 +116,40 @@ describe("trusted executable resolution", () => {
     });
   });
 
+  test("sanitizes repository-linked PATH entries when no trusted executable exists", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const repositoryTools = join(repository, "tools");
+    const linkedExecutable = join(root, "linked-executable");
+    const safe = join(root, "safe");
+    const executable = process.platform === "win32" ? "git.exe" : "git";
+    await Promise.all([
+      mkdir(repositoryTools, { recursive: true }),
+      mkdir(linkedExecutable),
+      mkdir(safe),
+    ]);
+    await writeFile(join(repositoryTools, executable), "untrusted executable");
+    await symlink(
+      join(repositoryTools, executable),
+      join(linkedExecutable, executable),
+      "file",
+    );
+
+    await expect(
+      inspectTrustedExecutable(
+        "git",
+        {
+          PATH: [linkedExecutable, safe].join(delimiter),
+          KEEP: "ok",
+        },
+        repository,
+      ),
+    ).resolves.toEqual({
+      executable: null,
+      environment: { KEEP: "ok", PATH: safe },
+    });
+  });
+
   test.skipIf(process.platform === "win32")(
     "preserves the invocation name of a trusted symlinked executable",
     async () => {
@@ -275,229 +182,6 @@ describe("trusted executable resolution", () => {
       expect(result.stdout.trim()).toBe(git);
     },
   );
-
-  test("preserves explicit invocations only outside the protected directory identity", async () => {
-    const name =
-      "preserves explicit invocations only outside the protected directory identity";
-    if (runMockInSubprocess(import.meta.path, name)) return;
-
-    const originalPromises = { ...fsPromises };
-    const root = join(tmpdir(), "trusted-invocation-metadata-mock");
-    const repository = join(root, "repository");
-    const trusted = join(root, "trusted");
-    const alias = join(root, "repository-alias");
-    const caseAlias = join(root, "REPOSITORY");
-    const extension = process.platform === "win32" ? ".exe" : "";
-    const canonical = join(root, "native", `tool${extension}`);
-    const caseTarget = join(caseAlias, "native", `tool${extension}`);
-    const selected = join(trusted, "selected git");
-    const inside = join(repository, "git");
-    const linkedParent = join(repository, "host-tools", "git");
-    const aliasedParent = join(alias, "git");
-    const caseParent = join(caseAlias, "git");
-    const traversedParent = `${alias}${sep}..${sep}trusted${sep}git`;
-    const externalCaseTarget = join(trusted, "case-target");
-    const unsafe = [
-      inside,
-      linkedParent,
-      aliasedParent,
-      caseParent,
-      traversedParent,
-      externalCaseTarget,
-    ];
-    const paths = new Map([
-      [repository, repository],
-      ...[selected, ...unsafe].map((path): [string, string] => [
-        `${path}${extension}`,
-        path === externalCaseTarget ? caseTarget : canonical,
-      ]),
-    ]);
-    const protectedInode = 9_007_199_254_740_993n;
-    const identities = new Map<string, bigint>([
-      [repository, protectedInode],
-      [alias, protectedInode],
-      [caseAlias, protectedInode],
-      [trusted, protectedInode - 1n],
-    ]);
-    let nextInode = 1n;
-    mock.module("node:fs/promises", () => ({
-      ...originalPromises,
-      realpath: async (path: string) => {
-        const result = paths.get(path);
-        if (result === undefined) {
-          throw Object.assign(new Error("missing synthetic path"), {
-            code: "ENOENT",
-          });
-        }
-        return result;
-      },
-      access: async () => {},
-      stat: async (path: string, options?: { bigint?: boolean }) => {
-        if (!options?.bigint) {
-          return { isFile: () => path === canonical || path === caseTarget };
-        }
-        if (!identities.has(path)) identities.set(path, nextInode++);
-        return { dev: 1n, ino: identities.get(path)! };
-      },
-    }));
-
-    try {
-      const resolver = await import("../src/trusted-executable.js");
-      const inspect = (path: string, preserveInvocation = true) =>
-        resolver.inspectTrustedExecutable(path, { PATH: "" }, repository, {
-          preserveInvocation,
-        });
-      expect((await inspect(selected)).executable).toBe(selected);
-      expect((await inspect(inside, false)).executable).toBe(canonical);
-      for (const path of unsafe) {
-        expect((await inspect(path)).executable).toBeNull();
-      }
-    } finally {
-      mock.module("node:fs/promises", () => originalPromises);
-    }
-  });
-
-  test("rejects canonical Windows batch targets without rejecting native aliases", async () => {
-    if (
-      runMockInSubprocess(
-        import.meta.path,
-        "rejects canonical Windows batch targets without rejecting native aliases",
-      )
-    ) {
-      return;
-    }
-    const originalPromises = { ...fsPromises };
-    const originalPlatform = Object.getOwnPropertyDescriptor(
-      process,
-      "platform",
-    )!;
-    const root = join(tmpdir(), "trusted-executable-metadata-mock");
-    const repository = join(root, "repository");
-    const first = join(root, "first");
-    const second = join(root, "second");
-    const firstExe = join(first, "rg.exe");
-    const firstCom = join(first, "rg.com");
-    const secondExe = join(second, "rg.exe");
-    const native = join(root, "native-target");
-    const command = join(root, "target.CmD");
-    const batch = join(root, "target.BaT");
-    let paths = new Map<string, string>();
-    let files = new Set<string>();
-    const accesses: [string, number][] = [];
-    const missing = () =>
-      Object.assign(new Error("missing mock path"), { code: "ENOENT" });
-    mock.module("node:fs/promises", () => ({
-      ...originalPromises,
-      realpath: async (path: string) => {
-        const canonical = paths.get(path);
-        if (canonical === undefined) throw missing();
-        return canonical;
-      },
-      access: async (path: string, mode: number) => {
-        accesses.push([path, mode]);
-        if (!files.has(path)) throw missing();
-      },
-      stat: async (path: string) => ({ isFile: () => files.has(path) }),
-    }));
-    const cases: {
-      platform: NodeJS.Platform;
-      entries: string[];
-      targets: [string, string][];
-      executable: string | null;
-      keptEntries?: string[];
-    }[] = [
-      {
-        platform: "win32",
-        entries: [first],
-        targets: [[firstExe, command]],
-        executable: null,
-      },
-      {
-        platform: "win32",
-        entries: [first],
-        targets: [[firstExe, batch]],
-        executable: null,
-      },
-      {
-        platform: "win32",
-        entries: [first, second],
-        targets: [
-          [firstExe, command],
-          [secondExe, native],
-        ],
-        executable: secondExe,
-      },
-      {
-        platform: "win32",
-        entries: [first],
-        targets: [[firstExe, native]],
-        executable: firstExe,
-      },
-      {
-        platform: "win32",
-        entries: [first],
-        targets: [[firstCom, native]],
-        executable: firstCom,
-      },
-      {
-        platform: "win32",
-        entries: [first, second],
-        targets: [
-          [firstExe, join(repository, "target.cmd")],
-          [secondExe, native],
-        ],
-        executable: secondExe,
-        keptEntries: [second],
-      },
-      {
-        platform: "linux",
-        entries: [first],
-        targets: [[join(first, "rg"), command]],
-        executable: join(first, "rg"),
-      },
-    ];
-
-    try {
-      for (const entry of cases) {
-        Object.defineProperty(process, "platform", { value: entry.platform });
-        paths = new Map([
-          [repository, repository],
-          ...entry.entries.map((path): [string, string] => [path, path]),
-          ...entry.targets,
-        ]);
-        files = new Set(entry.targets.map(([, canonical]) => canonical));
-        accesses.length = 0;
-        expect(
-          await inspectTrustedExecutable(
-            "rg",
-            { PATH: entry.entries.join(delimiter), KEEP: "ok" },
-            repository,
-          ),
-        ).toEqual({
-          executable: entry.executable,
-          environment: {
-            KEEP: "ok",
-            PATH: (entry.keptEntries ?? entry.entries).join(delimiter),
-          },
-        });
-        expect(
-          accesses.every(
-            ([, mode]) =>
-              mode ===
-              (entry.platform === "win32" ? constants.F_OK : constants.X_OK),
-          ),
-        ).toBe(true);
-        if (entry.platform === "win32") {
-          expect(accesses.some(([path]) => /\.(?:bat|cmd)$/iu.test(path))).toBe(
-            false,
-          );
-        }
-      }
-    } finally {
-      Object.defineProperty(process, "platform", originalPlatform);
-      mock.module("node:fs/promises", () => originalPromises);
-    }
-  });
 
   test("selects runnable Windows executables ahead of extensionless and batch files", async () => {
     const root = await temporaryDirectory();
@@ -605,6 +289,31 @@ describe("trusted executable resolution", () => {
         repository,
       ),
     ).toBeNull();
+  });
+
+  test("rejects Windows batch targets without requiring a canonical native suffix", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const trusted = join(root, "trusted");
+    await Promise.all([mkdir(repository), mkdir(trusted)]);
+    await Promise.all([
+      writeFile(join(trusted, "git.cmd"), "batch"),
+      writeFile(join(trusted, "tool"), "extensionless"),
+    ]);
+    await Promise.all([
+      symlink(join(trusted, "git.cmd"), join(trusted, "git.exe"), "file"),
+      symlink(join(trusted, "tool"), join(trusted, "tool.exe"), "file"),
+    ]);
+
+    expect(
+      await resolveWindowsExecutable("git", trusted, repository),
+    ).toBeNull();
+    expect(await resolveWindowsExecutable("tool", trusted, repository)).toEqual(
+      {
+        executable: join(trusted, "tool.exe"),
+        environment: { KEEP: "ok", PATH: trusted },
+      },
+    );
   });
 
   test("removes PATH entries containing repository-linked Windows shims", async () => {

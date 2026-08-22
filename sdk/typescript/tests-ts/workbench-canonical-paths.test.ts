@@ -118,7 +118,11 @@ function runPythonProbe(
 
   const result = Bun.spawnSync(
     [python, "-I", "-B", "-c", program, join(PLUGIN_ROOT, "scripts"), ...args],
-    { stdout: "pipe", stderr: "pipe" },
+    {
+      env: { ...process.env, CODEX_SECURITY_GIT: Bun.which("git") ?? "" },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
   );
   expect(new TextDecoder().decode(result.stderr)).toBe("");
   expect(result.exitCode).toBe(0);
@@ -129,6 +133,121 @@ function runPythonProbe(
 }
 
 describe("bundled workbench canonical paths", () => {
+  test("reads Unicode commit subjects regardless of locale or Git log encoding", async () => {
+    const repository = await temporaryDirectory();
+    expect(
+      runPythonProbe(
+        [
+          "import json, subprocess, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "import workbench_target as target",
+          "repository = Path(sys.argv[2])",
+          "def git(*args):",
+          "    subprocess.run(['git', '-C', str(repository), *args], check=True, capture_output=True)",
+          "git('init', '-q')",
+          "subjects = [('UTF-8', 'docs: \\u65e5\\u672c\\u8a9e \\ud55c\\uad6d\\uc5b4 \\U0001f527'), ('ISO-8859-1', 'docs: caf\\u00e9')]",
+          "for log_encoding, subject in subjects:",
+          "    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', subject)",
+          "    git('config', 'i18n.logOutputEncoding', log_encoding)",
+          "    for encoding in ('cp932', 'cp949'):",
+          "        subprocess._text_encoding = lambda: encoding",
+          "        assert target.git_target_metadata(repository)['commitSubject'] == subject",
+          "        assert target.git_bytes(repository, 'show', '-s', '--format=%s', 'HEAD') == (subject + '\\n').encode('utf-8')",
+          "print(json.dumps({'subjects': len(subjects), 'locales': 2}))",
+        ].join("\n"),
+        repository,
+      ),
+    ).toEqual({ subjects: 2, locales: 2 });
+  });
+
+  testPosix(
+    "rejects Windows batch Git targets after canonicalization",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const native = join(root, "git.com");
+      const batch = join(root, "git.cmd");
+      const extensionless = join(root, "git-native");
+      const nativeAlias = join(root, "trusted.exe");
+      const batchAlias = join(root, "untrusted.exe");
+      const extensionlessAlias = join(root, "native-alias.exe");
+      await mkdir(join(repository, ".git"), { recursive: true });
+      await Promise.all([
+        writeFile(native, "native\n"),
+        writeFile(batch, "batch\n"),
+        writeFile(extensionless, "native\n"),
+      ]);
+      await Promise.all([
+        symlink(native, nativeAlias),
+        symlink(batch, batchAlias),
+        symlink(extensionless, extensionlessAlias),
+      ]);
+
+      expect(
+        runPythonProbe(
+          [
+            "import json, os, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "import workbench_constants as constants",
+            "constants.sys.platform = 'win32'",
+            "repository = Path(sys.argv[2])",
+            "def inspect(candidate):",
+            "    os.environ['CODEX_SECURITY_GIT'] = candidate",
+            "    try: return {'path': constants.trusted_git_executable(repository)}",
+            "    except SystemExit as error: return {'error': str(error)}",
+            "print(json.dumps({name: inspect(path) for name, path in {'native': sys.argv[3], 'nativeAlias': sys.argv[4], 'batch': sys.argv[5], 'batchAlias': sys.argv[6], 'extensionless': sys.argv[7], 'extensionlessAlias': sys.argv[8]}.items()}))",
+          ].join("\n"),
+          repository,
+          native,
+          nativeAlias,
+          batch,
+          batchAlias,
+          extensionless,
+          extensionlessAlias,
+        ),
+      ).toEqual({
+        native: { path: native },
+        nativeAlias: { path: nativeAlias },
+        batch: { path: null },
+        batchAlias: { path: null },
+        extensionless: { path: null },
+        extensionlessAlias: { path: extensionlessAlias },
+      });
+    },
+  );
+
+  test("treats a stale trusted Git binding as unavailable", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const stale = join(
+      root,
+      process.platform === "win32" ? "missing-git.exe" : "missing-git",
+    );
+    await mkdir(repository);
+
+    expect(
+      runPythonProbe(
+        [
+          "import json, os, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "import workbench_target as target",
+          "repository = Path(sys.argv[2])",
+          "os.environ['CODEX_SECURITY_GIT'] = sys.argv[3]",
+          "def unexpected_spawn(*args, **kwargs):",
+          "    raise AssertionError('stale Git binding reached subprocess.run')",
+          "target.subprocess.run = unexpected_spawn",
+          "result = target.git_command(repository, 'status', text=True)",
+          "print(json.dumps({'returncode': result.returncode, 'stdout': result.stdout, 'command': result.args[0]}))",
+        ].join("\n"),
+        repository,
+        stale,
+      ),
+    ).toEqual({ returncode: 127, stdout: "", command: "git" });
+  });
+
   testPosix(
     "rejects private scan directories under insecure shared parents",
     async () => {

@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable
@@ -42,12 +43,7 @@ from rank_preview import (
     preview_for,
     preview_for_bytes,
 )
-from workbench_target import (
-    git_blob_bytes,
-    git_command,
-    git_directory_snapshot_paths,
-    ripgrep_command,
-)
+from workbench_target import git_blob_bytes, git_command, git_directory_snapshot_paths
 
 EXCLUDED_DIRS = {
     ".cache",
@@ -297,6 +293,21 @@ def path_is_excluded(path: Path) -> bool:
     return path.name.endswith((".min.js", ".map"))
 
 
+def windows_stream_component(path: Path) -> str | None:
+    """Return the first NTFS alternate-data-stream component."""
+
+    if os.name != "nt":
+        return None
+    return next(
+        (
+            component
+            for component in path.parts
+            if component != path.anchor and ":" in component
+        ),
+        None,
+    )
+
+
 def resolve_scope(
     repo: Path,
     scope: str,
@@ -305,6 +316,9 @@ def resolve_scope(
     reject_symlinks: bool = False,
 ) -> Path:
     scope_path = Path(scope).expanduser() if expand_user else Path(scope)
+    stream = windows_stream_component(scope_path)
+    if stream is not None:
+        raise SystemExit(f"Scope must not use an NTFS alternate data stream: {stream}")
     if not scope_path.is_absolute():
         scope_path = repo / scope_path
     if reject_symlinks:
@@ -525,6 +539,7 @@ def make_repo_scope_input(args: argparse.Namespace) -> None:
                 candidates = git_candidates
             else:
                 command = [
+                    "rg",
                     "--files",
                     "--hidden",
                     "--no-require-git",
@@ -535,7 +550,7 @@ def make_repo_scope_input(args: argparse.Namespace) -> None:
                     str(scope_path.relative_to(repo)),
                 ]
                 try:
-                    result = ripgrep_command(repo, *command)
+                    result = subprocess.run(command, cwd=repo, capture_output=True, check=False)
                 except OSError as exc:
                     ignore_names = (".gitignore", ".ignore", ".rgignore")
                     ancestors = (scope_path, *scope_path.parents)
@@ -614,25 +629,27 @@ def run_git_changed_paths(repo: Path, diff_args: list[str]) -> list[tuple[Path, 
     result = git_command(
         repo,
         "diff",
+        "--no-ext-diff",
+        "--no-textconv",
         "--name-status",
         "-z",
         "--diff-filter=ACMRD",
         *diff_args,
-        text=True,
+        text=False,
     )
     result.check_returncode()
-    fields = result.stdout.split("\0")
+    fields = result.stdout.split(b"\0")
     if fields and not fields[-1]:
         fields.pop()
 
     changed: list[tuple[Path, str]] = []
     index = 0
     while index < len(fields):
-        status = fields[index][0]
+        status = chr(fields[index][0])
         index += 1
         if status in {"C", "R"}:
             index += 1
-        path = repo / fields[index]
+        path = repo / os.fsdecode(fields[index])
         index += 1
         changed.append((path, status))
     return changed
@@ -650,14 +667,14 @@ def git_changed_paths(repo: Path, base: str, head: str, mode: str) -> list[tuple
             "--others",
             "--exclude-standard",
             "-z",
-            text=True,
+            text=False,
         )
         untracked.check_returncode()
         combined = dict(staged)
         combined.update(unstaged)
         combined.update(
-            (repo / relative, "A")
-            for relative in untracked.stdout.split("\0")
+            (repo / os.fsdecode(relative), "A")
+            for relative in untracked.stdout.split(b"\0")
             if relative
         )
         return sorted(combined.items())

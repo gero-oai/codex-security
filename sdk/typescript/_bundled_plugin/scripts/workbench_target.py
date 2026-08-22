@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import errno
 import hashlib
 import os
 import shutil
@@ -12,12 +11,12 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 
 # Some plugin hosts launch Python with safe-path isolation enabled.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from filesystem_identity import stored_filesystem_identity_matches
-from workbench_constants import GIT_REPOSITORY_ENVIRONMENT
+from workbench_constants import GIT_REPOSITORY_ENVIRONMENT, trusted_git_executable
 
 
 def git_output(
@@ -26,8 +25,8 @@ def git_output(
     git_dir: Path | None = None,
     work_tree: Path | None = None,
 ) -> str | None:
-    completed = git_command(target, *args, text=True, git_dir=git_dir, work_tree=work_tree)
-    output = completed.stdout.strip()
+    completed = git_command(target, *args, text=False, git_dir=git_dir, work_tree=work_tree)
+    output = os.fsdecode(completed.stdout).strip()
     return output if completed.returncode == 0 and output else None
 
 
@@ -121,146 +120,6 @@ def _read_sized_nul_field(
     return output[offset:end], end + 1
 
 
-def _protected_git_root(target: Path) -> Path | None:
-    """Return the outermost repository root, or None for a stale target."""
-    try:
-        root = target.resolve(strict=True)
-        if not stat.S_ISDIR(root.stat().st_mode):
-            return None
-        for ancestor in (root, *root.parents):
-            try:
-                (ancestor / ".git").lstat()
-            except FileNotFoundError:
-                continue
-            root = ancestor
-    except (FileNotFoundError, NotADirectoryError, RuntimeError):
-        # pathlib raised RuntimeError for symlink loops before Python 3.13.
-        return None
-    except OSError as error:
-        if error.errno != errno.ELOOP:
-            raise
-        return None
-    return root
-
-
-def _inside_protected_git_root(candidate: Path, root: Path) -> bool:
-    return candidate.is_relative_to(root) or (
-        len(candidate.parts) >= len(root.parts)
-        and Path(*candidate.parts[: len(root.parts)]).samefile(root)
-    )
-
-
-def _is_native_executable(candidate: Path, canonical: Path) -> bool:
-    windows = sys.platform == "win32"
-    return (
-        canonical.is_file()
-        and (
-            not windows
-            or (
-                candidate.suffix.lower() in {".exe", ".com"}
-                and canonical.suffix.lower() not in {".bat", ".cmd"}
-            )
-        )
-        and os.access(canonical, os.F_OK if windows else os.X_OK)
-    )
-
-
-def _trusted_executable(
-    target: Path,
-    environment: dict[str, str],
-    name: str,
-) -> str | None:
-    root = _protected_git_root(target)
-    if root is None:
-        return None
-    setting = f"CODEX_SECURITY_{name.upper()}"
-    configured = environment.get(setting)
-    if configured is not None:
-        if not configured:
-            return None
-        candidate = Path(configured)
-        if not candidate.is_absolute():
-            raise SystemExit(f"{setting} must name an absolute trusted executable.")
-        if sys.platform == "win32" and not os.path.splitext(candidate.name)[1]:
-            candidate = Path(f"{candidate}.exe")
-        try:
-            canonical = candidate.resolve(strict=True)
-            if _inside_protected_git_root(canonical, root) or any(
-                _inside_protected_git_root(ancestor.resolve(strict=True), root)
-                for ancestor in candidate.parents
-            ):
-                raise SystemExit(f"{setting} must stay outside the protected repository.")
-        except (OSError, RuntimeError) as error:
-            raise SystemExit(f"{setting} does not name an available executable.") from error
-        if not _is_native_executable(candidate, canonical):
-            raise SystemExit(f"{setting} does not name an available executable.")
-        return configured
-
-    entries: list[str] = []
-    executable: str | None = None
-    names = (f"{name}.exe", f"{name}.com") if sys.platform == "win32" else (name,)
-    if sys.platform == "win32":
-        path_keys = sorted(key for key in environment if key.upper() == "PATH")
-        if path_keys:
-            path = environment[path_keys[0]]
-            for key in path_keys:
-                del environment[key]
-            environment["PATH"] = path
-    for entry in os.get_exec_path(environment):
-        if sys.platform == "win32" and entry.startswith('"') and entry.endswith('"'):
-            entry = entry[1:-1]
-        if not entry:
-            continue
-        try:
-            directory = Path(entry).resolve(strict=True)
-            if _inside_protected_git_root(directory, root):
-                continue
-        except (OSError, RuntimeError):
-            continue
-        candidate: str | None = None
-        safe = True
-        for name in names:
-            path = directory / name
-            try:
-                canonical = path.resolve(strict=True)
-                if _inside_protected_git_root(canonical, root):
-                    safe = False
-                    break
-            except (OSError, RuntimeError):
-                continue
-            if _is_native_executable(path, canonical):
-                candidate = candidate or str(path)
-        if not safe:
-            continue
-        executable = executable or candidate
-        entries.append(str(directory))
-    environment["PATH"] = os.pathsep.join(entries)
-    return executable
-
-
-def _trusted_git_executable(target: Path, environment: dict[str, str]) -> str | None:
-    return _trusted_executable(target, environment, "git")
-
-
-def ripgrep_command(
-    target: Path,
-    *args: str,
-    stdout: IO[bytes] | int = subprocess.PIPE,
-) -> subprocess.CompletedProcess[bytes]:
-    environment = os.environ.copy()
-    executable = _trusted_executable(target, environment, "rg")
-    if executable is None:
-        raise FileNotFoundError("ripgrep is not available on a trusted PATH.")
-    return subprocess.run(
-        [executable, *args],
-        cwd=target,
-        stdout=stdout,
-        stderr=subprocess.PIPE,
-        env=environment,
-        check=False,
-    )
-
-
 def git_command(
     target: Path,
     *args: str,
@@ -275,28 +134,41 @@ def git_command(
     for name in GIT_REPOSITORY_ENVIRONMENT:
         environment.pop(name, None)
     environment["GIT_LITERAL_PATHSPECS"] = "1"
-    executable = _trusted_git_executable(target, environment)
+    executable = trusted_git_executable(target)
     # Repository-local config is untrusted; fsmonitor may name an executable hook.
-    command = [executable or "git", "-c", "core.fsmonitor=false", "-C", str(target)]
+    command = [
+        executable or "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "i18n.logOutputEncoding=UTF-8",
+        "-C",
+        str(target),
+    ]
     if git_dir is not None and work_tree is not None:
         command.extend(["--git-dir", str(git_dir), "--work-tree", str(work_tree)])
     full_command = [*command, *args]
-    if executable is not None:
-        try:
-            return subprocess.run(
-                full_command,
-                check=False,
-                capture_output=True,
-                env=environment,
-                text=text,
-                input=input_data,
-            )
-        except FileNotFoundError:
-            pass
-    # Git is optional for Codebase scans. Treat an unavailable executable like
-    # any other failed Git probe so the target falls back to a directory snapshot.
-    empty_output = "" if text else b""
-    return subprocess.CompletedProcess(full_command, 127, empty_output, empty_output)
+    if executable is None:
+        empty_output = "" if text else b""
+        return subprocess.CompletedProcess(full_command, 127, empty_output, empty_output)
+    try:
+        return subprocess.run(
+            full_command,
+            check=False,
+            capture_output=True,
+            env=environment,
+            text=text,
+            encoding="utf-8" if text else None,
+            errors="surrogateescape" if text else None,
+            input=input_data,
+        )
+    except FileNotFoundError:
+        # Git is optional for Codebase scans. Treat an unavailable executable like
+        # any other failed Git probe so the target falls back to a directory snapshot.
+        empty_output = "" if text else b""
+        return subprocess.CompletedProcess(full_command, 127, empty_output, empty_output)
 
 
 def update_digest_field(digest: Any, label: bytes, value: bytes) -> None:
@@ -310,6 +182,24 @@ def worktree_content_digest(target: Path) -> str:
     require_clean_submodule_worktrees(target)
     repository, pathspec = git_worktree_context(target)
     return worktree_content_digest_for_context(repository, pathspec)
+
+
+def remediation_checkout_snapshot(
+    scan: sqlite3.Row, *, expected_revision: str | None = None
+) -> tuple[str, str | None]:
+    target = require_scan_target_identity(scan)
+    revision = git_revision(target)
+    required_revision = expected_revision or scan["target_revision"]
+    if revision != required_revision:
+        raise SystemExit(
+            "Repository HEAD changed. Regenerate the remediation patch against the current checkout."
+        )
+    content_digest = (
+        worktree_content_digest(target)
+        if revision != "unversioned"
+        else directory_content_digest(target, excluded=(Path(scan["scan_dir"]),))
+    )
+    return revision, content_digest
 
 
 def worktree_content_digest_for_context(
@@ -657,7 +547,9 @@ def copy_git_worktree_files(source: Path, destination: Path, excluded: tuple[Pat
             if nested_git_dir is None:
                 raise SystemExit(f"Could not inspect nested Git working tree: {relative}")
             copy_git_worktree_files(source_path, destination_path, excluded)
-            (destination_path / ".git").write_text(f"gitdir: {nested_git_dir}\n")
+            (destination_path / ".git").write_text(
+                f"gitdir: {nested_git_dir}\n", encoding="utf-8"
+            )
         else:
             raise SystemExit(f"Unsupported Git working-tree file type: {relative}")
     copied_target = destination if pathspec == "." else destination / pathspec
@@ -692,9 +584,10 @@ def git_target_metadata(target: Path) -> dict[str, Any]:
     branch = git_output(target, "symbolic-ref", "--quiet", "--short", "HEAD")
     metadata.update({"branch": branch, "detachedHead": revision is not None and branch is None})
     if revision is not None:
+        subject = git_bytes(target, "show", "-s", "--format=%s", "HEAD")
         metadata.update(
             {
-                "commitSubject": git_output(target, "show", "-s", "--format=%s", "HEAD"),
+                "commitSubject": (subject or b"").decode("utf-8").strip() or None,
                 "revision": revision,
                 "shortRevision": revision[:7],
             }

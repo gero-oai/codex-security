@@ -12,11 +12,26 @@ from pathlib import Path
 
 # Some plugin hosts launch Python with safe-path isolation enabled.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from workbench_target import git_command, ripgrep_command
+from workbench_target import git_blob_bytes, git_command
 
 
 class InventoryError(ValueError):
     """Raised when the repository, scope, or inventory cannot be used safely."""
+
+
+def windows_stream_component(path: Path) -> str | None:
+    """Return the first NTFS alternate-data-stream component."""
+
+    if os.name != "nt":
+        return None
+    return next(
+        (
+            component
+            for component in path.parts
+            if component != path.anchor and ":" in component
+        ),
+        None,
+    )
 
 
 def resolve_repository(value: str) -> Path:
@@ -36,6 +51,11 @@ def resolve_scope(repository: Path, value: str) -> str:
         raise InventoryError("--scope: expected a non-empty file or directory")
 
     requested = Path(value).expanduser()
+    stream = windows_stream_component(requested)
+    if stream is not None:
+        raise InventoryError(
+            f"--scope: NTFS alternate data streams are not supported: {stream}"
+        )
     scope = requested if requested.is_absolute() else repository / requested
     try:
         resolved = scope.resolve(strict=True)
@@ -74,6 +94,7 @@ def resolve_output(value: str) -> Path:
 def generate_in_scope_files(repository: Path, scope: str, output: Path) -> int:
     """Atomically write the exact ripgrep inventory sorted as ``LC_ALL=C``."""
     command = [
+        "rg",
         "--files",
         "--hidden",
         "--no-ignore",
@@ -86,7 +107,13 @@ def generate_in_scope_files(repository: Path, scope: str, output: Path) -> int:
     ]
     with tempfile.TemporaryFile(mode="w+b") as inventory:
         try:
-            result = ripgrep_command(repository, *command, stdout=inventory)
+            result = subprocess.run(
+                command,
+                cwd=repository,
+                stdout=inventory,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
         except OSError as error:
             raise InventoryError(f"could not run ripgrep: {error}") from error
 
@@ -107,6 +134,8 @@ def committed_changed_paths(repository: Path, base: str, head: str) -> list[tupl
     result = git_command(
         repository,
         "diff",
+        "--no-ext-diff",
+        "--no-textconv",
         "--raw",
         "-z",
         "--diff-filter=ACMRD",
@@ -146,8 +175,6 @@ def generate_diff_in_scope_files(
         is_binary_sample,
         preview_for,
     )
-    from workbench_target import git_blob_bytes
-
     rows: list[bytes] = []
     try:
         changed = (

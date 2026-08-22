@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
@@ -23,10 +23,7 @@ import {
   repositoryRevision,
   type ScanTarget,
 } from "../src/index.js";
-import {
-  outermostGitMarkerRoot,
-  protectedGitInputRoots,
-} from "../src/targets.js";
+import { enclosingGitWorktreeRoot } from "../src/targets.js";
 
 // @ts-expect-error DiffTarget is intentionally nominal; use its constructor helpers.
 const structurallyInvalidTarget: ScanTarget = {
@@ -46,12 +43,12 @@ afterEach(async () => {
   );
 });
 
-async function repository(): Promise<string> {
+async function repository(name = "repo"): Promise<string> {
   const root = await realpath(
     await mkdtemp(join(tmpdir(), "codex-security-targets-")),
   );
   temporaryDirectories.push(root);
-  const repo = join(root, "repo");
+  const repo = join(root, name);
   await mkdir(join(repo, "src"), { recursive: true });
   await writeFile(join(repo, "src", "app.ts"), "export const ok = true;\n");
   git(repo, "init", "-b", "main");
@@ -65,185 +62,6 @@ async function repository(): Promise<string> {
 function git(repo: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
 }
-
-test("finds outer Git roots without rejecting local source files", async () => {
-  const repo = await repository();
-  const nested = join(repo, "nested");
-  await mkdir(join(nested, ".git"), { recursive: true });
-  const inside = join(nested, "source.bundle");
-  const outside = join(dirname(repo), "standalone.bundle");
-  await Promise.all([
-    writeFile(inside, "synthetic bundle fixture\n"),
-    writeFile(outside, "synthetic bundle fixture\n"),
-  ]);
-
-  expect(await outermostGitMarkerRoot(inside)).toBe(repo);
-  expect(await outermostGitMarkerRoot(outside)).toBe(outside);
-});
-
-test("protects lexical and resolved input repositories without claiming missing standalone paths", async () => {
-  const lexical = await repository();
-  const resolved = await repository();
-  const link = join(lexical, "linked-input");
-  const standalone = join(dirname(lexical), "standalone.bundle");
-  await symlink(
-    join(resolved, "src"),
-    link,
-    process.platform === "win32" ? "junction" : "dir",
-  );
-  await writeFile(standalone, "synthetic bundle fixture\n");
-
-  expect(await protectedGitInputRoots([join(link, "missing")])).toEqual([
-    lexical,
-    resolved,
-  ]);
-  expect(
-    await protectedGitInputRoots([join(dirname(lexical), "missing")]),
-  ).toEqual([]);
-  expect(await protectedGitInputRoots([standalone, standalone])).toEqual([
-    standalone,
-  ]);
-
-  const outside = join(dirname(resolved), "outside");
-  const outsideFile = join(outside, "source.bundle");
-  const outsideLink = join(dirname(lexical), "outside-link");
-  await mkdir(outside);
-  await writeFile(outsideFile, "synthetic bundle fixture\n");
-  await symlink(
-    outside,
-    outsideLink,
-    process.platform === "win32" ? "junction" : "dir",
-  );
-  expect(
-    await protectedGitInputRoots([join(outsideLink, "source.bundle")]),
-  ).toEqual([outsideFile]);
-});
-
-test("keeps unavailable filesystem roots out of shared input roots", async () => {
-  const repo = await repository();
-  const script = `
-    import { mock } from "bun:test";
-    import * as original from "node:fs/promises";
-    import { dirname, join } from "node:path";
-    const [repo, targets] = process.argv.slice(1);
-    const missing = join(dirname(repo), "unavailable-root", "repo");
-    const unavailable = new Set();
-    for (let path = missing; ; path = dirname(path)) {
-      unavailable.add(path);
-      if (dirname(path) === path) break;
-    }
-    const originalPromises = { ...original };
-    let errorCode = "ENOENT";
-    mock.module("node:fs/promises", () => ({
-      ...originalPromises,
-      realpath: async (path, ...args) => {
-        if (unavailable.has(path)) {
-          throw Object.assign(new Error("synthetic unavailable root"), {
-            code: errorCode,
-          });
-        }
-        return await originalPromises.realpath(path, ...args);
-      },
-    }));
-    try {
-      const { protectedGitInputRoots } = await import(targets);
-      const roots = await protectedGitInputRoots([missing, repo]);
-      errorCode = "EACCES";
-      let unexpectedError = null;
-      try {
-        await protectedGitInputRoots([missing]);
-      } catch (error) {
-        unexpectedError = error.code;
-      }
-      console.log(JSON.stringify({ roots, unexpectedError }));
-    } finally {
-      mock.module("node:fs/promises", () => originalPromises);
-    }
-  `;
-  const result = spawnSync(
-    process.execPath,
-    [
-      "-e",
-      script,
-      repo,
-      fileURLToPath(new URL("../src/targets.ts", import.meta.url)),
-    ],
-    { encoding: "utf8" },
-  );
-  expect(result.status, result.stderr).toBe(0);
-  expect(JSON.parse(result.stdout)).toEqual({
-    roots: [repo],
-    unexpectedError: "EACCES",
-  });
-});
-
-test("finds input repositories behind dangling directory links", async () => {
-  const lexical = await repository();
-  const resolved = await repository();
-  const target = join(resolved, "removed-directory");
-  const link = join(lexical, "linked-input");
-  await mkdir(target);
-  await symlink(
-    target,
-    link,
-    process.platform === "win32" ? "junction" : "dir",
-  );
-  await rm(target, { recursive: true });
-
-  expect(await protectedGitInputRoots([join(link, "missing")])).toEqual([
-    lexical,
-    resolved,
-  ]);
-});
-
-test("protects both repositories in a cyclic input link", async () => {
-  const lexical = await repository();
-  const resolved = await repository();
-  const left = join(lexical, "loop");
-  const right = join(resolved, "loop");
-  const type = process.platform === "win32" ? "junction" : "dir";
-  await mkdir(right);
-  await symlink(right, left, type);
-  await rm(right, { recursive: true });
-  await symlink(left, right, type);
-
-  expect(await protectedGitInputRoots([join(left, "missing")])).toEqual([
-    lexical,
-    resolved,
-  ]);
-});
-
-(process.platform === "win32" ? test.skip : test)(
-  "does not revisit a relative cyclic input link",
-  async () => {
-    const repo = await repository();
-    const link = join(repo, "loop");
-    await symlink("./loop/nested", link, "dir");
-
-    expect(await protectedGitInputRoots([join(link, "missing")])).toEqual([
-      repo,
-    ]);
-  },
-);
-
-(process.platform === "win32" ? test.skip : test)(
-  "preserves relative dangling-link target traversal",
-  async () => {
-    const lexical = await repository();
-    const resolved = await repository();
-    const target = join(resolved, "removed-directory");
-    const link = join(lexical, "linked-input");
-    await mkdir(target);
-    await symlink(join(resolved, "src"), join(lexical, "bridge"), "dir");
-    await symlink("bridge/../removed-directory", link, "dir");
-    await rm(target, { recursive: true });
-
-    expect(await protectedGitInputRoots([join(link, "missing")])).toEqual([
-      lexical,
-      resolved,
-    ]);
-  },
-);
 
 async function createRepositoryGitShim(
   directory: string,
@@ -308,6 +126,44 @@ describe("scan target normalization", () => {
     });
   });
 
+  test.skipIf(process.platform !== "win32")(
+    "rejects Windows repository roots that alias across runtimes",
+    async () => {
+      const root = await realpath(
+        await mkdtemp(join(tmpdir(), "codex-security-repository-alias-")),
+      );
+      temporaryDirectories.push(root);
+      const repository = join(root, "repository");
+      const ambiguous = join(root, "repository.");
+      const linked = join(root, "linked-repository");
+      await Promise.all([mkdir(repository), mkdir(ambiguous)]);
+      await symlink(ambiguous, linked, "junction");
+
+      expect(await realpath(repository)).not.toBe(await realpath(ambiguous));
+      await expect(normalizeRepository(repository)).resolves.toBe(
+        await realpath(repository),
+      );
+      for (const path of [ambiguous, linked]) {
+        await expect(normalizeRepository(path)).rejects.toThrow(
+          "Windows-ambiguous components",
+        );
+      }
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "preserves trailing whitespace in Git worktree paths",
+    async () => {
+      for (const suffix of [" ", "\r"]) {
+        const repo = await repository(`repo${suffix}`);
+        expect(await enclosingGitWorktreeRoot(repo)).toBe(await realpath(repo));
+        await expect(
+          normalizeTarget(repo, DiffTarget.refs({ base: "HEAD" })),
+        ).resolves.toMatchObject({ kind: "refs" });
+      }
+    },
+  );
+
   test("rejects empty and escaping paths", async () => {
     const repo = await repository();
     await expect(normalizeTarget(repo, [""])).rejects.toThrow("empty path");
@@ -315,6 +171,33 @@ describe("scan target normalization", () => {
       "outside the repository",
     );
   });
+
+  test.skipIf(process.platform !== "win32")(
+    "rejects NTFS alternate streams before runtime initialization",
+    async () => {
+      const repo = await repository();
+      const stream = join(repo, "src", "app.ts:synthetic-stream");
+      await writeFile(stream, "export const hidden = true;\n");
+
+      await expect(normalizeTarget(repo, [stream])).rejects.toThrow(
+        "unsupported colon component",
+      );
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "allows colons in POSIX path components",
+    async () => {
+      const repo = await repository();
+      const path = join(repo, "src", "app.ts:fixture");
+      await writeFile(path, "export const fixture = true;\n");
+
+      await expect(normalizeTarget(repo, [path])).resolves.toEqual({
+        kind: "paths",
+        paths: ["src/app.ts:fixture"],
+      });
+    },
+  );
 
   test("reports a path that disappears during normalization as invalid", async () => {
     const repo = await repository();
