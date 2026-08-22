@@ -200,6 +200,7 @@ export function dependencies(
     bulkScan?: MainDependencies["bulkScan"];
     onWorkbench?: (
       args: readonly string[],
+      input?: string,
       signal?: AbortSignal,
     ) => JsonObject | Promise<JsonObject>;
     onMatch?: MainDependencies["matchFindings"];
@@ -269,8 +270,8 @@ export function dependencies(
     ...(options.linearClient === undefined
       ? {}
       : { linearClient: options.linearClient }),
-    runWorkbench: async (args, signal) =>
-      (await options.onWorkbench?.(args, signal)) ?? { scans: [] },
+    runWorkbench: async (args, input, signal) =>
+      (await options.onWorkbench?.(args, input, signal)) ?? { scans: [] },
     matchFindings: async (input, comparisonOptions) =>
       (await options.onMatch?.(input, comparisonOptions)) ?? {
         matches: [],

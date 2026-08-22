@@ -11,6 +11,7 @@ import { join } from "node:path";
 import type { ThreadOptions, TurnOptions } from "@openai/codex-sdk";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  comparisonForScan,
   comparisonEnvironment,
   matchCompletedScan,
   matchScanFindings,
@@ -352,84 +353,80 @@ describe("semantic scan comparison", () => {
     expect(calls.prompt).toContain(JSON.stringify(input));
   });
 
-  test("matches open and dismissed findings from the same target", async () => {
+  test("rejects a confirmed match with conflicting same-scan uncertainty", async () => {
     const open = { findingId: "open", occurrenceId: "old-open" };
     const dismissed = { findingId: "dismissed", occurrenceId: "old-dismissed" };
     const after = { findingId: "renamed", occurrenceId: "new-renamed" };
-    const commands: (readonly string[])[] = [];
+    const commands: Array<{ args: readonly string[]; input?: string }> = [];
     let input: ScanComparisonInput | undefined;
-    await matchCompletedScan({
-      scanId: "current",
-      repository: "/repository",
-      previousFindings: [open],
-      falsePositives: [{ findingId: "dismissed", sourceScanId: "prior" }],
-      findings: [after],
-      environment: {
-        CODEX_HOME: "/provider-home",
-        CODEX_SECURITY_SCAN_ID: "current",
-        FIREWORKS_API_KEY: "synthetic-provider-key",
-      },
-      async workbench(args) {
-        commands.push(args);
-        return args[0] === "list-unmatched-scan-pairs"
-          ? {
-              batches: [
-                {
-                  afterScanId: "current",
-                  afterFindings: [after],
-                  beforeScans: [
-                    {
-                      scanId: "another-target",
-                      findings: [{ ...dismissed, occurrenceId: "foreign" }],
-                    },
-                    { scanId: "prior", findings: [open, dismissed] },
-                  ],
-                },
-              ],
-            }
-          : {};
-      },
-      async matchFindings(value, options) {
-        input = value;
-        expect(options).toMatchObject({
-          environment: {
-            CODEX_HOME: "/provider-home",
-            CODEX_SECURITY_SCAN_ID: "current",
-          },
-        });
-        const response = {
-          matches: [
-            {
-              beforeOccurrenceIds: ["old-dismissed"],
-              afterOccurrenceIds: ["new-renamed"],
-              confidence: "high",
-              reason: "Same dismissed root cause.",
+    await expect(
+      matchCompletedScan({
+        scanId: "current",
+        repository: "/repository",
+        previousFindings: [open],
+        falsePositives: [{ findingId: "dismissed", sourceScanId: "prior" }],
+        findings: [after],
+        environment: {
+          CODEX_HOME: "/provider-home",
+          CODEX_SECURITY_SCAN_ID: "current",
+          FIREWORKS_API_KEY: "synthetic-provider-key",
+        },
+        async workbench(args, commandInput) {
+          commands.push({ args, input: commandInput });
+          return args[0] === "list-unmatched-scan-pairs"
+            ? {
+                batches: [
+                  {
+                    afterScanId: "current",
+                    afterFindings: [after],
+                    beforeScans: [
+                      {
+                        scanId: "another-target",
+                        findings: [{ ...dismissed, occurrenceId: "foreign" }],
+                      },
+                      { scanId: "prior", findings: [open, dismissed] },
+                    ],
+                  },
+                ],
+              }
+            : {};
+        },
+        async matchFindings(value, options) {
+          input = value;
+          expect(options).toMatchObject({
+            environment: {
+              CODEX_HOME: "/provider-home",
+              CODEX_SECURITY_SCAN_ID: "current",
             },
-          ],
-          uncertain: [
-            {
-              beforeOccurrenceId: "old-open",
-              afterOccurrenceId: "new-renamed",
-              reason: "Possible match.",
-            },
-          ],
-        };
-        return await matchScanFindings(value, {
-          ...options,
-          codex: fakeCodex(response).codex,
-        });
-      },
-    });
+          });
+          const response = {
+            matches: [
+              {
+                beforeOccurrenceIds: ["old-dismissed"],
+                afterOccurrenceIds: ["new-renamed"],
+                confidence: "high",
+                reason: "Same dismissed root cause.",
+              },
+            ],
+            uncertain: [
+              {
+                beforeOccurrenceId: "old-open",
+                afterOccurrenceId: "new-renamed",
+                reason: "Possible match.",
+              },
+            ],
+          };
+          return await matchScanFindings(value, {
+            ...options,
+            codex: fakeCodex(response).codex,
+          });
+        },
+      }),
+    ).rejects.toThrow("conflicting confirmed and uncertain findings");
     expect(input).toEqual({ before: [open, dismissed], after: [after] });
-    expect(commands.map(([command]) => command)).toEqual([
+    expect(commands.map(({ args: [command] }) => command)).toEqual([
       "list-unmatched-scan-pairs",
-      "save-scan-comparison",
     ]);
-    const saved = JSON.parse(commands[1]!.at(-1)!) as ScanComparisonResult;
-    expect(
-      saved.matches.map(({ beforeOccurrenceIds }) => beforeOccurrenceIds),
-    ).toEqual([["old-dismissed"]]);
-    expect(saved.uncertain).toEqual([]);
   });
 
   test("compares complete selected scans before caching automatic matches", async () => {
@@ -457,7 +454,7 @@ describe("semantic scan comparison", () => {
       previousFindings: [firstOther, latestShared],
       falsePositives: [],
       findings: [after],
-      async workbench(args) {
+      async workbench(args, commandInput) {
         if (args[0] === "list-unmatched-scan-pairs") {
           return {
             batches: [
@@ -473,7 +470,7 @@ describe("semantic scan comparison", () => {
             ],
           };
         }
-        saved.set(args[2]!, JSON.parse(args.at(-1)!) as ScanComparisonResult);
+        saved.set(args[2]!, JSON.parse(commandInput!) as ScanComparisonResult);
         return {};
       },
       matchFindings(input, options) {
@@ -591,7 +588,7 @@ describe("semantic scan comparison", () => {
         previousFindings: before,
         falsePositives: [],
         findings: after,
-        async workbench(args) {
+        async workbench(args, commandInput) {
           if (args[0] === "list-unmatched-scan-pairs") {
             return {
               batches: [
@@ -604,7 +601,7 @@ describe("semantic scan comparison", () => {
               ],
             };
           }
-          saved.push(JSON.parse(args.at(-1)!) as ScanComparisonResult);
+          saved.push(JSON.parse(commandInput!) as ScanComparisonResult);
           return {};
         },
         async matchFindings(input, options) {
@@ -659,7 +656,7 @@ describe("semantic scan comparison", () => {
         previousFindings: before,
         falsePositives: [],
         findings: after,
-        async workbench(args) {
+        async workbench(args, commandInput) {
           if (args[0] === "list-unmatched-scan-pairs")
             return {
               batches: [
@@ -670,7 +667,7 @@ describe("semantic scan comparison", () => {
                 },
               ],
             };
-          saved.push(JSON.parse(args.at(-1)!) as ScanComparisonResult);
+          saved.push(JSON.parse(commandInput!) as ScanComparisonResult);
           return {};
         },
         async matchFindings(input, options) {
@@ -772,18 +769,14 @@ describe("semantic scan comparison", () => {
 
   test("allows cross-history uncertainty without relaxing two-scan matching", async () => {
     const input: ScanComparisonInput = {
-      before: [finding("before-confirmed"), finding("before-uncertain")],
-      after: [finding("after-shared")],
-    };
-    const response = {
-      matches: [
-        {
-          beforeOccurrenceIds: ["before-confirmed"],
-          afterOccurrenceIds: ["after-shared"],
-          confidence: "high",
-          reason: "Confirmed in one historical scan.",
-        },
+      before: [
+        { occurrenceId: "before-confirmed", findingId: "shared" },
+        { occurrenceId: "before-uncertain", findingId: "other" },
       ],
+      after: [{ occurrenceId: "after-shared", findingId: "shared" }],
+    };
+    const modelResponse = {
+      matches: [],
       uncertain: [
         {
           beforeOccurrenceId: "before-uncertain",
@@ -794,14 +787,35 @@ describe("semantic scan comparison", () => {
     } satisfies ScanComparisonResult;
 
     await expect(
-      matchScanFindings(input, { codex: fakeCodex(response).codex }),
+      matchScanFindings(input, { codex: fakeCodex(modelResponse).codex }),
     ).rejects.toThrow("invalid uncertain pair");
-    expect(
-      await matchScanFindings(input, {
-        codex: fakeCodex(response).codex,
-        allowHistoricalUncertainty: true,
-      }),
-    ).toEqual(response);
+    const response = await matchScanFindings(input, {
+      codex: fakeCodex(modelResponse).codex,
+      allowHistoricalUncertainty: true,
+    });
+    expect(response).toEqual({
+      matches: [
+        {
+          beforeOccurrenceIds: ["before-confirmed"],
+          afterOccurrenceIds: ["after-shared"],
+          confidence: "high",
+          reason:
+            "The findings share a stable identity or a previously confirmed link.",
+        },
+      ],
+      uncertain: modelResponse.uncertain,
+    });
+    expect(comparisonForScan(response, [input.before[0]!])).toEqual({
+      matches: response.matches,
+      uncertain: [],
+    });
+    expect(comparisonForScan(response, [input.before[1]!])).toEqual({
+      matches: [],
+      uncertain: modelResponse.uncertain,
+    });
+    expect(() => comparisonForScan(response, input.before)).toThrow(
+      "conflicting confirmed and uncertain findings",
+    );
   });
 
   const match = (beforeOccurrenceIds = ["before-1"]) => ({

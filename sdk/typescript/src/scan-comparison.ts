@@ -1,12 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import {
-  Codex,
-  type ModelReasoningEffort,
-  type ThreadOptions,
-  type TurnOptions,
-} from "@openai/codex-sdk";
+import { Codex, type ThreadOptions, type TurnOptions } from "@openai/codex-sdk";
 import { z } from "incur";
 import type { CodexSecuritySurface } from "./api.js";
 import { accountStatus } from "./auth.js";
@@ -49,6 +44,25 @@ export interface ScanComparisonProgress {
   pages?: number;
 }
 
+interface ScanComparisonMatch {
+  beforeOccurrenceIds: string[];
+  afterOccurrenceIds: string[];
+  confidence: "high";
+  reason: string;
+}
+
+interface ScanComparisonPair {
+  beforeOccurrenceId: string;
+  afterOccurrenceId: string;
+  reason: string;
+}
+
+export interface ScanComparisonResult {
+  matches: ScanComparisonMatch[];
+  uncertain: ScanComparisonPair[];
+  related?: ScanComparisonPair[];
+}
+
 /** @internal */
 interface ComparisonCodex {
   startThread(options: ThreadOptions): {
@@ -67,7 +81,7 @@ export interface ScanComparisonOptions {
   environment?: NodeJS.ProcessEnv;
   model?: string;
   onProgress?: (progress: ScanComparisonProgress) => void;
-  reasoningEffort?: ModelReasoningEffort;
+  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   signal?: AbortSignal;
   workingDirectory?: string;
 }
@@ -79,7 +93,10 @@ interface CompletedScanMatchingOptions
   previousFindings: readonly Record<string, unknown>[];
   falsePositives: readonly Record<string, unknown>[];
   findings: readonly Finding[];
-  workbench(args: readonly string[]): Promise<Record<string, unknown>>;
+  workbench(
+    args: readonly string[],
+    input?: string,
+  ): Promise<Record<string, unknown>>;
   matchFindings?: typeof matchScanFindings;
 }
 
@@ -153,8 +170,6 @@ interface EvidenceCursor {
   utf16Offset: number;
   nextOffset: number | null;
 }
-
-export type ScanComparisonResult = z.infer<typeof comparisonSchema>;
 
 export async function matchScanFindings(
   input: ScanComparisonInput,
@@ -250,7 +265,6 @@ export async function matchScanFindingsInternal(
   });
   const remainingPages = new Set(pages.keys());
   remainingPages.delete(0);
-  const pageIterator = remainingPages.values();
   const evidenceCursors = new Map<string, EvidenceCursor>();
   const requestedEvidence = {
     before: new Map<string, EvidenceCursor>(),
@@ -300,7 +314,7 @@ export async function matchScanFindingsInternal(
     const { request: modelRequest, ...result } = parsed.data;
     let request = modelRequest;
     if (request == null) {
-      const unseenPage = pageIterator.next().value;
+      const unseenPage = remainingPages.values().next().value;
       if (unseenPage !== undefined) {
         request = { kind: "catalogue", page: unseenPage };
       } else {
@@ -512,15 +526,17 @@ export async function matchCompletedScan(
   for (const { scanId, findings } of beforeScans) {
     options.signal?.throwIfAborted();
     const projected = comparisonForScan(comparison, findings);
-    await options.workbench([
-      "save-scan-comparison",
-      "--before-scan-id",
-      scanId,
-      "--after-scan-id",
-      options.scanId,
-      "--matches-json",
+    await options.workbench(
+      [
+        "save-scan-comparison",
+        "--before-scan-id",
+        scanId,
+        "--after-scan-id",
+        options.scanId,
+        "--matches-json-stdin",
+      ],
       JSON.stringify(projected),
-    ]);
+    );
   }
 }
 
@@ -586,18 +602,12 @@ function reconcileComparison(
       },
     ];
   });
-  const matchedBefore = new Set(
-    matches.flatMap((match) => match.beforeOccurrenceIds),
-  );
-  const matchedAfter = new Set(
-    matches.flatMap((match) => match.afterOccurrenceIds),
-  );
   const comparison = {
     matches,
     uncertain: response.uncertain.filter(
       ({ beforeOccurrenceId, afterOccurrenceId }) =>
-        !matchedBefore.has(beforeOccurrenceId) &&
-        (allowHistoricalUncertainty || !matchedAfter.has(afterOccurrenceId)),
+        groupByOccurrence.get(beforeOccurrenceId) !==
+        groupByOccurrence.get(afterOccurrenceId),
     ),
     ...(response.related === undefined
       ? {}
@@ -626,13 +636,21 @@ export function comparisonForScan(
       ? []
       : [{ ...match, beforeOccurrenceIds }];
   });
+  const uncertain = comparison.uncertain.filter(({ beforeOccurrenceId }) =>
+    beforeIds.has(beforeOccurrenceId),
+  );
   const matchedAfter = new Set(
     matches.flatMap(({ afterOccurrenceIds }) => afterOccurrenceIds),
   );
-  const uncertain = comparison.uncertain.filter(
-    ({ beforeOccurrenceId, afterOccurrenceId }) =>
-      beforeIds.has(beforeOccurrenceId) && !matchedAfter.has(afterOccurrenceId),
-  );
+  if (
+    uncertain.some(({ afterOccurrenceId }) =>
+      matchedAfter.has(afterOccurrenceId),
+    )
+  ) {
+    throw new CodexSecurityError(
+      "Scan matching returned conflicting confirmed and uncertain findings.",
+    );
+  }
   return {
     matches,
     uncertain,

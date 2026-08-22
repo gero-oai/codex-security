@@ -1,33 +1,34 @@
-import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
+import { resolvePluginPython, runCodexCommand } from "../src/runtime.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
-function runPythonProbe(
+async function runPythonProbe(
   program: string,
   ...args: string[]
-): Record<string, unknown> {
-  const python = Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
-  if (python === null) throw new Error("A Python interpreter is required.");
-  const result = spawnSync(
-    python,
-    ["-I", "-B", "-c", program, join(PLUGIN_ROOT, "scripts"), ...args],
-    { encoding: "utf8", timeout: 10_000 },
+): Promise<Record<string, unknown>> {
+  const python = await resolvePluginPython();
+  const result = await runCodexCommand(
+    { command: python },
+    ["-I", "-X", "utf8", "-B", "-", join(PLUGIN_ROOT, "scripts"), ...args],
+    process.env,
+    program,
+    AbortSignal.timeout(10_000),
   );
-  expect(result.status, result.stderr).toBe(0);
+  expect(result.exitCode, result.stderr).toBe(0);
+  expect(result.stderr).toBe("");
   return JSON.parse(result.stdout) as Record<string, unknown>;
 }
 
-test("keeps inline and stdin comparison transports compatible", () => {
-  const python = Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
-  if (python === null) throw new Error("A Python interpreter is required.");
+test("keeps inline and stdin comparison transports compatible", async () => {
+  const python = await resolvePluginPython();
   const probe = [
     "import json, sys",
     "sys.path.insert(0, sys.argv.pop(1))",
     "from workbench_cli import parse_args",
     "args = parse_args('Synthetic comparison transport')",
-    "print(json.dumps(json.loads(args.matches_json)))",
+    "print(json.dumps({'matchesJson': args.matches_json, 'matchesJsonStdin': args.matches_json_stdin}))",
   ].join("\n");
   const args = [
     "-I",
@@ -53,27 +54,77 @@ test("keeps inline and stdin comparison transports compatible", () => {
     uncertain: [],
   });
   for (const transport of [
-    ["--matches-json", payload],
-    ["--matches-json-stdin"],
+    {
+      args: ["--matches-json", payload],
+      expected: { matchesJson: payload, matchesJsonStdin: false },
+    },
+    {
+      args: ["--matches-json-stdin"],
+      expected: { matchesJson: null, matchesJsonStdin: true },
+    },
   ]) {
-    const result = spawnSync(python, [...args, ...transport], {
-      input: payload,
-      encoding: "utf8",
-      timeout: 10_000,
-    });
-    expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual(JSON.parse(payload));
+    const result = await runCodexCommand(
+      { command: python },
+      [...args, ...transport.args],
+      process.env,
+      undefined,
+      AbortSignal.timeout(10_000),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(transport.expected);
   }
-  const conflicting = spawnSync(
-    python,
+  const conflicting = await runCodexCommand(
+    { command: python },
     [...args, "--matches-json", payload, "--matches-json-stdin"],
-    { input: payload, encoding: "utf8", timeout: 10_000 },
+    process.env,
+    payload,
+    AbortSignal.timeout(10_000),
   );
-  expect(conflicting.status).toBe(2);
+  expect(conflicting.exitCode).toBe(2);
   expect(conflicting.stderr).toContain("not allowed with argument");
 });
 
-test("validates related pairs by confirmed group without replacing saved results", () => {
+test("keeps unrelated legacy repositories out of matching inputs", async () => {
+  const observed = await runPythonProbe(
+    `
+import argparse, json, sqlite3, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import workbench_scan_history as history
+connection = sqlite3.connect(':memory:')
+connection.row_factory = sqlite3.Row
+connection.executescript('''
+CREATE TABLE scans (id TEXT PRIMARY KEY, target_id TEXT, target_path TEXT, status TEXT, started_at TEXT);
+CREATE TABLE finding_occurrences (id TEXT PRIMARY KEY, finding_id TEXT, scan_id TEXT);
+CREATE TABLE finding_triage (occurrence_id TEXT, status TEXT, close_reason TEXT);
+CREATE TABLE finding_locations (occurrence_id TEXT, relative_path TEXT, role TEXT, sort_order INTEGER);
+CREATE TABLE scan_comparisons (before_scan_id TEXT, after_scan_id TEXT, result_json TEXT);
+CREATE TABLE scan_comparison_matches (before_scan_id TEXT, after_scan_id TEXT, before_occurrence_id TEXT, after_occurrence_id TEXT);
+''')
+for index, (scan, repository) in enumerate([
+    ('unrelated-before', 'unrelated'), ('unrelated-after', 'unrelated'),
+    ('before', 'selected'), ('after', 'selected')
+]):
+    connection.execute('INSERT INTO scans VALUES (?, NULL, ?, ?, ?)',
+                       (scan, str(Path(sys.argv[2]) / repository), 'complete', str(index)))
+connection.executemany('INSERT INTO finding_occurrences VALUES (?, ?, ?)', [
+    ('unrelated-first', 'unrelated-identity-a', 'unrelated-before'),
+    ('unrelated-second', 'unrelated-identity-b', 'unrelated-after')
+])
+connection.execute('INSERT INTO scan_comparison_matches VALUES (?, ?, ?, ?)',
+                   ('unrelated-before', 'unrelated-after', 'unrelated-first', 'unrelated-second'))
+comparison = history.compare_scans(
+    connection, argparse.Namespace(before_scan_id='before', after_scan_id='after'),
+    require_scan=lambda db, scan: db.execute('SELECT * FROM scans WHERE id = ?', (scan,)).fetchone(),
+    read_coverage=lambda _: {'completeness': 'complete'}, include_matching_inputs=True)
+print(json.dumps(comparison['matchingInputs']))
+`,
+    join(tmpdir(), "codex-security-legacy-repositories"),
+  );
+  expect(observed).toEqual({ before: [], after: [] });
+});
+
+test("validates related pairs by confirmed group without replacing saved results", async () => {
   const probe = `
 import argparse, json, sqlite3, sys
 sys.path.insert(0, sys.argv[1])
@@ -146,10 +197,13 @@ for value in invalid:
     assert snapshot() == original
 print(json.dumps({'summary': accepted['summary'],
                   'related': [(item['beforeOccurrenceId'], item['afterOccurrenceId']) for item in accepted['related']],
-                  'savedPairs': len(original[1]), 'rejected': len(invalid)}))
+                  'savedPairs': len(original[1])}))
 `;
   expect(
-    runPythonProbe(probe, join(tmpdir(), "codex-security-validation-fixture")),
+    await runPythonProbe(
+      probe,
+      join(tmpdir(), "codex-security-validation-fixture"),
+    ),
   ).toEqual({
     summary: { new: 1, persisting: 2, reopened: 0, resolved: 1, unknown: 0 },
     related: [
@@ -157,11 +211,10 @@ print(json.dumps({'summary': accepted['summary'],
       ["c", "z"],
     ],
     savedPairs: 5,
-    rejected: 8,
   });
 });
 
-test("upgrades existing history with indexed identity and reverse comparison lookups", () => {
+test("upgrades existing history with indexed identity and reverse comparison lookups", async () => {
   const probe = `
 import json, sqlite3, sys
 from pathlib import Path
@@ -217,10 +270,10 @@ print(json.dumps({'unchanged': rows() == original, 'comparisons': len(original),
                   'targetScopedIdentity': first_identity[0] != other_identity[0],
                   'foreignKeyErrors': len(connection.execute('PRAGMA foreign_key_check').fetchall())}))
 `;
-  const observed = runPythonProbe(
+  const observed = (await runPythonProbe(
     probe,
     join(tmpdir(), "codex-security-index-fixture"),
-  ) as {
+  )) as {
     plan: string[];
     identityPlan: string[];
   };
@@ -252,7 +305,7 @@ print(json.dumps({'unchanged': rows() == original, 'comparisons': len(original),
   ).toBe(true);
 });
 
-test("loads each scan once and scopes saved links to uncached history", () => {
+test("loads each scan once and scopes saved links to uncached history", async () => {
   const probe = [
     "import argparse, json, sqlite3, sys",
     "sys.path.insert(0, sys.argv[1])",
@@ -320,7 +373,7 @@ test("loads each scan once and scopes saved links to uncached history", () => {
     "}))",
   ].join("\n");
 
-  const observed = runPythonProbe(
+  const observed = await runPythonProbe(
     probe,
     join(tmpdir(), "codex-security-matching-fixture"),
   );
@@ -367,7 +420,7 @@ test("loads each scan once and scopes saved links to uncached history", () => {
   );
 });
 
-test("reconciles cached statuses without losing grouped coverage or uncertainty", () => {
+test("reconciles cached statuses without losing grouped coverage or uncertainty", async () => {
   const probe = `
 import argparse, json, sqlite3, sys
 sys.path.insert(0, sys.argv[1])
@@ -438,7 +491,7 @@ restored = compare()
 print(json.dumps({'uncertain': uncertain, 'excluded': excluded, 'resolved': resolved,
                   'linked': linked, 'unchanged': unchanged, 'restored': restored}))
 `;
-  const observed = runPythonProbe(
+  const observed = await runPythonProbe(
     probe,
     join(tmpdir(), "codex-security-comparison-fixture"),
   );
@@ -480,7 +533,7 @@ print(json.dumps({'uncertain': uncertain, 'excluded': excluded, 'resolved': reso
   expect(observed["restored"]).toEqual(observed["resolved"]);
 });
 
-test("loads displayed relations in bulk and follows current confirmed identities", () => {
+test("loads displayed relations in bulk and follows current confirmed identities", async () => {
   const probe = `
 import json, sqlite3, sys
 sys.path.insert(0, sys.argv[1])
@@ -572,7 +625,7 @@ print(json.dumps({
     'legacyCount': len(legacy_rows), 'legacyQueries': len(queries)
 }))
 `;
-  const observed = runPythonProbe(probe);
+  const observed = await runPythonProbe(probe);
   expect(observed).toMatchObject({
     scoped: {
       "left-0": [{ occurrenceId: "right-0", scanId: "two" }],
@@ -591,4 +644,51 @@ print(json.dumps({
     legacyQueries: 2,
   });
   expect(observed["batchedQueries"]).toBe(observed["expectedBatchedQueries"]);
+});
+
+test("loads oversized comparison matches from stdin", async () => {
+  const python = await resolvePluginPython();
+
+  const probe = [
+    "import argparse, io, json, sqlite3, sys",
+    "sys.path.insert(0, sys.argv[1])",
+    "import workbench_scan_history as history",
+    "connection = sqlite3.connect(':memory:')",
+    "connection.row_factory = sqlite3.Row",
+    "connection.executescript('''",
+    "CREATE TABLE scan_comparisons (before_scan_id TEXT, after_scan_id TEXT, result_json TEXT, created_at TEXT, updated_at TEXT);",
+    "CREATE TABLE scan_comparison_matches (before_scan_id TEXT, after_scan_id TEXT, before_occurrence_id TEXT, after_occurrence_id TEXT, reason TEXT);",
+    "''')",
+    "scans = {'before': {'id': 'before', 'status': 'complete', 'target_id': 'target', 'target_path': '/repo'}, 'after': {'id': 'after', 'status': 'complete', 'target_id': 'target', 'target_path': '/repo'}}",
+    "findings = {'before': {'old': {'id': 'old'}}, 'after': {'new': {'id': 'new'}}}",
+    "history._scan_findings = lambda _connection, scan_id: findings[scan_id]",
+    "history.compare_scans = lambda *_args, **_kwargs: {'saved': True}",
+    "payload = sys.stdin.read()",
+    "sys.stdin = io.StringIO(payload)",
+    "result = history.save_scan_comparison(connection, argparse.Namespace(before_scan_id='before', after_scan_id='after', matches_json=None, matches_json_stdin=True), now=lambda: 'now', require_scan=lambda _connection, scan_id: scans[scan_id], read_coverage=lambda _scan: {})",
+    "print(json.dumps(result))",
+  ].join("\n");
+  const payload = JSON.stringify({
+    matches: [
+      {
+        beforeOccurrenceIds: ["old"],
+        afterOccurrenceIds: ["new"],
+        confidence: "high",
+        reason: "x".repeat(64 * 1024),
+      },
+    ],
+    uncertain: [],
+  });
+
+  const result = await runCodexCommand(
+    { command: python },
+    ["-I", "-B", "-c", probe, join(PLUGIN_ROOT, "scripts")],
+    process.env,
+    payload,
+    AbortSignal.timeout(10_000),
+  );
+
+  expect(result.exitCode, result.stderr).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(JSON.parse(result.stdout)).toEqual({ saved: true });
 });

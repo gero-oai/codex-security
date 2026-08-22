@@ -30,10 +30,12 @@ def _same_repository(
     *,
     after_identity: tuple[str | None, tuple[str, str] | None] | None = None,
 ) -> bool:
-    if before["target_id"] == after["target_id"]:
+    if before["target_id"] is not None and before["target_id"] == after["target_id"]:
         return True
     before_target = Path(before["target_path"])
     after_target = Path(after["target_path"])
+    if before_target.resolve() == after_target.resolve():
+        return True
     before_git_dir = git_output(
         before_target, "rev-parse", "--path-format=absolute", "--git-common-dir"
     )
@@ -255,7 +257,7 @@ def list_unmatched_scan_pairs(
         for scan in connection.execute(
             "SELECT * FROM scans WHERE status = 'complete' ORDER BY started_at, id"
         )
-        if Path(scan["target_path"]).resolve() == repository or _same_repository(scan, requested)
+        if _same_repository(scan, requested)
     ]
 
     available = []
@@ -351,24 +353,20 @@ def _saved_finding_links(
 
 def _finding_aliases(links: Iterable[tuple[str, str]]) -> dict[str, str]:
     parents: dict[str, str] = {}
-    finding_ids: set[str] = set()
 
     def root(value: str) -> str:
-        path = []
-        while value in parents:
-            path.append(value)
+        parents.setdefault(value, value)
+        while parents[value] != value:
+            parents[value] = parents[parents[value]]
             value = parents[value]
-        for item in path:
-            parents[item] = value
         return value
 
     for before_id, after_id in links:
-        finding_ids.update((before_id, after_id))
         before = root(before_id)
         after = root(after_id)
         if before != after:
             parents[after] = before
-    return {finding_id: root(finding_id) for finding_id in finding_ids}
+    return {finding_id: root(finding_id) for finding_id in parents}
 
 
 def _known_finding_groups(links: list[sqlite3.Row], scan_ids: set[str]) -> list[list[str]]:
@@ -456,8 +454,6 @@ def compare_scans(
             else None
         )
         selected = current if current is not None else previous
-        if selected is None:
-            continue
         item = {
             "findingId": selected["finding_id"],
             "path": selected["relative_path"],
@@ -594,8 +590,11 @@ def save_scan_comparison(
     read_coverage(after)
     before_findings = _scan_findings(connection, before["id"])
     after_findings = _scan_findings(connection, after["id"])
+    matches_json = (
+        sys.stdin.read() if getattr(args, "matches_json_stdin", False) else args.matches_json
+    )
     try:
-        payload = json.loads(args.matches_json)
+        payload = json.loads(matches_json)
     except (TypeError, ValueError) as exc:
         raise SystemExit("Scan comparison matches must be a valid JSON object.") from exc
     if (

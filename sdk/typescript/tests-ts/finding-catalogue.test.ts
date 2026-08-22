@@ -250,7 +250,7 @@ describe("finding catalogue", () => {
         },
       ];
       const observed = conversation(() => ({ matches: [], uncertain }));
-      const result = await matchScanFindings(
+      const pending = matchScanFindings(
         {
           before: [
             finding("old", { findingId: "identity-a" }),
@@ -261,12 +261,41 @@ describe("finding catalogue", () => {
         },
         { codex: observed.codex, allowHistoricalUncertainty },
       );
+      if (!allowHistoricalUncertainty) {
+        await expect(pending).rejects.toThrow("invalid uncertain pair");
+        return;
+      }
+      const result = await pending;
       expect(result.matches).toHaveLength(1);
-      expect(result.uncertain).toEqual(
-        allowHistoricalUncertainty ? uncertain : [],
-      );
+      expect(result.uncertain).toEqual(uncertain);
     },
   );
+
+  test("rejects uncertainty for a finding with a known identity match", async () => {
+    const observed = conversation(() => ({
+      matches: [],
+      uncertain: [
+        {
+          beforeOccurrenceId: "old",
+          afterOccurrenceId: "other",
+          reason: "The earlier finding may instead match another result.",
+        },
+      ],
+    }));
+    await expect(
+      matchScanFindings(
+        {
+          before: [finding("old", { findingId: "identity-a" })],
+          after: [
+            finding("new", { findingId: "identity-b" }),
+            finding("other", { findingId: "identity-c" }),
+          ],
+          knownFindingGroups: [["identity-a", "identity-b"]],
+        },
+        { codex: observed.codex, allowHistoricalUncertainty: true },
+      ),
+    ).rejects.toThrow("invalid uncertain pair");
+  });
 
   test("extends semantic matches through aliases found only on the later side", async () => {
     const observed = conversation(() => ({

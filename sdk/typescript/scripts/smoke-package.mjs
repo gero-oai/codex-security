@@ -320,6 +320,8 @@ try {
       "--no-audit",
       "--no-fund",
       archive,
+      `typescript@${packageManifest.devDependencies.typescript}`,
+      `@types/node@${packageManifest.devDependencies["@types/node"]}`,
     ],
     { cwd: consumer },
   );
@@ -360,57 +362,25 @@ try {
     { cwd: consumer },
   );
 
-  const comparisonConsumer = join(consumer, "scan-comparison.ts");
-  await writeFile(
-    comparisonConsumer,
-    `import {
-      matchScanFindings,
-      type ScanComparisonInput,
-      type ScanComparisonOptions,
-      type ScanComparisonResult,
-    } from ${JSON.stringify(packageManifest.name)};
-
-    const input: ScanComparisonInput = {
-      before: [],
-      after: [],
-      knownFindingGroups: [["finding-a", "finding-b"]],
-    };
-    const options: ScanComparisonOptions = {
-      environment: { CODEX_SECURITY_STATE_DIR: "." },
-      model: "synthetic-model",
-      reasoningEffort: "medium",
-      signal: new AbortController().signal,
-      workingDirectory: ".",
-      onProgress: ({ phase }) => { void phase; },
-    };
-    const result: Promise<ScanComparisonResult> = matchScanFindings(input, options);
-    void result;
-
-    // @ts-expect-error Historical matching policy is internal.
-    matchScanFindings(input, { allowHistoricalUncertainty: true });
-    const codex = {
-      startThread: () => ({ run: async () => ({ finalResponse: "{}" }) }),
-    };
-    // @ts-expect-error Codex injection is internal.
-    matchScanFindings(input, { codex });
-    `,
+  await cp(
+    join(packageRoot, "scripts", "fixtures", "package-consumer.ts"),
+    join(consumer, "consumer.ts"),
   );
   run(
     process.execPath,
     [
-      fileURLToPath(import.meta.resolve("typescript/bin/tsc")),
-      "--noEmit",
+      join(consumer, "node_modules", "typescript", "bin", "tsc"),
       "--strict",
-      "--skipLibCheck",
+      "--noEmit",
+      "--target",
+      "ES2022",
+      "--lib",
+      "ESNext",
       "--module",
       "NodeNext",
-      "--target",
-      "ES2024",
       "--types",
       "node",
-      "--typeRoots",
-      join(packageRoot, "node_modules", "@types"),
-      comparisonConsumer,
+      "consumer.ts",
     ],
     { cwd: consumer },
   );
@@ -560,7 +530,7 @@ try {
   await smokeNestedDeepScanWorker(installedRoot, consumer);
 
   console.log(
-    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, CLI, ${expectedPluginFiles.length} bundled plugin files, bundled Codex version, and a nested worker without global codex.`,
+    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, NodeNext types, CLI, ${expectedPluginFiles.length} bundled plugin files, bundled Codex version, and a nested worker without global codex.`,
   );
 } finally {
   await rm(consumer, {

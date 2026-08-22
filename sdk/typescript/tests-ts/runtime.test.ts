@@ -14,6 +14,7 @@ import {
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import * as fsPromises from "node:fs/promises";
@@ -2027,6 +2028,7 @@ describe("plugin runtime preparation", () => {
     expect(workerEnvironment["CODEX_CLI_PATH"]).toBe(
       resolveCodexCommand().command,
     );
+    expect(workerEnvironment["PYTHONUTF8"]).toBe("1");
     const globalCodex = spawnSync("codex", ["--version"], {
       encoding: "utf8",
       env: workerEnvironment,
@@ -2058,6 +2060,7 @@ describe("plugin runtime preparation", () => {
       CODEX_CLI_PATH: configured,
       PATH: "",
       PYTHON: "/managed/python",
+      PYTHONUTF8: "1",
     });
     expect(
       pluginExecutionEnvironment("/managed/python", {
@@ -2358,6 +2361,39 @@ describe("runtime directories and plugin Python boundary", () => {
     expect(existsSync(lock)).toBe(true);
     await release();
     expect(existsSync(lock)).toBe(false);
+  });
+
+  test("recovers credential-home locks whose owner names no process", async () => {
+    const root = await temporaryDirectory();
+    const home = await prepareCodexSecurityCredentialHome({
+      CODEX_SECURITY_STATE_DIR: join(root, "state"),
+    });
+    const lock = join(home, ".codex-security-scan.lock");
+    for (const pid of [0, -1, 0.5, 2 ** 31, 2 ** 53]) {
+      await mkdir(lock, { mode: 0o700 });
+      await writeFile(
+        join(lock, "owner.json"),
+        `${JSON.stringify({ pid, token: "unidentifiable-owner" })}\n`,
+        { mode: 0o600 },
+      );
+      const aged = new Date(Date.now() - 10 * 60_000);
+      await utimes(lock, aged, aged);
+
+      // Bound acquisition so a false live-owner result cannot hang the test.
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(), 5_000);
+      try {
+        const release = await acquireCodexSecurityCredentialHomeLock(
+          home,
+          abort.signal,
+        );
+        expect(existsSync(lock)).toBe(true);
+        await release();
+      } finally {
+        clearTimeout(timer);
+      }
+      expect(existsSync(lock)).toBe(false);
+    }
   });
 
   test("prevents ambient credential imports after an explicit logout", async () => {
@@ -3893,14 +3929,14 @@ describe("runtime directories and plugin Python boundary", () => {
         "assert os.environ.get('CODEX_API_KEY') is None",
         "assert os.environ.get('OPENROUTER_API_KEY') is None",
         "assert os.environ.get('FIREWORKS_API_KEY') is None",
-        "print(json.dumps({'ok': True, 'details': 'x' * (5 * 1024 * 1024)}))",
+        "payload = sys.stdin.read()",
+        "print(json.dumps({'ok': True, 'label': '出力', 'inputLength': len(payload), 'details': 'x' * (5 * 1024 * 1024)}, ensure_ascii=False))",
       ].join("\n"),
     );
-    const python = Bun.which("python3") ?? Bun.which("python");
-    expect(python).not.toBeNull();
+    const python = await resolvePluginPython();
     const result = await runWorkbench(
       {
-        python: python!,
+        python,
         pluginRoot,
         environment: {
           PATH: process.env["PATH"],
@@ -3911,8 +3947,11 @@ describe("runtime directories and plugin Python boundary", () => {
         },
       },
       ["test-command"],
+      "x".repeat(64 * 1024),
     );
     expect(result["ok"]).toBe(true);
+    expect(result["label"]).toBe("出力");
+    expect(result["inputLength"]).toBe(64 * 1024);
     expect(result["details"]).toHaveLength(5 * 1024 * 1024);
   });
 
@@ -3929,11 +3968,6 @@ describe("runtime directories and plugin Python boundary", () => {
         [
           "import argparse, json, os, sys",
           "from pathlib import Path",
-          "assert sys.flags.isolated and sys.dont_write_bytecode",
-          "assert os.environ.get('OPENAI_API_KEY') is None",
-          "assert os.environ.get('CODEX_API_KEY') is None",
-          "assert os.environ.get('OPENROUTER_API_KEY') is None",
-          "assert os.environ.get('FIREWORKS_API_KEY') is None",
           "if '--help' in sys.argv:",
           "    with Path(__file__).with_name('help-calls').open('ab') as calls: calls.write(b'help\\n')",
           "    if os.environ.get('FAIL_COMPARISON_HELP'): sys.exit('Synthetic help failure')",
@@ -3951,16 +3985,12 @@ describe("runtime directories and plugin Python boundary", () => {
           "args = parser.parse_args()",
           "uses_stdin = getattr(args, 'matches_json_stdin', False)",
           "payload = json.loads(sys.stdin.buffer.read().decode('utf-8') if uses_stdin else args.matches_json)",
-          ...(!supportsStdin
-            ? ["assert set(payload) == {'matches', 'uncertain'}"]
-            : []),
           "print(json.dumps({'payload': payload, 'usesStdin': uses_stdin}))",
         ].join("\n"),
       );
-      const python = Bun.which("python3") ?? Bun.which("python");
-      expect(python).not.toBeNull();
+      const python = await resolvePluginPython();
       const options = {
-        python: python!,
+        python,
         pluginRoot,
         environment: {
           PATH: process.env["PATH"],
@@ -4000,9 +4030,9 @@ describe("runtime directories and plugin Python boundary", () => {
         "before-scan",
         "--after-scan-id",
         "after-scan",
-        "--matches-json",
-        JSON.stringify(original),
+        "--matches-json-stdin",
       ];
+      const input = JSON.stringify(original);
       await expect(
         runWorkbench(
           {
@@ -4010,6 +4040,7 @@ describe("runtime directories and plugin Python boundary", () => {
             environment: { ...options.environment, FAIL_COMPARISON_HELP: "1" },
           },
           args,
+          input,
         ),
       ).rejects.toThrow("Synthetic help failure");
       const expected = {
@@ -4018,12 +4049,13 @@ describe("runtime directories and plugin Python boundary", () => {
           ? original
           : { matches: original.matches, uncertain: original.uncertain },
       };
-      expect(await runWorkbench(options, args)).toEqual(expected);
-      expect(await runWorkbench(options, args)).toEqual(expected);
+      expect(await runWorkbench(options, args, input)).toEqual(expected);
+      expect(await runWorkbench(options, args, input)).toEqual(expected);
       expect(await readFile(join(scripts, "help-calls"), "utf8")).toBe(
         "help\nhelp\n",
       );
-      expect(JSON.parse(args.at(-1)!)).toEqual(original);
+      expect(args.at(-1)).toBe("--matches-json-stdin");
+      expect(JSON.parse(input)).toEqual(original);
     },
   );
 
@@ -4966,6 +4998,48 @@ describe("runtime directories and plugin Python boundary", () => {
     ).toBe(await realpath(interpreter!));
   });
 
+  test.skipIf(process.platform !== "win32")(
+    "runs plugin helpers with UTF-8 standard streams",
+    async () => {
+      const root = await temporaryDirectory("codex-security-python-utf8-");
+      const repository = join(root, "repository");
+      const output = join(root, "出力.jsonl");
+      await mkdir(repository);
+      await writeFile(join(repository, "source.py"), "value = 1\n");
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+
+      const result = spawnSync(
+        python!,
+        [
+          "-B",
+          join(PLUGIN_ROOT, "scripts", "generate_rank_input.py"),
+          "make-repo-rank-input",
+          "--repo",
+          repository,
+          "--out",
+          output,
+        ],
+        {
+          encoding: "utf8",
+          env: pluginExecutionEnvironment(python!, {
+            ...process.env,
+            pythonutf8: "0",
+          }),
+        },
+      );
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("出力.jsonl");
+      expect(
+        (await readFile(output, "utf8"))
+          .trimEnd()
+          .split("\n")
+          .map((row) => (JSON.parse(row) as { path: string }).path),
+      ).toEqual(["source.py"]);
+    },
+  );
+
   testPosix("uses configured, inherited, and managed Python", async () => {
     const root = await temporaryDirectory();
     const configured = join(root, "configured-python");
@@ -5012,6 +5086,7 @@ describe("runtime directories and plugin Python boundary", () => {
     expect(pluginExecutionEnvironment(managed, { TEST: "1" })).toEqual({
       TEST: "1",
       PYTHON: managed,
+      PYTHONUTF8: "1",
       CODEX_CLI_PATH: resolveCodexCommand().command,
     });
     await expect(

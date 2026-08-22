@@ -76,6 +76,7 @@ const CREDENTIAL_LOCK_NAME = ".codex-security-scan.lock";
 const CREDENTIAL_LOGOUT_MARKER = ".codex-security-logged-out";
 const CREDENTIAL_LOCK_POLL_MILLISECONDS = 25;
 const INCOMPLETE_CREDENTIAL_LOCK_MILLISECONDS = 30_000;
+const MAX_PROCESS_ID = 2_147_483_647;
 const MAX_WINDOWS_CREDENTIAL_ACL_STDERR = 64 * 1024;
 
 export interface PluginInstall {
@@ -859,6 +860,8 @@ async function secureWindowsCredentialHome(path: string): Promise<void> {
     "$path = $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH",
     "while ($true) { $parent = Microsoft.PowerShell.Management\\Split-Path -Path $path -Parent; if (-not $parent -or $parent -eq $path) { break }; Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $parent | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl; $path = $parent }",
     "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+    // A temporary descendant can disappear after enumeration. Its missing
+    // descriptor reduces the count and retries the stable snapshot.
     "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH -Recurse -Force | Microsoft.PowerShell.Core\\ForEach-Object { try { Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $_.FullName | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl } catch { if ($_.FullyQualifiedErrorId -notlike 'GetAcl_PathNotFound,*') { throw } } }",
   ].join("; ");
   const resolvePrincipalScript = [
@@ -1140,9 +1143,17 @@ async function recoverStaleCredentialHomeLock(lock: string): Promise<boolean> {
     }
   }
 
-  if (isRecord(owner) && typeof owner["pid"] === "number") {
+  // Only positive signed-32-bit PIDs identify an owner. Other values can name
+  // process groups or fail argument validation, so use the stale-age check.
+  const ownerPid = isRecord(owner) ? owner["pid"] : undefined;
+  if (
+    typeof ownerPid === "number" &&
+    Number.isInteger(ownerPid) &&
+    ownerPid > 0 &&
+    ownerPid <= MAX_PROCESS_ID
+  ) {
     try {
-      process.kill(owner["pid"], 0);
+      process.kill(ownerPid, 0);
       return false;
     } catch (error) {
       if (nodeErrorCode(error) !== "ESRCH") {
@@ -1362,6 +1373,7 @@ const workbenchComparisonStdinSupport = new Map<string, boolean>();
 export async function runWorkbench(
   options: WorkbenchCommandOptions,
   args: readonly string[],
+  input?: string,
 ): Promise<JsonObject> {
   const script = join(options.pluginRoot, "scripts", "workbench_db.py");
   const environment = Object.fromEntries(
@@ -1379,8 +1391,8 @@ export async function runWorkbench(
   ): Promise<string> => {
     const result = await runCodexCommand(
       { command: options.python },
-      ["-I", "-B", script, ...arguments_],
-      environment,
+      ["-I", "-X", "utf8", "-B", script, ...arguments_],
+      pythonUtf8Environment(environment),
       input,
       options.signal,
     );
@@ -1388,7 +1400,7 @@ export async function runWorkbench(
       throw new Error(
         result.stderr.trim() ||
           result.stdout.trim() ||
-          `Python exited with status ${result.exitCode}.`,
+          `Workbench exited with status ${result.exitCode}.`,
       );
     }
     return result.stdout;
@@ -1396,11 +1408,12 @@ export async function runWorkbench(
   let stdout: string;
   try {
     const arguments_ = [...args];
-    let input: string | undefined;
-    const matchesIndex = arguments_.indexOf("--matches-json");
-    const matches =
-      matchesIndex === -1 ? undefined : arguments_[matchesIndex + 1];
-    if (arguments_[0] === "save-scan-comparison" && matches !== undefined) {
+    const matchesStdinIndex = arguments_.indexOf("--matches-json-stdin");
+    if (
+      arguments_[0] === "save-scan-comparison" &&
+      matchesStdinIndex !== -1 &&
+      input !== undefined
+    ) {
       const key = JSON.stringify([options.python, script]);
       let supportsStdin = workbenchComparisonStdinSupport.get(key);
       if (supportsStdin === undefined) {
@@ -1409,16 +1422,19 @@ export async function runWorkbench(
         supportsStdin = help.includes("--matches-json-stdin");
         workbenchComparisonStdinSupport.set(key, supportsStdin);
       }
-      if (supportsStdin) {
-        input = matches;
-        arguments_.splice(matchesIndex, 2, "--matches-json-stdin");
-      } else {
+      if (!supportsStdin) {
         // Older custom plugins accept only the original comparison format.
-        const comparison: unknown = JSON.parse(matches);
+        const comparison: unknown = JSON.parse(input);
         if (isRecord(comparison) && "related" in comparison) {
           delete comparison["related"];
-          arguments_[matchesIndex + 1] = JSON.stringify(comparison);
         }
+        arguments_.splice(
+          matchesStdinIndex,
+          1,
+          "--matches-json",
+          JSON.stringify(comparison),
+        );
+        input = undefined;
       }
     }
     stdout = await run(arguments_, input);
@@ -2359,10 +2375,21 @@ export function pluginExecutionEnvironment(
   environment: ProcessEnvironment = process.env,
 ): ProcessEnvironment {
   return {
-    ...environment,
+    ...pythonUtf8Environment(environment),
     PYTHON: python,
     CODEX_CLI_PATH: resolveCodexCommand(environment).command,
   };
+}
+
+export function pythonUtf8Environment(
+  environment: ProcessEnvironment,
+): ProcessEnvironment {
+  const normalized = { ...environment };
+  for (const name of Object.keys(normalized)) {
+    if (name.toUpperCase() === "PYTHONUTF8") delete normalized[name];
+  }
+  normalized["PYTHONUTF8"] = "1";
+  return normalized;
 }
 
 export async function cleanupSdkDirectory(path: string): Promise<void> {
