@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -104,12 +105,14 @@ from workbench_target import (
     copy_git_worktree_files,
     directory_content_digest,
     directory_snapshot_regular_file_count,
+    git_bytes,
     git_command,
     git_output,
     git_revision,
     git_submodule_paths,
     git_target_metadata,
     git_worktree_context,
+    remediation_checkout_snapshot,
     require_git_worktree_head,
     require_remediation_target,
     require_scan_target_identity,
@@ -127,13 +130,40 @@ from workbench_validation import (
     require_occurrence,
     require_uuid,
     sqlite_busy,
-    user_text,
+    user_context_argument,
 )
 
 FINDING_ARTIFACT_DIRECTORIES_LIMIT = 80
 FINDING_ARTIFACTS_LIMIT = 40
 FINDING_WRITEUP_REPORT_PATH = re.compile(r"^findings/([a-z0-9][a-z0-9._-]*)/\1\.md$")
 SCAN_RECIPE_MAX_BYTES = 256 * 1024
+
+WINDOWS_SYSTEM_SID = "S-1-5-18"
+WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544"
+WINDOWS_TRUSTED_INSTALLER_SID = (
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+)
+WINDOWS_SID = re.compile(r"^S-1-(?:\d+-)*\d+$")
+WINDOWS_ALLOW_ACE_TYPES = {0, 5, 9, 11}
+WINDOWS_DENY_ACE_TYPES = {1, 6, 10, 12}
+WINDOWS_ACE_OBJECT_INHERIT = 0x01
+WINDOWS_ACE_CONTAINER_INHERIT = 0x02
+WINDOWS_ACE_NO_PROPAGATE = 0x04
+WINDOWS_ACE_INHERIT_ONLY = 0x08
+WINDOWS_ACE_FLAGS = 0x1F
+WINDOWS_DACL_PRESENT = 0x0004
+WINDOWS_DACL_PROTECTED = 0x1000
+WINDOWS_FULL_CONTROL = 0x1F01FF
+WINDOWS_GENERIC_ALL = 0x10000000
+WINDOWS_REPLACE_DIRECTORY = 0x100D0040
+WINDOWS_WRITE_DIRECTORY = 0x500D0046
+WINDOWS_WORKBENCH_FILES = (
+    "workbench.sqlite3",
+    "workbench.sqlite3-journal",
+    "workbench.sqlite3-shm",
+    "workbench.sqlite3-wal",
+)
+windows_acl_context: tuple[Path, Path, str, dict[str, str]] | None = None
 
 
 def now() -> str:
@@ -165,6 +195,311 @@ def state_dir() -> Path:
 
 def database_path() -> Path:
     return state_dir() / "workbench.sqlite3"
+
+
+def run_windows_state_acl_command(
+    command: Path,
+    arguments: list[str],
+    environment: dict[str, str],
+) -> str:
+    try:
+        result = subprocess.run(
+            [str(command), *arguments],
+            capture_output=True,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            text=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Could not run Windows state ACL tool: {command.name}.") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            f"Windows state ACL tool failed: {command.name}."
+            + (f" {detail}" if detail else "")
+        )
+    return result.stdout
+
+
+def windows_state_acl_context() -> tuple[Path, Path, str, dict[str, str]]:
+    global windows_acl_context
+    if windows_acl_context is not None:
+        return windows_acl_context
+    system_directory = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    powershell = system_directory / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() != "PSMODULEPATH"
+    }
+    environment["PSModulePath"] = str(
+        system_directory / "WindowsPowerShell" / "v1.0" / "Modules"
+    )
+    identity = run_windows_state_acl_command(
+        system_directory / "whoami.exe",
+        ["/user", "/fo", "csv", "/nh"],
+        environment,
+    )
+    try:
+        sid = next(csv.reader([identity.strip()]))[-1]
+    except (IndexError, StopIteration) as exc:
+        raise RuntimeError("Unable to identify the current Windows user SID.") from exc
+    if WINDOWS_SID.fullmatch(sid) is None:
+        raise RuntimeError("Unable to identify the current Windows user SID.")
+    windows_acl_context = powershell, system_directory / "icacls.exe", sid, environment
+    return windows_acl_context
+
+
+def windows_state_acl_records(
+    path: Path,
+    context: tuple[Path, Path, str, dict[str, str]],
+    *,
+    workbench_files: bool = False,
+) -> list[dict[str, Any]]:
+    powershell, _, _, base_environment = context
+    script = [
+        "$ErrorActionPreference = 'Stop'",
+        "function Write-CodexSecurityAcl {",
+        "param($kind, $path)",
+        "$sddl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $path | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+        "$raw = Microsoft.PowerShell.Utility\\ConvertFrom-SddlString -Sddl $sddl | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty RawDescriptor",
+        "$owner = $raw | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Owner | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Value",
+        "$rules = @($raw | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty DiscretionaryAcl | Microsoft.PowerShell.Core\\ForEach-Object {",
+        "$sid = $_ | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty SecurityIdentifier | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Value",
+        "[pscustomobject]@{ type = [int]$_.AceType; flags = [int]$_.AceFlags; mask = [int64]$_.AccessMask; sid = $sid }",
+        "})",
+        "[pscustomobject]@{ kind = $kind; owner = $owner; control = [int]$raw.ControlFlags; rules = $rules } | Microsoft.PowerShell.Utility\\ConvertTo-Json -Compress -Depth 4",
+        "}",
+        "$path = $env:CODEX_SECURITY_STATE_ACL_PATH",
+    ]
+    if workbench_files:
+        names = ", ".join(f"'{name}'" for name in WINDOWS_WORKBENCH_FILES)
+        script.extend(
+            [
+                "while ($true) { $parent = Microsoft.PowerShell.Management\\Split-Path -Path $path -Parent; if (-not $parent -or $parent -eq $path) { break }; Write-CodexSecurityAcl 'ancestor' $parent; $path = $parent }",
+                "Write-CodexSecurityAcl 'root' $env:CODEX_SECURITY_STATE_ACL_PATH",
+                f"foreach ($name in @({names})) {{ $child = Microsoft.PowerShell.Management\\Join-Path -Path $env:CODEX_SECURITY_STATE_ACL_PATH -ChildPath $name; if (Microsoft.PowerShell.Management\\Test-Path -LiteralPath $child) {{ try {{ Write-CodexSecurityAcl 'entry' $child }} catch {{ if ($_.FullyQualifiedErrorId -notlike 'GetAcl_PathNotFound*') {{ throw }} }} }} }}",
+            ]
+        )
+    else:
+        script.append(
+            "while ($true) { Write-CodexSecurityAcl 'ancestor' $path; $parent = Microsoft.PowerShell.Management\\Split-Path -Path $path -Parent; if (-not $parent -or $parent -eq $path) { break }; $path = $parent }"
+        )
+    environment = {**base_environment, "CODEX_SECURITY_STATE_ACL_PATH": str(path)}
+    output = run_windows_state_acl_command(
+        powershell,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "\n".join(script)],
+        environment,
+    )
+    records: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Windows state ACL inspection returned invalid data.") from exc
+        if not isinstance(record, dict):
+            raise RuntimeError("Windows state ACL inspection returned invalid data.")
+        records.append(record)
+    if not records:
+        raise RuntimeError("Windows state ACL could not be inspected.")
+    return records
+
+
+def require_windows_state_acl(
+    record: dict[str, Any],
+    current_user_sid: str,
+    scope: str,
+) -> None:
+    owner = record.get("owner")
+    control = record.get("control")
+    rules = record.get("rules")
+    if (
+        not isinstance(owner, str)
+        or WINDOWS_SID.fullmatch(owner) is None
+        or not isinstance(control, int)
+        or not isinstance(rules, list)
+        or not rules
+        or control & WINDOWS_DACL_PRESENT == 0
+    ):
+        raise RuntimeError("Windows state ACL is incomplete.")
+
+    trusted = {current_user_sid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID}
+    if scope in {"ancestor", "creation-parent"}:
+        trusted.add(WINDOWS_TRUSTED_INSTALLER_SID)
+    if owner not in trusted:
+        raise RuntimeError(f"Windows state ACL owner is not trusted: {owner}.")
+
+    grants_current_user = False
+    foreign_access = False
+    denied_access = False
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) != {"type", "flags", "mask", "sid"}:
+            raise RuntimeError("Windows state ACL contains an invalid access rule.")
+        ace_type = rule["type"]
+        flags = rule["flags"]
+        mask = rule["mask"]
+        principal = rule["sid"]
+        if (
+            not isinstance(ace_type, int)
+            or ace_type not in WINDOWS_ALLOW_ACE_TYPES | WINDOWS_DENY_ACE_TYPES
+            or not isinstance(flags, int)
+            or flags < 0
+            or flags & ~WINDOWS_ACE_FLAGS
+            or not isinstance(mask, int)
+            or not isinstance(principal, str)
+            or WINDOWS_SID.fullmatch(principal) is None
+        ):
+            raise RuntimeError("Windows state ACL contains an unsupported access rule.")
+        mask &= 0xFFFFFFFF
+        if ace_type in WINDOWS_DENY_ACE_TYPES:
+            denied_access = True
+            continue
+        if principal not in trusted:
+            if scope in {"root", "entry"}:
+                foreign_access = True
+            elif flags & WINDOWS_ACE_INHERIT_ONLY == 0 and mask & WINDOWS_REPLACE_DIRECTORY:
+                foreign_access = True
+            elif (
+                scope == "creation-parent"
+                and (flags & WINDOWS_ACE_INHERIT_ONLY == 0 or flags & WINDOWS_ACE_CONTAINER_INHERIT)
+                and mask & WINDOWS_WRITE_DIRECTORY
+            ):
+                foreign_access = True
+            continue
+        if (
+            principal == current_user_sid
+            and ace_type == 0
+            and flags & WINDOWS_ACE_INHERIT_ONLY == 0
+            and (
+                mask & WINDOWS_FULL_CONTROL == WINDOWS_FULL_CONTROL
+                or mask & WINDOWS_GENERIC_ALL
+            )
+        ):
+            grants_current_user = scope != "root" or (
+                flags & WINDOWS_ACE_OBJECT_INHERIT
+                and flags & WINDOWS_ACE_CONTAINER_INHERIT
+                and flags & WINDOWS_ACE_NO_PROPAGATE == 0
+            )
+
+    if scope in {"ancestor", "creation-parent"}:
+        if foreign_access:
+            raise RuntimeError(
+                "Windows state ancestor allows another identity to replace or populate the directory."
+            )
+        return
+    if scope == "root" and control & WINDOWS_DACL_PROTECTED == 0:
+        raise RuntimeError("Windows state ACL must be protected from inheritance.")
+    if not grants_current_user:
+        raise RuntimeError("Windows state ACL does not grant the current user access.")
+    if foreign_access:
+        raise RuntimeError("Windows state ACL grants access to another identity.")
+    if denied_access:
+        raise RuntimeError("Windows state ACL contains a deny rule.")
+
+
+def existing_windows_state_ancestor(path: Path) -> Path:
+    current = Path(os.path.abspath(path))
+    while True:
+        try:
+            current.lstat()
+            return current
+        except FileNotFoundError:
+            parent = current.parent
+            if parent == current:
+                raise
+            current = parent
+
+
+def require_secure_windows_state_ancestry(
+    path: Path,
+    context: tuple[Path, Path, str, dict[str, str]],
+    *,
+    allow_state_creation: bool = False,
+) -> None:
+    records = windows_state_acl_records(path, context)
+    if any(record.get("kind") != "ancestor" for record in records):
+        raise RuntimeError("Windows state ancestry could not be verified.")
+    for index, record in enumerate(records):
+        require_windows_state_acl(
+            record,
+            context[2],
+            "creation-parent" if allow_state_creation and index == 0 else "ancestor",
+        )
+
+
+def require_private_windows_state_path(
+    path: Path,
+    context: tuple[Path, Path, str, dict[str, str]],
+) -> None:
+    records = windows_state_acl_records(path, context)
+    if any(record.get("kind") != "ancestor" for record in records):
+        raise RuntimeError("Windows state path ACL could not be verified.")
+    require_windows_state_acl(records[0], context[2], "entry")
+    for record in records[1:]:
+        require_windows_state_acl(record, context[2], "ancestor")
+
+
+def require_regular_windows_state_file(path: Path) -> bool:
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or attributes & reparse_point
+    ):
+        raise RuntimeError(f"Windows state file is not a regular file: {path.name}.")
+    return True
+
+
+def require_regular_windows_workbench_files(root: Path) -> None:
+    for name in WINDOWS_WORKBENCH_FILES:
+        require_regular_windows_state_file(root / name)
+
+
+def require_private_windows_state_directory(
+    root: Path,
+    context: tuple[Path, Path, str, dict[str, str]],
+) -> None:
+    require_regular_windows_workbench_files(root)
+    records = windows_state_acl_records(root, context, workbench_files=True)
+    ancestors = [record for record in records if record.get("kind") == "ancestor"]
+    roots = [record for record in records if record.get("kind") == "root"]
+    entries = [record for record in records if record.get("kind") == "entry"]
+    if len(roots) != 1 or len(ancestors) + len(roots) + len(entries) != len(records):
+        raise RuntimeError("Windows state ACL snapshot could not be verified.")
+    for record in ancestors:
+        require_windows_state_acl(record, context[2], "ancestor")
+    require_windows_state_acl(roots[0], context[2], "root")
+    for record in entries:
+        require_windows_state_acl(record, context[2], "entry")
+
+
+def install_private_windows_state_acl(
+    path: Path,
+    context: tuple[Path, Path, str, dict[str, str]],
+) -> None:
+    _, icacls, current_user_sid, environment = context
+    run_windows_state_acl_command(
+        icacls,
+        [
+            str(path),
+            "/inheritance:r",
+            "/grant:r",
+            f"*{current_user_sid}:(OI)(CI)F",
+            f"*{WINDOWS_SYSTEM_SID}:(OI)(CI)F",
+            f"*{WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F",
+        ],
+        environment,
+    )
 
 
 def require_secure_state_ancestry(path: str) -> None:
@@ -207,7 +542,15 @@ def require_secure_state_ancestry(path: str) -> None:
 def scan_completion_lock(scan_id: str) -> Any:
     lock_dir = state_dir() / "completion-locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
+    windows_acl = windows_state_acl_context() if os.name == "nt" else None
+    if windows_acl is not None:
+        lock_dir = require_canonical_scan_directory(lock_dir)
     lock_path = lock_dir / f"{require_uuid(scan_id, 'scan-id')}.lock"
+    existing_windows_lock = False
+    if windows_acl is not None:
+        existing_windows_lock = require_regular_windows_state_file(lock_path)
+        if existing_windows_lock:
+            require_private_windows_state_path(lock_path, windows_acl)
     descriptor = os.open(
         lock_path,
         os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0),
@@ -215,6 +558,8 @@ def scan_completion_lock(scan_id: str) -> Any:
     )
     locked = False
     try:
+        if windows_acl is not None and not existing_windows_lock:
+            require_private_windows_state_path(lock_path, windows_acl)
         acquire_completion_file_lock(descriptor)
         locked = True
         yield
@@ -271,6 +616,11 @@ def connect() -> sqlite3.Connection:
     requested = requested_state_dir()
     root = Path(requested)
     try:
+        windows_acl = windows_state_acl_context() if os.name == "nt" else None
+        lexical_existing = None
+        if windows_acl is not None:
+            lexical_existing = existing_windows_state_ancestor(root)
+            require_secure_windows_state_ancestry(lexical_existing, windows_acl)
         require_secure_state_ancestry(requested)
         root = root.resolve()
         missing = []
@@ -287,7 +637,16 @@ def connect() -> sqlite3.Connection:
                 existing = parent
         if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
             raise SystemExit("State path must use real directories.")
-        if os.name != "nt":
+        if windows_acl is not None:
+            if missing or lexical_existing is None or os.path.normcase(
+                str(lexical_existing)
+            ) != os.path.normcase(str(existing)):
+                require_secure_windows_state_ancestry(
+                    existing,
+                    windows_acl,
+                    allow_state_creation=bool(missing),
+                )
+        else:
             geteuid = getattr(os, "geteuid", None)
             effective_uid = geteuid() if geteuid is not None else None
             for parent in (existing, *existing.parents):
@@ -296,14 +655,22 @@ def connect() -> sqlite3.Connection:
             try:
                 directory.mkdir(mode=0o700)
             except FileExistsError:
-                require_canonical_scan_directory(directory)
+                require_canonical_scan_directory(directory, validate_windows_acl=False)
+                if windows_acl is not None:
+                    require_secure_windows_state_ancestry(
+                        directory,
+                        windows_acl,
+                        allow_state_creation=True,
+                    )
                 continue
-            if (
-                os.name != "nt"
-                and stat.S_IMODE(directory.stat().st_mode) & 0o700 != 0o700
-            ):
+            if windows_acl is not None:
+                install_private_windows_state_acl(directory, windows_acl)
+                require_private_windows_state_directory(directory, windows_acl)
+            elif stat.S_IMODE(directory.stat().st_mode) & 0o700 != 0o700:
                 directory.chmod(0o700)
-        root = require_canonical_scan_directory(root)
+        root = require_canonical_scan_directory(root, validate_windows_acl=False)
+        if windows_acl is not None:
+            require_private_windows_state_directory(root, windows_acl)
     except (OSError, RuntimeError, SystemExit) as exc:
         raise SystemExit(
             f"Codex Security state directory is unsafe: {root}. {exc}"
@@ -399,11 +766,11 @@ def require_diff_target(
         }
     if kind == "commit":
         head = resolve_git_commit(target, head_revision or "", "Commit")
-        commit = git_output(target, "cat-file", "-p", head)
+        commit = git_bytes(target, "cat-file", "-p", head)
         if commit is None:
             raise SystemExit(f"Commit is not available in the local checkout: {head}")
         parent_line = next(
-            (line for line in commit.splitlines() if line.startswith("parent ")),
+            (line for line in commit.splitlines() if line.startswith(b"parent ")),
             None,
         )
         if parent_line is None:
@@ -411,7 +778,7 @@ def require_diff_target(
         else:
             parent = resolve_git_commit(
                 target,
-                parent_line.removeprefix("parent ").strip(),
+                parent_line.removeprefix(b"parent ").decode("ascii").strip(),
                 "Commit parent",
             )
         if base_revision and base_revision != parent:
@@ -687,17 +1054,15 @@ def verify_manifest_binding(scan: sqlite3.Row, manifest: dict[str, Any]) -> None
 
 def require_scope(scope: str, mode: str, target: Path) -> str:
     value = scope.strip() or "."
-    if "\\" in value:
+    requested_scope = Path(value)
+    if "\\" in value and (os.name != "nt" or not requested_scope.is_absolute()):
         raise SystemExit("Scan scope must use repository-relative POSIX paths.")
-    parsed = PurePosixPath(value)
-    if ".." in parsed.parts:
+    if ".." in requested_scope.parts:
         raise SystemExit("Scan scope must stay inside the scanned target.")
     try:
         resolved_scope = (
-            Path(parsed.as_posix()).resolve()
-            if parsed.is_absolute()
-            else (target / parsed.as_posix()).resolve()
-        )
+            requested_scope if requested_scope.is_absolute() else target / requested_scope
+        ).resolve()
         relative_scope = resolved_scope.relative_to(target)
     except (RuntimeError, ValueError) as exc:
         raise SystemExit("Scan scope must stay inside the scanned target.") from exc
@@ -801,7 +1166,7 @@ def create_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -
                 optional_text(args.target_summary, maximum=2400),
                 default_scope,
                 args.mode,
-                user_text(args.user_context),
+                user_context_argument(args),
                 diff_target_kind,
                 diff_base_revision,
                 diff_head_revision,
@@ -860,7 +1225,7 @@ def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> 
                 target_summary,
                 scope,
                 args.mode,
-                user_text(args.user_context),
+                user_context_argument(args),
                 diff_target["kind"] if diff_target else None,
                 diff_target["baseRevision"] if diff_target else None,
                 diff_target["headRevision"] if diff_target else None,
@@ -1025,7 +1390,7 @@ def _start_prompt_driven_scan(
     target_path = str(target)
     scope = inspected["scope"]
     diff_target = inspected["diffTarget"]
-    user_context = user_text(args.user_context)
+    user_context = user_context_argument(args)
     target_summary = optional_text(args.target_summary, maximum=2400)
     if diff_target is not None and not target_summary:
         target_summary = diff_target_summary(diff_target)
@@ -1691,7 +2056,14 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
     if next(scan_dir.iterdir(), None) is not None:
         raise SystemExit("The scan artifact directory must be empty before the scan starts.")
 
-    recipe = parse_scan_recipe(args.recipe_json, repository)
+    user_context = None
+    if args.registration_json_stdin:
+        registration = json.load(sys.stdin)
+        recipe_json = json.dumps(registration["recipe"], ensure_ascii=False, separators=(",", ":"))
+        user_context = registration.get("userContext")
+    else:
+        recipe_json = sys.stdin.read() if args.recipe_json_stdin else args.recipe_json
+    recipe = parse_scan_recipe(recipe_json, repository)
     requested_target = recipe["target"]
     paths = requested_target["paths"]
     scope = paths[0] if len(paths) == 1 else "."
@@ -1776,10 +2148,11 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
             scan_dir=scan_dir,
         )
         connection.execute(
-            "UPDATE scans SET recipe_json = ?, parent_scan_id = ? WHERE id = ?",
+            "UPDATE scans SET recipe_json = ?, parent_scan_id = ?, user_context = ? WHERE id = ?",
             (
                 json.dumps(recipe, allow_nan=False, separators=(",", ":"), sort_keys=True),
                 parent_scan_id,
+                user_context,
                 scan_id,
             ),
         )
@@ -2927,24 +3300,6 @@ def require_pending_remediation_action(current: sqlite3.Row, requested: str) -> 
         )
 
 
-def remediation_checkout_snapshot(
-    scan: sqlite3.Row, *, expected_revision: str | None = None
-) -> tuple[str, str | None]:
-    target = require_scan_target_identity(scan)
-    revision = git_revision(target)
-    required_revision = expected_revision or scan["target_revision"]
-    if revision != required_revision:
-        raise SystemExit(
-            "Repository HEAD changed. Regenerate the remediation patch against the current checkout."
-        )
-    content_digest = (
-        worktree_content_digest(target)
-        if revision != "unversioned"
-        else directory_content_digest(target, excluded=(Path(scan["scan_dir"]),))
-    )
-    return revision, content_digest
-
-
 def require_reviewed_patch_applied(
     scan: sqlite3.Row, remediation: sqlite3.Row, patch_path: str
 ) -> str | None:
@@ -2991,7 +3346,7 @@ def require_reviewed_patch_applied(
         applied = git_command(
             checkout if unversioned else checkout_root,
             *arguments,
-            text=True,
+            text=False,
             git_dir=Path(git_dir) if git_dir is not None else None,
             work_tree=checkout_root if git_dir is not None else None,
         )
@@ -3009,6 +3364,14 @@ def require_reviewed_patch_applied(
                 work_tree=checkout_root,
             )
         )
+        if reverted_digest != remediation["base_content_digest"] and unversioned:
+            checkout = Path(temporary) / "checkout-lf"
+            copy_directory_excluding(target, checkout, excluded)
+            applied_without_conversion = git_command(
+                checkout, "-c", "core.autocrlf=input", *arguments, text=True
+            )
+            if applied_without_conversion.returncode == 0:
+                reverted_digest = directory_content_digest(checkout)
         if reverted_digest != remediation["base_content_digest"]:
             raise SystemExit(
                 "The selected checkout contains changes outside the reviewed patch. Remove them before recording the patch as applied."
@@ -3856,7 +4219,11 @@ def require_trusted_output_ancestor(parent: Path | str, effective_uid: int | Non
         )
 
 
-def require_canonical_scan_directory(scan_dir: Path) -> Path:
+def require_canonical_scan_directory(
+    scan_dir: Path,
+    *,
+    validate_windows_acl: bool = True,
+) -> Path:
     scan_dir = scan_dir.absolute()
     try:
         metadata = scan_dir.lstat()
@@ -3871,7 +4238,12 @@ def require_canonical_scan_directory(scan_dir: Path) -> Path:
         raise SystemExit("Scan directory must be an existing canonical non-symlink directory.")
     # Re-check privacy on every resolution so a mid-scan rename/replace under a
     # shared parent cannot substitute another user's forged artifact tree.
-    if os.name != "nt":
+    if os.name == "nt" and validate_windows_acl:
+        try:
+            require_private_windows_state_path(scan_dir, windows_state_acl_context())
+        except (OSError, RuntimeError) as exc:
+            raise SystemExit("Scan directory has an unsafe Windows ACL.") from exc
+    elif os.name != "nt":
         if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise SystemExit(
                 "Scan directory must not be accessible to other users (chmod 700)."
@@ -3903,6 +4275,8 @@ def reject_non_finite_json(value: str) -> None:
 
 
 def main() -> None:
+    # Workbench callers send UTF-8 even when Windows uses a legacy code page.
+    sys.stdin.reconfigure(encoding="utf-8")
     args = parse_args(__doc__)
     deep_scan.configure(
         deep_scan.DeepScanDependencies(

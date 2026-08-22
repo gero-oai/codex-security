@@ -9,6 +9,7 @@ import {
   rm,
   stat,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
@@ -17,6 +18,8 @@ import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryDirectories: string[] = [];
 const testPosix = process.platform === "win32" ? test.skip : test;
+const testWindows = process.platform === "win32" ? test : test.skip;
+let windowsUserSid: string | undefined;
 
 afterEach(async () => {
   await Promise.all(
@@ -46,6 +49,89 @@ function runPython(stateDirectory: string, args: string[]) {
       CODEX_SECURITY_STATE_DIR: stateDirectory,
     },
   });
+}
+
+function connectDirectly(stateDirectory: string) {
+  return runPython(stateDirectory, [
+    "-c",
+    [
+      "import sys",
+      "sys.path.insert(0, sys.argv[1])",
+      "import workbench_db as workbench",
+      "workbench.connect().close()",
+    ].join("\n"),
+    join(PLUGIN_ROOT, "scripts"),
+  ]);
+}
+
+function windowsSystemDirectory(): string {
+  return join(process.env["SystemRoot"] ?? "C:\\Windows", "System32");
+}
+
+function currentWindowsUserSid(): string {
+  if (windowsUserSid !== undefined) return windowsUserSid;
+  const result = spawnSync(
+    join(windowsSystemDirectory(), "whoami.exe"),
+    ["/user", "/fo", "csv", "/nh"],
+    { encoding: "utf8", windowsHide: true },
+  );
+  expect(result.status).toBe(0);
+  const sid = /"(S-1-(?:\d+-)*\d+)"\s*$/u.exec(result.stdout)?.[1];
+  expect(sid).toBeDefined();
+  windowsUserSid = sid!;
+  return windowsUserSid;
+}
+
+function runIcacls(path: string, args: string[]) {
+  const result = spawnSync(
+    join(windowsSystemDirectory(), "icacls.exe"),
+    [path, ...args],
+    { encoding: "utf8", windowsHide: true },
+  );
+  expect(result.status).toBe(0);
+}
+
+function protectWindowsDirectory(path: string): void {
+  runIcacls(path, [
+    "/inheritance:r",
+    "/grant:r",
+    `*${currentWindowsUserSid()}:(OI)(CI)F`,
+    "*S-1-5-18:(OI)(CI)F",
+    "*S-1-5-32-544:(OI)(CI)F",
+  ]);
+}
+
+function windowsAclSddl(path: string): string {
+  const powershell = join(
+    windowsSystemDirectory(),
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const result = spawnSync(
+    powershell,
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, CODEX_SECURITY_TEST_ACL_PATH: path },
+      windowsHide: true,
+    },
+  );
+  expect(result.status).toBe(0);
+  return result.stdout.trim();
+}
+
+function expectPrivateWindowsDirectory(path: string): void {
+  const descriptor = windowsAclSddl(path);
+  expect(descriptor).toMatch(/D:[A-Z_]*P/u);
+  expect(descriptor).toContain(`;FA;;;${currentWindowsUserSid()})`);
+  expect(descriptor).toContain("OICI");
 }
 
 test("direct workbench initialization creates and pins private state", async () => {
@@ -94,6 +180,228 @@ test("direct workbench initialization creates and pins private state", async () 
     }
   }
 });
+
+test("Windows state creation ACLs distinguish metadata from directory writes", () => {
+  const result = runPython("", [
+    "-c",
+    [
+      "import json, sys",
+      "sys.path.insert(0, sys.argv[1])",
+      "import workbench_db as workbench",
+      "user = 'S-1-5-21-1-2-3-1001'",
+      "results = {}",
+      "for mask in (0x10, 0x100, 0x2, 0x4, 0x40, 0x40000000):",
+      "    record = {'owner': user, 'control': workbench.WINDOWS_DACL_PRESENT, 'rules': [{'type': 0, 'flags': 0, 'mask': mask, 'sid': 'S-1-1-0'}]}",
+      "    try:",
+      "        workbench.require_windows_state_acl(record, user, 'creation-parent')",
+      "    except RuntimeError:",
+      "        results[hex(mask)] = 'rejected'",
+      "    else:",
+      "        results[hex(mask)] = 'accepted'",
+      "print(json.dumps(results, sort_keys=True))",
+    ].join("\n"),
+    join(PLUGIN_ROOT, "scripts"),
+  ]);
+
+  expect(result.status).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(JSON.parse(result.stdout)).toEqual({
+    "0x10": "accepted",
+    "0x100": "accepted",
+    "0x2": "rejected",
+    "0x4": "rejected",
+    "0x40": "rejected",
+    "0x40000000": "rejected",
+  });
+});
+
+test("Windows state inspection tolerates both missing Get-Acl sidecar errors", () => {
+  const result = runPython("", [
+    "-c",
+    [
+      "import json, sys",
+      "from pathlib import Path",
+      "from unittest.mock import patch",
+      "sys.path.insert(0, sys.argv[1])",
+      "import workbench_db as workbench",
+      "scripts = []",
+      "def inspect(command, arguments, environment):",
+      "    scripts.append(arguments[-1])",
+      "    return json.dumps({'kind': 'root'})",
+      "context = (Path('powershell.exe'), Path('icacls.exe'), 'S-1-5-21-1-2-3-1001', {})",
+      "with patch.object(workbench, 'run_windows_state_acl_command', side_effect=inspect):",
+      "    workbench.windows_state_acl_records(Path('state'), context, workbench_files=True)",
+      "print(json.dumps({'missing': 'GetAcl_PathNotFound*' in scripts[0], 'narrow': 'GetAcl_PathNotFound,*' in scripts[0]}))",
+    ].join("\n"),
+    join(PLUGIN_ROOT, "scripts"),
+  ]);
+
+  expect(result.status).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(JSON.parse(result.stdout)).toEqual({ missing: true, narrow: false });
+});
+
+testWindows(
+  "direct workbench rejects unsafe Windows state without changing its ACL",
+  async () => {
+    const root = await temporaryDirectory();
+    const state = join(root, "state");
+    await mkdir(state);
+    protectWindowsDirectory(root);
+    protectWindowsDirectory(state);
+    runIcacls(state, ["/grant", "*S-1-1-0:(OI)(CI)R"]);
+    const before = windowsAclSddl(state);
+    const command = [
+      join(PLUGIN_ROOT, "scripts", "workbench_db.py"),
+      "list-scans",
+      "--repository",
+      root,
+    ];
+
+    const unsafeRoot = runPython(state, command);
+    expect(unsafeRoot.status).not.toBe(0);
+    expect(unsafeRoot.stderr).toContain("state directory is unsafe");
+    expect(windowsAclSddl(state)).toBe(before);
+    expect(existsSync(join(state, "workbench.sqlite3"))).toBe(false);
+
+    runIcacls(state, ["/remove:g", "*S-1-1-0"]);
+    const sidecar = join(state, "workbench.sqlite3-wal");
+    await writeFile(sidecar, "unsafe sidecar\n", "utf8");
+    runIcacls(sidecar, ["/grant", "*S-1-1-0:R"]);
+    const sidecarBefore = windowsAclSddl(sidecar);
+    const unsafeSidecar = runPython(state, command);
+    expect(unsafeSidecar.status).not.toBe(0);
+    expect(unsafeSidecar.stderr).toContain("state directory is unsafe");
+    expect(windowsAclSddl(sidecar)).toBe(sidecarBefore);
+    expect(existsSync(join(state, "workbench.sqlite3"))).toBe(false);
+  },
+);
+
+testWindows(
+  "direct workbench gives missing Windows state a private protected ACL",
+  async () => {
+    const root = await temporaryDirectory();
+    const component = join(root, "nested");
+    const state = join(component, "state");
+    protectWindowsDirectory(root);
+    const result = connectDirectly(state);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(existsSync(join(state, "workbench.sqlite3"))).toBe(true);
+    for (const directory of [component, state]) {
+      expectPrivateWindowsDirectory(directory);
+    }
+  },
+);
+
+testWindows(
+  "direct workbench rejects writable ACLs inherited by missing Windows state",
+  async () => {
+    const root = await temporaryDirectory();
+    const parent = join(root, "parent");
+    const state = join(parent, "state");
+    await mkdir(parent);
+    protectWindowsDirectory(root);
+    protectWindowsDirectory(parent);
+    runIcacls(parent, ["/grant", "*S-1-1-0:(CI)(IO)F"]);
+    const before = windowsAclSddl(parent);
+    const result = connectDirectly(state);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("state directory is unsafe");
+    expect(windowsAclSddl(parent)).toBe(before);
+    expect(existsSync(state)).toBe(false);
+  },
+);
+
+testWindows(
+  "direct workbench skips unrelated Windows state while preserving its ACL",
+  async () => {
+    const root = await temporaryDirectory();
+    const state = join(root, "state");
+    await mkdir(state);
+    protectWindowsDirectory(root);
+    protectWindowsDirectory(state);
+    const unrelated = join(state, "codex-home");
+    await mkdir(unrelated);
+    runIcacls(unrelated, ["/grant", "*S-1-1-0:(OI)(CI)R"]);
+    const before = windowsAclSddl(state);
+    const unrelatedBefore = windowsAclSddl(unrelated);
+    const result = connectDirectly(state);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(windowsAclSddl(state)).toBe(before);
+    expect(windowsAclSddl(unrelated)).toBe(unrelatedBefore);
+    expectPrivateWindowsDirectory(state);
+    expect(existsSync(join(state, "workbench.sqlite3"))).toBe(true);
+    const accessed = runPython(state, [
+      "-c",
+      [
+        "import sys",
+        "from pathlib import Path",
+        "sys.path.insert(0, sys.argv[1])",
+        "import workbench_db as workbench",
+        "workbench.require_canonical_scan_directory(Path(sys.argv[2]))",
+      ].join("\n"),
+      join(PLUGIN_ROOT, "scripts"),
+      unrelated,
+    ]);
+    expect(accessed.status).not.toBe(0);
+    expect(accessed.stderr).toContain("unsafe Windows ACL");
+    expect(windowsAclSddl(unrelated)).toBe(unrelatedBefore);
+  },
+);
+
+testWindows(
+  "direct workbench tolerates Windows SQLite sidecar churn",
+  async () => {
+    const root = await temporaryDirectory();
+    const state = join(root, "state");
+    protectWindowsDirectory(root);
+    const initialized = connectDirectly(state);
+    expect(initialized.status).toBe(0);
+    const result = runPython(state, [
+      "-c",
+      [
+        "import sys, threading",
+        "from pathlib import Path",
+        "sys.path.insert(0, sys.argv[1])",
+        "import workbench_db as workbench",
+        "sidecar = workbench.state_dir() / 'workbench.sqlite3-wal'",
+        "started = threading.Event()",
+        "stop = threading.Event()",
+        "def churn():",
+        "    started.set()",
+        "    while not stop.is_set():",
+        "        try:",
+        "            sidecar.write_bytes(b'wal')",
+        "        except PermissionError:",
+        "            pass",
+        "        try:",
+        "            sidecar.unlink()",
+        "        except (FileNotFoundError, PermissionError):",
+        "            pass",
+        "thread = threading.Thread(target=churn)",
+        "thread.start()",
+        "started.wait()",
+        "try:",
+        "    context = workbench.windows_state_acl_context()",
+        "    for _ in range(8):",
+        "        workbench.require_private_windows_state_directory(workbench.state_dir(), context)",
+        "finally:",
+        "    stop.set()",
+        "    thread.join()",
+        "    sidecar.unlink(missing_ok=True)",
+      ].join("\n"),
+      join(PLUGIN_ROOT, "scripts"),
+    ]);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+  },
+);
 
 test("direct workbench validates a competing private initializer", async () => {
   const root = await temporaryDirectory();
