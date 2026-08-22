@@ -20,7 +20,7 @@ import {
 } from "../src/security-policy.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 import { preparePersistentOutputRoot } from "../src/runtime.js";
-import { runMockInSubprocess } from "./support/isolated-mock.js";
+import { runTestInSubprocess } from "./support/test-subprocess.js";
 import {
   POLICY,
   PYTHON,
@@ -249,7 +249,7 @@ describe("security policy generation", () => {
   test("does not silently drop inherited policies when Git is unavailable", async () => {
     const name =
       "does not silently drop inherited policies when Git is unavailable";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const checkout = await fixture();
     const standalone = await fixture();
     execFileSync("git", ["init", "--quiet", checkout.repository]);
@@ -514,7 +514,7 @@ describe("security policy preview", () => {
   test("reports an early diff subprocess exit without an unhandled stdin error", async () => {
     const name =
       "reports an early diff subprocess exit without an unhandled stdin error";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     const draft = await f.generate();
     const node = execFileSync("node", ["-p", "process.execPath"], {

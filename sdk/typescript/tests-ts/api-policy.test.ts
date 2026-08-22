@@ -827,8 +827,8 @@ describe("CodexSecurity policy API", () => {
         await mkdir(dirname(path), { recursive: true });
         await writeFile(path, "Synthetic policy guidance.\n");
       }
-      f.runtime["plugin"] = {
-        ...(f.runtime["plugin"] as Record<string, unknown>),
+      f.runtime.plugin = {
+        ...f.runtime.plugin,
         pluginRoot,
       };
       await expect(
@@ -882,8 +882,8 @@ describe("CodexSecurity policy API", () => {
       await mkdir(dirname(destination), { recursive: true });
       await writeFile(destination, "synthetic plugin fixture\n");
     }
-    f.runtime["plugin"] = {
-      ...(f.runtime["plugin"] as Record<string, unknown>),
+    f.runtime.plugin = {
+      ...f.runtime.plugin,
       pluginRoot,
     };
     await expect(
