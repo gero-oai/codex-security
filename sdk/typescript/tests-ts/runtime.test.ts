@@ -147,6 +147,55 @@ function abortCredentialLockWaitWhenOwnerIsInspected(
   }) as typeof process.kill);
 }
 
+function captureCredentialLockHeartbeatTimer() {
+  const realSetInterval = globalThis.setInterval.bind(globalThis);
+  const realClearInterval = globalThis.clearInterval.bind(globalThis);
+  const unref = mock(() => undefined);
+  const interval = { unref } as unknown as NodeJS.Timeout;
+  let callback: (() => Promise<void>) | undefined;
+  let milliseconds: number | undefined;
+  let cleared = false;
+  const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
+    candidate: (...args: unknown[]) => void,
+    delay?: number,
+    ...args: unknown[]
+  ) => {
+    if (delay === 5_000 && callback === undefined) {
+      callback = candidate as () => Promise<void>;
+      milliseconds = delay;
+      return interval;
+    }
+    return realSetInterval(candidate, delay, ...args);
+  }) as typeof setInterval);
+  const clearIntervalSpy = spyOn(
+    globalThis,
+    "clearInterval",
+  ).mockImplementation(((timer: NodeJS.Timeout) => {
+    if (timer === interval) {
+      cleared = true;
+      return;
+    }
+    realClearInterval(timer);
+  }) as typeof clearInterval);
+
+  return {
+    get callback() {
+      return callback;
+    },
+    get cleared() {
+      return cleared;
+    },
+    get milliseconds() {
+      return milliseconds;
+    },
+    restore() {
+      clearIntervalSpy.mockRestore();
+      setIntervalSpy.mockRestore();
+    },
+    unref,
+  };
+}
+
 async function plugin(root: string, version = "1.2.3"): Promise<string> {
   const path = join(root, "plugin");
   await mkdir(join(path, ".codex-plugin"), { recursive: true });
@@ -2362,35 +2411,19 @@ describe("runtime directories and plugin Python boundary", () => {
       CODEX_SECURITY_STATE_DIR: join(root, "state"),
     });
     const lock = join(home, ".codex-security-scan.lock");
-    let heartbeat: (() => Promise<void>) | undefined;
-    const unref = mock(() => undefined);
-    const interval = { unref } as unknown as NodeJS.Timeout;
-    let cleared = false;
-    const setHeartbeat = spyOn(globalThis, "setInterval").mockImplementation(((
-      callback: () => Promise<void>,
-      milliseconds: number,
-    ) => {
-      expect(milliseconds).toBe(5_000);
-      heartbeat = callback;
-      return interval;
-    }) as typeof setInterval);
-    const clearHeartbeat = spyOn(
-      globalThis,
-      "clearInterval",
-    ).mockImplementation(((timer: NodeJS.Timeout) => {
-      if (timer === interval) cleared = true;
-    }) as typeof clearInterval);
+    const heartbeatTimer = captureCredentialLockHeartbeatTimer();
     let release: (() => Promise<void>) | undefined;
     let inspectOwner: ReturnType<typeof spyOn> | undefined;
 
     try {
       release = await acquireCodexSecurityCredentialHomeLock(home);
-      expect(unref).toHaveBeenCalledTimes(1);
-      expect(heartbeat).toBeDefined();
+      expect(heartbeatTimer.milliseconds).toBe(5_000);
+      expect(heartbeatTimer.unref).toHaveBeenCalledTimes(1);
+      expect(heartbeatTimer.callback).toBeDefined();
 
       const stale = new Date(Date.now() - 60_000);
       await utimes(lock, stale, stale);
-      await heartbeat!();
+      await heartbeatTimer.callback!();
       expect(Date.now() - (await stat(lock)).mtimeMs).toBeLessThan(30_000);
 
       const controller = new AbortController();
@@ -2406,11 +2439,10 @@ describe("runtime directories and plugin Python boundary", () => {
       try {
         if (release !== undefined) await release();
       } finally {
-        clearHeartbeat.mockRestore();
-        setHeartbeat.mockRestore();
+        heartbeatTimer.restore();
       }
     }
-    expect(cleared).toBe(true);
+    expect(heartbeatTimer.cleared).toBe(true);
     expect(existsSync(lock)).toBe(false);
   });
 
@@ -2535,25 +2567,10 @@ describe("runtime directories and plugin Python boundary", () => {
     });
     const lock = join(home, ".codex-security-scan.lock");
     const controller = new AbortController();
-    let heartbeat: (() => Promise<void>) | undefined;
-    const interval = {
-      unref: mock(() => undefined),
-    } as unknown as NodeJS.Timeout;
-    const setHeartbeat = spyOn(globalThis, "setInterval").mockImplementation(((
-      callback: () => Promise<void>,
-      milliseconds: number,
-    ) => {
-      expect(milliseconds).toBe(5_000);
-      if (heartbeat === undefined) heartbeat = callback;
-      else controller.abort(new DOMException("lock stolen", "AbortError"));
-      return interval;
-    }) as typeof setInterval);
-    const clearHeartbeat = spyOn(
-      globalThis,
-      "clearInterval",
-    ).mockImplementation((() => undefined) as typeof clearInterval);
+    const heartbeatTimer = captureCredentialLockHeartbeatTimer();
     const realDelay = timersPromises.setTimeout;
     let waitedForHeartbeat = false;
+    let observedDelaySignal: AbortSignal | undefined;
     mock.module("node:timers/promises", () => ({
       ...timersPromises,
       setTimeout: (async (
@@ -2561,11 +2578,10 @@ describe("runtime directories and plugin Python boundary", () => {
         value?: unknown,
         options?: { signal?: AbortSignal },
       ) => {
-        expect(options?.signal).toBe(controller.signal);
+        observedDelaySignal = options?.signal;
         if (milliseconds === 5_000) {
           waitedForHeartbeat = true;
-          expect(heartbeat).toBeDefined();
-          await heartbeat!();
+          await heartbeatTimer.callback!();
           return value;
         }
         controller.abort(new DOMException("canceled", "AbortError"));
@@ -2576,6 +2592,9 @@ describe("runtime directories and plugin Python boundary", () => {
 
     try {
       release = await acquireCodexSecurityCredentialHomeLock(home);
+      expect(heartbeatTimer.milliseconds).toBe(5_000);
+      expect(heartbeatTimer.unref).toHaveBeenCalledTimes(1);
+      expect(heartbeatTimer.callback).toBeDefined();
       const stale = new Date(Date.now() - 10 * 60_000);
       await utimes(lock, stale, stale);
 
@@ -2585,6 +2604,7 @@ describe("runtime directories and plugin Python boundary", () => {
       );
       await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
       expect(waitedForHeartbeat).toBe(true);
+      expect(observedDelaySignal).toBe(controller.signal);
       expect(Date.now() - (await stat(lock)).mtimeMs).toBeLessThan(30_000);
       expect(existsSync(lock)).toBe(true);
     } finally {
@@ -2595,8 +2615,7 @@ describe("runtime directories and plugin Python boundary", () => {
       try {
         if (release !== undefined) await release();
       } finally {
-        clearHeartbeat.mockRestore();
-        setHeartbeat.mockRestore();
+        heartbeatTimer.restore();
       }
     }
   });
