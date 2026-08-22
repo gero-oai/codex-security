@@ -27,7 +27,7 @@ export type PolicyPrompt = Pick<
 >;
 export type PolicySecurity = Pick<
   CodexSecurity,
-  "generatePolicy" | "preflightPolicy" | "close"
+  "generatePolicy" | "preflightPolicy" | "previewPolicy" | "close"
 >;
 
 export interface PolicyCommandOptions {
@@ -191,28 +191,40 @@ export async function runPolicyCommand(
     controller.signal.throwIfAborted();
     const cost = draft.cost;
     let python: string | undefined;
-    const resolvePython = async () =>
-      (python ??= await (dependencies.resolvePython ?? resolvePluginPython)({
-        configuredPath: options.config.pythonPath,
-        environment: dependencies.environment,
-        protectedRoot:
-          (
-            await enclosingGitWorktreeRoots(draft.repository, controller.signal)
-          ).at(-1) ?? draft.repository,
-        signal: controller.signal,
-      }));
-    const diff = await securityPolicyDiff(
-      draft,
-      resolvePython,
-      controller.signal,
-    );
+    const diff =
+      security === undefined
+        ? display(
+            await securityPolicyDiff(
+              draft,
+              async () =>
+                (python ??= await (
+                  dependencies.resolvePython ?? resolvePluginPython
+                )({
+                  configuredPath: options.config.pythonPath,
+                  environment: dependencies.environment,
+                  protectedRoot:
+                    (
+                      await enclosingGitWorktreeRoots(
+                        draft.repository,
+                        controller.signal,
+                      )
+                    ).at(-1) ?? draft.repository,
+                  signal: controller.signal,
+                })),
+              controller.signal,
+            ),
+            true,
+          )
+        : await security.previewPolicy(draft, {
+            signal: controller.signal,
+          });
     const changed = diff.length > 0;
     const humanOutput = options.format === "toon" && !options.explicitOutput;
     if (humanOutput) {
       const preview = [
         `\nPolicy target: ${display(draft.targetPath)}`,
         changed
-          ? display(diff, true).replace(/\n$/u, "")
+          ? diff.replace(/\n$/u, "")
           : "SECURITY.md is already up to date.",
         ...(draft.reviewNotes.length === 0
           ? []

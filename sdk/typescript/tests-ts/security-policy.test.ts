@@ -16,7 +16,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import * as fsPromises from "node:fs/promises";
-import { dirname, join, sep } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { strToU8, zipSync } from "fflate";
 import {
@@ -25,16 +25,18 @@ import {
 } from "../src/errors.js";
 import {
   applySecurityPolicy,
+  inspectSecurityPolicyPaths,
   loadSecurityPolicyDraft,
   readSecurityPolicy,
   resolveSecurityPolicyGuidance,
   resolveSecurityPolicyTarget,
   securityPolicyDiff,
+  securityPolicyProtectedRoots,
   type SecurityPolicyStage,
 } from "../src/security-policy.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 import { preparePersistentOutputRoot } from "../src/runtime.js";
-import { runMockInSubprocess } from "./support/isolated-mock.js";
+import { runTestInSubprocess } from "./support/test-subprocess.js";
 import {
   POLICY,
   PYTHON,
@@ -118,6 +120,38 @@ describe("security policy generation", () => {
       expect((await stat(draft.draftPath)).mode & 0o777).toBe(0o600);
   });
 
+  test("keeps generated artifacts readable and editable under a restrictive umask", async () => {
+    if (
+      runTestInSubprocess(
+        import.meta.path,
+        "keeps generated artifacts readable and editable under a restrictive umask",
+      )
+    )
+      return;
+    const f = await fixture();
+    const previous = process.umask(0o600);
+    try {
+      await f.generate({
+        run: async (stage) => {
+          if (stage !== "architecture")
+            expect(
+              await readFile(join(f.outputDir, "project-spec.md"), "utf8"),
+            ).toContain("src/service.ts:1");
+          return stageResult(stage);
+        },
+      });
+    } finally {
+      process.umask(previous);
+    }
+    for (const name of await readdir(f.outputDir)) {
+      const path = join(f.outputDir, name);
+      expect((await stat(path)).mode & 0o600).toBe(0o600);
+      if (process.platform !== "win32")
+        expect((await stat(path)).mode & 0o077).toBe(0);
+      await writeFile(path, await readFile(path));
+    }
+  });
+
   test("infers the Git root while keeping a component as the policy scope", async () => {
     const f = await fixture();
     execFileSync("git", ["init", "--quiet", f.repository]);
@@ -139,6 +173,21 @@ describe("security policy generation", () => {
     expect(
       await resolveSecurityPolicyTarget(f.repository, "services/api"),
     ).toEqual(target);
+  });
+
+  test("rejects a nested checkout that is re-rooted after target resolution", async () => {
+    const f = await fixture();
+    policyGit(f.repository, "init", "--quiet");
+    const nested = join(f.repository, "nested");
+    await mkdir(nested);
+    policyGit(nested, "init", "--quiet");
+    const target = await resolveSecurityPolicyTarget(nested);
+
+    await rm(join(nested, ".git"), { recursive: true, force: true });
+
+    await expect(securityPolicyProtectedRoots(target)).rejects.toThrow(
+      "Git metadata changed",
+    );
   });
 
   test("rejects Git configuration that redirects the selected checkout", async () => {
@@ -165,6 +214,31 @@ describe("security policy generation", () => {
         );
         expect(await readdir(f.outputDir)).toEqual([]);
       }
+    }
+  });
+
+  test("requires a worktree binding for a separate Git directory outside the checkout", async () => {
+    for (const external of [false, true]) {
+      const f = await fixture();
+      const metadata = join(external ? f.root : f.repository, "git-data");
+      policyGit(
+        f.repository,
+        "init",
+        "--quiet",
+        "--separate-git-dir",
+        metadata,
+      );
+      if (external) {
+        await expect(resolveSecurityPolicyTarget(f.repository)).rejects.toThrow(
+          "core.worktree",
+        );
+        policyGit(f.repository, "config", "core.worktree", f.repository);
+      }
+      expect(await resolveSecurityPolicyTarget(f.repository)).toEqual({
+        repository: f.repository,
+        scope: ".",
+        targetPath: join(f.repository, "SECURITY.md"),
+      });
     }
   });
 
@@ -200,6 +274,34 @@ describe("security policy generation", () => {
     }
   });
 
+  test("excludes separately named Git directories from policy discovery", async () => {
+    for (const nested of [false, true]) {
+      const f = await fixture();
+      const checkout = nested ? join(f.repository, "a-checkout") : f.repository;
+      const metadata = join(f.repository, nested ? "docs" : ".metadata");
+      if (nested) {
+        policyGit(f.repository, "init", "--quiet");
+        await mkdir(checkout);
+      }
+      policyGit(checkout, "init", "--quiet", "--separate-git-dir", metadata);
+      if (nested) policyGit(checkout, "config", "core.worktree", checkout);
+      await writeFile(join(f.repository, "SECURITY.md"), POLICY);
+      if (nested) await writeFile(join(checkout, "SECURITY.md"), POLICY);
+      await writeFile(join(metadata, "SECURITY.md"), "Not policy guidance\n");
+      await writeFile(
+        join(metadata, "refs", "heads", "SECURITY.md"),
+        "Not policy guidance\n",
+      );
+      expect(
+        await inspectSecurityPolicyPaths(
+          await resolveSecurityPolicyTarget(f.repository),
+        ),
+      ).toEqual(
+        nested ? ["SECURITY.md", "a-checkout/SECURITY.md"] : ["SECURITY.md"],
+      );
+    }
+  });
+
   test("keeps linked worktrees and submodules as their own policy roots", async () => {
     const f = await fixture();
     policyGit(f.repository, "init", "--quiet");
@@ -229,6 +331,19 @@ describe("security policy generation", () => {
       scope: "component",
       targetPath: join(linked, "component", "SECURITY.md"),
     });
+    const linkedMetadata = execFileSync(
+      "git",
+      ["-C", linked, "rev-parse", "--absolute-git-dir"],
+      { encoding: "utf8" },
+    ).trim();
+    const backlink = join(linkedMetadata, "gitdir");
+    const originalBacklink = await readFile(backlink);
+    await writeFile(
+      backlink,
+      `${relative(linkedMetadata, join(linked, ".git"))}\n`,
+    );
+    expect((await resolveSecurityPolicyTarget(linked)).repository).toBe(linked);
+    await writeFile(backlink, originalBacklink);
     const submodule = await addPolicySubmodule(
       f.repository,
       join(f.root, "submodule-source"),
@@ -264,7 +379,7 @@ describe("security policy generation", () => {
   test("does not silently drop inherited policies when Git is unavailable", async () => {
     const name =
       "does not silently drop inherited policies when Git is unavailable";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const checkout = await fixture();
     const standalone = await fixture();
     execFileSync("git", ["init", "--quiet", checkout.repository]);
@@ -923,7 +1038,7 @@ describe("security policy review and application", () => {
   test("handles unavailable hard links without clobbering policy files", async () => {
     const name =
       "handles unavailable hard links without clobbering policy files";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const originalLink = fsPromises.link;
     const originalCopyFile = fsPromises.copyFile;
     let linkErrorCode = "ENOTSUP";
@@ -1001,7 +1116,7 @@ describe("security policy review and application", () => {
   test("restores a concurrent save captured immediately before replacement", async () => {
     const name =
       "restores a concurrent save captured immediately before replacement";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     await writeFile(join(f.repository, "SECURITY.md"), "# Original policy\n");
     const draft = await f.generate();
@@ -1035,7 +1150,7 @@ describe("security policy review and application", () => {
   test("keeps both files when a concurrent writer claims the destination", async () => {
     const name =
       "keeps both files when a concurrent writer claims the destination";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     const original = "# Original policy\n";
     const concurrent = "# Concurrent save\n";
@@ -1071,7 +1186,7 @@ describe("security policy review and application", () => {
 
   test("keeps a recovery copy changed through an already-open file", async () => {
     const name = "keeps a recovery copy changed through an already-open file";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     await writeFile(join(f.repository, "SECURITY.md"), "# Original policy\n");
     const draft = await f.generate();
@@ -1134,7 +1249,7 @@ describe("security policy review and application", () => {
   test("keeps the original inode beside the target across filesystem boundaries", async () => {
     const name =
       "keeps the original inode beside the target across filesystem boundaries";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     await writeFile(join(f.repository, "SECURITY.md"), "# Original policy\n");
     const draft = await f.generate();
@@ -1179,7 +1294,7 @@ describe("security policy review and application", () => {
   test("retains open-writer data when rollback must copy instead of hard-link", async () => {
     const name =
       "retains open-writer data when rollback must copy instead of hard-link";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     const original = "# Original policy\n";
     await writeFile(join(f.repository, "SECURITY.md"), original);
@@ -1243,6 +1358,7 @@ describe("security policy review and application", () => {
           "--separate-git-dir",
           metadata,
         );
+        policyGit(f.repository, "config", "core.worktree", f.repository);
         inside = join(metadata, "artifacts");
       }
       const original = "# Original policy\n";
@@ -1265,7 +1381,7 @@ describe("security policy review and application", () => {
 
   test("restores the original policy when canceled after moving it", async () => {
     const name = "restores the original policy when canceled after moving it";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     const original = "# Original policy\n";
     await writeFile(join(f.repository, "SECURITY.md"), original);
@@ -1303,7 +1419,7 @@ describe("security policy review and application", () => {
 
   test("does not follow a symlink that races with an existing policy", async () => {
     const name = "does not follow a symlink that races with an existing policy";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     await writeFile(join(f.repository, "SECURITY.md"), "# Original policy\n");
     const draft = await f.generate();
@@ -1347,7 +1463,7 @@ describe("security policy review and application", () => {
     async () => {
       const name =
         "preserves an existing policy mode under a restrictive umask";
-      if (runMockInSubprocess(import.meta.path, name)) return;
+      if (runTestInSubprocess(import.meta.path, name)) return;
       const f = await fixture();
       const target = join(f.repository, "SECURITY.md");
       await writeFile(target, "# Existing policy\n");
@@ -1363,10 +1479,77 @@ describe("security policy review and application", () => {
     },
   );
 
+  test.skipIf(process.platform !== "win32")(
+    "preserves an existing Windows security descriptor",
+    async () => {
+      const name = "preserves an existing Windows security descriptor";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      await writeFile(target, "# Existing policy\n");
+      const systemDirectory = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+      );
+      execFileSync(
+        join(systemDirectory, "icacls.exe"),
+        [target, "/inheritance:d"],
+        { windowsHide: true },
+      );
+      const powershell = join(
+        systemDirectory,
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+      const descriptor = () =>
+        execFileSync(
+          powershell,
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+          ],
+          {
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              CODEX_SECURITY_TEST_ACL_PATH: target,
+            },
+            windowsHide: true,
+          },
+        ).trim();
+      const before = descriptor();
+      expect(before).toContain("D:P");
+      const draft = await f.generate();
+      const originalLink = fsPromises.link;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        link: async () => {
+          throw Object.assign(new Error("hard links are unsupported"), {
+            code: "ENOTSUP",
+          });
+        },
+      }));
+      try {
+        await applySecurityPolicy(draft);
+        expect(await readFile(target, "utf8")).toBe(POLICY);
+        expect(descriptor()).toBe(before);
+      } finally {
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          link: originalLink,
+        }));
+      }
+    },
+  );
+
   test("preserves read-only mode when temporary cleanup changes permissions", async () => {
     const name =
       "preserves read-only mode when temporary cleanup changes permissions";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const originalRm = fsPromises.rm;
     const originalWriteFile = fsPromises.writeFile;
     for (const existing of [false, true]) {
@@ -1409,7 +1592,7 @@ describe("security policy review and application", () => {
   test("finishes verification when cancellation arrives after the write commits", async () => {
     const name =
       "finishes verification when cancellation arrives after the write commits";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const originalLink = fsPromises.link;
     const originalRename = fsPromises.rename;
     for (const existing of [false, true]) {
@@ -1508,7 +1691,7 @@ describe("security policy review and application", () => {
   test("reports an early diff subprocess exit without an unhandled stdin error", async () => {
     const name =
       "reports an early diff subprocess exit without an unhandled stdin error";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     const draft = await f.generate();
     const node = execFileSync("node", ["-p", "process.execPath"], {
@@ -1937,7 +2120,7 @@ describe("security policy review and application", () => {
 
   test("stops policy-link walks before inspecting another target", async () => {
     const name = "stops policy-link walks before inspecting another target";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const originalLstat = fsPromises.lstat;
     const originalReadlink = fsPromises.readlink;
     const originalRealpath = fsPromises.realpath;

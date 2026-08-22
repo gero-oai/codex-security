@@ -15,14 +15,16 @@ import {
   SecurityPolicyRecoveryError,
   SecurityPolicyVerificationError,
 } from "../src/errors.js";
-import type {
-  SecurityPolicyDraft,
-  SecurityPolicyOptions,
+import {
+  securityPolicyDiff,
+  type SecurityPolicyDraft,
+  type SecurityPolicyOptions,
 } from "../src/index.js";
+import { formatSecurityPolicyText } from "../src/security-policy.js";
 import type { PolicyPrompt } from "../src/security-policy-cli.js";
 import { resolvePluginPython } from "../src/runtime.js";
 import { capture, dependencies, FakeSignals } from "./cli-fixtures.js";
-import { runMockInSubprocess } from "./support/isolated-mock.js";
+import { runTestInSubprocess } from "./support/test-subprocess.js";
 import {
   POLICY,
   PYTHON,
@@ -120,6 +122,14 @@ function policyDependencies(
             reasoningEffort: "xhigh",
           };
         },
+        previewPolicy: async (
+          draft: SecurityPolicyDraft,
+          preview: { signal?: AbortSignal } = {},
+        ) =>
+          formatSecurityPolicyText(
+            await securityPolicyDiff(draft, PYTHON, preview.signal),
+            true,
+          ),
         close: async () => {
           options.onClose?.();
         },
@@ -690,7 +700,7 @@ describe("policy CLI", () => {
   test("reports a written policy when verification fails after cancellation", async () => {
     const name =
       "reports a written policy when verification fails after cancellation";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     const pluginPath = await policyPlugin(
       f.root,
@@ -852,7 +862,7 @@ describe("policy CLI", () => {
       },
     });
     deps.resolvePolicyPython = async () => {
-      throw new Error("Must not resolve Python");
+      throw new Error("Must not resolve Python during preflight");
     };
     expect(
       await main(
@@ -1512,7 +1522,7 @@ describe("policy CLI", () => {
 
   test("lets a later interrupt escape post-write verification", async () => {
     const name = "lets a later interrupt escape post-write verification";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     const draft = await f.generate();
     const signals = new FakeSignals();
@@ -1562,7 +1572,7 @@ describe("policy CLI", () => {
   test("reports recovery paths even when a conflict also receives cancellation", async () => {
     const name =
       "reports recovery paths even when a conflict also receives cancellation";
-    if (runMockInSubprocess(import.meta.path, name)) return;
+    if (runTestInSubprocess(import.meta.path, name)) return;
     const f = await fixture();
     const original = "# Original policy\n";
     const concurrent = "# Concurrent save\n";
