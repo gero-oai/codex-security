@@ -92,7 +92,7 @@ export interface PublishScanResult {
   dryRun?: boolean;
   issues?: PreparedPublicationIssue[];
   warnings?: string[];
-  payloadDigest?: string;
+  payloadDigest: string;
 }
 
 export interface PublicationCodexResult {

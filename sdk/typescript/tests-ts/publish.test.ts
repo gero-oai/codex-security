@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
   appendFile,
   mkdtemp,
@@ -463,7 +463,7 @@ describe("connected Linear publication", () => {
       {
         ...OPTIONS,
         findingIds: ["finding-1", "finding-3"],
-        expectedDigest: preview.payloadDigest!,
+        expectedDigest: preview.payloadDigest,
       },
       dependencies(
         publication,
@@ -553,7 +553,7 @@ describe("connected Linear publication", () => {
       const publication = structuredClone(original);
       const options: PublishScanOptions = {
         ...OPTIONS,
-        expectedDigest: preview.payloadDigest!,
+        expectedDigest: preview.payloadDigest,
       };
       change(publication, options);
       let started = false;
@@ -641,6 +641,29 @@ describe("connected Linear publication", () => {
     expect(repeated.payloadDigest).toBe(first.payloadDigest);
     expect(rotated.payloadDigest).not.toBe(first.payloadDigest);
     expect(reassigned.payloadDigest).not.toBe(first.payloadDigest);
+    expect(first.payloadDigest).toBe(
+      createHmac("sha256", "synthetic-first-key")
+        .update(
+          JSON.stringify({
+            version: 2,
+            scanId: publication.scanId,
+            destination: {
+              type: publication.destination.type,
+              teamId: publication.destination.teamId,
+              projectId: publication.destination.projectId ?? null,
+            },
+            assigneeId: "reviewer@example.test",
+            issues: publication.issues.map((issue) => ({
+              findingId: issue.findingId,
+              occurrenceId: issue.occurrenceId,
+              title: issue.title,
+              description: issue.description,
+              priority: issue.priority ?? null,
+            })),
+          }),
+        )
+        .digest("hex"),
+    );
     expect(JSON.stringify(first)).not.toContain("synthetic-first-key");
     expect(JSON.stringify(first)).not.toContain("reviewer@example.test");
 
@@ -658,7 +681,7 @@ describe("connected Linear publication", () => {
       ...OPTIONS,
       linearApiKey: "synthetic-first-key",
       assigneeId: "reviewer@example.test",
-      expectedDigest: first.payloadDigest!,
+      expectedDigest: first.payloadDigest,
     };
     expect(
       (
@@ -762,7 +785,8 @@ describe("connected Linear publication", () => {
           publication,
           {},
           {
-            prepare: async () => {
+            prepare: async (_scanDirectory, prepareOptions) => {
+              expect(prepareOptions.signal).toBe(controller.signal);
               controller.abort(new Error("Publication preparation stopped."));
               return publication;
             },

@@ -343,7 +343,7 @@ describe("database-backed Linear publication integration", () => {
           "--finding",
           selected.findingId,
           "--expect-digest",
-          preview.payloadDigest!,
+          preview.payloadDigest,
           "--json",
         ],
         stdout.stream,

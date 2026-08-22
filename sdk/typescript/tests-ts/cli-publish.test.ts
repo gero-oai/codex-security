@@ -58,6 +58,7 @@ function publicationResult(
   return {
     scanId: "scan-123",
     uploadId: "scan-123",
+    payloadDigest: "a".repeat(64),
     destination: {
       type: "linear" as const,
       teamId: "team-from-flags",
@@ -74,6 +75,24 @@ function publicationResult(
 }
 
 describe("publish scan", () => {
+  test("advertises executable finding selection and digest flags", async () => {
+    const stdout = capture();
+    const stderr = capture();
+
+    expect(
+      await main(
+        ["publish", "scan", "--llms-full"],
+        stdout.stream,
+        stderr.stream,
+        dependencies(),
+      ),
+    ).toBe(0);
+    expect(stdout.text()).toContain("`--finding`");
+    expect(stdout.text()).toContain("`--expect-digest`");
+    expect(stdout.text()).not.toContain("`--expectDigest`");
+    expect(stderr.text()).toBe("");
+  });
+
   test("forwards repeated finding selections and the reviewed payload digest", async () => {
     const stdout = capture();
     const stderr = capture();

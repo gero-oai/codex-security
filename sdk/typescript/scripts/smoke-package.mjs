@@ -320,6 +320,8 @@ try {
       "--no-audit",
       "--no-fund",
       archive,
+      `typescript@${packageManifest.devDependencies.typescript}`,
+      `@types/node@${packageManifest.devDependencies["@types/node"]}`,
     ],
     { cwd: consumer },
   );
@@ -347,6 +349,29 @@ try {
       "--input-type=module",
       "--eval",
       `const sdk = await import(${JSON.stringify(packageManifest.name)}); if (typeof sdk.CodexSecurity !== "function") throw new Error("The installed package does not export CodexSecurity."); if (typeof sdk.publishScan !== "function") throw new Error("The installed package does not export publishScan.");`,
+    ],
+    { cwd: consumer },
+  );
+
+  await cp(
+    join(packageRoot, "scripts", "fixtures", "package-consumer.ts"),
+    join(consumer, "consumer.ts"),
+  );
+  run(
+    process.execPath,
+    [
+      join(consumer, "node_modules", "typescript", "bin", "tsc"),
+      "--strict",
+      "--noEmit",
+      "--target",
+      "ES2022",
+      "--lib",
+      "ESNext",
+      "--module",
+      "NodeNext",
+      "--types",
+      "node",
+      "consumer.ts",
     ],
     { cwd: consumer },
   );
@@ -489,15 +514,6 @@ try {
     ),
     publication,
   );
-  assert.throws(
-    () =>
-      run(
-        process.execPath,
-        [...selectedPublicationArgs.slice(0, -1), "0".repeat(64), "--json"],
-        selectedPublicationOptions,
-      ),
-    /does not match the expected digest/u,
-  );
   const directPublicationArgs = [
     "--require",
     networkGuard,
@@ -541,49 +557,11 @@ try {
     directPublicationText,
     /lin_api_|security@example\.test/u,
   );
-  assert.deepEqual(
-    JSON.parse(
-      run(
-        process.execPath,
-        [
-          ...directPublicationArgs,
-          "--expect-digest",
-          directPublication.payloadDigest,
-        ],
-        directPublicationOptions,
-      ),
-    ),
-    directPublication,
-  );
-  const rotatedPublicationArgs = [...directPublicationArgs];
-  rotatedPublicationArgs[
-    rotatedPublicationArgs.indexOf("--linear-api-key") + 1
-  ] = "lin_api_SYNTHETIC_INSTALLED_ROTATED";
-  const rotatedPublication = JSON.parse(
-    run(process.execPath, rotatedPublicationArgs, directPublicationOptions),
-  );
-  assert.notEqual(
-    rotatedPublication.payloadDigest,
-    directPublication.payloadDigest,
-  );
-  assert.throws(
-    () =>
-      run(
-        process.execPath,
-        [
-          ...rotatedPublicationArgs,
-          "--expect-digest",
-          directPublication.payloadDigest,
-        ],
-        directPublicationOptions,
-      ),
-    /does not match the expected digest/u,
-  );
 
   await smokeNestedDeepScanWorker(installedRoot, consumer);
 
   console.log(
-    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, CLI, ${expectedPluginFiles.length} bundled plugin files, bundled Codex version, and a nested worker without global codex.`,
+    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, NodeNext types, CLI, ${expectedPluginFiles.length} bundled plugin files, bundled Codex version, and a nested worker without global codex.`,
   );
 } finally {
   await rm(consumer, {

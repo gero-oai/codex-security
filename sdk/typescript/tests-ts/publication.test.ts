@@ -1,5 +1,15 @@
 import { createHash } from "node:crypto";
-import { chmod, cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -18,7 +28,6 @@ const DESTINATION = {
   destination: "linear",
   teamId: "team_example",
   projectId: "project_example",
-  uploadedAt: "2026-06-01T10:30:00Z",
 } as const;
 
 afterEach(async () => {
@@ -58,6 +67,20 @@ async function reseal(scanDirectory: string): Promise<void> {
 }
 
 describe("scan publication preparation", () => {
+  test("preserves cancellation while loading the sealed scan", async () => {
+    const scanDirectory = await copyExample();
+    const controller = new AbortController();
+    const reason = new Error("Publication preparation canceled.");
+    controller.abort(reason);
+
+    await expect(
+      prepareScanPublication(scanDirectory, {
+        ...DESTINATION,
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(reason);
+  });
+
   test("prepares stable descriptions without a wall-clock upload timestamp", async () => {
     const scanDirectory = await copyExample();
     const options = { destination: "linear", teamId: "team_example" } as const;
@@ -79,7 +102,7 @@ describe("scan publication preparation", () => {
     expect(publication).toMatchObject({
       scanId: "scan_example_001",
       uploadId: "scan_example_001",
-      scanDirectory,
+      scanDirectory: await realpath(scanDirectory),
       destination: {
         type: "linear",
         teamId: "team_example",
@@ -114,10 +137,35 @@ describe("scan publication preparation", () => {
     expect(issue.description).toContain("**Scan mode:** standard");
     expect(issue.description).toContain("**CWE:** CWE-22");
     expect(issue.description).toContain("**Sink:** `src/extract.py:41-44`");
-    expect(issue.description).toContain("**Uploaded:** 2026-06-01T10:30:00Z");
+    expect(issue.description).not.toContain("**Uploaded:**");
     expect(issue.description).toContain("without containment validation");
     expect(issue.description).toContain("Normalize destinations");
     expect(issue.description).not.toContain("/blob/deadbeef/");
+  });
+
+  test("uses the canonical scan directory beneath an aliased parent", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "codex-security-publication-alias-"),
+    );
+    temporaryDirectories.push(root);
+    const parent = join(root, "actual-parent");
+    const alias = join(root, "aliased-parent");
+    const scanDirectory = join(parent, "scan");
+    await mkdir(parent);
+    await cp(EXAMPLE, scanDirectory, { recursive: true });
+    if (process.platform !== "win32") await chmod(scanDirectory, 0o700);
+    await symlink(
+      parent,
+      alias,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const publication = await prepareScanPublication(
+      join(alias, "scan"),
+      DESTINATION,
+    );
+
+    expect(publication.scanDirectory).toBe(await realpath(scanDirectory));
   });
 
   test.each([
@@ -153,7 +201,6 @@ describe("scan publication preparation", () => {
     const publication = await prepareScanPublication(scanDirectory, {
       destination: "linear",
       teamId: "team_example",
-      uploadedAt: "2026-06-01T10:30:00Z",
     });
 
     expect(publication.destination).toEqual({

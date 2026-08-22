@@ -1,5 +1,7 @@
-import { resolve } from "node:path";
-import { loadContract, type LoadedContract } from "./contract.js";
+import {
+  loadContractWithScanDirectory,
+  type LoadedContract,
+} from "./contract.js";
 import type {
   Finding,
   FindingCodeEvidence,
@@ -19,7 +21,7 @@ export interface PrepareScanPublicationOptions {
   destination: "linear";
   teamId: string;
   projectId?: string;
-  uploadedAt?: string;
+  signal?: AbortSignal;
 }
 
 export interface PreparedPublicationIssue {
@@ -50,15 +52,17 @@ export async function prepareScanPublication(
   scanDirectory: string,
   options: PrepareScanPublicationOptions,
 ): Promise<PreparedScanPublication> {
-  const contract = await loadContract(scanDirectory, {
-    pluginRoot: await bundledPluginRoot(),
-  });
+  const { contract, scanDirectory: canonicalScanDirectory } =
+    await loadContractWithScanDirectory(scanDirectory, {
+      pluginRoot: await bundledPluginRoot(),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
   const scanId = contract.manifest.scan.id;
 
   return {
     scanId,
     uploadId: scanId,
-    scanDirectory: resolve(scanDirectory),
+    scanDirectory: canonicalScanDirectory,
     destination: {
       type: options.destination,
       teamId: options.teamId,
@@ -72,11 +76,7 @@ export async function prepareScanPublication(
         findingId: finding.findingId,
         occurrenceId: finding.occurrenceId,
         title: `[Codex Security][${finding.severity.level.toUpperCase()}] ${finding.title}`,
-        description: renderFindingDescription(
-          contract,
-          finding,
-          options.uploadedAt,
-        ),
+        description: renderFindingDescription(contract, finding),
         ...(priority === undefined ? {} : { priority }),
       };
     }),
@@ -86,7 +86,6 @@ export async function prepareScanPublication(
 function renderFindingDescription(
   contract: LoadedContract,
   finding: Finding,
-  uploadedAt: string | undefined,
 ): string {
   const { coverage } = contract;
   const { scan } = contract.manifest;
@@ -119,7 +118,6 @@ function renderFindingDescription(
     `**Scan mode:** ${scanMode(coverage.mode)}`,
     `**Started:** ${scan.startedAt}`,
     `**Completed:** ${scan.completedAt}`,
-    ...(uploadedAt === undefined ? [] : [`**Uploaded:** ${uploadedAt}`]),
     "",
     "### Affected locations",
     "",
