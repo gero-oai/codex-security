@@ -184,6 +184,7 @@ export async function matchScanFindingsInternal(
   runtimeOptions: { surface: CodexSecuritySurface; singleTurn?: boolean },
 ): Promise<ScanComparisonResult> {
   options.signal?.throwIfAborted();
+  validateComparisonInput(input);
   if (input.before.length === 0 || input.after.length === 0) {
     return { matches: [], uncertain: [] };
   }
@@ -234,6 +235,7 @@ export async function matchScanFindingsInternal(
       ),
       config: {
         allow_login_shell: false,
+        project_doc_max_bytes: 0,
         responses_api_metadata: {
           codex_security_surface: runtimeOptions.surface,
         },
@@ -915,6 +917,24 @@ function environmentEntry(
   return Object.entries(environment).find(
     ([name]) => name.toUpperCase() === upper,
   )?.[1];
+}
+
+function validateComparisonInput(input: ScanComparisonInput): void {
+  const occurrenceIds = new Set<string>();
+  for (const findings of [input.before, input.after]) {
+    for (const finding of findings) {
+      if (
+        typeof finding.occurrenceId !== "string" ||
+        finding.occurrenceId.trim().length === 0 ||
+        occurrenceIds.has(finding.occurrenceId)
+      ) {
+        throw new CodexSecurityError(
+          "Scan comparison occurrence IDs must be nonempty and globally unique.",
+        );
+      }
+      occurrenceIds.add(finding.occurrenceId);
+    }
+  }
 }
 
 function validateComparison(

@@ -767,6 +767,31 @@ describe("semantic scan comparison", () => {
     }
   });
 
+  test.each([
+    ["empty", { before: [finding(" ")], after: [] }],
+    [
+      "same-scan duplicate",
+      { before: [finding("duplicate"), finding("duplicate")], after: [] },
+    ],
+    [
+      "cross-scan duplicate",
+      {
+        before: [finding("duplicate")],
+        after: [finding("duplicate")],
+      },
+    ],
+  ])("rejects %s occurrence IDs before matching", async (_, input) => {
+    const codex: NonNullable<ScanComparisonOptions["codex"]> = {
+      startThread() {
+        throw new Error("No model should start for invalid input.");
+      },
+    };
+
+    await expect(matchScanFindings(input, { codex })).rejects.toThrow(
+      "must be nonempty and globally unique",
+    );
+  });
+
   test("allows cross-history uncertainty without relaxing two-scan matching", async () => {
     const input: ScanComparisonInput = {
       before: [
