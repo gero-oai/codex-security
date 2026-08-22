@@ -220,6 +220,10 @@ takes precedence when guidance conflicts. Linked worktrees and initialized
 submodules use their own roots. Git metadata and paths outside the selected
 checkout cannot be policy targets.
 
+External Git metadata must be bound to this checkout. For a separate Git
+directory you created intentionally, set `core.worktree` to the checkout's
+absolute path. Repair moved linked worktrees with `git worktree repair`.
+
 Before starting Codex, the command checks the policy files it may read. It
 rejects links outside the checkout or into Git metadata, and ancestor links
 that would spread a component policy to a wider scope.

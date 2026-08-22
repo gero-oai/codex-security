@@ -960,7 +960,6 @@ interface CliDependencies {
   ): Pick<CodexSecurity, "run" | "preflight" | "close">;
   createPolicySecurity?: (config: CodexSecurityConfig) => PolicySecurity;
   policyPrompt?: PolicyPrompt;
-  resolvePolicyPython?: typeof resolvePluginPython;
   environment: NodeJS.ProcessEnv;
   prepareAuthenticationHome?: (
     environment: NodeJS.ProcessEnv,
@@ -2340,10 +2339,7 @@ export async function main(
           const outcome = await withTerminalErrorsHandled(errorOutput, () =>
             runPolicyCommand(
               {
-                repository: resolve(
-                  directory,
-                  expandHome(args.repository ?? "."),
-                ),
+                repository: resolveCliPath(directory, args.repository ?? "."),
                 config: {
                   pluginPath: options.pluginPath,
                   pythonPath: options.python,
@@ -2358,12 +2354,12 @@ export async function main(
                   auth: options.auth,
                   path: options.path,
                   knowledgeBasePaths: options.knowledgeBase.map((path) =>
-                    resolve(directory, expandHome(path)),
+                    resolveCliPath(directory, path),
                   ),
                   outputDir:
                     options.outputDir === undefined
                       ? undefined
-                      : resolve(directory, expandHome(options.outputDir)),
+                      : resolveCliPath(directory, options.outputDir),
                   maxCostUsd: options.maxCost,
                 },
                 headless: options.headless || explicitOutput,
@@ -2405,7 +2401,6 @@ export async function main(
                 addSignalListener: dependencies.addSignalListener,
                 removeSignalListener: dependencies.removeSignalListener,
                 forceExit: dependencies.forceExit,
-                resolvePython: dependencies.resolvePolicyPython,
               },
             ),
           );

@@ -9,13 +9,15 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  inspectSecurityPolicyPaths,
   readSecurityPolicy,
   resolveSecurityPolicyGuidance,
   resolveSecurityPolicyTarget,
   securityPolicyDiff,
+  securityPolicyProtectedRoots,
   type SecurityPolicyStage,
 } from "../src/security-policy.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
@@ -103,6 +105,38 @@ describe("security policy generation", () => {
       expect((await stat(draft.draftPath)).mode & 0o777).toBe(0o600);
   });
 
+  test("keeps generated artifacts readable and editable under a restrictive umask", async () => {
+    if (
+      runTestInSubprocess(
+        import.meta.path,
+        "keeps generated artifacts readable and editable under a restrictive umask",
+      )
+    )
+      return;
+    const f = await fixture();
+    const previous = process.umask(0o600);
+    try {
+      await f.generate({
+        run: async (stage) => {
+          if (stage !== "architecture")
+            expect(
+              await readFile(join(f.outputDir, "project-spec.md"), "utf8"),
+            ).toContain("src/service.ts:1");
+          return stageResult(stage);
+        },
+      });
+    } finally {
+      process.umask(previous);
+    }
+    for (const name of await readdir(f.outputDir)) {
+      const path = join(f.outputDir, name);
+      expect((await stat(path)).mode & 0o600).toBe(0o600);
+      if (process.platform !== "win32")
+        expect((await stat(path)).mode & 0o077).toBe(0);
+      await writeFile(path, await readFile(path));
+    }
+  });
+
   test("infers the Git root while keeping a component as the policy scope", async () => {
     const f = await fixture();
     execFileSync("git", ["init", "--quiet", f.repository]);
@@ -124,6 +158,21 @@ describe("security policy generation", () => {
     expect(
       await resolveSecurityPolicyTarget(f.repository, "services/api"),
     ).toEqual(target);
+  });
+
+  test("rejects a nested checkout that is re-rooted after target resolution", async () => {
+    const f = await fixture();
+    policyGit(f.repository, "init", "--quiet");
+    const nested = join(f.repository, "nested");
+    await mkdir(nested);
+    policyGit(nested, "init", "--quiet");
+    const target = await resolveSecurityPolicyTarget(nested);
+
+    await rm(join(nested, ".git"), { recursive: true, force: true });
+
+    await expect(securityPolicyProtectedRoots(target)).rejects.toThrow(
+      "Git metadata changed",
+    );
   });
 
   test("rejects Git configuration that redirects the selected checkout", async () => {
@@ -150,6 +199,31 @@ describe("security policy generation", () => {
         );
         expect(await readdir(f.outputDir)).toEqual([]);
       }
+    }
+  });
+
+  test("requires a worktree binding for a separate Git directory outside the checkout", async () => {
+    for (const external of [false, true]) {
+      const f = await fixture();
+      const metadata = join(external ? f.root : f.repository, "git-data");
+      policyGit(
+        f.repository,
+        "init",
+        "--quiet",
+        "--separate-git-dir",
+        metadata,
+      );
+      if (external) {
+        await expect(resolveSecurityPolicyTarget(f.repository)).rejects.toThrow(
+          "core.worktree",
+        );
+        policyGit(f.repository, "config", "core.worktree", f.repository);
+      }
+      expect(await resolveSecurityPolicyTarget(f.repository)).toEqual({
+        repository: f.repository,
+        scope: ".",
+        targetPath: join(f.repository, "SECURITY.md"),
+      });
     }
   });
 
@@ -185,6 +259,34 @@ describe("security policy generation", () => {
     }
   });
 
+  test("excludes separately named Git directories from policy discovery", async () => {
+    for (const nested of [false, true]) {
+      const f = await fixture();
+      const checkout = nested ? join(f.repository, "a-checkout") : f.repository;
+      const metadata = join(f.repository, nested ? "docs" : ".metadata");
+      if (nested) {
+        policyGit(f.repository, "init", "--quiet");
+        await mkdir(checkout);
+      }
+      policyGit(checkout, "init", "--quiet", "--separate-git-dir", metadata);
+      if (nested) policyGit(checkout, "config", "core.worktree", checkout);
+      await writeFile(join(f.repository, "SECURITY.md"), POLICY);
+      if (nested) await writeFile(join(checkout, "SECURITY.md"), POLICY);
+      await writeFile(join(metadata, "SECURITY.md"), "Not policy guidance\n");
+      await writeFile(
+        join(metadata, "refs", "heads", "SECURITY.md"),
+        "Not policy guidance\n",
+      );
+      expect(
+        await inspectSecurityPolicyPaths(
+          await resolveSecurityPolicyTarget(f.repository),
+        ),
+      ).toEqual(
+        nested ? ["SECURITY.md", "a-checkout/SECURITY.md"] : ["SECURITY.md"],
+      );
+    }
+  });
+
   test("keeps linked worktrees and submodules as their own policy roots", async () => {
     const f = await fixture();
     policyGit(f.repository, "init", "--quiet");
@@ -214,6 +316,19 @@ describe("security policy generation", () => {
       scope: "component",
       targetPath: join(linked, "component", "SECURITY.md"),
     });
+    const linkedMetadata = execFileSync(
+      "git",
+      ["-C", linked, "rev-parse", "--absolute-git-dir"],
+      { encoding: "utf8" },
+    ).trim();
+    const backlink = join(linkedMetadata, "gitdir");
+    const originalBacklink = await readFile(backlink);
+    await writeFile(
+      backlink,
+      `${relative(linkedMetadata, join(linked, ".git"))}\n`,
+    );
+    expect((await resolveSecurityPolicyTarget(linked)).repository).toBe(linked);
+    await writeFile(backlink, originalBacklink);
     const submodule = await addPolicySubmodule(
       f.repository,
       join(f.root, "submodule-source"),

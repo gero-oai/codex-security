@@ -18,6 +18,7 @@ import Ajv, { type AnySchema } from "ajv";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   CodexSecurity,
+  InvalidTargetError,
   OutputDirectoryNotEmptyError,
   securityPolicyDiff,
   writeCodexConfig,
@@ -54,6 +55,7 @@ async function setup(
     ) => AsyncGenerator<ThreadEvent>;
     onPrepare?: () => void;
     onRevision?: () => Promise<void>;
+    secureOutput?: (path: string) => Promise<void>;
     surface?: "cli" | "sdk";
     config?: Record<string, unknown>;
   } = {},
@@ -84,6 +86,9 @@ async function setup(
       resolvePluginPython: async (selection: PluginPythonOptions) => {
         pythonSelections.push(selection);
         return PYTHON;
+      },
+      requirePrivatePolicyOutputDirectory: async (path: string) => {
+        await options.secureOutput?.(path);
       },
       repositoryRevision: async () => {
         await options.onRevision?.();
@@ -154,6 +159,30 @@ async function* events(
 }
 
 describe("CodexSecurity policy API", () => {
+  test("requires private output before starting a policy turn", async () => {
+    let announced = false;
+    const secured: string[] = [];
+    const f = await setup({
+      secureOutput: async (path) => {
+        secured.push(path);
+        throw new Error("Policy output could not be made private");
+      },
+    });
+    await expect(
+      f.security.generatePolicy(f.repository, {
+        outputDir: f.outputDir,
+        onOutputDirReady: () => {
+          announced = true;
+        },
+      }),
+    ).rejects.toThrow("Policy output could not be made private");
+    expect(secured).toEqual([f.outputDir]);
+    expect(announced).toBe(false);
+    expect(f.threads).toHaveLength(0);
+    expect(await readdir(f.outputDir)).toEqual([]);
+    await f.security.close();
+  });
+
   test("keeps prompt data on one encoded line and binds plugin Python", async () => {
     const marker = "source\u0085line\u2028separator\u2029end";
     const scope = `component-${marker}`;
@@ -289,6 +318,96 @@ describe("CodexSecurity policy API", () => {
     await f.security.close();
   });
 
+  test("rejects Git metadata borrowed from another checkout before starting Codex", async () => {
+    for (const kind of [
+      "ordinary",
+      "separate",
+      "linked",
+      "submodule",
+      "unregistered-directory",
+      "unregistered-gitfile",
+    ]) {
+      let prepared = false;
+      const f = await setup({ onPrepare: () => (prepared = true) });
+      const owner = join(f.root, "other-repository");
+      await mkdir(owner);
+      policyGit(
+        owner,
+        "init",
+        "--quiet",
+        ...(kind === "separate"
+          ? ["--separate-git-dir", join(f.root, "other-git-data")]
+          : []),
+      );
+      policyGit(owner, "commit", "--allow-empty", "--quiet", "-m", "initial");
+      let checkout = owner;
+      if (kind === "linked") {
+        checkout = join(f.root, "other-worktree");
+        policyGit(owner, "worktree", "add", "--quiet", "--detach", checkout);
+      } else if (kind === "submodule") {
+        checkout = await addPolicySubmodule(
+          owner,
+          join(f.root, "submodule-source"),
+        );
+      }
+      let metadata = execFileSync(
+        "git",
+        ["-C", checkout, "rev-parse", "--absolute-git-dir"],
+        { encoding: "utf8" },
+      ).trim();
+      if (kind.startsWith("unregistered-")) {
+        const common = metadata;
+        metadata = join(
+          f.repository,
+          kind === "unregistered-directory" ? ".git" : "git-data",
+        );
+        await mkdir(metadata);
+        await writeFile(
+          join(metadata, "HEAD"),
+          await readFile(join(common, "HEAD")),
+        );
+        await writeFile(join(metadata, "commondir"), `${common}\n`);
+        await writeFile(
+          join(metadata, "gitdir"),
+          `${join(f.repository, ".git")}\n`,
+        );
+      }
+      if (kind !== "unregistered-directory")
+        await writeFile(join(f.repository, ".git"), `gitdir: ${metadata}\n`);
+      for (const operation of [
+        () => f.security.preflightPolicy(f.repository),
+        () => f.security.generatePolicy(f.repository),
+      ])
+        await expect(operation()).rejects.toThrow(InvalidTargetError);
+      expect(prepared).toBe(false);
+      expect(f.threads).toHaveLength(0);
+      expect(await readdir(f.outputDir)).toEqual([]);
+      await f.security.close();
+    }
+  });
+
+  test("rejects Git metadata added after policy validation", async () => {
+    const f = await setup({
+      secureOutput: async () => {
+        const metadata = join(f.root, "late-git-data");
+        policyGit(
+          f.repository,
+          "init",
+          "--quiet",
+          "--separate-git-dir",
+          metadata,
+        );
+        policyGit(f.repository, "config", "core.worktree", f.repository);
+      },
+    });
+
+    await expect(
+      f.security.generatePolicy(f.repository, { outputDir: f.outputDir }),
+    ).rejects.toThrow(InvalidTargetError);
+    expect(f.threads).toHaveLength(0);
+    await f.security.close();
+  });
+
   test("rejects Git metadata targets before starting Codex", async () => {
     let prepared = false;
     const f = await setup({
@@ -378,6 +497,7 @@ describe("CodexSecurity policy API", () => {
       if (kind === "separate") {
         common = join(f.root, "git-data");
         policyGit(repository, "init", "--quiet", "--separate-git-dir", common);
+        policyGit(repository, "config", "core.worktree", repository);
       } else {
         policyGit(repository, "init", "--quiet");
         policyGit(
@@ -757,8 +877,15 @@ describe("CodexSecurity policy API", () => {
     });
     expect(observed).toEqual(["architecture", "threat_model", "policy"]);
     expect(f.threads).toHaveLength(3);
+    const readRoots = f.threads[0]!.additionalDirectories;
+    expect(readRoots).toContain(f.repository);
+    expect(readRoots).toContain(PLUGIN_ROOT);
+    expect(readRoots).toContain(dirname(PYTHON));
+    expect(readRoots).not.toContain(f.runtime.codexHome);
+    expect(readRoots).not.toContain(join(f.root, "state"));
     for (const thread of f.threads) {
       expect(thread.workingDirectory).toBe(f.outputDir);
+      expect(thread.additionalDirectories).toEqual(readRoots);
       expect(thread.approvalPolicy).toBe("never");
       expect(thread.networkAccessEnabled).toBe(false);
       expect(thread.webSearchMode).toBe("disabled");
@@ -966,6 +1093,28 @@ describe("CodexSecurity policy API", () => {
     }
   });
 
+  test("leaves quoted model-provider names in the native configuration", async () => {
+    const provider = "synthetic.provider";
+    const f = await setup({
+      config: {
+        codexOverrides: {
+          model_provider: provider,
+          model_providers: {
+            [provider]: {
+              name: "Synthetic provider",
+              base_url: "https://example.invalid/v1",
+              wire_api: "responses",
+            },
+          },
+        },
+      },
+    });
+    await f.security.generatePolicy(f.repository, { outputDir: f.outputDir });
+    expect(f.configuration()?.config?.["model_provider"]).toBe(provider);
+    expect(f.configuration()?.config).not.toHaveProperty("model_providers");
+    await f.security.close();
+  });
+
   test("retains an explicit plugin selection without persisting its location", async () => {
     const f = await setup({ config: { pluginPath: PLUGIN_ROOT } });
     const draft = await f.security.generatePolicy(f.repository, {
@@ -991,6 +1140,7 @@ describe("CodexSecurity policy API", () => {
     });
     const extracted = f.configuration()?.env?.["CODEX_SECURITY_KNOWLEDGE_BASE"];
     expect(extracted).toBeDefined();
+    expect(f.threads[0]!.additionalDirectories).toContain(extracted);
     expect(
       f.prompts.every((prompt) => prompt.includes(JSON.stringify(extracted))),
     ).toBe(true);

@@ -1,8 +1,16 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { existsSync } from "node:fs";
-import { lstat, realpath, stat } from "node:fs/promises";
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { promisify } from "node:util";
 import { InvalidTargetError } from "./errors.js";
 import { resolveTrustedExecutable } from "./trusted-executable.js";
@@ -199,6 +207,8 @@ export async function enclosingGitWorktreeRoot(
       "Git's worktree root does not match the selected checkout's .git marker. Select the intended checkout explicitly or fix its Git configuration.",
     );
   }
+  if (markerRoot !== null)
+    await requireGitWorktreeBinding(canonicalRoot, signal);
   return canonicalRoot;
 }
 
@@ -223,16 +233,77 @@ export async function enclosingGitWorktreeRoots(
 export async function gitMetadataDirectories(
   repository: string,
   signal?: AbortSignal,
-): Promise<string[]> {
-  const directories = await Promise.all([
+): Promise<[string, string]> {
+  const [directory, commonDirectory] = await Promise.all([
     gitOutput(repository, ["rev-parse", "--absolute-git-dir"], signal),
     gitOutput(repository, ["rev-parse", "--git-common-dir"], signal),
   ]);
-  return await Promise.all(
-    directories.map((directory) =>
-      abortable(() => realpath(resolve(repository, directory)), signal),
-    ),
+  return await Promise.all([
+    abortable(() => realpath(resolve(repository, directory)), signal),
+    abortable(() => realpath(resolve(repository, commonDirectory)), signal),
+  ]);
+}
+
+async function requireGitWorktreeBinding(
+  repository: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  let cause: unknown;
+  try {
+    const [directory, commonDirectory] = await gitMetadataDirectories(
+      repository,
+      signal,
+    );
+    if (
+      [directory, commonDirectory].every(
+        (path) => !relativePathIsOutside(relative(repository, path)),
+      )
+    )
+      return;
+    if (relative(directory, commonDirectory) === "") {
+      // The toplevel check already verified the configured worktree path.
+      if (
+        await gitOutput(
+          repository,
+          ["config", "--get", "core.worktree"],
+          signal,
+        )
+      )
+        return;
+    } else {
+      // A copied backlink is not registration in the common Git directory.
+      const worktreesDirectory = await abortable(
+        () => realpath(join(commonDirectory, "worktrees")),
+        signal,
+      );
+      if (relative(worktreesDirectory, dirname(directory)) === "") {
+        const contents = await abortable(
+          () => readFile(join(directory, "gitdir"), "utf8"),
+          signal,
+        );
+        const backlink = resolve(directory, contents.trimEnd());
+        if (
+          basename(backlink) === ".git" &&
+          relative(
+            repository,
+            await abortable(() => realpath(dirname(backlink)), signal),
+          ) === ""
+        )
+          return;
+      }
+    }
+  } catch (error) {
+    throwIfAborted(signal);
+    cause = error;
+  }
+  throw new InvalidTargetError(
+    "Git metadata is not bound to the selected checkout. Select the intended checkout, repair a moved worktree with git worktree repair, or set core.worktree for a separate Git directory you own.",
+    { cause },
   );
+}
+
+export function relativePathIsOutside(path: string): boolean {
+  return path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path);
 }
 
 export function validatedGitEnvironment(
@@ -352,11 +423,7 @@ export async function normalizeTarget(
       });
     }
     const relativePath = relative(root, canonical);
-    if (
-      relativePath === ".." ||
-      relativePath.startsWith(`..${sep}`) ||
-      isAbsolute(relativePath)
-    ) {
+    if (relativePathIsOutside(relativePath)) {
       throw new InvalidTargetError(
         `Path target is outside the repository: ${value}`,
       );
@@ -493,7 +560,7 @@ async function gitOutput(
   throwIfAborted(signal);
   const command = await resolveTrustedExecutable(
     "git",
-    isolatedGitEnvironment(args[0] === "rev-parse"),
+    isolatedGitEnvironment(args[0] === "rev-parse" || args[0] === "config"),
     (await gitMarkerRoot(repository, signal, "outermost")) ?? repository,
   );
   if (command === null)

@@ -27,7 +27,6 @@ import {
   type ThreadOptions,
   type TurnOptions,
 } from "@openai/codex-sdk";
-import { z } from "incur";
 import {
   parse as parseToml,
   stringify as stringifyToml,
@@ -82,6 +81,7 @@ import {
   CodexSecurityError,
   ConfigurationError,
   IncompleteScanError,
+  InvalidTargetError,
   OutputDirectoryError,
   OutputDirectoryNotEmptyError,
   errorMessage,
@@ -107,9 +107,11 @@ import {
   resolveSecurityPolicyGuidance,
   resolveSecurityPolicyTarget,
   runSecurityPolicyStages,
+  parseSecurityPolicyStageResult,
   securityPolicyDiff,
   securityPolicyProtectedRoots,
-  securityPolicyStageSchema,
+  securityPolicyReadableRoots,
+  securityPolicyStageOutputSchema,
   type SecurityPolicyDraft,
   type SecurityPolicyOptions,
   type SecurityPolicyPreflight,
@@ -144,12 +146,14 @@ import {
   prepareCodexSecurityCredentialHome,
   preserveCodexSecurityPluginRegistration,
   pluginExecutionEnvironment,
+  pluginPythonReadRoots,
   planOutputArchive,
   prepareOutputDir,
   preparePersistentOutputRoot,
   requireModelSafeOutputDir,
   requireOutputOutsideRepositories,
   requireOutputOutsideRepository,
+  requirePrivatePolicyOutputDirectory,
   resolveCodexCommand,
   resolvePluginPath,
   resolvePluginPython,
@@ -368,6 +372,7 @@ interface ClientDependencies {
   ) => Promise<PreparedRuntime>;
   resolvePluginPython?: typeof resolvePluginPython;
   prepareOutputDir?: typeof prepareOutputDir;
+  requirePrivatePolicyOutputDirectory?: typeof requirePrivatePolicyOutputDirectory;
   repositoryRevision?: typeof repositoryRevision;
   resolveCodexCommand?: () => CodexCommand;
   runWorkbench?: typeof runWorkbench;
@@ -653,6 +658,10 @@ export class CodexSecurity {
       );
       requireOutputOutsideRepositories(inputs.protectedRoots, outputDir);
       requireModelSafeOutputDir(outputDir);
+      await (
+        this.#dependencies.requirePrivatePolicyOutputDirectory ??
+        requirePrivatePolicyOutputDirectory
+      )(outputDir);
       notifyObserver(
         "onOutputDirReady",
         options.onOutputDirReady,
@@ -667,6 +676,31 @@ export class CodexSecurity {
         signal,
       );
       await requireUnchangedSecurityPolicy(target, snapshot, signal);
+      const validatedReadRoots = await securityPolicyReadableRoots(
+        target,
+        inputs.protectedRoots,
+        signal,
+      );
+      if (
+        validatedReadRoots.length !== inputs.policyReadRoots.length ||
+        validatedReadRoots.some(
+          (path, index) => path !== inputs.policyReadRoots[index],
+        )
+      ) {
+        throw new InvalidTargetError(
+          "Git metadata changed after security-policy validation. Retry with a stable checkout.",
+        );
+      }
+      const policyReadRoots = [
+        ...inputs.policyReadRoots,
+        runtime.plugin.pluginRoot,
+        ...(await pluginPythonReadRoots(python, {
+          environment: session.scanEnvironment,
+          protectedPaths: [homedir(), inputs.stateDirectory, runtime.codexHome],
+          signal,
+        })),
+        ...(knowledgeBase === null ? [] : [knowledgeBase.path]),
+      ].filter((path, index, roots) => roots.indexOf(path) === index);
       const { codex } = this.#createSessionCodex(
         session,
         {
@@ -702,15 +736,14 @@ export class CodexSecurity {
           );
         }
       };
-      const outputSchema = z.toJSONSchema(securityPolicyStageSchema, {
-        target: "draft-7",
-      });
+      const outputSchema = securityPolicyStageOutputSchema();
       const run = async (
         stage: SecurityPolicyStage,
         prompt: string,
       ): Promise<SecurityPolicyStageResult> => {
         const thread = codex.startThread({
           workingDirectory: outputDir,
+          additionalDirectories: policyReadRoots,
           skipGitRepoCheck: true,
           approvalPolicy: "never",
           networkAccessEnabled: false,
@@ -782,7 +815,7 @@ export class CodexSecurity {
           }
           signal.throwIfAborted();
           try {
-            return securityPolicyStageSchema.parse(
+            return parseSecurityPolicyStageResult(
               JSON.parse(turn.finalResponse),
             );
           } catch (error) {
@@ -2361,12 +2394,11 @@ export class CodexSecurity {
     target: SecurityPolicyTarget,
     options: SecurityPolicyOptions,
     signal?: AbortSignal,
-  ): Promise<LocalScanInputs & { policyPaths: string[] }> {
+  ): Promise<
+    LocalScanInputs & { policyPaths: string[]; policyReadRoots: string[] }
+  > {
     requirePolicyConfigKeys(this.config.codexOverrides);
-    const protectedRoots = await securityPolicyProtectedRoots(
-      target.repository,
-      signal,
-    );
+    const protectedRoots = await securityPolicyProtectedRoots(target, signal);
     const inputs = await this.#validateLocalInputs(
       target.repository,
       {
@@ -2382,6 +2414,11 @@ export class CodexSecurity {
     return {
       ...inputs,
       policyPaths: await inspectSecurityPolicyPaths(target, signal),
+      policyReadRoots: await securityPolicyReadableRoots(
+        target,
+        protectedRoots,
+        signal,
+      ),
     };
   }
 
@@ -3590,11 +3627,8 @@ export function scanRuntimeCodexConfig(
       },
       [POLICY_PERMISSION_PROFILE]: {
         filesystem: {
-          ":root": "read",
+          ":minimal": "read",
           ":workspace_roots": "read",
-          ...(protectedCredentialHome === undefined
-            ? {}
-            : { [protectedCredentialHome]: "read" }),
         },
         network: { enabled: false },
       },
@@ -3635,6 +3669,9 @@ function requirePolicyConfigKeys(config: unknown): void {
 function policyCodexConfig(config: JsonObject): JsonObject {
   requirePolicyConfigKeys(config);
   const resolved = resolveCodexProfile(config);
+  // The selected provider is already written as TOML. The SDK cannot quote
+  // provider names when it flattens this table into command-line overrides.
+  delete resolved["model_providers"];
   const features = isRecord(resolved["features"]) ? resolved["features"] : {};
   return {
     ...resolved,

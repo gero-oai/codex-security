@@ -8,7 +8,6 @@ import {
   readlink,
   realpath,
   stat,
-  writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
@@ -25,6 +24,7 @@ import {
   gitMetadataDirectories,
   normalizeRepository,
   normalizeTarget,
+  relativePathIsOutside,
 } from "./targets.js";
 
 export type SecurityPolicyStage = "architecture" | "threat_model" | "policy";
@@ -57,15 +57,67 @@ export interface SecurityPolicyTarget {
   targetPath: string;
 }
 
+interface SecurityPolicyRepositoryBinding {
+  gitRoot: string | null;
+  metadata: readonly string[];
+}
+
+const securityPolicyRepositoryBindings = new WeakMap<
+  SecurityPolicyTarget,
+  SecurityPolicyRepositoryBinding
+>();
+
+async function requireSecurityPolicyRepositoryBinding(
+  target: SecurityPolicyTarget,
+  signal?: AbortSignal,
+): Promise<SecurityPolicyRepositoryBinding> {
+  const binding = securityPolicyRepositoryBindings.get(target);
+  if (binding === undefined) {
+    throw new InvalidTargetError(
+      "Resolve the security-policy target before validating its repository.",
+    );
+  }
+  const root = await enclosingGitWorktreeRoot(target.repository, signal, {
+    requireIfPresent: true,
+  });
+  const metadata =
+    root === null ? [] : await gitMetadataDirectories(root, signal);
+  if (
+    root !== binding.gitRoot ||
+    metadata.length !== binding.metadata.length ||
+    metadata.some((path, index) => path !== binding.metadata[index])
+  ) {
+    throw new InvalidTargetError(
+      "Git metadata changed after the security-policy target was resolved. Retry with a stable checkout.",
+    );
+  }
+  return binding;
+}
+
 export async function securityPolicyProtectedRoots(
-  repository: string,
+  target: SecurityPolicyTarget,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const roots = await enclosingGitWorktreeRoots(repository, signal);
+  await requireSecurityPolicyRepositoryBinding(target, signal);
+  const roots = await enclosingGitWorktreeRoots(target.repository, signal);
   const metadata = await Promise.all(
     roots.map((root) => gitMetadataDirectories(root, signal)),
   );
-  return [...new Set([roots.at(-1) ?? repository, ...metadata.flat()])];
+  return [...new Set([roots.at(-1) ?? target.repository, ...metadata.flat()])];
+}
+
+export async function securityPolicyReadableRoots(
+  target: SecurityPolicyTarget,
+  protectedRoots: readonly string[],
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const binding = await requireSecurityPolicyRepositoryBinding(target, signal);
+  if (binding.metadata.some((path) => !protectedRoots.includes(path))) {
+    throw new InvalidTargetError(
+      "Git metadata changed during security-policy validation. Retry with a stable checkout.",
+    );
+  }
+  return [...new Set([target.repository, ...binding.metadata])];
 }
 
 export interface SecurityPolicyPreflight extends SecurityPolicyTarget {
@@ -76,7 +128,7 @@ export interface SecurityPolicyPreflight extends SecurityPolicyTarget {
   maxCostUsd?: number;
 }
 
-export const securityPolicyStageSchema = z
+const securityPolicyStageSchema = z
   .object({
     markdown: z.string(),
     questions: z.array(z.string()),
@@ -85,9 +137,24 @@ export const securityPolicyStageSchema = z
   })
   .strict();
 
-export type SecurityPolicyStageResult = z.infer<
-  typeof securityPolicyStageSchema
->;
+export interface SecurityPolicyStageResult {
+  markdown: string;
+  questions: string[];
+  reviewNotes: string[];
+  blockedReason: string | null;
+}
+
+export function securityPolicyStageOutputSchema(): Record<string, unknown> {
+  return z.toJSONSchema(securityPolicyStageSchema, {
+    target: "draft-7",
+  }) as Record<string, unknown>;
+}
+
+export function parseSecurityPolicyStageResult(
+  value: unknown,
+): SecurityPolicyStageResult {
+  return securityPolicyStageSchema.parse(value);
+}
 
 const manifestSchema = z.object({
   documentType: z.literal("codex-security.policy-draft"),
@@ -135,6 +202,21 @@ const MAX_SECURITY_MD_BYTES = 1024 * 1024;
 // The define-security-policy skill asks at most three questions at once.
 const OWNER_QUESTION_BATCH_SIZE = 3;
 
+async function writePolicyArtifact(
+  path: string,
+  content: string,
+  signal: AbortSignal,
+): Promise<void> {
+  signal.throwIfAborted();
+  const file = await open(path, "wx", 0o600);
+  try {
+    await file.chmod(0o600);
+    await file.writeFile(content, { encoding: "utf8", signal });
+  } finally {
+    await file.close();
+  }
+}
+
 export async function resolveSecurityPolicyTarget(
   repository: string,
   path = ".",
@@ -148,15 +230,20 @@ export async function resolveSecurityPolicyTarget(
       "A security policy target must be a directory.",
     );
   }
-  const root =
-    (await enclosingGitWorktreeRoot(directory, signal, {
-      requireIfPresent: true,
-    })) ?? selectedRoot;
+  const gitRoot = await enclosingGitWorktreeRoot(directory, signal, {
+    requireIfPresent: true,
+  });
+  const root = gitRoot ?? selectedRoot;
   const target = {
     repository: root,
     scope: relative(root, directory).split(sep).join("/") || ".",
     targetPath: join(directory, "SECURITY.md"),
   };
+  securityPolicyRepositoryBindings.set(target, {
+    gitRoot,
+    metadata:
+      gitRoot === null ? [] : await gitMetadataDirectories(gitRoot, signal),
+  });
   await readSecurityPolicy(target.targetPath);
   return target;
 }
@@ -365,23 +452,28 @@ function policyPathsMatch(
   );
 }
 
-interface SecurityPolicyPath {
-  path: string;
-  repository: string;
-  reportingPolicy: boolean;
-  isSymbolicLink: boolean;
-}
-
 async function* securityPolicyPaths(
   root: string,
   repositories: readonly string[],
   signal?: AbortSignal,
-): AsyncGenerator<SecurityPolicyPath> {
+): AsyncGenerator<string> {
   const knownRoots = new Set<string>();
-  const reportingPaths = new Map<string, string>();
+  const gitDirectories = new Set<string>();
+  const policies: string[] = [];
+  const reportingPaths = new Set<string>();
+  const isGitData = (path: string): boolean =>
+    [...gitDirectories].some(
+      (directory) => !relativePathIsOutside(relative(directory, path)),
+    );
   const addRoot = async (repository: string) => {
     if (knownRoots.has(repository)) return;
     knownRoots.add(repository);
+    const gitRoot = await enclosingGitWorktreeRoot(repository, signal, {
+      requireIfPresent: true,
+    });
+    if (gitRoot !== null)
+      for (const directory of await gitMetadataDirectories(gitRoot, signal))
+        gitDirectories.add(directory);
     for (const name of [".github", "docs"]) {
       let directory = join(repository, name);
       const metadata = await lstat(directory).catch(
@@ -395,7 +487,7 @@ async function* securityPolicyPaths(
         directory = await realpath(directory);
         policyRelativePath(repository, directory);
       }
-      reportingPaths.set(join(directory, "SECURITY.md"), repository);
+      reportingPaths.add(join(directory, "SECURITY.md"));
     }
   };
   for (const repository of repositories) await addRoot(repository);
@@ -412,6 +504,7 @@ async function* securityPolicyPaths(
     signal?.throwIfAborted();
     const entry = directories.pop()!;
     const { directory } = entry;
+    if (isGitData(directory)) continue;
     let repository = knownRoots.has(directory) ? directory : entry.repository;
     const entries = await readdir(directory, { withFileTypes: true });
     if (
@@ -439,12 +532,7 @@ async function* securityPolicyPaths(
       (metadata?.isFile() || metadata?.isSymbolicLink()) &&
       !reportingPaths.has(path)
     )
-      yield {
-        path,
-        repository,
-        reportingPolicy: false,
-        isSymbolicLink: metadata.isSymbolicLink(),
-      };
+      policies.push(path);
     // Match the plugin inventory: do not follow directory links or Git data.
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name === ".git") continue;
@@ -464,18 +552,9 @@ async function* securityPolicyPaths(
       directories.push({ directory: join(directory, entry.name), repository });
     }
   }
-  for (const [path, repository] of reportingPaths) {
-    const metadata = await lstat(path).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
-      throw error;
-    });
-    yield {
-      path,
-      repository,
-      reportingPolicy: true,
-      isSymbolicLink: metadata?.isSymbolicLink() ?? false,
-    };
-  }
+  // A nested checkout can register a Git directory visited earlier in the walk.
+  for (const path of policies) if (!isGitData(path)) yield path;
+  for (const path of reportingPaths) if (!isGitData(path)) yield path;
 }
 
 export async function inspectSecurityPolicyPaths(
@@ -483,25 +562,21 @@ export async function inspectSecurityPolicyPaths(
   signal?: AbortSignal,
 ): Promise<string[]> {
   const paths: string[] = [];
-  for await (const entry of securityPolicyPaths(
+  for await (const path of securityPolicyPaths(
     dirname(target.targetPath),
     [target.repository],
     signal,
   )) {
-    const alias = await policyLinkSnapshot(
-      entry.path,
-      target.repository,
-      signal,
-    );
+    const alias = await policyLinkSnapshot(path, target.repository, signal);
     if (alias.status === "cycle")
       throw new CodexSecurityError(
-        `Security-policy link contains a cycle: ${entry.path}`,
+        `Security-policy link contains a cycle: ${path}`,
       );
     const destination = await policyLinkDestination(target.repository, alias);
     if (alias.status !== "resolved" || destination === null) continue;
     if ((await stat(destination)).isFile()) {
       await readPolicyFile(destination);
-      paths.push(policyRelativePath(target.repository, entry.path));
+      paths.push(policyRelativePath(target.repository, path));
     }
   }
   return paths.sort();
@@ -544,10 +619,6 @@ function policyRelativePath(repository: string, path: string): string {
     );
   }
   return result.split(sep).join("/");
-}
-
-function relativePathIsOutside(path: string): boolean {
-  return path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path);
 }
 
 export async function requireUnchangedSecurityPolicy(
@@ -616,11 +687,11 @@ export async function runSecurityPolicyStages(options: {
 }): Promise<SecurityPolicyDraft> {
   const { target, outputDir, signal } = options;
   const { previousContent, inheritedPolicySha256 } = options.snapshot;
-  await writeFile(join(outputDir, ORIGINAL_NAME), previousContent ?? "", {
-    flag: "wx",
-    mode: 0o600,
+  await writePolicyArtifact(
+    join(outputDir, ORIGINAL_NAME),
+    previousContent ?? "",
     signal,
-  });
+  );
   const specificationPath = join(outputDir, "project-spec.md");
   const threatModelPath = join(outputDir, "THREAT_MODEL.md");
   const draftPath = join(outputDir, "SECURITY.md");
@@ -655,15 +726,16 @@ export async function runSecurityPolicyStages(options: {
     options.onStage?.(stage);
     const result = await options.run(stage, `${common}\n\n${instructions}`);
     signal.throwIfAborted();
-    if (result.markdown.trim().length === 0) {
-      throw new CodexSecurityError(
-        `The ${stage} stage returned an empty document.`,
-      );
-    }
-    await writeFile(path, result.markdown, { flag: "wx", mode: 0o600, signal });
+    const hasDocument = result.markdown.trim().length > 0;
+    if (hasDocument) await writePolicyArtifact(path, result.markdown, signal);
     if (result.blockedReason !== null) {
       throw new CodexSecurityError(
         `Security-policy ${stage} stage could not inspect the required evidence: ${result.blockedReason}`,
+      );
+    }
+    if (!hasDocument) {
+      throw new CodexSecurityError(
+        `The ${stage} stage returned an empty document.`,
       );
     }
     return result;
@@ -754,14 +826,10 @@ export async function runSecurityPolicyStages(options: {
     customPlugin: options.pluginPath !== undefined,
     reviewNotes,
   };
-  await writeFile(
+  await writePolicyArtifact(
     join(outputDir, MANIFEST_NAME),
     `${JSON.stringify(manifest, null, 2)}\n`,
-    {
-      flag: "wx",
-      mode: 0o600,
-      signal,
-    },
+    signal,
   );
   return {
     ...target,

@@ -5,19 +5,16 @@ import { formatUsd } from "./cost.js";
 import { safeErrorMessage } from "./errors.js";
 import {
   formatSecurityPolicyText as display,
-  securityPolicyDiff,
   type SecurityPolicyOptions,
   type SecurityPolicyStage,
 } from "./security-policy.js";
-import { resolvePluginPython } from "./runtime.js";
-import { enclosingGitWorktreeRoots } from "./targets.js";
 
 type SignalName = "SIGINT" | "SIGTERM";
 type Output = { write(value: string): unknown };
 export type PolicyPrompt = Pick<BulkScanPrompt, "isInteractive" | "input">;
 export type PolicySecurity = Pick<
   CodexSecurity,
-  "generatePolicy" | "preflightPolicy" | "close"
+  "generatePolicy" | "preflightPolicy" | "previewPolicy" | "close"
 >;
 
 export interface PolicyCommandOptions {
@@ -45,7 +42,6 @@ export interface PolicyCommandDependencies {
   addSignalListener(signal: SignalName, listener: () => void): void;
   removeSignalListener(signal: SignalName, listener: () => void): void;
   forceExit(signal: SignalName): void;
-  resolvePython?: typeof resolvePluginPython;
 }
 
 const STAGES: Record<SecurityPolicyStage, string> = {
@@ -164,30 +160,16 @@ export async function runPolicyCommand(
     });
     controller.signal.throwIfAborted();
     const cost = draft.cost;
-    const diff = await securityPolicyDiff(
-      draft,
-      async () =>
-        await (dependencies.resolvePython ?? resolvePluginPython)({
-          configuredPath: options.config.pythonPath,
-          environment: dependencies.environment,
-          protectedRoot:
-            (
-              await enclosingGitWorktreeRoots(
-                draft.repository,
-                controller.signal,
-              )
-            ).at(-1) ?? draft.repository,
-          signal: controller.signal,
-        }),
-      controller.signal,
-    );
+    const diff = await security.previewPolicy(draft, {
+      signal: controller.signal,
+    });
     const changed = diff.length > 0;
     const humanOutput = options.format === "toon" && !options.explicitOutput;
     if (humanOutput) {
       const preview = [
         `\nPolicy target: ${display(draft.targetPath)}`,
         changed
-          ? display(diff, true).replace(/\n$/u, "")
+          ? diff.replace(/\n$/u, "")
           : "SECURITY.md is already up to date.",
         ...(draft.reviewNotes.length === 0
           ? []

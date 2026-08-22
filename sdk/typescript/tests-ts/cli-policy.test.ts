@@ -1,28 +1,20 @@
-import {
-  lstat,
-  mkdir,
-  readFile,
-  readdir,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
-import { delimiter, dirname, join } from "node:path";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, describe, expect, test } from "bun:test";
 import { main } from "../src/cli.js";
-import type {
-  SecurityPolicyDraft,
-  SecurityPolicyOptions,
+import {
+  securityPolicyDiff,
+  type SecurityPolicyDraft,
+  type SecurityPolicyOptions,
 } from "../src/index.js";
+import { formatSecurityPolicyText } from "../src/security-policy.js";
 import type { PolicyPrompt } from "../src/security-policy-cli.js";
-import { resolvePluginPython } from "../src/runtime.js";
 import { capture, dependencies, FakeSignals } from "./cli-fixtures.js";
 import {
   POLICY,
   PYTHON,
-  addPolicySubmodule,
   policyFixture,
-  policyGit,
   stageResult,
 } from "./support/security-policy.js";
 
@@ -70,7 +62,6 @@ function policyDependencies(
       signals: options.signals,
     }),
     policyPrompt: options.prompt ?? prompt(),
-    resolvePolicyPython: async () => PYTHON,
     createPolicySecurity: (config: unknown) => {
       options.onConfig?.(config);
       return {
@@ -109,6 +100,14 @@ function policyDependencies(
             reasoningEffort: "xhigh",
           };
         },
+        previewPolicy: async (
+          draft: SecurityPolicyDraft,
+          preview: { signal?: AbortSignal } = {},
+        ) =>
+          formatSecurityPolicyText(
+            await securityPolicyDiff(draft, PYTHON, preview.signal),
+            true,
+          ),
         close: async () => {
           options.onClose?.();
         },
@@ -550,7 +549,7 @@ describe("policy CLI", () => {
     expect(stderr.text()).toContain("+Last line  \n");
   });
 
-  test("preflights without generation or Python discovery", async () => {
+  test("preflights without generation", async () => {
     const f = await fixture();
     const stdout = capture();
     const deps = policyDependencies(f, {
@@ -558,9 +557,6 @@ describe("policy CLI", () => {
         throw new Error("Must not generate");
       },
     });
-    deps.resolvePolicyPython = async () => {
-      throw new Error("Must not resolve Python");
-    };
     expect(
       await main(
         ["policy", "--dry-run", "--json"],
@@ -572,95 +568,6 @@ describe("policy CLI", () => {
     expect(JSON.parse(stdout.text()).dryRun).toBe(true);
     expect(await readdir(f.outputDir)).toEqual([]);
   });
-
-  test("protects enclosing checkouts during CLI Python discovery", async () => {
-    const f = await fixture();
-    policyGit(f.repository, "init", "--quiet");
-    const nested = await addPolicySubmodule(
-      f.repository,
-      join(f.root, "submodule-source"),
-    );
-    const draft = await f.generate({ path: "services/api" });
-    const protectedRoots: (string | undefined)[] = [];
-    const deps = {
-      ...policyDependencies(f, { draft }),
-      resolvePolicyPython: async (
-        options: Parameters<typeof resolvePluginPython>[0],
-      ) => {
-        protectedRoots.push(options?.protectedRoot);
-        return PYTHON;
-      },
-    };
-    for (const [repository, path] of [
-      [f.repository, "services/api"],
-      [nested, "."],
-    ] as const) {
-      expect(
-        await main(
-          ["policy", repository, "--path", path, "--json"],
-          capture().stream,
-          capture().stream,
-          deps,
-        ),
-      ).toBe(0);
-    }
-    expect(protectedRoots).toEqual([f.repository, f.repository]);
-    await expect(lstat(join(nested, "SECURITY.md"))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-  });
-
-  test.skipIf(process.platform === "win32")(
-    "does not run an enclosing checkout's Python shim during preview",
-    async () => {
-      const f = await fixture();
-      policyGit(f.repository, "init", "--quiet");
-      const nested = await addPolicySubmodule(
-        f.repository,
-        join(f.root, "submodule-source"),
-      );
-      const draft = await f.generate({ path: "services/api" });
-      const unsafeBin = join(f.repository, ".venv", "bin");
-      const trustedBin = join(f.root, "trusted-bin");
-      const unsafePython = join(unsafeBin, "python3");
-      await mkdir(unsafeBin, { recursive: true });
-      await mkdir(trustedBin);
-      await writeFile(
-        unsafePython,
-        '#!/bin/sh\nprintf executed > "$0.executed"\nprintf "codex-security-python-ok\\n"\n',
-        { mode: 0o700 },
-      );
-      await symlink(PYTHON, join(trustedBin, "python3"), "file");
-      for (const explicit of [false, true]) {
-        const stdout = capture();
-        const deps = {
-          ...policyDependencies(f, { draft }),
-          environment: {
-            PATH: [unsafeBin, trustedBin].join(delimiter),
-            ...(explicit ? { PYTHON: unsafePython } : {}),
-          },
-          resolvePolicyPython: async (
-            options: Parameters<typeof resolvePluginPython>[0],
-          ) =>
-            await resolvePluginPython({ ...options, managedRuntimeRoots: [] }),
-        };
-        const code = await main(
-          ["policy", nested, "--json", "--full-output"],
-          stdout.stream,
-          capture().stream,
-          deps,
-        );
-        expect(code).toBe(explicit ? 2 : 0);
-        expect(JSON.parse(stdout.text()).ok).toBe(!explicit);
-        await expect(lstat(`${unsafePython}.executed`)).rejects.toMatchObject({
-          code: "ENOENT",
-        });
-      }
-      await expect(lstat(join(nested, "SECURITY.md"))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-    },
-  );
 
   test("propagates dry-run cancellation and never returns false success", async () => {
     for (const [signal, exitCode] of [
