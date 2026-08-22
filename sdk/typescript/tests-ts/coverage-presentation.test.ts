@@ -82,6 +82,21 @@ describe("coverage scope presentation", () => {
     expect(formatScopePath("src/generated/**")).toBe("src/generated/**");
   });
 
+  test("distinguishes canonically equivalent path spellings", () => {
+    for (const [composed, decomposed, encoded] of [
+      ["src/café.ts", "src/cafe\u0301.ts", '"src/cafe\\u0301.ts"'],
+      ["src/가.ts", "src/\u1100\u1161.ts", '"src/\\u1100\\u1161.ts"'],
+    ] as const) {
+      expect(composed.normalize("NFC")).toBe(decomposed.normalize("NFC"));
+      expect(formatScopePath(composed)).toBe(composed);
+      expect(formatScopePath(decomposed)).toBe(encoded);
+      expect(JSON.parse(encoded)).toBe(decomposed);
+      expect(formatScopePath(composed).normalize("NFC")).not.toBe(
+        formatScopePath(decomposed).normalize("NFC"),
+      );
+    }
+  });
+
   test("escapes invisible Unicode controls independently of Python's Unicode database", () => {
     // Unicode 17 DerivedGeneralCategory.txt, General_Category=Format.
     const formatControls = (
@@ -154,6 +169,10 @@ describe("coverage scope presentation", () => {
       ["src/a`b.ts", "``src/a`b.ts``"],
       ["`edge`", "`` `edge` ``"],
       ["src/naïve.ts", "`src/naïve.ts`"],
+      ["src/café.ts", "`src/café.ts`"],
+      ["src/cafe\u0301.ts", '`"src/cafe\\u0301.ts"`'],
+      ["src/가.ts", "`src/가.ts`"],
+      ["src/\u1100\u1161.ts", '`"src/\\u1100\\u1161.ts"`'],
     ] as const;
     const excluded = [
       ["vendor/a  b", '`"vendor/a  b"`'],

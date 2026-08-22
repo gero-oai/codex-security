@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import unicodedata
 from collections import Counter
 from typing import Any
 
@@ -22,6 +23,7 @@ DISPOSITION_LABELS = {
 WRITEUP_REPORT_PATH_RE = re.compile(r"^findings/([a-z0-9][a-z0-9._-]*)/\1\.md$")
 
 SCOPE_PATH_QUOTING_RE = re.compile(r"""[\s,;'"\\\x00-\x1f]""")
+SCOPE_PATH_NON_ASCII_RE = re.compile(r"[^\x20-\x7e]")
 # Unicode 17 General_Category=Format, Default_Ignorable_Code_Point, C1 controls,
 # and line separators.
 SCOPE_PATH_CONTROLS_RE = re.compile(
@@ -75,8 +77,17 @@ def _strings(value: Any) -> list[str]:
 def _scope_path(value: Any, fallback: str = "unspecified") -> str:
     path = value if isinstance(value, str) else fallback
     rendered = path
-    if not path or SCOPE_PATH_QUOTING_RE.search(path) or SCOPE_PATH_CONTROLS_RE.search(path):
-        rendered = SCOPE_PATH_CONTROLS_RE.sub(
+    normalization_sensitive = unicodedata.normalize("NFC", path) != path
+    if (
+        not path
+        or normalization_sensitive
+        or SCOPE_PATH_QUOTING_RE.search(path)
+        or SCOPE_PATH_CONTROLS_RE.search(path)
+    ):
+        escaped_characters = SCOPE_PATH_NON_ASCII_RE
+        if not normalization_sensitive:
+            escaped_characters = SCOPE_PATH_CONTROLS_RE
+        rendered = escaped_characters.sub(
             lambda match: json.dumps(match.group(0))[1:-1],
             json.dumps(path, ensure_ascii=False),
         )

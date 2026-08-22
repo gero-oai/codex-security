@@ -7,8 +7,10 @@ export type CoverageSummary = Pick<
   Partial<Pick<CoverageDocument, "explicitExclusions">>;
 
 export function formatScopePath(path: string): string {
+  const normalizationSensitive = path.normalize("NFC") !== path;
   if (
     path.length > 0 &&
+    !normalizationSensitive &&
     !/[\s,;'"\\\u0000-\u001f\u007f-\u009f\p{Cf}\p{Default_Ignorable_Code_Point}]/u.test(
       path,
     )
@@ -16,7 +18,9 @@ export function formatScopePath(path: string): string {
     return path;
   }
   return JSON.stringify(path).replace(
-    /[\u007f-\u009f\u2028\u2029\p{Cf}\p{Default_Ignorable_Code_Point}]/gu,
+    normalizationSensitive
+      ? /[^\u0020-\u007e]/gu
+      : /[\u007f-\u009f\u2028\u2029\p{Cf}\p{Default_Ignorable_Code_Point}]/gu,
     (character) =>
       character
         .split("")
