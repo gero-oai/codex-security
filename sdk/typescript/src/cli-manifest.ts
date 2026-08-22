@@ -48,11 +48,13 @@ export const INFO_OUTPUT_SCHEMA = z.object({
 const INFO_METADATA_FIELDS = new Set(Object.keys(INFO_OUTPUT_SCHEMA.shape));
 export const SCAN_MARKDOWN_RESULT_RESTRICTION =
   "Markdown output is not supported for scan results.";
+export const PATCH_STRUCTURED_OUTPUT_RESTRICTION =
+  "JSON and JSONL patch output require a saved finding identifier, --scan, or --resume-pr.";
 
 interface CommandResultRule {
   commands: readonly string[];
   message(command: string): string;
-  rejects(argv: readonly string[]): boolean;
+  rejects?(argv: readonly string[]): boolean;
 }
 
 function hasOptionValue(
@@ -77,10 +79,14 @@ function structuredOutputRequested(argv: readonly string[]): boolean {
 
 const COMMAND_RESULT_RULES: readonly CommandResultRule[] = [
   {
-    commands: ["validate", "patch", "login", "logout"],
+    commands: ["validate", "login", "logout"],
     message: (command) =>
       `${command} does not support noninteractive JSON output; run it without --json, --format json, or --format jsonl.`,
     rejects: structuredOutputRequested,
+  },
+  {
+    commands: ["patch"],
+    message: () => PATCH_STRUCTURED_OUTPUT_RESTRICTION,
   },
   {
     commands: ["export"],
@@ -144,7 +150,7 @@ export function validateCommandResultOptions(
 ): string | undefined {
   const root = command.split(" ", 1)[0]!;
   return commandResultRules(command)
-    .find((rule) => rule.rejects(argv))
+    .find((rule) => rule.rejects?.(argv) === true)
     ?.message(root);
 }
 
@@ -182,6 +188,42 @@ export function fullMarkdownManifestArguments(
   // Incur 0.4.13 omits the requested path from its structured manifest.
   const { commandArguments, format } = parseIncurArguments(argv);
   return format === undefined || format === "md" ? commandArguments : undefined;
+}
+
+export async function applyManifestTokenControls(
+  markdown: string,
+  argv: readonly string[],
+): Promise<string> {
+  const controls: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === "--token-count") {
+      controls.push(argument);
+    } else if (argument === "--token-limit" || argument === "--token-offset") {
+      const value = argv[++index];
+      if (value !== undefined) controls.push(argument, value);
+    }
+  }
+  if (controls.length === 0) return markdown;
+
+  const renderer = Cli.create("codex-security-manifest", {
+    output: z.string(),
+    run: () => markdown,
+  });
+  let output = "";
+  let exitCode: number | undefined;
+  await renderer.serve(["--format", "md", ...controls], {
+    stdout: (value) => {
+      output += value;
+    },
+    exit: (code) => {
+      exitCode = code;
+    },
+  });
+  if (exitCode !== undefined) {
+    throw new Error("Could not apply manifest token controls.");
+  }
+  return output;
 }
 
 function commandScope(

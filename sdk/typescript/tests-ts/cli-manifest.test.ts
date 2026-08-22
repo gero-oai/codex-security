@@ -7,6 +7,7 @@ import {
   fullMarkdownManifestArguments,
   INCUR_VALUE_OPTIONS,
   parseIncurArguments,
+  PATCH_STRUCTURED_OUTPUT_RESTRICTION,
   renderFullMarkdownManifest,
   validateCommandResultOptions,
 } from "../src/cli-manifest.js";
@@ -333,7 +334,6 @@ describe("full CLI manifest", () => {
   test("preserves scoped paths when global discovery flags come first or between commands", async () => {
     for (const args of [
       ["--llms-full", "--format", "md", "scans", "show"],
-      ["scans", "--llms-full", "--token-count", "show"],
       ["--filter-output", "scan", "scans", "show", "--llms-full"],
       ["--filter-output=scan", "scans", "show", "--llms-full"],
       ["--token-limit=100000", "scans", "show", "--llms-full"],
@@ -347,6 +347,23 @@ describe("full CLI manifest", () => {
     expect(
       await invoke(["--filter-output", "scan", "--llms-full"]),
     ).toStartWith("# codex-security\n");
+  });
+
+  test("applies token controls to the generated Markdown reference", async () => {
+    const count = await invoke(["--llms-full", "--token-count"]);
+    expect(Number(count.trim())).toBeGreaterThan(0);
+    const scopedCount = await invoke([
+      "scans",
+      "--llms-full",
+      "--token-count",
+      "show",
+    ]);
+    expect(Number(scopedCount.trim())).toBeGreaterThan(0);
+    expect(Number(scopedCount.trim())).toBeLessThan(Number(count.trim()));
+
+    const limited = await invoke(["--llms-full", "--token-limit", "1"]);
+    expect(limited).toContain("[truncated: showing tokens 0–1 of ");
+    expect(limited.length).toBeLessThan((await invoke(["--llms-full"])).length);
   });
 
   test("keeps schema discovery separate from execution-only format checks", async () => {
@@ -535,7 +552,6 @@ describe("full CLI manifest", () => {
       ["scan", ["scan", "--format", "md"]],
       ["scan", ["scan", "--filter-output", "findings"]],
       ["validate", ["validate", "--json"]],
-      ["patch", ["patch", "--format", "jsonl"]],
       ["login", ["login", "--json"]],
       ["logout", ["logout", "--json"]],
       [
@@ -555,5 +571,14 @@ describe("full CLI manifest", () => {
       );
       expect(scoped).toContain(restriction!);
     }
+    expect(
+      validateCommandResultOptions("patch", ["patch", "--format", "jsonl"]),
+    ).toBeUndefined();
+    expect(commandResultRestrictions("patch")).toContain(
+      PATCH_STRUCTURED_OUTPUT_RESTRICTION,
+    );
+    expect(sections.get("patch")).toContain(
+      PATCH_STRUCTURED_OUTPUT_RESTRICTION,
+    );
   });
 });
