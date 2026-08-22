@@ -25,8 +25,8 @@ def git_output(
     git_dir: Path | None = None,
     work_tree: Path | None = None,
 ) -> str | None:
-    completed = git_command(target, *args, text=True, git_dir=git_dir, work_tree=work_tree)
-    output = completed.stdout.strip()
+    completed = git_command(target, *args, text=False, git_dir=git_dir, work_tree=work_tree)
+    output = os.fsdecode(completed.stdout).strip()
     return output if completed.returncode == 0 and output else None
 
 
@@ -135,7 +135,15 @@ def git_command(
         environment.pop(name, None)
     environment["GIT_LITERAL_PATHSPECS"] = "1"
     # Repository-local config is untrusted; fsmonitor may name an executable hook.
-    command = ["git", "-c", "core.fsmonitor=false", "-C", str(target)]
+    command = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "i18n.logOutputEncoding=UTF-8",
+        "-C",
+        str(target),
+    ]
     if git_dir is not None and work_tree is not None:
         command.extend(["--git-dir", str(git_dir), "--work-tree", str(work_tree)])
     full_command = [*command, *args]
@@ -146,6 +154,8 @@ def git_command(
             capture_output=True,
             env=environment,
             text=text,
+            encoding="utf-8" if text else None,
+            errors="surrogateescape" if text else None,
             input=input_data,
         )
     except FileNotFoundError:
@@ -166,6 +176,24 @@ def worktree_content_digest(target: Path) -> str:
     require_clean_submodule_worktrees(target)
     repository, pathspec = git_worktree_context(target)
     return worktree_content_digest_for_context(repository, pathspec)
+
+
+def remediation_checkout_snapshot(
+    scan: sqlite3.Row, *, expected_revision: str | None = None
+) -> tuple[str, str | None]:
+    target = require_scan_target_identity(scan)
+    revision = git_revision(target)
+    required_revision = expected_revision or scan["target_revision"]
+    if revision != required_revision:
+        raise SystemExit(
+            "Repository HEAD changed. Regenerate the remediation patch against the current checkout."
+        )
+    content_digest = (
+        worktree_content_digest(target)
+        if revision != "unversioned"
+        else directory_content_digest(target, excluded=(Path(scan["scan_dir"]),))
+    )
+    return revision, content_digest
 
 
 def worktree_content_digest_for_context(
@@ -347,6 +375,18 @@ def clean_worktree_content_digest() -> str:
 def git_directory_snapshot_paths(
     target: Path, *, skip_unsafe_paths: bool = False, _selected_target: Path | None = None
 ) -> list[Path] | None:
+    try:
+        resolved_target = target.resolve()
+        canonical_target = (
+            _selected_target if _selected_target is not None else resolved_target
+        )
+        within_target = directory_is_within_target(resolved_target, canonical_target)
+    except (OSError, RuntimeError):
+        within_target = False
+    if not within_target:
+        if skip_unsafe_paths:
+            return []
+        raise SystemExit("Git working-tree paths must stay inside the selected target.")
     repository_root = git_output(target, "rev-parse", "--show-toplevel")
     if repository_root is None:
         return None
@@ -364,8 +404,6 @@ def git_directory_snapshot_paths(
     if listed is None:
         raise SystemExit("Could not inspect files in the selected Git working tree.")
     paths: list[Path] = []
-    resolved_target = target.resolve()
-    canonical_target = _selected_target.resolve() if _selected_target is not None else resolved_target
     resolved_parents: dict[Path, Path] = {target: resolved_target}
     for raw_path in (raw_path for raw_path in listed.split(b"\0") if raw_path):
         path = repository / os.fsdecode(raw_path)
@@ -398,7 +436,7 @@ def git_directory_snapshot_paths(
         nested_repository_root = git_output(path, "rev-parse", "--show-toplevel")
         if (
             nested_repository_root is not None
-            and Path(nested_repository_root).resolve() == path.resolve()
+            and Path(nested_repository_root).resolve() == directory
         ):
             nested_paths = git_directory_snapshot_paths(
                 path, skip_unsafe_paths=skip_unsafe_paths, _selected_target=canonical_target
@@ -422,6 +460,21 @@ def directory_is_within_target(directory: Path, target: Path) -> bool:
         return any(candidate.samefile(target) for candidate in (directory, *directory.parents))
     except OSError:
         return False
+
+
+def existing_ancestor_is_within_target(path: Path, target: Path) -> bool:
+    """Resolve the nearest existing path without losing missing Git entries."""
+    candidate = path
+    while True:
+        try:
+            candidate.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            parent = candidate.parent
+            if parent == candidate:
+                return False
+            candidate = parent
+            continue
+        return directory_is_within_target(candidate.resolve(strict=True), target)
 
 
 def directory_content_digest(
@@ -553,7 +606,9 @@ def copy_git_worktree_files(source: Path, destination: Path, excluded: tuple[Pat
             if nested_git_dir is None:
                 raise SystemExit(f"Could not inspect nested Git working tree: {relative}")
             copy_git_worktree_files(source_path, destination_path, excluded)
-            (destination_path / ".git").write_text(f"gitdir: {nested_git_dir}\n")
+            (destination_path / ".git").write_text(
+                f"gitdir: {nested_git_dir}\n", encoding="utf-8"
+            )
         else:
             raise SystemExit(f"Unsupported Git working-tree file type: {relative}")
     copied_target = destination if pathspec == "." else destination / pathspec
@@ -588,9 +643,10 @@ def git_target_metadata(target: Path) -> dict[str, Any]:
     branch = git_output(target, "symbolic-ref", "--quiet", "--short", "HEAD")
     metadata.update({"branch": branch, "detachedHead": revision is not None and branch is None})
     if revision is not None:
+        subject = git_bytes(target, "show", "-s", "--format=%s", "HEAD")
         metadata.update(
             {
-                "commitSubject": git_output(target, "show", "-s", "--format=%s", "HEAD"),
+                "commitSubject": (subject or b"").decode("utf-8").strip() or None,
                 "revision": revision,
                 "shortRevision": revision[:7],
             }

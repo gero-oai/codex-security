@@ -15,6 +15,21 @@ class InventoryError(ValueError):
     """Raised when the repository, scope, or inventory cannot be used safely."""
 
 
+def windows_stream_component(path: Path) -> str | None:
+    """Return the first NTFS alternate-data-stream component."""
+
+    if os.name != "nt":
+        return None
+    return next(
+        (
+            component
+            for component in path.parts
+            if component != path.anchor and ":" in component
+        ),
+        None,
+    )
+
+
 def resolve_repository(value: str) -> Path:
     """Resolve the repository once so every scope is bound to its real root."""
     try:
@@ -32,6 +47,11 @@ def resolve_scope(repository: Path, value: str) -> str:
         raise InventoryError("--scope: expected a non-empty file or directory")
 
     requested = Path(value).expanduser()
+    stream = windows_stream_component(requested)
+    if stream is not None:
+        raise InventoryError(
+            f"--scope: NTFS alternate data streams are not supported: {stream}"
+        )
     scope = requested if requested.is_absolute() else repository / requested
     try:
         resolved = scope.resolve(strict=True)
@@ -154,7 +174,7 @@ def generate_diff_in_scope_files(
         is_binary_sample,
         preview_for,
     )
-    from workbench_target import directory_is_within_target, git_blob_bytes
+    from workbench_target import existing_ancestor_is_within_target, git_blob_bytes
 
     rows: list[bytes] = []
     try:
@@ -186,6 +206,19 @@ def generate_diff_in_scope_files(
 
         for path, status in eligible:
             relative = path.relative_to(repository)
+            if mode != "revisions":
+                try:
+                    within_target = existing_ancestor_is_within_target(
+                        path, repository
+                    )
+                except (OSError, RuntimeError) as error:
+                    raise InventoryError(
+                        "could not inspect a changed Git working-tree path"
+                    ) from error
+                if not within_target:
+                    raise InventoryError(
+                        "changed Git working-tree paths must stay inside the selected target"
+                    )
             if status != "D":
                 if mode == "revisions":
                     contents = revision_blobs[relative]
@@ -196,19 +229,6 @@ def generate_diff_in_scope_files(
                     if is_binary_sample(contents):
                         continue
                 else:
-                    try:
-                        parent = path.parent.resolve(strict=True)
-                        if not directory_is_within_target(parent, repository):
-                            path.lstat()
-                            raise InventoryError(
-                                "changed Git working-tree paths must stay inside the selected target"
-                            )
-                    except (FileNotFoundError, NotADirectoryError):
-                        continue
-                    except (OSError, RuntimeError) as error:
-                        raise InventoryError(
-                            "could not inspect a changed Git working-tree path"
-                        ) from error
                     if (
                         path.is_symlink()
                         or not path.is_file()

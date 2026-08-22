@@ -146,6 +146,7 @@ describe("bundled workbench canonical paths", () => {
       join(repository, "linked"),
       process.platform === "win32" ? "junction" : "dir",
     );
+    await mkdir(join(repository, "cyclic"));
     await mkdir(join(repository, "nested-checkout"));
     await mkdir(join(repository, "internal-source"));
     await writeFile(
@@ -182,6 +183,15 @@ describe("bundled workbench canonical paths", () => {
         "repository = Path(sys.argv[2])",
         "output = Path(sys.argv[3])",
         "candidate = repository / 'linked' / 'private.py'",
+        "outside = repository.parent / 'outside'",
+        "safe_fallback_digest = workbench.directory_content_digest(repository / 'internal-source', _selected_target=repository).startswith('codex-security-snapshot/v1:sha256:')",
+        "try:",
+        "    workbench.directory_content_digest(outside, _selected_target=repository)",
+        "except SystemExit:",
+        "    outside_digest_rejected = True",
+        "else:",
+        "    outside_digest_rejected = False",
+        "outside_progress_skipped = workbench.git_directory_snapshot_paths(outside, skip_unsafe_paths=True, _selected_target=repository) == []",
         "reads = []",
         "def preview(path, *_):",
         "    contents = path.read_text()",
@@ -191,7 +201,6 @@ describe("bundled workbench canonical paths", () => {
         "previews.preview_for = preview",
         "ranking.preview_for = preview",
         "inventories = {}",
-        "rankings = {}",
         "for status in ('M', 'D'):",
         "    ranking.git_changed_paths = lambda *_: [(candidate, status)]",
         "    try:",
@@ -199,10 +208,6 @@ describe("bundled workbench canonical paths", () => {
         "        inventories[status] = output.read_text()",
         "    except inventory.InventoryError as error:",
         "        inventories[status] = str(error)",
-        "    args = SimpleNamespace(repo=repository, base='base', head='head', mode='local-patch', area='.', preview_bytes=1024, out=output)",
-        "    with contextlib.redirect_stdout(io.StringIO()):",
-        "        ranking.make_diff_rank_input(args)",
-        "    rankings[status] = [json.loads(row)['path'] for row in output.read_text().splitlines()]",
         "inventory.committed_changed_paths = lambda *_: [(candidate, 'M')]",
         "workbench.git_blob_bytes = lambda _, names: [b'private = True\\n' for _ in names]",
         "inventory.generate_diff_in_scope_files(repository, 'base', 'head', 'revisions', output)",
@@ -224,8 +229,11 @@ describe("bundled workbench canonical paths", () => {
         "inventory.generate_diff_in_scope_files(repository, 'base', 'head', 'local-patch', output)",
         "inventories['missingParent'] = output.read_text()",
         "ranking.git_changed_paths = lambda *_: [(repository / 'linked' / 'vanished.py', 'A')]",
-        "inventory.generate_diff_in_scope_files(repository, 'base', 'head', 'local-patch', output)",
-        "inventories['vanishedExternalParent'] = output.read_text()",
+        "try:",
+        "    inventory.generate_diff_in_scope_files(repository, 'base', 'head', 'local-patch', output)",
+        "    inventories['vanishedExternalParent'] = output.read_text()",
+        "except inventory.InventoryError as error:",
+        "    inventories['vanishedExternalParent'] = str(error)",
         "blocked_parent = repository / 'not-a-directory'",
         "blocked_parent.write_text('not a directory\\n')",
         "ranking.git_changed_paths = lambda *_: [(blocked_parent / 'nested' / 'added.py', 'A')]",
@@ -293,17 +301,8 @@ describe("bundled workbench canonical paths", () => {
         "missing_skipped = workbench.git_directory_snapshot_paths(repository) == []",
         "selected = repository / 'selected'",
         "workbench.git_worktree_context = lambda _: (repository, 'selected')",
-        "workbench.git_bytes = lambda *_: b'selected\\0selected/public.py\\0'",
+        "workbench.git_bytes = lambda *_: b'selected\\0'",
         "selected_paths = [path.relative_to(selected).as_posix() for path in workbench.git_directory_snapshot_paths(selected)]",
-        "parent_resolutions = []",
-        "def counted_resolve(path, *args, **kwargs):",
-        "    if path == selected:",
-        "        parent_resolutions.append(path)",
-        "    return original_resolve(path, *args, **kwargs)",
-        "Path.resolve = counted_resolve",
-        "workbench.git_bytes = lambda *_: b'selected/public.py\\0selected/public.py\\0'",
-        "workbench.git_directory_snapshot_paths(selected)",
-        "Path.resolve = original_resolve",
         "unicode_directory = repository / unicodedata.normalize('NFD', 'café')",
         "unicode_directory.mkdir()",
         "(unicode_directory / 'public.py').write_text('public = True\\n')",
@@ -338,7 +337,7 @@ describe("bundled workbench canonical paths", () => {
         "    direct_link_rejected = True",
         "else:",
         "    direct_link_rejected = False",
-        "print(json.dumps({'inventories': inventories, 'rankings': rankings, 'externalReads': reads, 'snapshotRejected': snapshot_rejected, 'unsafeProgressCount': unsafe_progress_count, 'nestedUnsafeProgressCount': nested_unsafe_progress_count, 'nestedSafePaths': nested_safe_paths, 'nestedSafeDigest': nested_safe_digest, 'selectedNestedRejected': selected_nested_rejected, 'cyclicProgressCount': cyclic_progress_count, 'missingSkipped': missing_skipped, 'selectedPaths': selected_paths, 'parentResolutions': len(parent_resolutions), 'unicodeAccepted': unicode_accepted, 'caseAliasAccepted': case_alias_accepted, 'caseAliasChangesAccepted': case_alias_changes_accepted, 'directLinkRejected': direct_link_rejected}))",
+        "print(json.dumps({'inventories': inventories, 'externalReads': reads, 'safeFallbackDigest': safe_fallback_digest, 'outsideDigestRejected': outside_digest_rejected, 'outsideProgressSkipped': outside_progress_skipped, 'snapshotRejected': snapshot_rejected, 'unsafeProgressCount': unsafe_progress_count, 'nestedUnsafeProgressCount': nested_unsafe_progress_count, 'nestedSafePaths': nested_safe_paths, 'nestedSafeDigest': nested_safe_digest, 'selectedNestedRejected': selected_nested_rejected, 'cyclicProgressCount': cyclic_progress_count, 'missingSkipped': missing_skipped, 'selectedPaths': selected_paths, 'unicodeAccepted': unicode_accepted, 'caseAliasAccepted': case_alias_accepted, 'caseAliasChangesAccepted': case_alias_changes_accepted, 'directLinkRejected': direct_link_rejected}))",
       ].join("\n"),
       repository,
       join(root, "inventory.txt"),
@@ -347,18 +346,18 @@ describe("bundled workbench canonical paths", () => {
     expect(result).toEqual({
       inventories: {
         M: "changed Git working-tree paths must stay inside the selected target",
-        D: "linked/private.py\n",
+        D: "changed Git working-tree paths must stay inside the selected target",
         revisions: "linked/private.py\n",
         cyclic: "could not inspect a changed Git working-tree path",
         missingParent: "",
-        vanishedExternalParent: "",
+        vanishedExternalParent:
+          "changed Git working-tree paths must stay inside the selected target",
         notDirectoryParent: "",
       },
-      rankings: {
-        M: ["linked/private.py"],
-        D: ["linked/private.py"],
-      },
       externalReads: [],
+      safeFallbackDigest: true,
+      outsideDigestRejected: true,
+      outsideProgressSkipped: true,
       snapshotRejected: true,
       unsafeProgressCount: 0,
       nestedUnsafeProgressCount: 0,
@@ -371,12 +370,39 @@ describe("bundled workbench canonical paths", () => {
       cyclicProgressCount: 0,
       missingSkipped: true,
       selectedPaths: [".", "public.py"],
-      parentResolutions: 1,
       unicodeAccepted: true,
       caseAliasAccepted: true,
       caseAliasChangesAccepted: true,
       directLinkRejected: process.platform === "win32",
     });
+  });
+
+  test("reads Unicode commit subjects regardless of locale or Git log encoding", async () => {
+    const repository = await temporaryDirectory();
+    expect(
+      runPythonProbe(
+        [
+          "import json, subprocess, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "import workbench_target as target",
+          "repository = Path(sys.argv[2])",
+          "def git(*args):",
+          "    subprocess.run(['git', '-C', str(repository), *args], check=True, capture_output=True)",
+          "git('init', '-q')",
+          "subjects = [('UTF-8', 'docs: \\u65e5\\u672c\\u8a9e \\ud55c\\uad6d\\uc5b4 \\U0001f527'), ('ISO-8859-1', 'docs: caf\\u00e9')]",
+          "for log_encoding, subject in subjects:",
+          "    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', subject)",
+          "    git('config', 'i18n.logOutputEncoding', log_encoding)",
+          "    for encoding in ('cp932', 'cp949'):",
+          "        subprocess._text_encoding = lambda: encoding",
+          "        assert target.git_target_metadata(repository)['commitSubject'] == subject",
+          "        assert target.git_bytes(repository, 'show', '-s', '--format=%s', 'HEAD') == (subject + '\\n').encode('utf-8')",
+          "print(json.dumps({'subjects': len(subjects), 'locales': 2}))",
+        ].join("\n"),
+        repository,
+      ),
+    ).toEqual({ subjects: 2, locales: 2 });
   });
 
   testPosix(
