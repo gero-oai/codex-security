@@ -1,6 +1,12 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { constants, existsSync, readdirSync, type Stats } from "node:fs";
+import {
+  constants,
+  existsSync,
+  readdirSync,
+  type BigIntStats,
+  type Stats,
+} from "node:fs";
 import {
   chmod,
   cp,
@@ -22,7 +28,16 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { createRequire } from "node:module";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -33,12 +48,19 @@ import { parse } from "smol-toml";
 import {
   CodexSecurityError,
   OutputDirectoryError,
+  OutputDirectoryNotEmptyError,
+  OutputInsideProtectedRootError,
   PluginBootstrapError,
   PluginPythonUnavailableError,
+  type ProtectedScanPathKind,
   errorMessage,
 } from "./errors.js";
 import type { JsonObject } from "./config.js";
 import { resolveTrustedExecutable } from "./trusted-executable.js";
+import {
+  isWindowsUnsafePathComponent,
+  windowsUnsafePathComponent,
+} from "./windows-path.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -54,7 +76,44 @@ const CREDENTIAL_LOCK_NAME = ".codex-security-scan.lock";
 const CREDENTIAL_LOGOUT_MARKER = ".codex-security-logged-out";
 const CREDENTIAL_LOCK_POLL_MILLISECONDS = 25;
 const INCOMPLETE_CREDENTIAL_LOCK_MILLISECONDS = 30_000;
+const MAX_PROCESS_ID = 2_147_483_647;
 const MAX_WINDOWS_CREDENTIAL_ACL_STDERR = 64 * 1024;
+const PLUGIN_HELPER_SECRET_ENVIRONMENT_VARIABLES = new Set([
+  "OPENAI_API_KEY",
+  "CODEX_API_KEY",
+  "OPENROUTER_API_KEY",
+  "FIREWORKS_API_KEY",
+]);
+const PREPARE_SCAN_ARTIFACT_RESTORER_PROGRAM = `
+from pathlib import Path
+from runpy import run_path
+import json
+import sys
+
+module = run_path(sys.argv[1])
+canonical_path, root_identity = module["scan_root_identity"](Path(sys.argv[2]))
+print(json.dumps({
+    "canonicalPath": str(canonical_path),
+    "dev": str(root_identity[0]),
+    "ino": str(root_identity[1]),
+}, ensure_ascii=False))
+`.trim();
+const RESTORE_SCAN_ARTIFACT_PROGRAM = `
+from pathlib import Path
+from runpy import run_path
+import sys
+
+module = run_path(sys.argv[1])
+try:
+    module["write_scan_local_bytes"](
+        Path(sys.argv[2]),
+        sys.argv[3],
+        sys.stdin.buffer.read(),
+        expected_root_identity=(int(sys.argv[4]), int(sys.argv[5])),
+    )
+except (module["ContractError"], OSError) as error:
+    raise SystemExit(str(error))
+`.trim();
 
 export interface PluginInstall {
   pluginRoot: string;
@@ -95,6 +154,10 @@ export interface WorkbenchCommandOptions {
   failureMessage?: string;
 }
 
+export interface ScanArtifactRestorer {
+  restore(relativePath: string, contents: Uint8Array): Promise<void>;
+}
+
 function environmentValue(
   environment: ProcessEnvironment,
   requested: string,
@@ -112,10 +175,21 @@ export function codexSecurityStateDirectory(
   environment: ProcessEnvironment = process.env,
 ): string {
   const configured = environmentValue(environment, "CODEX_SECURITY_STATE_DIR");
-  if (configured !== undefined) return resolve(expandHome(configured));
-  const codexHome =
-    environmentValue(environment, "CODEX_HOME") ?? join(homedir(), ".codex");
-  return resolve(expandHome(codexHome), "state", "plugins", "codex-security");
+  const path =
+    configured !== undefined
+      ? resolve(expandHome(configured, environment))
+      : resolve(
+          expandHome(
+            environmentValue(environment, "CODEX_HOME") ??
+              join(homedir(), ".codex"),
+            environment,
+          ),
+          "state",
+          "plugins",
+          "codex-security",
+        );
+  requireModelSafeOutputDir(path);
+  return path;
 }
 
 export function codexSecurityCredentialHome(
@@ -148,7 +222,7 @@ export async function prepareCodexSecurityCredentialHome(
       throw error;
     }
     if ((process.umask() & 0o700) !== 0) await chmod(path, 0o700);
-    const metadata = await lstat(path);
+    const metadata = await lstat(path, { bigint: true });
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
       throw new OutputDirectoryError(
         `Codex Security credential home is not a directory: ${path}`,
@@ -183,17 +257,17 @@ export async function requireSecureCredentialHome(
   options: {
     platform?: NodeJS.Platform;
     secureWindowsHome?: (path: string) => Promise<void>;
-    metadata?: Stats;
-    expectedDevice?: number;
-    expectedInode?: number;
+    metadata?: BigIntStats;
+    expectedDevice?: bigint;
+    expectedInode?: bigint;
     validateWindowsAcl?: boolean;
   } = {},
-): Promise<Stats> {
+): Promise<BigIntStats> {
   const platform = options.platform ?? process.platform;
   let metadata = options.metadata;
   if (metadata === undefined) {
     try {
-      metadata = await lstat(path);
+      metadata = await lstat(path, { bigint: true });
     } catch (error) {
       throw new OutputDirectoryError(
         `Unable to inspect the Codex Security credential home: ${path}`,
@@ -208,7 +282,7 @@ export async function requireSecureCredentialHome(
   }
   const canonical = await realpath(path);
   requireModelSafeOutputDir(canonical);
-  const canonicalMetadata = await lstat(canonical);
+  const canonicalMetadata = await lstat(canonical, { bigint: true });
   if (
     canonicalMetadata.dev !== metadata.dev ||
     canonicalMetadata.ino !== metadata.ino
@@ -233,17 +307,19 @@ export async function requireSecureCredentialHome(
       `Codex Security credential home was replaced: ${canonical}`,
     );
   }
-  if (platform === "win32") {
-    if (options.validateWindowsAcl !== false) {
-      await requirePrivateCredentialHome(metadata, canonical, {
+  if (platform !== "win32" || options.validateWindowsAcl !== false) {
+    await requirePrivateCredentialHome(
+      { mode: Number(metadata.mode), uid: Number(metadata.uid) },
+      canonical,
+      {
         platform,
         secureWindowsHome: options.secureWindowsHome,
-      });
-    }
-    return metadata;
+      },
+    );
   }
-  await requirePrivateCredentialHome(metadata, canonical, { platform });
-  await requireSecureOutputAncestry(canonical);
+  if (platform !== "win32") {
+    await requireSecureOutputAncestry(canonical);
+  }
   return metadata;
 }
 
@@ -824,7 +900,9 @@ async function secureWindowsCredentialHome(path: string): Promise<void> {
     "$path = $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH",
     "while ($true) { $parent = Microsoft.PowerShell.Management\\Split-Path -Path $path -Parent; if (-not $parent -or $parent -eq $path) { break }; Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $parent | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl; $path = $parent }",
     "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
-    "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH -Recurse -Force | Microsoft.PowerShell.Security\\Get-Acl | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+    // A temporary descendant can disappear after enumeration. Its missing
+    // descriptor reduces the count and retries the stable snapshot.
+    "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH -Recurse -Force | Microsoft.PowerShell.Core\\ForEach-Object { try { Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $_.FullName | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl } catch { if ($_.FullyQualifiedErrorId -notlike 'GetAcl_PathNotFound,*') { throw } } }",
   ].join("; ");
   const resolvePrincipalScript = [
     "$ErrorActionPreference = 'Stop'",
@@ -996,10 +1074,6 @@ async function secureWindowsCredentialHome(path: string): Promise<void> {
   }
 }
 
-interface CredentialLockReadRetry {
-  deadline?: number;
-}
-
 export async function acquireCodexSecurityCredentialHomeLock(
   codexHome: string,
   signal?: AbortSignal,
@@ -1014,11 +1088,9 @@ export async function acquireCodexSecurityCredentialHomeLock(
   );
   const expectedDevice = homeMetadata.dev;
   const expectedInode = homeMetadata.ino;
-  const platform = securityOptions.platform ?? process.platform;
   const lock = join(codexHome, CREDENTIAL_LOCK_NAME);
   const ownerPath = join(lock, "owner.json");
   const token = randomUUID();
-  const readRetry: CredentialLockReadRetry = {};
 
   while (true) {
     throwIfSignalAborted(signal);
@@ -1033,12 +1105,10 @@ export async function acquireCodexSecurityCredentialHomeLock(
       throw error;
     });
     if (existingLock !== null) {
-      if (await recoverStaleCredentialHomeLock(lock, platform, readRetry))
-        continue;
+      if (await recoverStaleCredentialHomeLock(lock)) continue;
       await delay(CREDENTIAL_LOCK_POLL_MILLISECONDS, undefined, { signal });
       continue;
     }
-    delete readRetry.deadline;
     await requireSecureCredentialHome(codexHome, {
       ...securityOptions,
       expectedDevice,
@@ -1048,8 +1118,7 @@ export async function acquireCodexSecurityCredentialHomeLock(
       await mkdir(lock, { mode: 0o700 });
     } catch (error) {
       if (nodeErrorCode(error) !== "EEXIST") throw error;
-      if (await recoverStaleCredentialHomeLock(lock, platform, readRetry))
-        continue;
+      if (await recoverStaleCredentialHomeLock(lock)) continue;
       await delay(CREDENTIAL_LOCK_POLL_MILLISECONDS, undefined, { signal });
       continue;
     }
@@ -1087,19 +1156,12 @@ export async function acquireCodexSecurityCredentialHomeLock(
   }
 }
 
-async function recoverStaleCredentialHomeLock(
-  lock: string,
-  platform: NodeJS.Platform,
-  readRetry: CredentialLockReadRetry,
-): Promise<boolean> {
+async function recoverStaleCredentialHomeLock(lock: string): Promise<boolean> {
   const metadata = await lstat(lock).catch((error: unknown) => {
     if (nodeErrorCode(error) === "ENOENT") return null;
     throw error;
   });
-  if (metadata === null) {
-    delete readRetry.deadline;
-    return true;
-  }
+  if (metadata === null) return true;
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
     throw new OutputDirectoryError(
       `Codex Security credential-home lock is not a directory: ${lock}`,
@@ -1107,25 +1169,10 @@ async function recoverStaleCredentialHomeLock(
   }
 
   let owner: unknown;
-  const deadline =
-    platform === "win32"
-      ? (readRetry.deadline ??=
-          Date.now() + INCOMPLETE_CREDENTIAL_LOCK_MILLISECONDS)
-      : undefined;
   try {
     owner = JSON.parse(await readFile(join(lock, "owner.json"), "utf8"));
   } catch (error) {
-    const code = nodeErrorCode(error);
-    // Re-enter the acquisition loop so a Windows read retry rechecks the lock.
-    if (
-      deadline !== undefined &&
-      (code === "EPERM" || code === "EBUSY") &&
-      Date.now() < deadline
-    ) {
-      return false;
-    }
-    delete readRetry.deadline;
-    if (code !== "ENOENT" && !(error instanceof SyntaxError)) {
+    if (nodeErrorCode(error) !== "ENOENT" && !(error instanceof SyntaxError)) {
       throw error;
     }
     if (
@@ -1135,11 +1182,18 @@ async function recoverStaleCredentialHomeLock(
       return false;
     }
   }
-  delete readRetry.deadline;
 
-  if (isRecord(owner) && typeof owner["pid"] === "number") {
+  // Only positive signed-32-bit PIDs identify an owner. Other values can name
+  // process groups or fail argument validation, so use the stale-age check.
+  const ownerPid = isRecord(owner) ? owner["pid"] : undefined;
+  if (
+    typeof ownerPid === "number" &&
+    Number.isInteger(ownerPid) &&
+    ownerPid > 0 &&
+    ownerPid <= MAX_PROCESS_ID
+  ) {
     try {
-      process.kill(owner["pid"], 0);
+      process.kill(ownerPid, 0);
       return false;
     } catch (error) {
       if (nodeErrorCode(error) !== "ESRCH") {
@@ -1300,18 +1354,54 @@ export async function preserveCodexSecurityPluginRegistration(
   };
 }
 
-export async function preparePersistentScanRoot(
+export function requireOutputOutsideRepository(
+  repository: string,
+  outputDirectory: string,
+  pathKind: ProtectedScanPathKind = "output",
+): void {
+  const outputRelative = relative(repository, outputDirectory);
+  const repositoryRelative = relative(outputDirectory, repository);
+  if (
+    outputRelative === "" ||
+    (outputRelative !== ".." &&
+      !outputRelative.startsWith(`..${sep}`) &&
+      !isAbsolute(outputRelative)) ||
+    (pathKind === "output" &&
+      repositoryRelative !== ".." &&
+      !repositoryRelative.startsWith(`..${sep}`) &&
+      !isAbsolute(repositoryRelative))
+  ) {
+    throw new OutputInsideProtectedRootError(
+      outputDirectory,
+      repository,
+      pathKind,
+    );
+  }
+}
+
+export function requireOutputOutsideRepositories(
+  repositories: readonly string[],
+  outputDirectory: string,
+  pathKind: ProtectedScanPathKind = "output",
+): void {
+  for (const repository of repositories)
+    requireOutputOutsideRepository(repository, outputDirectory, pathKind);
+}
+
+export async function preparePersistentOutputRoot(
   stateDirectory: string,
+  category: "scans" | "policies",
   repositoryName: string,
 ): Promise<string> {
+  requireModelSafeOutputDir(stateDirectory);
   await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
   let root = await realpath(stateDirectory);
-  for (const directory of ["scans", safePrefix(repositoryName)]) {
+  for (const directory of [category, safePrefix(repositoryName)]) {
     root = join(root, directory);
     await mkdir(root, { recursive: true, mode: 0o700 });
     if (!(await lstat(root)).isDirectory()) {
       throw new OutputDirectoryError(
-        `Persistent scan output must use real directories: ${root}`,
+        `Persistent ${category === "scans" ? "scan" : "policy"} output must use real directories: ${root}`,
       );
     }
   }
@@ -1321,33 +1411,32 @@ export async function preparePersistentScanRoot(
 export async function runWorkbench(
   options: WorkbenchCommandOptions,
   args: readonly string[],
+  input?: string,
 ): Promise<JsonObject> {
   let stdout: string;
   try {
-    ({ stdout } = await execFile(
-      options.python,
+    const result = await runCodexCommand(
+      { command: options.python },
       [
         "-I",
+        "-X",
+        "utf8",
         "-B",
         join(options.pluginRoot, "scripts", "workbench_db.py"),
         ...args,
       ],
-      {
-        env: Object.fromEntries(
-          Object.entries(options.environment).filter(
-            ([name]) =>
-              name.toUpperCase() !== "OPENAI_API_KEY" &&
-              name.toUpperCase() !== "CODEX_API_KEY" &&
-              name.toUpperCase() !== "OPENROUTER_API_KEY" &&
-              name.toUpperCase() !== "FIREWORKS_API_KEY",
-          ),
-        ),
-        encoding: "utf8",
-        maxBuffer: Infinity,
-        windowsHide: true,
-        signal: options.signal,
-      },
-    ));
+      pluginHelperEnvironment(options.environment),
+      input,
+      options.signal,
+    );
+    if (!result.success) {
+      throw new Error(
+        result.stderr.trim() ||
+          result.stdout.trim() ||
+          `Workbench exited with status ${result.exitCode}.`,
+      );
+    }
+    stdout = result.stdout;
   } catch (error) {
     if (options.signal?.aborted) throw error;
     const detail = processErrorDetail(error);
@@ -1430,9 +1519,7 @@ export async function validateOutputDir(
         );
       }
       if (!archiveExisting && (await readdir(path)).length !== 0) {
-        throw new OutputDirectoryError(
-          `Scan output directory is not empty: ${path}. To keep the existing results and start a new scan, add --archive-existing.`,
-        );
+        throw new OutputDirectoryNotEmptyError(path);
       }
       requirePrivateOutputDirectory(metadata, path);
       await requireSecureOutputAncestry(path);
@@ -1473,6 +1560,100 @@ export async function validateOutputDir(
   }
 }
 
+export async function prepareScanArtifactRestorer(
+  options: WorkbenchCommandOptions,
+  scanDirectory: string,
+): Promise<ScanArtifactRestorer> {
+  let canonicalPath: string;
+  let dev: string;
+  let ino: string;
+  try {
+    const result = await runCodexCommand(
+      { command: options.python },
+      [
+        "-I",
+        "-X",
+        "utf8",
+        "-B",
+        "-c",
+        PREPARE_SCAN_ARTIFACT_RESTORER_PROGRAM,
+        join(options.pluginRoot, "scripts", "finalize_scan_contract.py"),
+        scanDirectory,
+      ],
+      pluginHelperEnvironment(options.environment),
+      undefined,
+      options.signal,
+    );
+    if (!result.success) {
+      throw new Error(
+        result.stderr.trim() ||
+          result.stdout.trim() ||
+          `Artifact restoration setup exited with status ${result.exitCode}.`,
+      );
+    }
+    const prepared: unknown = JSON.parse(result.stdout);
+    if (
+      !isRecord(prepared) ||
+      typeof prepared["canonicalPath"] !== "string" ||
+      prepared["canonicalPath"].length === 0 ||
+      typeof prepared["dev"] !== "string" ||
+      !/^(?:0|[1-9]\d*)$/u.test(prepared["dev"]) ||
+      typeof prepared["ino"] !== "string" ||
+      !/^(?:0|[1-9]\d*)$/u.test(prepared["ino"])
+    ) {
+      throw new Error("Artifact restoration setup returned invalid output.");
+    }
+    canonicalPath = prepared["canonicalPath"];
+    dev = prepared["dev"];
+    ino = prepared["ino"];
+  } catch (error) {
+    if (options.signal?.aborted) throw error;
+    throw new OutputDirectoryError(
+      "Could not securely prepare completed scan artifact restoration.",
+      { cause: error },
+    );
+  }
+
+  return {
+    async restore(relativePath, contents) {
+      try {
+        const result = await runCodexCommand(
+          { command: options.python },
+          [
+            "-I",
+            "-X",
+            "utf8",
+            "-B",
+            "-c",
+            RESTORE_SCAN_ARTIFACT_PROGRAM,
+            join(options.pluginRoot, "scripts", "finalize_scan_contract.py"),
+            canonicalPath,
+            relativePath,
+            dev,
+            ino,
+          ],
+          pluginHelperEnvironment(options.environment),
+          contents,
+          options.signal,
+        );
+        if (!result.success) {
+          throw new Error(
+            result.stderr.trim() ||
+              result.stdout.trim() ||
+              `Artifact restoration exited with status ${result.exitCode}.`,
+          );
+        }
+      } catch (error) {
+        if (options.signal?.aborted) throw error;
+        throw new OutputDirectoryError(
+          "Could not safely restore a completed scan artifact.",
+          { cause: error },
+        );
+      }
+    },
+  };
+}
+
 export async function planOutputArchive(
   outputDirectory: string | null,
 ): Promise<string | null> {
@@ -1494,6 +1675,31 @@ export function requireModelSafeOutputDir(path: string): void {
     throw new OutputDirectoryError(
       "Scan output directory must not contain control or line-separator characters.",
     );
+  }
+  const ambiguous =
+    process.platform === "win32" ? windowsUnsafePathComponent(path) : undefined;
+  if (ambiguous !== undefined) {
+    throw new OutputDirectoryError(
+      `Codex Security paths must not contain Windows-ambiguous components: ${ambiguous}`,
+    );
+  }
+}
+
+export async function canonicalizeModelSafePath(
+  input: string,
+): Promise<string> {
+  const path = resolve(expandHome(input));
+  requireModelSafeOutputDir(path);
+  for (let ancestor = path; ; ancestor = dirname(ancestor)) {
+    try {
+      const canonicalAncestor = resolve(ancestor, await realpath(ancestor));
+      const canonical = resolve(canonicalAncestor, relative(ancestor, path));
+      requireModelSafeOutputDir(canonical);
+      return canonical;
+    } catch (error) {
+      if (nodeErrorCode(error) !== "ENOENT") throw error;
+      if (dirname(ancestor) === ancestor) throw error;
+    }
   }
 }
 
@@ -2010,11 +2216,13 @@ export function resolveCodexCommand(
   environment: ProcessEnvironment = process.env,
 ): CodexCommand {
   const configured = environmentValue(environment, "CODEX_CLI_PATH");
+  const expanded =
+    configured === undefined ? undefined : expandHome(configured, environment);
   if (
-    configured &&
-    (process.platform !== "win32" || /\.(?:exe|com)$/iu.test(configured))
+    expanded &&
+    (process.platform !== "win32" || /\.(?:exe|com)$/iu.test(expanded))
   ) {
-    return { command: resolve(configured) };
+    return { command: resolve(expanded) };
   }
 
   const platform = process.platform === "android" ? "linux" : process.platform;
@@ -2239,7 +2447,7 @@ export async function resolvePluginPython(
   }
 
   for (const candidate of process.platform === "win32"
-    ? ["python", "python3"]
+    ? ["python", "python3", "py"]
     : ["python3", "python"]) {
     const resolved = await usablePython(
       candidate,
@@ -2251,7 +2459,7 @@ export async function resolvePluginPython(
   }
   throw new PluginPythonUnavailableError(
     "The bundled Codex Security plugin requires Python 3.10 or later (Python 3.10 also requires tomli), but no usable interpreter was found. " +
-      "Set pythonPath, --python, or PYTHON, install the Codex managed runtime, or add python3/python to PATH.",
+      "Set pythonPath, --python, or PYTHON, install the Codex managed runtime, or add python3/python (py on Windows) to PATH.",
   );
 }
 
@@ -2260,10 +2468,34 @@ export function pluginExecutionEnvironment(
   environment: ProcessEnvironment = process.env,
 ): ProcessEnvironment {
   return {
-    ...environment,
+    ...pythonUtf8Environment(environment),
     PYTHON: python,
     CODEX_CLI_PATH: resolveCodexCommand(environment).command,
   };
+}
+
+export function pythonUtf8Environment(
+  environment: ProcessEnvironment,
+): ProcessEnvironment {
+  const normalized = { ...environment };
+  for (const name of Object.keys(normalized)) {
+    if (name.toUpperCase() === "PYTHONUTF8") delete normalized[name];
+  }
+  normalized["PYTHONUTF8"] = "1";
+  return normalized;
+}
+
+function pluginHelperEnvironment(
+  environment: ProcessEnvironment,
+): ProcessEnvironment {
+  return pythonUtf8Environment(
+    Object.fromEntries(
+      Object.entries(environment).filter(
+        ([name]) =>
+          !PLUGIN_HELPER_SECRET_ENVIRONMENT_VARIABLES.has(name.toUpperCase()),
+      ),
+    ),
+  );
 }
 
 export async function cleanupSdkDirectory(path: string): Promise<void> {
@@ -2274,7 +2506,7 @@ export async function runCodexCommand(
   command: CodexCommand,
   args: readonly string[],
   environment: ProcessEnvironment,
-  input?: string,
+  input?: string | Uint8Array,
   signal?: AbortSignal,
 ): Promise<CodexCommandResult> {
   const child = spawn(command.command, [...args], {
@@ -2432,7 +2664,7 @@ function safeArchivePath(value: string): string {
     parts.includes("..") ||
     value.includes("\\") ||
     value.includes("\0") ||
-    parts.some((part) => part.includes(":")) ||
+    parts.some(isWindowsUnsafePathComponent) ||
     normalized.length === 0
   ) {
     throw new PluginBootstrapError(
@@ -2469,7 +2701,9 @@ async function usablePython(
   signal?: AbortSignal,
 ): Promise<string | null> {
   const command = await resolveTrustedExecutable(
-    isPythonPathCandidate(candidate) ? expandHome(candidate) : candidate,
+    isPythonPathCandidate(candidate)
+      ? expandHome(candidate, environment)
+      : candidate,
     environment,
     protectedRoot,
   );
@@ -2522,9 +2756,10 @@ async function isRegularFile(path: string): Promise<boolean> {
 
 async function sameFile(left: string, right: string): Promise<boolean> {
   try {
+    // NTFS file IDs can exceed JavaScript's safe integer range.
     const [leftMetadata, rightMetadata] = await Promise.all([
-      stat(left),
-      stat(right),
+      stat(left, { bigint: true }),
+      stat(right, { bigint: true }),
     ]);
     return (
       leftMetadata.dev === rightMetadata.dev &&
@@ -2535,10 +2770,20 @@ async function sameFile(left: string, right: string): Promise<boolean> {
   }
 }
 
-export function expandHome(value: string): string {
-  if (value === "~") return homedir();
-  if (value.startsWith("~/") || value.startsWith("~\\")) {
-    return join(homedir(), value.slice(2));
+export function expandHome(
+  value: string,
+  environment: ProcessEnvironment = process.env,
+): string {
+  const home =
+    (process.platform === "win32"
+      ? environmentValue(environment, "USERPROFILE") ??
+        environmentValue(environment, "HOME")
+      : environmentValue(environment, "HOME") ??
+        environmentValue(environment, "USERPROFILE")) ?? homedir();
+  if (value === "~") return home;
+  if (value.startsWith("~/")) return join(home, value.slice(2));
+  if (value.startsWith("~\\")) {
+    return join(home, ...value.slice(2).split("\\"));
   }
   return value;
 }
