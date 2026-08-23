@@ -512,7 +512,22 @@ class PublicationProgressPresenter {
       return;
     }
 
-    if (event.type === "mutation_settled" || event.type === "batch_settled") {
+    if (event.type === "mutation_settled") {
+      if (this.#dashboard !== null) {
+        this.#dashboard.setPublicationProgress(event.settled, event.total);
+        this.#dashboard.setStage(
+          `Saving Linear publication results: ${event.settled}/${event.total}`,
+        );
+      } else {
+        this.#write(
+          `[${event.settled}/${event.total}] Recorded Linear request outcome for reconciliation.`,
+          true,
+        );
+      }
+      return;
+    }
+
+    if (event.type === "batch_settled") {
       this.#dashboard?.setStage("Saving Linear publication results");
       return;
     }

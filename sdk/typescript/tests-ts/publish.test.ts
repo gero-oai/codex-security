@@ -1434,6 +1434,120 @@ describe("connected Linear publication", () => {
     ]);
   });
 
+  test.each([
+    ["URL-only event evidence in forward order", "url", false, "forward"],
+    ["URL-only event evidence in reverse order", "url", false, "reverse"],
+    ["lowercase entity event evidence", "entityId", false, "forward"],
+    ["lowercase entity reverse order", "entityId", false, "reverse"],
+    ["uppercase entity forward order", "entityId", true, "forward"],
+    ["uppercase entity event evidence", "entityId", true, "reverse"],
+  ] as const)(
+    "refuses to combine disjoint %s with a handoff identifier",
+    async (_label, eventKind, uppercaseEntityId, evidenceOrder) => {
+      const publication = preparedPublication(2);
+      const [target, sibling] = publication.issues as [
+        PreparedPublicationIssue,
+        PreparedPublicationIssue,
+      ];
+      const eventIdentifier = "SYNTH-EVENT-901";
+      const handoffIdentifier = "SYNTH-HANDOFF-902";
+      const siblingIdentifier = "SYNTH-SIBLING-903";
+      const canonicalEntityId = "11111111-2222-4333-8444-555555555555";
+      const targetEvent = issueEventWithResult(target, {
+        structured_content:
+          eventKind === "url"
+            ? {
+                url: `https://linear.app/example/issue/${eventIdentifier}`,
+              }
+            : {
+                id: uppercaseEntityId
+                  ? canonicalEntityId.toUpperCase()
+                  : canonicalEntityId,
+              },
+      });
+      const siblingUrl = `https://linear.app/example/issue/${siblingIdentifier}`;
+      const siblingEvent = issueEventWithResult(sibling, {
+        structured_content: {
+          identifier: siblingIdentifier,
+          url: siblingUrl,
+        },
+      });
+      const output =
+        evidenceOrder === "forward"
+          ? [targetEvent, siblingEvent].join("\n")
+          : [siblingEvent, targetEvent].join("\n");
+      const targetHandoff = handoffRecord(publication, target, {
+        identifier: handoffIdentifier,
+      });
+      const siblingHandoff = handoffRecord(publication, sibling, {
+        identifier: siblingIdentifier,
+        url: siblingUrl,
+      });
+      const records =
+        evidenceOrder === "forward"
+          ? [targetHandoff, siblingHandoff]
+          : [siblingHandoff, targetHandoff];
+      const receipts: PublishScanResult[] = [];
+      let handoffFile = "";
+      let persisted: string[] = [];
+
+      await expect(
+        publishScanInternal(
+          publication.scanDirectory,
+          OPTIONS,
+          dependencies(
+            publication,
+            {},
+            {
+              runCodex: async (_command, _args, input) => {
+                handoffFile = publicationData(input).handoffFile;
+                await writeHandoff(input, records);
+                return { exitCode: 0, stdout: output, stderr: "" };
+              },
+              recordPublishedIssues: async (_prepared, issues) => {
+                persisted = issues.map(
+                  ({ issueIdentifier }) => issueIdentifier,
+                );
+                return [...issues];
+              },
+              writeReceipt: async (receipt) => {
+                receipts.push(structuredClone(receipt));
+              },
+            },
+          ),
+        ),
+      ).rejects.toThrow("could not verify every completed mutation");
+
+      expect(persisted).toEqual([siblingIdentifier]);
+      const receipt = receipts.at(-1)!;
+      expect(receipt).toMatchObject({
+        indeterminate: true,
+        created: [
+          {
+            findingId: sibling.findingId,
+            issueIdentifier: siblingIdentifier,
+            url: siblingUrl,
+          },
+        ],
+        failed: [
+          {
+            findingId: target.findingId,
+            error: expect.stringContaining("conflicting Linear issue"),
+          },
+        ],
+        counts: { findings: 2, created: 1, failed: 1 },
+      });
+      expect(JSON.stringify(receipt.failed)).not.toContain(eventIdentifier);
+      expect(JSON.stringify(receipt.failed)).not.toContain(handoffIdentifier);
+      expect(await readFile(handoffFile, "utf8")).toBe(
+        `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+      );
+      expect(
+        await readFile(await publicationEventsFile(handoffFile), "utf8"),
+      ).toBe(`${output}\n`);
+    },
+  );
+
   test("accepts repeated equal carrier claims without staging recovery evidence", async () => {
     const publication = preparedPublication();
     const issue = publication.issues[0]!;
@@ -1514,7 +1628,7 @@ describe("connected Linear publication", () => {
             await writeHandoff(input, [
               {
                 ...handoffRecord(publication, issue, { identifier, url }),
-                id: entityId,
+                id: entityId.toUpperCase(),
               },
             ]);
             return { exitCode: 0, stdout: output, stderr: "" };

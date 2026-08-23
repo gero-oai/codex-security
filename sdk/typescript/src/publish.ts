@@ -1066,6 +1066,10 @@ function reconcileFindingEvidence(
   if (handoff?.status === "invalid") {
     if (
       completedCall?.resolution.state === "resolved" &&
+      evidenceClaimsCorroborate(
+        completedCall.resolution.claims,
+        handoff.resolution.claims,
+      ) &&
       (handoff.recoverableWithEvent === true ||
         corroboratesRelabeledEntity(completedCall.resolution, handoff))
     ) {
@@ -1103,6 +1107,18 @@ function reconcileFindingEvidence(
         true,
       );
     }
+    if (
+      completedCall !== undefined &&
+      !evidenceClaimsCorroborate(
+        completedCall.resolution.claims,
+        handoff.resolution.claims,
+      )
+    ) {
+      return failed(
+        "Codex reported a conflicting Linear issue for this finding.",
+        true,
+      );
+    }
     const combined = resolveClaims([
       ...(completedCall?.resolution.claims ?? []),
       ...handoff.resolution.claims,
@@ -1129,6 +1145,17 @@ function reconcileFindingEvidence(
     );
   }
   return { issue, indeterminate: false };
+}
+
+function evidenceClaimsCorroborate(
+  left: readonly PublicationClaim[],
+  right: readonly PublicationClaim[],
+): boolean {
+  if (left.length === 0 || right.length === 0) return true;
+  const leftClaims = new Set(
+    left.map((claim) => `${claim.kind}\0${claim.value}`),
+  );
+  return right.some((claim) => leftClaims.has(`${claim.kind}\0${claim.value}`));
 }
 
 function corroboratesRelabeledEntity(

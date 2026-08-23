@@ -466,6 +466,20 @@ describe("database-backed Linear publication integration", () => {
       progress.findLastIndex((event) => event.type === "mutation_settled"),
     );
     expect(stderr.text()).not.toContain("mutation_settled");
+    const neutralProgress = stderr
+      .text()
+      .split("\n")
+      .filter((line) =>
+        line.includes("Recorded Linear request outcome for reconciliation."),
+      );
+    expect(neutralProgress).toEqual([
+      "[1/3] Recorded Linear request outcome for reconciliation.",
+      "[2/3] Recorded Linear request outcome for reconciliation.",
+      "[3/3] Recorded Linear request outcome for reconciliation.",
+    ]);
+    expect(neutralProgress.join("\n")).not.toContain(duplicateIdentifier);
+    expect(neutralProgress.join("\n")).not.toContain(siblingIdentifier);
+    expect(stdout.text()).not.toContain("Recorded Linear request outcome");
     expect(stderr.text()).toContain(
       `[1/3] Failed ${completed.findings[0]!.findingId}`,
     );
