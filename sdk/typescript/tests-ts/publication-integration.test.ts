@@ -39,6 +39,8 @@ const OPTIONS = {
   teamId: "team-example",
   projectId: "project-example",
 } as const;
+const CLAIM_COLLISION_ERROR =
+  "Codex wrote a Linear publication that reused or relabeled a claim across incompatible publication evidence.";
 const temporaryDirectories: string[] = [];
 
 interface PublicationFixture {
@@ -379,6 +381,126 @@ describe("database-backed Linear publication integration", () => {
     expect(stdout.text()).not.toContain(key);
   });
 
+  test("reports only reconciled CLI outcomes when direct API results reuse an identity", async () => {
+    const completed = await fixture(3);
+    const sealed = await artifactDigests(completed.scanDirectory);
+    const key = "lin_api_SYNTHETIC_COLLISION_KEY";
+    const environment = {
+      ...completed.environment,
+      CODEX_SECURITY_LINEAR_API_KEY: key,
+    };
+    const stdout = capture();
+    const stderr = capture();
+    const cli = dependencies({ environment });
+    const duplicateIdentifier = "SYNTH-DIRECT-DUPLICATE";
+    const siblingIdentifier = "SYNTH-DIRECT-SIBLING";
+    type LinearClient = ReturnType<
+      NonNullable<PublishScanDependencies["linearClient"]>
+    >;
+    type IssueInput = Parameters<LinearClient["createIssue"]>[0];
+
+    cli.publishScan = async (directory, options) =>
+      publishScanInternal(directory, options, {
+        environment,
+        linearClient: () =>
+          ({
+            users: async () => ({ nodes: [] }),
+            createIssue: async (input: IssueInput) => {
+              const index = completed.findings.findIndex(({ findingId }) =>
+                input.description?.includes(findingId),
+              );
+              expect(index).toBeGreaterThanOrEqual(0);
+              const identifier =
+                index < 2 ? duplicateIdentifier : siblingIdentifier;
+              return {
+                success: true,
+                issue: Promise.resolve({
+                  identifier,
+                  url: `https://linear.app/example/issue/${identifier}`,
+                }),
+              };
+            },
+          }) as unknown as LinearClient,
+      });
+
+    expect(
+      await main(
+        [
+          "publish",
+          "scan",
+          completed.scanDirectory,
+          "--to",
+          "linear",
+          "--linear-team",
+          OPTIONS.teamId,
+          "--project",
+          OPTIONS.projectId,
+          "--json",
+        ],
+        stdout.stream,
+        stderr.stream,
+        cli,
+      ),
+    ).toBe(2);
+
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).not.toContain(`Created ${duplicateIdentifier}`);
+    expect(stderr.text()).toContain(
+      `[1/3] Failed ${completed.findings[0]!.findingId}`,
+    );
+    expect(stderr.text()).toContain(
+      `[2/3] Failed ${completed.findings[1]!.findingId}`,
+    );
+    expect(stderr.text()).toContain(`[3/3] Created ${siblingIdentifier}`);
+    expect(storedPublications(completed)).toEqual([
+      {
+        scan_id: SCAN_ID,
+        finding_id: completed.findings[2]!.findingId,
+        occurrence_id: completed.findings[2]!.occurrenceId,
+        destination_type: "linear",
+        team_id: OPTIONS.teamId,
+        project_id: OPTIONS.projectId,
+        external_id: siblingIdentifier,
+        external_url: `https://linear.app/example/issue/${siblingIdentifier}`,
+      },
+    ]);
+    expect(
+      JSON.parse(await readFile(receiptPath(completed), "utf8")),
+    ).toMatchObject({
+      indeterminate: true,
+      created: [
+        {
+          findingId: completed.findings[2]!.findingId,
+          issueIdentifier: siblingIdentifier,
+        },
+      ],
+      failed: completed.findings.slice(0, 2).map(({ findingId }) => ({
+        findingId,
+        error: CLAIM_COLLISION_ERROR,
+      })),
+      counts: { findings: 3, created: 1, failed: 2 },
+    });
+    const handoffRoot = join(
+      completed.stateDirectory,
+      "publications",
+      "linear",
+      "handoffs",
+    );
+    const handoffDirectories = await readdir(handoffRoot);
+    expect(handoffDirectories).toHaveLength(1);
+    expect(
+      (
+        await readFile(
+          join(handoffRoot, handoffDirectories[0]!, "issues.jsonl"),
+          "utf8",
+        )
+      )
+        .trim()
+        .split("\n"),
+    ).toHaveLength(3);
+    expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
+  });
+
   test("publishes 23 sealed findings through a durable handoff without Codex JSON", async () => {
     const completed = await fixture(23);
     const sealed = await artifactDigests(completed.scanDirectory);
@@ -707,6 +829,495 @@ describe("database-backed Linear publication integration", () => {
     expect(
       await readFile(receiptPath(completed), "utf8").catch(() => null),
     ).toBe(null);
+    expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
+  });
+
+  test("keeps conflicting connector identities out of CLI history and retains recovery evidence", async () => {
+    const completed = await fixture(1);
+    const sealed = await artifactDigests(completed.scanDirectory);
+    const stdout = capture();
+    const stderr = capture();
+    const cli = dependencies({ environment: completed.environment });
+    let handoffFile = "";
+    let handoffLine = "";
+    let completedEvent = "";
+
+    cli.publishScan = async (directory, options) =>
+      publishScanInternal(directory, options, {
+        environment: completed.environment,
+        resolveCodex: () => ({ command: "synthetic-codex" }),
+        runCodex: async (_command, _args, prompt) => {
+          const payload = await publicationPayload(prompt);
+          const finding = payload.batches[0]![0]!;
+          handoffFile = payload.handoffFile;
+          handoffLine = JSON.stringify({
+            scanId: payload.scanId,
+            findingId: finding.findingId,
+            occurrenceId: finding.occurrenceId,
+            issueIdentifier: "SYNTH-A",
+            arguments: finding.arguments,
+          });
+          await appendFile(handoffFile, `${handoffLine}\n`, "utf8");
+          completedEvent = JSON.stringify({
+            type: "item.completed",
+            item: {
+              id: "tool-conflicting-publication",
+              type: "mcp_tool_call",
+              server: "codex_apps",
+              tool: "linear.save_issue",
+              arguments: finding.arguments,
+              status: "completed",
+              result: {
+                structured_content: { identifier: "SYNTH-A" },
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify({ identifier: "SYNTH-B" }),
+                  },
+                ],
+              },
+            },
+          });
+          return { exitCode: 0, stdout: completedEvent, stderr: "" };
+        },
+      });
+
+    expect(
+      await main(
+        [
+          "publish",
+          "scan",
+          completed.scanDirectory,
+          "--to",
+          "linear",
+          "--linear-team",
+          OPTIONS.teamId,
+          "--project",
+          OPTIONS.projectId,
+          "--json",
+        ],
+        stdout.stream,
+        stderr.stream,
+        cli,
+      ),
+    ).toBe(2);
+
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain(
+      "could not verify every completed mutation",
+    );
+    expect(stderr.text()).toContain(handoffFile);
+    expect(storedPublications(completed)).toEqual([]);
+    const receipt = JSON.parse(
+      await readFile(receiptPath(completed), "utf8"),
+    ) as PublishScanResult;
+    expect(receipt).toMatchObject({
+      indeterminate: true,
+      created: [],
+      failed: [
+        {
+          findingId: completed.findings[0]!.findingId,
+          error:
+            "The connected Linear app returned conflicting created issue identifiers or URLs.",
+        },
+      ],
+      counts: { findings: 1, created: 0, failed: 1 },
+    });
+    expect(await readFile(handoffFile, "utf8")).toBe(`${handoffLine}\n`);
+    const eventFiles = (await readdir(dirname(handoffFile))).filter(
+      (name) => name.startsWith("events-") && name.endsWith(".jsonl"),
+    );
+    expect(eventFiles).toHaveLength(1);
+    expect(
+      await readFile(join(dirname(handoffFile), eventFiles[0]!), "utf8"),
+    ).toBe(`${completedEvent}\n`);
+    expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
+  });
+
+  test("does not report created CLI outcomes that global evidence reconciliation rejects", async () => {
+    const completed = await fixture(2);
+    const sealed = await artifactDigests(completed.scanDirectory);
+    const stdout = capture();
+    const stderr = capture();
+    const cli = dependencies({ environment: completed.environment });
+    const sharedUrl = "https://linear.app/example/issue/SYNTH-SHARED";
+    let handoffFile = "";
+    let completedEvents: string[] = [];
+
+    cli.publishScan = async (directory, options) =>
+      publishScanInternal(directory, options, {
+        environment: completed.environment,
+        resolveCodex: () => ({ command: "synthetic-codex" }),
+        runCodex: async (_command, _args, prompt, _environment, onEvent) => {
+          const payload = await publicationPayload(prompt);
+          handoffFile = payload.handoffFile;
+          completedEvents = payload.batches.flat().map((finding, index) =>
+            JSON.stringify({
+              type: "item.completed",
+              item: {
+                id: `tool-global-collision-${index + 1}`,
+                type: "mcp_tool_call",
+                server: "codex_apps",
+                tool: "linear.save_issue",
+                arguments: finding.arguments,
+                status: "completed",
+                result: {
+                  structured_content: {
+                    identifier: `SYNTH-STREAM-${index + 1}`,
+                    url: sharedUrl,
+                  },
+                  content: [],
+                },
+              },
+            }),
+          );
+          for (const event of completedEvents) {
+            onEvent?.(JSON.parse(event) as unknown);
+          }
+          return {
+            exitCode: 0,
+            stdout: completedEvents.join("\n"),
+            stderr: "",
+          };
+        },
+      });
+
+    expect(
+      await main(
+        [
+          "publish",
+          "scan",
+          completed.scanDirectory,
+          "--to",
+          "linear",
+          "--linear-team",
+          OPTIONS.teamId,
+          "--project",
+          OPTIONS.projectId,
+          "--json",
+        ],
+        stdout.stream,
+        stderr.stream,
+        cli,
+      ),
+    ).toBe(2);
+
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).not.toContain("] Created ");
+    expect(stderr.text()).toContain("[1/2] Failed ");
+    expect(stderr.text()).toContain("[2/2] Failed ");
+    expect(stderr.text()).toContain(
+      "could not verify every completed mutation",
+    );
+    expect(storedPublications(completed)).toEqual([]);
+    expect(
+      JSON.parse(await readFile(receiptPath(completed), "utf8")),
+    ).toMatchObject({
+      indeterminate: true,
+      created: [],
+      failed: completed.findings.map(({ findingId }) => ({ findingId })),
+      counts: { findings: 2, created: 0, failed: 2 },
+    });
+    expect(await readFile(handoffFile, "utf8")).toBe("");
+    const eventFiles = (await readdir(dirname(handoffFile))).filter(
+      (name) => name.startsWith("events-") && name.endsWith(".jsonl"),
+    );
+    expect(eventFiles).toHaveLength(1);
+    expect(
+      await readFile(join(dirname(handoffFile), eventFiles[0]!), "utf8"),
+    ).toBe(`${completedEvents.join("\n")}\n`);
+    expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
+  });
+
+  test("keeps whitespace-obscured identity reuse out of CLI history and retains recovery evidence", async () => {
+    const completed = await fixture(3);
+    const sealed = await artifactDigests(completed.scanDirectory);
+    const stdout = capture();
+    const stderr = capture();
+    const cli = dependencies({ environment: completed.environment });
+    const sharedValue = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+    const trustedIdentifier = "SYNTH-CLI-TRUSTED";
+    const siblingIdentifier = "SYNTH-CLI-SIBLING";
+    let handoffFile = "";
+    let handoffLines: string[] = [];
+    let completedEvent = "";
+
+    cli.publishScan = async (directory, options) =>
+      publishScanInternal(directory, options, {
+        environment: completed.environment,
+        resolveCodex: () => ({ command: "synthetic-codex" }),
+        runCodex: async (_command, _args, prompt) => {
+          const payload = await publicationPayload(prompt);
+          const trusted = payload.batches[0]![0]!;
+          const relabeled = payload.batches[0]![1]!;
+          const sibling = payload.batches[0]![2]!;
+          handoffFile = payload.handoffFile;
+          handoffLines = [
+            JSON.stringify({
+              scanId: payload.scanId,
+              findingId: sibling.findingId,
+              occurrenceId: sibling.occurrenceId,
+              issueIdentifier: siblingIdentifier,
+              arguments: sibling.arguments,
+            }),
+            JSON.stringify({
+              scanId: payload.scanId,
+              findingId: relabeled.findingId,
+              occurrenceId: relabeled.occurrenceId,
+              issueIdentifier: ` \t${sharedValue}\n`,
+              arguments: relabeled.arguments,
+            }),
+          ];
+          await appendFile(handoffFile, `${handoffLines.join("\n")}\n`);
+          completedEvent = JSON.stringify({
+            type: "item.completed",
+            item: {
+              id: "tool-cross-kind-publication",
+              type: "mcp_tool_call",
+              server: "codex_apps",
+              tool: "linear.save_issue",
+              arguments: trusted.arguments,
+              status: "completed",
+              result: {
+                structured_content: {
+                  id: sharedValue,
+                  identifier: trustedIdentifier,
+                  url: `https://linear.app/example/issue/${trustedIdentifier}`,
+                },
+              },
+            },
+          });
+          return { exitCode: 0, stdout: completedEvent, stderr: "" };
+        },
+      });
+
+    expect(
+      await main(
+        [
+          "publish",
+          "scan",
+          completed.scanDirectory,
+          "--to",
+          "linear",
+          "--linear-team",
+          OPTIONS.teamId,
+          "--project",
+          OPTIONS.projectId,
+          "--json",
+        ],
+        stdout.stream,
+        stderr.stream,
+        cli,
+      ),
+    ).toBe(2);
+
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain(
+      "could not verify every completed mutation",
+    );
+    expect(stderr.text()).not.toContain(sharedValue);
+    expect(stderr.text()).toContain(handoffFile);
+    expect(
+      storedPublications(completed).map(({ external_id }) => external_id),
+    ).toEqual([siblingIdentifier]);
+    const receipt = JSON.parse(
+      await readFile(receiptPath(completed), "utf8"),
+    ) as PublishScanResult;
+    expect(receipt).toMatchObject({
+      indeterminate: true,
+      created: [
+        {
+          findingId: completed.findings[2]!.findingId,
+          issueIdentifier: siblingIdentifier,
+        },
+      ],
+      failed: [
+        {
+          findingId: completed.findings[0]!.findingId,
+          error: CLAIM_COLLISION_ERROR,
+        },
+        {
+          findingId: completed.findings[1]!.findingId,
+          error: CLAIM_COLLISION_ERROR,
+        },
+      ],
+      counts: { findings: 3, created: 1, failed: 2 },
+    });
+    expect(
+      receipt.created.map(({ issueIdentifier }) => issueIdentifier),
+    ).not.toContain(sharedValue);
+    expect(JSON.stringify(receipt.failed)).not.toContain(sharedValue);
+    expect(await readFile(handoffFile, "utf8")).toBe(
+      `${handoffLines.join("\n")}\n`,
+    );
+    const eventFiles = (await readdir(dirname(handoffFile))).filter(
+      (name) => name.startsWith("events-") && name.endsWith(".jsonl"),
+    );
+    expect(eventFiles).toHaveLength(1);
+    expect(
+      await readFile(join(dirname(handoffFile), eventFiles[0]!), "utf8"),
+    ).toBe(`${completedEvent}\n`);
+    expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
+  });
+
+  test("persists a corroborated human key but keeps UUID-only SQLite publication evidence indeterminate", async () => {
+    const completed = await fixture(2);
+    const sealed = await artifactDigests(completed.scanDirectory);
+    const stdout = capture();
+    const stderr = capture();
+    const cli = dependencies({ environment: completed.environment });
+    const recoveredEntityId = "44444444-5555-4666-8777-888888888888";
+    const unresolvedEntityId = "55555555-6666-4777-8888-999999999999";
+    const recoveredIdentifier = "SYNTH-713";
+    const recoveredUrl = "https://linear.app/example/issue/SYNTH-713";
+    const unresolvedUrl = "https://linear.app/example/issue/SYNTH-ENTITY-ONLY";
+    let handoffFile = "";
+    let handoffLines: string[] = [];
+    let completedEvents: string[] = [];
+
+    cli.publishScan = async (directory, options) =>
+      publishScanInternal(directory, options, {
+        environment: completed.environment,
+        resolveCodex: () => ({ command: "synthetic-codex" }),
+        runCodex: async (_command, _args, prompt) => {
+          const payload = await publicationPayload(prompt);
+          const recovered = payload.batches[0]![0]!;
+          const unresolved = payload.batches[0]![1]!;
+          handoffFile = payload.handoffFile;
+          handoffLines = [
+            JSON.stringify({
+              scanId: payload.scanId,
+              findingId: recovered.findingId,
+              occurrenceId: recovered.occurrenceId,
+              issueIdentifier: recoveredEntityId,
+              url: recoveredUrl,
+              arguments: recovered.arguments,
+            }),
+            JSON.stringify({
+              scanId: payload.scanId,
+              findingId: unresolved.findingId,
+              occurrenceId: unresolved.occurrenceId,
+              issueIdentifier: unresolvedEntityId,
+              url: unresolvedUrl,
+              arguments: unresolved.arguments,
+            }),
+          ];
+          await appendFile(handoffFile, `${handoffLines.join("\n")}\n`);
+          completedEvents = [
+            JSON.stringify({
+              type: "item.completed",
+              item: {
+                id: "tool-corroborated-entity-publication",
+                type: "mcp_tool_call",
+                server: "codex_apps",
+                tool: "linear.save_issue",
+                arguments: recovered.arguments,
+                status: "completed",
+                result: {
+                  structured_content: {
+                    id: recoveredEntityId,
+                    key: recoveredIdentifier,
+                    url: recoveredUrl,
+                  },
+                },
+              },
+            }),
+            JSON.stringify({
+              type: "item.completed",
+              item: {
+                id: "tool-entity-only-publication",
+                type: "mcp_tool_call",
+                server: "codex_apps",
+                tool: "linear.save_issue",
+                arguments: unresolved.arguments,
+                status: "completed",
+                result: {
+                  structured_content: {
+                    id: unresolvedEntityId,
+                    url: unresolvedUrl,
+                  },
+                },
+              },
+            }),
+          ];
+          return {
+            exitCode: 0,
+            stdout: completedEvents.join("\n"),
+            stderr: "",
+          };
+        },
+      });
+
+    expect(
+      await main(
+        [
+          "publish",
+          "scan",
+          completed.scanDirectory,
+          "--to",
+          "linear",
+          "--linear-team",
+          OPTIONS.teamId,
+          "--project",
+          OPTIONS.projectId,
+          "--json",
+        ],
+        stdout.stream,
+        stderr.stream,
+        cli,
+      ),
+    ).toBe(2);
+
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain(
+      "could not verify every completed mutation",
+    );
+    expect(stderr.text()).toContain(handoffFile);
+    expect(
+      storedPublications(completed).map(({ external_id }) => external_id),
+    ).toEqual([recoveredIdentifier]);
+    const receipt = JSON.parse(
+      await readFile(receiptPath(completed), "utf8"),
+    ) as PublishScanResult;
+    expect(receipt).toMatchObject({
+      indeterminate: true,
+      created: [
+        {
+          findingId: completed.findings[0]!.findingId,
+          issueIdentifier: recoveredIdentifier,
+          url: recoveredUrl,
+        },
+      ],
+      failed: [
+        {
+          findingId: completed.findings[1]!.findingId,
+          error: expect.stringContaining("valid created issue identifier"),
+        },
+      ],
+      counts: { findings: 2, created: 1, failed: 1 },
+    });
+    expect(
+      receipt.created.map(({ issueIdentifier }) => issueIdentifier),
+    ).not.toContain(recoveredEntityId);
+    expect(
+      receipt.created.map(({ issueIdentifier }) => issueIdentifier),
+    ).not.toContain(unresolvedEntityId);
+    const recoveryRecords = (await readFile(handoffFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(recoveryRecords.map((record) => record["issueIdentifier"])).toEqual([
+      recoveredEntityId,
+      unresolvedEntityId,
+      recoveredIdentifier,
+    ]);
+    const eventFiles = (await readdir(dirname(handoffFile))).filter(
+      (name) => name.startsWith("events-") && name.endsWith(".jsonl"),
+    );
+    expect(eventFiles).toHaveLength(1);
+    expect(
+      await readFile(join(dirname(handoffFile), eventFiles[0]!), "utf8"),
+    ).toBe(`${completedEvents.join("\n")}\n`);
     expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
   });
 

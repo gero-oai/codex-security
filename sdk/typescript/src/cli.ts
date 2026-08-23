@@ -512,6 +512,11 @@ class PublicationProgressPresenter {
       return;
     }
 
+    if (event.type === "batch_settled") {
+      this.#dashboard?.setStage("Saving Linear publication results");
+      return;
+    }
+
     if (event.type === "issue_completed") {
       const detail =
         event.error === undefined
