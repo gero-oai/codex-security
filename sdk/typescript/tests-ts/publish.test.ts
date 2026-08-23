@@ -652,12 +652,14 @@ describe("direct Linear API publication", () => {
     expect(handoffLines).toHaveLength(20);
   });
 
-  test("cancels slow active peers after the first durable mutation checkpoint", async () => {
+  test("preserves uncertain peer evidence after checkpoint cancellation", async () => {
     const publication = preparedPublication(23);
     const controller = new AbortController();
+    const releasePeers = Promise.withResolvers<void>();
     const updates: PublishScanProgress[] = [];
     let started = 0;
     let stopped = 0;
+    let remoteCommitted = false;
     let persisted: string[] = [];
     let receipt: PublishScanResult | undefined;
     const injected = dependencies(
@@ -670,17 +672,18 @@ describe("direct Linear API publication", () => {
             if (input.title === publication.issues[0]!.title) {
               return;
             }
-            await new Promise<void>((_resolve, reject) => {
-              const stop = (): void => {
-                stopped += 1;
-                reject(new Error("Publication canceled."));
-              };
-              if (signal?.aborted) {
-                stop();
-                return;
-              }
-              signal?.addEventListener("abort", stop, { once: true });
-            });
+            if (input.title === publication.issues[1]!.title) {
+              remoteCommitted = true;
+              await releasePeers.promise;
+              throw new Error(
+                "Synthetic response unavailable after remote mutation.",
+              );
+            }
+            await releasePeers.promise;
+            if (signal?.aborted) {
+              stopped += 1;
+              throw new Error("Publication canceled.");
+            }
           },
         }),
         recordPublishedIssues: async (_prepared, issues) => {
@@ -702,8 +705,12 @@ describe("direct Linear API publication", () => {
           signal: controller.signal,
           onProgress: (event) => {
             updates.push(event);
-            if (event.type === "mutation_settled") {
+            if (
+              event.type === "mutation_settled" &&
+              !controller.signal.aborted
+            ) {
               controller.abort("checkpoint");
+              releasePeers.resolve();
             }
           },
         },
@@ -711,27 +718,25 @@ describe("direct Linear API publication", () => {
       ),
     ).rejects.toThrow(/publication handoff remains at/u);
 
-    expect({ started, stopped, persisted }).toEqual({
+    expect({ started, stopped, remoteCommitted, persisted }).toEqual({
       started: 20,
-      stopped: 19,
-      persisted: ["SEC-1"],
+      stopped: 0,
+      remoteCommitted: true,
+      persisted: Array.from(
+        { length: 20 },
+        (_, index) => `SEC-${index + 1}`,
+      ).filter((identifier) => identifier !== "SEC-2"),
     });
     expect(receipt).toMatchObject({
-      counts: { findings: 23, created: 1, failed: 22 },
+      indeterminate: true,
+      counts: { findings: 23, created: 19, failed: 4 },
     });
     expect(
       updates.filter((event) => event.type === "mutation_settled"),
-    ).toEqual([
-      {
-        type: "mutation_settled",
-        findingId: "finding-1",
-        settled: 1,
-        total: 23,
-      },
+    ).toHaveLength(20);
+    expect(updates.filter((event) => event.type === "batch_settled")).toEqual([
+      { type: "batch_settled", settled: 20, total: 23 },
     ]);
-    expect(updates.filter((event) => event.type === "batch_settled")).toEqual(
-      [],
-    );
     const terminal = updates.filter(
       (
         event,
@@ -741,51 +746,66 @@ describe("direct Linear API publication", () => {
     expect(terminal).toHaveLength(23);
     expect(
       terminal.filter((event) => event.issueIdentifier !== undefined),
-    ).toEqual([
-      {
-        type: "issue_completed",
-        findingId: "finding-1",
-        issueIdentifier: "SEC-1",
-        completed: 1,
-        total: 23,
-      },
-    ]);
+    ).toHaveLength(19);
     expect(
       updates.findIndex((event) => event.type === "issue_completed"),
     ).toBeGreaterThan(
       updates.findIndex((event) => event.type === "mutation_settled"),
     );
+
+    const stateDirectory = injected.environment!["CODEX_SECURITY_STATE_DIR"]!;
+    const handoffRoot = join(
+      stateDirectory,
+      "publications",
+      "linear",
+      "handoffs",
+    );
+    const handoffDirectories = await readdir(handoffRoot);
+    expect(handoffDirectories).toHaveLength(1);
+    const handoffRecords = (
+      await readFile(
+        join(handoffRoot, handoffDirectories[0]!, "issues.jsonl"),
+        "utf8",
+      )
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(handoffRecords).toHaveLength(20);
+    expect(
+      handoffRecords.find((record) => record["findingId"] === "finding-2"),
+    ).toMatchObject({
+      findingId: "finding-2",
+      error: "Synthetic response unavailable after remote mutation.",
+      possibleMutation: true,
+    });
   });
 
-  test("recovers completed direct issues before honoring cancellation", async () => {
+  test("lets active direct mutations settle after external cancellation", async () => {
     const publication = preparedPublication(23);
     const controller = new AbortController();
+    const firstBatchStarted = Promise.withResolvers<void>();
+    const releaseBatch = Promise.withResolvers<void>();
+    const updates: PublishScanProgress[] = [];
     let started = 0;
     let stopped = 0;
     let persisted: string[] = [];
-    let receipt: unknown;
+    let receipt: PublishScanResult | undefined;
     const injected = dependencies(
       publication,
       {},
       {
         linearClient: linearApiClient(publication, {
-          create: async (input, signal) => {
+          create: async (_input, signal) => {
             started += 1;
-            if (input.title === publication.issues[0]!.title) {
-              await new Promise((resolve) => setTimeout(resolve, 0));
-              controller.abort("SIGINT");
-              return;
+            if (started === 20) {
+              firstBatchStarted.resolve();
             }
-            await new Promise<void>((_resolve, reject) => {
-              signal?.addEventListener(
-                "abort",
-                () => {
-                  stopped += 1;
-                  reject(new Error("Publication canceled."));
-                },
-                { once: true },
-              );
-            });
+            await releaseBatch.promise;
+            if (signal?.aborted) {
+              stopped += 1;
+              throw new Error("Publication canceled.");
+            }
           },
         }),
         recordPublishedIssues: async (_prepared, issues) => {
@@ -798,26 +818,59 @@ describe("direct Linear API publication", () => {
       },
     );
 
-    await expect(
-      publishScanInternal(
-        publication.scanDirectory,
-        {
-          ...OPTIONS,
-          linearApiKey: "synthetic-key",
-          signal: controller.signal,
+    const publicationPromise = publishScanInternal(
+      publication.scanDirectory,
+      {
+        ...OPTIONS,
+        linearApiKey: "synthetic-key",
+        signal: controller.signal,
+        onProgress: (event) => {
+          updates.push(event);
         },
-        injected,
-      ),
-    ).rejects.toThrow(/publication handoff remains at/u);
+      },
+      injected,
+    );
+    await firstBatchStarted.promise;
+    controller.abort("external cancellation");
+    releaseBatch.resolve();
+    await expect(publicationPromise).rejects.toThrow(
+      /publication handoff remains at/u,
+    );
 
     expect({ started, stopped, persisted }).toEqual({
       started: 20,
-      stopped: 19,
-      persisted: ["SEC-1"],
+      stopped: 0,
+      persisted: Array.from({ length: 20 }, (_, index) => `SEC-${index + 1}`),
     });
     expect(receipt).toMatchObject({
-      counts: { findings: 23, created: 1, failed: 22 },
+      counts: { findings: 23, created: 20, failed: 3 },
     });
+    expect(
+      updates.filter((event) => event.type === "mutation_settled"),
+    ).toHaveLength(20);
+    expect(updates.filter((event) => event.type === "batch_settled")).toEqual([
+      { type: "batch_settled", settled: 20, total: 23 },
+    ]);
+
+    const stateDirectory = injected.environment!["CODEX_SECURITY_STATE_DIR"]!;
+    const handoffRoot = join(
+      stateDirectory,
+      "publications",
+      "linear",
+      "handoffs",
+    );
+    const handoffDirectories = await readdir(handoffRoot);
+    expect(handoffDirectories).toHaveLength(1);
+    expect(
+      (
+        await readFile(
+          join(handoffRoot, handoffDirectories[0]!, "issues.jsonl"),
+          "utf8",
+        )
+      )
+        .trim()
+        .split("\n"),
+    ).toHaveLength(20);
   });
 });
 

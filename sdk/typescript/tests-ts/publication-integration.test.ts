@@ -536,6 +536,96 @@ describe("database-backed Linear publication integration", () => {
     expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
   });
 
+  test("keeps neutral mutation counts out of terminal TTY progress", async () => {
+    const stdout = capture();
+    const stderr = capture(true);
+    const cli = dependencies();
+    const result: PublishScanResult = {
+      scanId: "11111111-1111-4111-8111-111111111111",
+      uploadId: "11111111-1111-4111-8111-111111111111",
+      destination: { type: "linear", teamId: "team-example" },
+      created: [
+        {
+          findingId: "finding-1",
+          occurrenceId: "occurrence-1",
+          issueIdentifier: "SEC-1",
+          url: "https://linear.app/example/issue/SEC-1",
+        },
+        {
+          findingId: "finding-2",
+          occurrenceId: "occurrence-2",
+          issueIdentifier: "SEC-2",
+          url: "https://linear.app/example/issue/SEC-2",
+        },
+      ],
+      failed: [],
+      counts: { findings: 2, created: 2, failed: 0 },
+    };
+    cli.publishScan = async (_directory, options) => {
+      options.onProgress?.({
+        type: "started",
+        scanId: result.scanId,
+        total: 2,
+      });
+      for (const settled of [1, 2]) {
+        options.onProgress?.({
+          type: "mutation_settled",
+          findingId: `finding-${settled}`,
+          settled,
+          total: 2,
+        });
+      }
+      for (const completed of [1, 2]) {
+        options.onProgress?.({
+          type: "issue_completed",
+          findingId: `finding-${completed}`,
+          issueIdentifier: `SEC-${completed}`,
+          completed,
+          total: 2,
+        });
+      }
+      options.onProgress?.({
+        type: "completed",
+        created: 2,
+        failed: 0,
+        total: 2,
+      });
+      return result;
+    };
+
+    expect(
+      await main(
+        [
+          "publish",
+          "scan",
+          "completed-scan",
+          "--to",
+          "linear",
+          "--linear-team",
+          "team-example",
+          "--json",
+        ],
+        stdout.stream,
+        stderr.stream,
+        cli,
+      ),
+    ).toBe(0);
+
+    const progress = stderr.text();
+    const neutralComplete = progress.indexOf(
+      "Saving Linear publication results: 2/2",
+    );
+    const firstCreated = progress.indexOf("Created SEC-1");
+    const terminalComplete = /FINDINGS\s+2 \/ 2 processed/gu.exec(
+      progress,
+    )?.index;
+    expect(neutralComplete).toBeGreaterThan(-1);
+    expect(neutralComplete).toBeLessThan(firstCreated);
+    expect(firstCreated).toBeGreaterThan(-1);
+    expect(terminalComplete).toBeGreaterThan(firstCreated);
+    expect(JSON.parse(stdout.text())).toEqual(result);
+  });
+
   test("publishes 23 sealed findings through a durable handoff without Codex JSON", async () => {
     const completed = await fixture(23);
     const sealed = await artifactDigests(completed.scanDirectory);

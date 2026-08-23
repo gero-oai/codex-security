@@ -514,7 +514,6 @@ class PublicationProgressPresenter {
 
     if (event.type === "mutation_settled") {
       if (this.#dashboard !== null) {
-        this.#dashboard.setPublicationProgress(event.settled, event.total);
         this.#dashboard.setStage(
           `Saving Linear publication results: ${event.settled}/${event.total}`,
         );

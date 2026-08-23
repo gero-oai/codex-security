@@ -262,13 +262,17 @@ export async function publishScanInternal(
     environment,
   );
   options.signal?.throwIfAborted();
-  const linearClient =
+  const usesAbortableLinearClient =
+    linearApiKey !== undefined &&
+    options.signal !== undefined &&
+    options.assigneeId?.includes("@") === true;
+  let linearClient =
     linearApiKey === undefined
       ? undefined
       : createLinearClient(
           {
             apiKey: linearApiKey,
-            ...(options.signal === undefined ? {} : { signal: options.signal }),
+            ...(usesAbortableLinearClient ? { signal: options.signal } : {}),
           },
           dependencies.linearClient,
         );
@@ -284,6 +288,13 @@ export async function publishScanInternal(
       );
     }
     assigneeId = users.nodes[0]!.id;
+  }
+  if (linearApiKey !== undefined && usesAbortableLinearClient) {
+    options.signal?.throwIfAborted();
+    linearClient = createLinearClient(
+      { apiKey: linearApiKey },
+      dependencies.linearClient,
+    );
   }
   const command =
     linearClient === undefined
@@ -543,7 +554,7 @@ async function publishLinearApiIssues(
         const { team, project, ...content } = arguments_;
         let outcome:
           | { issueIdentifier: string; url: string }
-          | { error: string };
+          | { error: string; possibleMutation?: true };
         try {
           const response = await client.createIssue({
             teamId: team,
@@ -557,8 +568,10 @@ async function publishLinearApiIssues(
           }
           outcome = { issueIdentifier: result.identifier, url: result.url };
         } catch (error) {
-          if (signal?.aborted) return;
-          outcome = { error: safeErrorMessage(error) };
+          outcome = {
+            error: safeErrorMessage(error),
+            ...(signal?.aborted ? { possibleMutation: true } : {}),
+          };
         }
 
         await appendHandoff({
