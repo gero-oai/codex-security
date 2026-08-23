@@ -1,5 +1,6 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
   appendFile,
   chmod,
@@ -14,6 +15,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
 import { afterEach, describe, expect, test } from "bun:test";
 import { main } from "../src/cli.js";
 import type {
@@ -1126,6 +1128,139 @@ describe("database-backed Linear publication integration", () => {
     ).toBeNull();
     expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
   });
+
+  test.skipIf(process.platform === "win32")(
+    "exits on a later signal when a Linear mutation never settles",
+    async () => {
+      const completed = await fixture(1);
+      const wrapper = join(
+        completed.stateDirectory,
+        "stalled-linear-publication.mjs",
+      );
+      const cliModule = new URL("../src/cli.ts", import.meta.url).href;
+      const publishModule = new URL("../src/publish.ts", import.meta.url).href;
+      const fixturesModule = new URL("./cli-fixtures.ts", import.meta.url).href;
+      await writeFile(
+        wrapper,
+        `
+import { main } from ${JSON.stringify(cliModule)};
+import { publishScanInternal } from ${JSON.stringify(publishModule)};
+import { dependencies } from ${JSON.stringify(fixturesModule)};
+
+const scanDirectory = ${JSON.stringify(completed.scanDirectory)};
+const environment = ${JSON.stringify(completed.environment)};
+const deps = dependencies({
+  currentDirectory: scanDirectory,
+  environment,
+});
+deps.now = () => Date.now();
+deps.addSignalListener = (signal, listener) => process.on(signal, listener);
+deps.removeSignalListener = (signal, listener) => process.off(signal, listener);
+deps.forceExit = (signal) => process.kill(process.pid, signal);
+deps.publishScan = async (directory, options) => {
+  options.signal?.addEventListener(
+    "abort",
+    () => process.stdout.write("publication-aborted\\n"),
+    { once: true },
+  );
+  return publishScanInternal(directory, options, {
+    environment,
+    linearClient: () => ({
+      users: async () => ({ nodes: [] }),
+      createIssue: async () => {
+        process.stdout.write("mutation-started\\n");
+        await new Promise(() => {});
+      },
+    }),
+  });
+};
+
+const status = await main(
+  [
+    "publish",
+    "scan",
+    scanDirectory,
+    "--to",
+    "linear",
+    "--linear-team",
+    ${JSON.stringify(OPTIONS.teamId)},
+    "--linear-project",
+    ${JSON.stringify(OPTIONS.projectId)},
+    "--linear-api-key",
+    "synthetic-key",
+    "--json",
+  ],
+  process.stdout,
+  process.stderr,
+  deps,
+);
+process.exit(status);
+`,
+        { mode: 0o600 },
+      );
+
+      const child = spawn(process.execPath, [wrapper], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      let diagnostic = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        diagnostic += chunk;
+      });
+      const lines = createInterface({ input: child.stdout });
+      const iterator = lines[Symbol.asyncIterator]();
+      const nextLine = async (): Promise<string> => {
+        const next = await iterator.next();
+        if (next.done) {
+          throw new Error(
+            `Stalled publication exited before its checkpoint: ${diagnostic}`,
+          );
+        }
+        return next.value;
+      };
+
+      try {
+        expect(await nextLine()).toBe("mutation-started");
+        expect(child.kill("SIGINT")).toBe(true);
+        expect(await nextLine()).toBe("publication-aborted");
+        expect(child.exitCode).toBeNull();
+        expect(child.signalCode).toBeNull();
+
+        expect(child.kill("SIGTERM")).toBe(true);
+        const [code, signal] = (await once(child, "close")) as [
+          number | null,
+          NodeJS.Signals | null,
+        ];
+        expect(code).toBeNull();
+        expect(signal).toBe("SIGTERM");
+        expect(diagnostic).not.toContain("Created");
+
+        const handoffRoot = join(
+          completed.stateDirectory,
+          "publications",
+          "linear",
+          "handoffs",
+        );
+        const handoffDirectories = await readdir(handoffRoot);
+        expect(handoffDirectories).toHaveLength(1);
+        const handoffDirectory = join(handoffRoot, handoffDirectories[0]!);
+        expect(
+          await readFile(join(handoffDirectory, "issues.jsonl"), "utf8"),
+        ).toBe("");
+        expect(
+          await readFile(join(handoffDirectory, "publication.json"), "utf8"),
+        ).toContain(completed.findings[0]!.findingId);
+      } finally {
+        lines.close();
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+          await once(child, "close").catch(() => undefined);
+        }
+      }
+    },
+    10_000,
+  );
 
   test("does not report created CLI outcomes that global evidence reconciliation rejects", async () => {
     const completed = await fixture(2);
