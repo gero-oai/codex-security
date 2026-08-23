@@ -1944,13 +1944,37 @@ export async function main(
     async run({ args, format, formatExplicit, options }) {
       const controller = new AbortController();
       let presentation: PublicationProgressPresenter | undefined;
+      let observingSignals = false;
+      let firstSignalAt = 0;
       const cancel = (signal: SignalName): void => {
         presentation?.stop();
+        if (controller.signal.aborted) {
+          // Launchers and terminals can deliver the same initial signal twice.
+          if (
+            signal === controller.signal.reason &&
+            dependencies.now() - firstSignalAt < 500
+          ) {
+            return;
+          }
+          stopObservingSignals();
+          dependencies.forceExit(signal);
+          return;
+        }
+        firstSignalAt = dependencies.now();
         controller.abort(signal);
       };
-      const onInterrupt = (): void => cancel("SIGINT");
-      const onTerminate = (): void => cancel("SIGTERM");
-      let observingSignals = false;
+      function onInterrupt(): void {
+        cancel("SIGINT");
+      }
+      function onTerminate(): void {
+        cancel("SIGTERM");
+      }
+      function stopObservingSignals(): void {
+        if (!observingSignals) return;
+        dependencies.removeSignalListener("SIGINT", onInterrupt);
+        dependencies.removeSignalListener("SIGTERM", onTerminate);
+        observingSignals = false;
+      }
       try {
         const linearApiKey = resolveLinearApiKey(
           dependencies.environment,
@@ -2232,10 +2256,7 @@ export async function main(
         }
         return undefined;
       } finally {
-        if (observingSignals) {
-          dependencies.removeSignalListener("SIGINT", onInterrupt);
-          dependencies.removeSignalListener("SIGTERM", onTerminate);
-        }
+        stopObservingSignals();
       }
     },
   });

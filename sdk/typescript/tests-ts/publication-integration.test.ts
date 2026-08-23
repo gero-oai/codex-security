@@ -1059,6 +1059,74 @@ describe("database-backed Linear publication integration", () => {
     expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
   });
 
+  test("redacts a failed final indeterminate receipt without deleting recovery evidence", async () => {
+    const completed = await fixture(1);
+    const sealed = await artifactDigests(completed.scanDirectory);
+    const stdout = capture();
+    const stderr = capture();
+    const cli = dependencies({ environment: completed.environment });
+    const secret = "sk-proj-SYNTHETIC_FINAL_RECEIPT_SECRET";
+    let handoffFile = "";
+    let handoffLine = "";
+
+    cli.publishScan = async (directory, options) =>
+      publishScanInternal(directory, options, {
+        environment: completed.environment,
+        resolveCodex: () => ({ command: "synthetic-codex" }),
+        runCodex: async (_command, _args, prompt) => {
+          const payload = await publicationPayload(prompt);
+          const finding = payload.batches[0]![0]!;
+          handoffFile = payload.handoffFile;
+          handoffLine = JSON.stringify({
+            scanId: payload.scanId,
+            findingId: finding.findingId,
+            occurrenceId: finding.occurrenceId,
+            error: "Synthetic response omitted the human issue key.",
+            possibleMutation: true,
+            arguments: finding.arguments,
+          });
+          await appendFile(handoffFile, `${handoffLine}\n`, "utf8");
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+        writeReceipt: async () => {
+          throw new Error(`Receipt storage unavailable: ${secret}`);
+        },
+      });
+
+    expect(
+      await main(
+        [
+          "publish",
+          "scan",
+          completed.scanDirectory,
+          "--to",
+          "linear",
+          "--linear-team",
+          OPTIONS.teamId,
+          "--project",
+          OPTIONS.projectId,
+          "--json",
+        ],
+        stdout.stream,
+        stderr.stream,
+        cli,
+      ),
+    ).toBe(2);
+
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain(
+      "partial receipt could not be saved: [redacted]",
+    );
+    expect(stderr.text()).toContain(handoffFile);
+    expect(stderr.text()).not.toContain(secret);
+    expect(storedPublications(completed)).toEqual([]);
+    expect(await readFile(handoffFile, "utf8")).toBe(`${handoffLine}\n`);
+    expect(
+      await readFile(receiptPath(completed), "utf8").catch(() => null),
+    ).toBeNull();
+    expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
+  });
+
   test("does not report created CLI outcomes that global evidence reconciliation rejects", async () => {
     const completed = await fixture(2);
     const sealed = await artifactDigests(completed.scanDirectory);

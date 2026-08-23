@@ -916,6 +916,9 @@ has already started is allowed to settle so its confirmed result or uncertain
 marks a fully saved request batch. Per-finding `issue_completed` events remain
 the terminal outcomes and are emitted only after all available identity
 evidence has been reconciled; they are not a pre-mutation cancellation hook.
+The CLI's first interrupt follows this recovery path. If a started request never
+settles, send a later interrupt to force the process to exit; the publication
+handoff remains for manual reconciliation.
 
 Add `projectId: "PROJECT_ID"` to the options to publish into a specific Linear
 project instead of directly to the team.

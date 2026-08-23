@@ -1,6 +1,9 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { stripVTControlCharacters } from "node:util";
 import { afterEach, describe, expect, test } from "bun:test";
 import { main } from "../src/cli.js";
@@ -379,6 +382,188 @@ describe("publish scan", () => {
       expect(signals.listeners.get("SIGTERM")?.size).toBe(0);
     }
   });
+
+  test("escalates a later publication signal while the first waits for recovery", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    const signals = new FakeSignals();
+    const releasePublication = Promise.withResolvers<void>();
+    const publicationStarted = Promise.withResolvers<void>();
+    const forced: string[] = [];
+    let observedSignal: AbortSignal | undefined;
+    const deps = dependencies({ signals });
+    deps.forceExit = (signal) => forced.push(signal);
+    deps.publishScan = async (_scanDirectory, options) => {
+      observedSignal = options.signal;
+      publicationStarted.resolve();
+      await releasePublication.promise;
+      return publicationResult();
+    };
+
+    const publishing = main(
+      ["publish", "scan", "completed-scan", ...DESTINATION_OPTIONS, "--json"],
+      stdout.stream,
+      stderr.stream,
+      deps,
+    );
+    await publicationStarted.promise;
+
+    try {
+      signals.emit("SIGINT");
+      expect(observedSignal?.aborted).toBe(true);
+      expect(observedSignal?.reason).toBe("SIGINT");
+      expect(forced).toEqual([]);
+
+      signals.emit("SIGTERM");
+      expect(forced).toEqual(["SIGTERM"]);
+      expect(signals.listeners.get("SIGINT")?.size).toBe(0);
+      expect(signals.listeners.get("SIGTERM")?.size).toBe(0);
+    } finally {
+      releasePublication.resolve();
+    }
+
+    expect(await publishing).toBe(130);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain("Publication canceled by Ctrl-C.");
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "exits on a later signal when a Linear mutation never settles",
+    async () => {
+      const directory = await publicationDirectory();
+      const wrapper = join(directory, "stalled-linear-publication.mjs");
+      const cliModule = new URL("../src/cli.ts", import.meta.url).href;
+      const publishModule = new URL("../src/publish.ts", import.meta.url).href;
+      const fixturesModule = new URL("./cli-fixtures.ts", import.meta.url).href;
+      await writeFile(
+        wrapper,
+        `
+import { main } from ${JSON.stringify(cliModule)};
+import { publishScanInternal } from ${JSON.stringify(publishModule)};
+import { dependencies } from ${JSON.stringify(fixturesModule)};
+
+const stateDirectory = ${JSON.stringify(directory)};
+const environment = {
+  ...process.env,
+  CODEX_SECURITY_STATE_DIR: stateDirectory,
+};
+const publication = {
+  scanId: "scan-stalled-publication",
+  uploadId: "scan-stalled-publication",
+  scanDirectory: stateDirectory,
+  destination: {
+    type: "linear",
+    teamId: "team-from-flags",
+    projectId: "project-from-flags",
+  },
+  issues: [{
+    findingId: "finding-stalled-publication",
+    occurrenceId: "occurrence-stalled-publication",
+    title: "[Codex Security][HIGH] Synthetic stalled publication",
+    description: "Synthetic stalled Linear mutation.",
+    priority: 2,
+  }],
+};
+const deps = dependencies({
+  currentDirectory: stateDirectory,
+  environment,
+});
+deps.now = () => Date.now();
+deps.addSignalListener = (signal, listener) => process.on(signal, listener);
+deps.removeSignalListener = (signal, listener) => process.off(signal, listener);
+deps.forceExit = (signal) => process.kill(process.pid, signal);
+deps.publishScan = async (scanDirectory, options) => {
+  options.signal?.addEventListener(
+    "abort",
+    () => process.stdout.write("publication-aborted\\n"),
+    { once: true },
+  );
+  return publishScanInternal(scanDirectory, options, {
+    environment,
+    prepare: async () => publication,
+    preparePublicationStore: async () => undefined,
+    recordPublishedIssues: async (_prepared, issues) => [...issues],
+    writeReceipt: async () => undefined,
+    linearClient: () => ({
+      users: async () => ({ nodes: [] }),
+      createIssue: async () => {
+        process.stdout.write("mutation-started\\n");
+        await new Promise(() => {});
+      },
+    }),
+  });
+};
+
+const status = await main(
+  [
+    "publish",
+    "scan",
+    stateDirectory,
+    "--to",
+    "linear",
+    "--linear-team",
+    "team-from-flags",
+    "--linear-project",
+    "project-from-flags",
+    "--linear-api-key",
+    "synthetic-key",
+    "--json",
+  ],
+  process.stdout,
+  process.stderr,
+  deps,
+);
+process.exit(status);
+`,
+        { mode: 0o600 },
+      );
+
+      const child = spawn(process.execPath, [wrapper], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      let diagnostic = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        diagnostic += chunk;
+      });
+      const lines = createInterface({ input: child.stdout });
+      const iterator = lines[Symbol.asyncIterator]();
+      const nextLine = async (): Promise<string> => {
+        const next = await iterator.next();
+        if (next.done) {
+          throw new Error(
+            `Stalled publication exited before its checkpoint: ${diagnostic}`,
+          );
+        }
+        return next.value;
+      };
+
+      try {
+        expect(await nextLine()).toBe("mutation-started");
+        expect(child.kill("SIGINT")).toBe(true);
+        expect(await nextLine()).toBe("publication-aborted");
+        expect(child.exitCode).toBeNull();
+        expect(child.signalCode).toBeNull();
+
+        expect(child.kill("SIGTERM")).toBe(true);
+        const [code, signal] = (await once(child, "close")) as [
+          number | null,
+          NodeJS.Signals | null,
+        ];
+        expect(code).toBeNull();
+        expect(signal).toBe("SIGTERM");
+        expect(diagnostic).not.toContain("Created");
+      } finally {
+        lines.close();
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+          await once(child, "close").catch(() => undefined);
+        }
+      }
+    },
+    10_000,
+  );
 
   test("prints the first five persisted Linear issues and database-backed totals", async () => {
     const stdout = capture();
