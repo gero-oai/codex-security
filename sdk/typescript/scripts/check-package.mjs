@@ -35,19 +35,22 @@ if (archive === undefined || args.length > 2) {
 
 const archivePath = resolve(archive);
 const MAX_EXPANDED_ASSET_BYTES = 32 * 1024 * 1024;
-const archiveBytes = gunzipSync(readFileSync(archivePath), {
+const compressedArchive = readFileSync(archivePath);
+const archiveBytes = gunzipSync(compressedArchive, {
   maxOutputLength: MAX_EXPANDED_ASSET_BYTES,
 });
+const rawEntries = plainTarEntries(archiveBytes);
 const PUBLIC_LOGO_SHA256 =
   "9b9c2b09b2fa064611fb62307d321d5c2ea70cf0789f7ce34cdb0fc0d9190b3a";
 const processEnvironment = { ...process.env };
 delete processEnvironment.TAR_OPTIONS;
 const tarOptions = {
   env: { ...processEnvironment, LC_ALL: "C" },
+  input: compressedArchive,
   maxBuffer: archiveBytes.byteLength + 1024,
 };
 function tar(args, encoding = "buffer") {
-  const result = spawnSync("tar", args, {
+  const result = spawnSync("tar", ["--ignore-zeros", ...args], {
     ...tarOptions,
     encoding,
   });
@@ -65,10 +68,7 @@ function invalidTarEntry() {
   throw new Error("npm tarball contains an invalid tar entry.");
 }
 
-const rawEntries = plainTarEntries(archiveBytes);
-const entries = tar(["-tzf", archivePath], "utf8")
-  .split(/\r?\n/u)
-  .filter(Boolean);
+const entries = tar(["-tzf", "-"], "utf8").split(/\r?\n/u).filter(Boolean);
 const files = new Set(entries);
 if (files.size !== entries.length) {
   throw new Error("npm tarball contains duplicate paths.");
@@ -191,7 +191,7 @@ for (const file of files) {
   }
 }
 
-const listing = tar(["-tvzf", archivePath], "utf8");
+const listing = tar(["-tvzf", "-"], "utf8");
 const listingLines = regularTarListingLines(listing);
 if (
   listingLines.length !== entries.length ||
@@ -235,7 +235,7 @@ function extractedArchiveFiles() {
       "--no-acls",
       "--no-xattrs",
       "-xzf",
-      archivePath,
+      "-",
       "-C",
       extractionRoot,
     ]);
