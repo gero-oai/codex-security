@@ -63,6 +63,12 @@ export interface PublishScanOptions {
 export type PublishScanProgress =
   | { type: "started"; scanId: string; total: number }
   | { type: "codex_event"; event: unknown }
+  | {
+      type: "mutation_settled";
+      findingId: string;
+      settled: number;
+      total: number;
+    }
   | { type: "batch_settled"; settled: number; total: number }
   | {
       type: "issue_completed";
@@ -522,10 +528,12 @@ async function publishLinearApiIssues(
     handoffWrites = pending.catch(() => undefined);
     await pending;
   };
+  let durableSettled = 0;
 
   for (let index = 0; index < publication.issues.length; index += 20) {
     if (signal?.aborted) break;
     const batch = publication.issues.slice(index, index + 20);
+    let batchSettled = 0;
     const settled = await Promise.allSettled(
       batch.map(async (issue) => {
         const arguments_ = linearPublicationArguments(
@@ -560,6 +568,14 @@ async function publishLinearApiIssues(
           ...outcome,
           arguments: arguments_,
         });
+        batchSettled += 1;
+        durableSettled += 1;
+        reportPublicationProgress(observer, {
+          type: "mutation_settled",
+          findingId: issue.findingId,
+          settled: durableSettled,
+          total: publication.issues.length,
+        });
       }),
     );
     const rejected = settled.find(
@@ -572,11 +588,13 @@ async function publishLinearApiIssues(
         { cause: rejected.reason },
       );
     }
-    reportPublicationProgress(observer, {
-      type: "batch_settled",
-      settled: index + batch.length,
-      total: publication.issues.length,
-    });
+    if (batchSettled === batch.length) {
+      reportPublicationProgress(observer, {
+        type: "batch_settled",
+        settled: durableSettled,
+        total: publication.issues.length,
+      });
+    }
   }
 }
 

@@ -435,6 +435,16 @@ describe("direct Linear API publication", () => {
       { type: "batch_settled", settled: 20, total: 23 },
       { type: "batch_settled", settled: 23, total: 23 },
     ]);
+    const mutationCheckpoints = updates.filter(
+      (event) => event.type === "mutation_settled",
+    );
+    expect(mutationCheckpoints).toHaveLength(23);
+    expect(mutationCheckpoints.map((event) => event.settled)).toEqual(
+      Array.from({ length: 23 }, (_, index) => index + 1),
+    );
+    expect(
+      new Set(mutationCheckpoints.map((event) => event.findingId)).size,
+    ).toBe(23);
     expect(
       updates
         .filter((event) => event.type === "issue_completed")
@@ -549,7 +559,7 @@ describe("direct Linear API publication", () => {
     );
   });
 
-  test("stops before the next direct batch when batch progress aborts publication", async () => {
+  test("stops before the next direct batch when durable mutation progress aborts publication", async () => {
     const publication = preparedPublication(23);
     const controller = new AbortController();
     const updates: PublishScanProgress[] = [];
@@ -584,7 +594,7 @@ describe("direct Linear API publication", () => {
           signal: controller.signal,
           onProgress: (event) => {
             updates.push(event);
-            if (event.type === "batch_settled") {
+            if (event.type === "mutation_settled") {
               controller.abort("SIGINT");
             }
           },
@@ -614,6 +624,13 @@ describe("direct Linear API publication", () => {
     expect(updates.filter((event) => event.type === "batch_settled")).toEqual([
       { type: "batch_settled", settled: 20, total: 23 },
     ]);
+    const mutationCheckpoints = updates.filter(
+      (event) => event.type === "mutation_settled",
+    );
+    expect(mutationCheckpoints).toHaveLength(20);
+    expect(mutationCheckpoints.map((event) => event.settled)).toEqual(
+      Array.from({ length: 20 }, (_, index) => index + 1),
+    );
 
     const stateDirectory = injected.environment!["CODEX_SECURITY_STATE_DIR"]!;
     const handoffRoot = join(
@@ -633,6 +650,111 @@ describe("direct Linear API publication", () => {
       .trim()
       .split("\n");
     expect(handoffLines).toHaveLength(20);
+  });
+
+  test("cancels slow active peers after the first durable mutation checkpoint", async () => {
+    const publication = preparedPublication(23);
+    const controller = new AbortController();
+    const updates: PublishScanProgress[] = [];
+    let started = 0;
+    let stopped = 0;
+    let persisted: string[] = [];
+    let receipt: PublishScanResult | undefined;
+    const injected = dependencies(
+      publication,
+      {},
+      {
+        linearClient: linearApiClient(publication, {
+          create: async (input, signal) => {
+            started += 1;
+            if (input.title === publication.issues[0]!.title) {
+              return;
+            }
+            await new Promise<void>((_resolve, reject) => {
+              const stop = (): void => {
+                stopped += 1;
+                reject(new Error("Publication canceled."));
+              };
+              if (signal?.aborted) {
+                stop();
+                return;
+              }
+              signal?.addEventListener("abort", stop, { once: true });
+            });
+          },
+        }),
+        recordPublishedIssues: async (_prepared, issues) => {
+          persisted = issues.map(({ issueIdentifier }) => issueIdentifier);
+          return [...issues];
+        },
+        writeReceipt: async (result) => {
+          receipt = structuredClone(result);
+        },
+      },
+    );
+
+    await expect(
+      publishScanInternal(
+        publication.scanDirectory,
+        {
+          ...OPTIONS,
+          linearApiKey: "synthetic-key",
+          signal: controller.signal,
+          onProgress: (event) => {
+            updates.push(event);
+            if (event.type === "mutation_settled") {
+              controller.abort("checkpoint");
+            }
+          },
+        },
+        injected,
+      ),
+    ).rejects.toThrow(/publication handoff remains at/u);
+
+    expect({ started, stopped, persisted }).toEqual({
+      started: 20,
+      stopped: 19,
+      persisted: ["SEC-1"],
+    });
+    expect(receipt).toMatchObject({
+      counts: { findings: 23, created: 1, failed: 22 },
+    });
+    expect(
+      updates.filter((event) => event.type === "mutation_settled"),
+    ).toEqual([
+      {
+        type: "mutation_settled",
+        findingId: "finding-1",
+        settled: 1,
+        total: 23,
+      },
+    ]);
+    expect(updates.filter((event) => event.type === "batch_settled")).toEqual(
+      [],
+    );
+    const terminal = updates.filter(
+      (
+        event,
+      ): event is Extract<PublishScanProgress, { type: "issue_completed" }> =>
+        event.type === "issue_completed",
+    );
+    expect(terminal).toHaveLength(23);
+    expect(
+      terminal.filter((event) => event.issueIdentifier !== undefined),
+    ).toEqual([
+      {
+        type: "issue_completed",
+        findingId: "finding-1",
+        issueIdentifier: "SEC-1",
+        completed: 1,
+        total: 23,
+      },
+    ]);
+    expect(
+      updates.findIndex((event) => event.type === "issue_completed"),
+    ).toBeGreaterThan(
+      updates.findIndex((event) => event.type === "mutation_settled"),
+    );
   });
 
   test("recovers completed direct issues before honoring cancellation", async () => {
@@ -1946,6 +2068,136 @@ describe("connected Linear publication", () => {
       `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
     );
   });
+
+  test.each([
+    [
+      "lowercase event, uppercase handoff, forward event order",
+      false,
+      "forward",
+    ],
+    [
+      "lowercase event, uppercase handoff, reverse event order",
+      false,
+      "reverse",
+    ],
+    [
+      "uppercase event, lowercase handoff, forward event order",
+      true,
+      "forward",
+    ],
+    [
+      "uppercase event, lowercase handoff, reverse event order",
+      true,
+      "reverse",
+    ],
+  ] as const)(
+    "rejects case-aliased entity UUIDs across %s",
+    async (_label, eventUsesUppercase, eventOrder) => {
+      const publication = preparedPublication(3);
+      const [eventOwner, handoffOwner, sibling] = publication.issues as [
+        PreparedPublicationIssue,
+        PreparedPublicationIssue,
+        PreparedPublicationIssue,
+      ];
+      const canonicalEntityId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      const uppercaseEntityId = canonicalEntityId.toUpperCase();
+      const eventEntityId = eventUsesUppercase
+        ? uppercaseEntityId
+        : canonicalEntityId;
+      const handoffEntityId = eventUsesUppercase
+        ? canonicalEntityId
+        : uppercaseEntityId;
+      const eventIdentifier = "SYNTH-UUID-EVENT-1";
+      const handoffIdentifier = "SYNTH-UUID-HANDOFF-2";
+      const siblingIdentifier = "SYNTH-UUID-SIBLING-3";
+      const collidingEvent = issueEventWithResult(eventOwner, {
+        structured_content: {
+          id: eventEntityId,
+          identifier: eventIdentifier,
+          url: `https://linear.app/example/issue/${eventIdentifier}`,
+        },
+      });
+      const siblingEvent = issueEvent(sibling, {
+        identifier: siblingIdentifier,
+        url: `https://linear.app/example/issue/${siblingIdentifier}`,
+      });
+      const output =
+        eventOrder === "forward"
+          ? [collidingEvent, siblingEvent].join("\n")
+          : [siblingEvent, collidingEvent].join("\n");
+      const handoff = {
+        ...handoffRecord(publication, handoffOwner, {
+          identifier: handoffIdentifier,
+          url: `https://linear.app/example/issue/${handoffIdentifier}`,
+        }),
+        id: handoffEntityId,
+      };
+      const receipts: PublishScanResult[] = [];
+      let handoffFile = "";
+      let persisted: string[] = [];
+
+      await expect(
+        publishScanInternal(
+          publication.scanDirectory,
+          OPTIONS,
+          dependencies(
+            publication,
+            {},
+            {
+              runCodex: async (_command, _args, input) => {
+                handoffFile = publicationData(input).handoffFile;
+                await writeHandoff(input, [handoff]);
+                return { exitCode: 0, stdout: output, stderr: "" };
+              },
+              recordPublishedIssues: async (_prepared, issues) => {
+                persisted = issues.map((issue) => issue.issueIdentifier);
+                return [...issues];
+              },
+              writeReceipt: async (receipt) => {
+                receipts.push(structuredClone(receipt));
+              },
+            },
+          ),
+        ),
+      ).rejects.toThrow("could not verify every completed mutation");
+
+      expect(persisted).toEqual([siblingIdentifier]);
+      const receipt = receipts.at(-1)!;
+      expect(receipt).toMatchObject({
+        indeterminate: true,
+        created: [
+          {
+            findingId: sibling.findingId,
+            issueIdentifier: siblingIdentifier,
+          },
+        ],
+        failed: [
+          {
+            findingId: eventOwner.findingId,
+            error: CLAIM_COLLISION_ERROR,
+          },
+          {
+            findingId: handoffOwner.findingId,
+            error: CLAIM_COLLISION_ERROR,
+          },
+        ],
+        counts: { findings: 3, created: 1, failed: 2 },
+      });
+      expect(JSON.stringify(receipt.failed)).not.toContain(canonicalEntityId);
+      expect(JSON.stringify(receipt.failed)).not.toContain(uppercaseEntityId);
+      const recoveryRecords = (await readFile(handoffFile, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(recoveryRecords.map((record) => record["findingId"])).toEqual([
+        handoffOwner.findingId,
+        sibling.findingId,
+      ]);
+      expect(
+        await readFile(await publicationEventsFile(handoffFile), "utf8"),
+      ).toBe(`${output}\n`);
+    },
+  );
 
   test.each([
     [

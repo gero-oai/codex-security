@@ -109,6 +109,33 @@ describe("Linear publication claim resolution", () => {
     },
   );
 
+  test("canonicalizes UUID spelling without changing human issue-key spelling", () => {
+    const uppercaseEntityId = alternateEntityId.toUpperCase();
+    expect(
+      resolvePublicationClaims({
+        id: uppercaseEntityId,
+        structured_content: { id: alternateEntityId },
+      }),
+    ).toEqual({
+      state: "absent",
+      claims: [{ kind: "entityId", value: alternateEntityId }],
+    });
+
+    const lowercaseIdentifier = identifier.toLowerCase();
+    expect(
+      resolvePublicationClaims({
+        identifier,
+        structured_content: { identifier: lowercaseIdentifier },
+      }),
+    ).toEqual({
+      state: "conflicting",
+      claims: [
+        { kind: "identifier", value: identifier },
+        { kind: "identifier", value: lowercaseIdentifier },
+      ],
+    });
+  });
+
   test("normalizes surrounding whitespace before classifying issue identities", () => {
     expect(
       resolvePublicationClaims({

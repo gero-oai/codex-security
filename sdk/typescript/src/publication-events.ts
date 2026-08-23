@@ -147,8 +147,10 @@ export function resolveClaims(
 ): ClaimResolution {
   const seen = new Set<string>();
   const normalized = claims.flatMap<PublicationClaim>((claim) => {
-    const value = claim.value.trim();
-    return value.length === 0 ? [] : [{ kind: claim.kind, value }];
+    const trimmed = claim.value.trim();
+    if (trimmed.length === 0) return [];
+    const value = isCanonicalUuid(trimmed) ? trimmed.toLowerCase() : trimmed;
+    return [{ kind: claim.kind, value }];
   });
   const retained = normalized
     .filter((claim) => {

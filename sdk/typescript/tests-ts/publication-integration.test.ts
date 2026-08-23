@@ -392,6 +392,7 @@ describe("database-backed Linear publication integration", () => {
     const stdout = capture();
     const stderr = capture();
     const cli = dependencies({ environment });
+    const progress: PublishScanProgress[] = [];
     const duplicateIdentifier = "SYNTH-DIRECT-DUPLICATE";
     const siblingIdentifier = "SYNTH-DIRECT-SIBLING";
     type LinearClient = ReturnType<
@@ -400,28 +401,38 @@ describe("database-backed Linear publication integration", () => {
     type IssueInput = Parameters<LinearClient["createIssue"]>[0];
 
     cli.publishScan = async (directory, options) =>
-      publishScanInternal(directory, options, {
-        environment,
-        linearClient: () =>
-          ({
-            users: async () => ({ nodes: [] }),
-            createIssue: async (input: IssueInput) => {
-              const index = completed.findings.findIndex(({ findingId }) =>
-                input.description?.includes(findingId),
-              );
-              expect(index).toBeGreaterThanOrEqual(0);
-              const identifier =
-                index < 2 ? duplicateIdentifier : siblingIdentifier;
-              return {
-                success: true,
-                issue: Promise.resolve({
-                  identifier,
-                  url: `https://linear.app/example/issue/${identifier}`,
-                }),
-              };
-            },
-          }) as unknown as LinearClient,
-      });
+      publishScanInternal(
+        directory,
+        {
+          ...options,
+          onProgress: (event) => {
+            progress.push(event);
+            options.onProgress?.(event);
+          },
+        },
+        {
+          environment,
+          linearClient: () =>
+            ({
+              users: async () => ({ nodes: [] }),
+              createIssue: async (input: IssueInput) => {
+                const index = completed.findings.findIndex(({ findingId }) =>
+                  input.description?.includes(findingId),
+                );
+                expect(index).toBeGreaterThanOrEqual(0);
+                const identifier =
+                  index < 2 ? duplicateIdentifier : siblingIdentifier;
+                return {
+                  success: true,
+                  issue: Promise.resolve({
+                    identifier,
+                    url: `https://linear.app/example/issue/${identifier}`,
+                  }),
+                };
+              },
+            }) as unknown as LinearClient,
+        },
+      );
 
     expect(
       await main(
@@ -445,6 +456,16 @@ describe("database-backed Linear publication integration", () => {
 
     expect(stdout.text()).toBe("");
     expect(stderr.text()).not.toContain(`Created ${duplicateIdentifier}`);
+    const mutationCheckpoints = progress.filter(
+      (event) => event.type === "mutation_settled",
+    );
+    expect(mutationCheckpoints).toHaveLength(3);
+    expect(
+      progress.findIndex((event) => event.type === "issue_completed"),
+    ).toBeGreaterThan(
+      progress.findLastIndex((event) => event.type === "mutation_settled"),
+    );
+    expect(stderr.text()).not.toContain("mutation_settled");
     expect(stderr.text()).toContain(
       `[1/3] Failed ${completed.findings[0]!.findingId}`,
     );

@@ -907,6 +907,13 @@ console.log(publication.scanId);
 console.log(publication.created.length);
 ```
 
+For direct API publication, `mutation_settled` is a neutral checkpoint emitted
+only after one finding's mutation result or error has been saved to the recovery
+handoff. It does not mean that an issue was created. `batch_settled` marks a
+fully saved request batch. Per-finding `issue_completed` events remain the
+terminal outcomes and are emitted only after all available identity evidence
+has been reconciled.
+
 Add `projectId: "PROJECT_ID"` to the options to publish into a specific Linear
 project instead of directly to the team.
 

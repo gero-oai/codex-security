@@ -512,7 +512,7 @@ class PublicationProgressPresenter {
       return;
     }
 
-    if (event.type === "batch_settled") {
+    if (event.type === "mutation_settled" || event.type === "batch_settled") {
       this.#dashboard?.setStage("Saving Linear publication results");
       return;
     }
