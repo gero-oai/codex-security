@@ -123,8 +123,6 @@ def target_tree(target: Path, revision: str) -> tuple[Path, str] | None:
     if not OBJECT_ID.fullmatch(revision):
         return None
     repository, prefix = git_worktree_context(target)
-    if local_git_bytes(repository, "replace", "--list") != b"":
-        return None
     raw_tree = local_git_bytes(
         repository,
         "rev-parse",
@@ -154,7 +152,7 @@ def capture_source_scopes(
     diff_target_kind: str | None = None,
 ) -> dict[str, Any]:
     revision, snapshot = target_identity[:2]
-    authority: dict[str, Any] = {"version": 1, "revision": revision, "scopes": []}
+    authority: dict[str, Any] = {"version": 1, "paths": []}
     if (
         (diff_target_kind is not None and diff_target_kind not in {"commit", "range"})
         or revision == "unversioned"
@@ -166,8 +164,7 @@ def capture_source_scopes(
         if context is None:
             return authority
         repository, tree = context
-        authority["targetTree"] = tree
-        captured: set[tuple[str, str, str]] = set()
+        captured: set[str] = set()
         for requested in paths:
             parsed = relative_path(requested)
             selected_path = safe_source_path(target, requested)
@@ -186,22 +183,17 @@ def capture_source_scopes(
                 metadata.st_mode
             ):
                 continue
-            scope = {
-                "path": parsed.as_posix(),
-                "kind": entry[1],
-                "objectId": entry[2],
-            }
-            key = tuple(scope.values())
-            if key not in captured:
-                captured.add(key)
-                authority["scopes"].append(scope)
+            selected = parsed.as_posix()
+            if selected not in captured:
+                captured.add(selected)
+                authority["paths"].append(selected)
     except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
-        return {"version": 1, "revision": revision, "scopes": []}
+        return {"version": 1, "paths": []}
     return authority
 
 
 def load_source_scopes(
-    scan: sqlite3.Row, target: Path
+    scan: sqlite3.Row, target: Path, selected_paths: list[str]
 ) -> tuple[Path, tuple[SourceScope, ...]] | None:
     try:
         saved = scan["source_scopes_json"]
@@ -210,56 +202,54 @@ def load_source_scopes(
     if not isinstance(saved, str):
         return None
     metadata = json.loads(saved)
-    tree = metadata.get("targetTree") if isinstance(metadata, dict) else None
-    records = metadata.get("scopes") if isinstance(metadata, dict) else None
+    records = metadata.get("paths") if isinstance(metadata, dict) else None
     if (
         not isinstance(metadata, dict)
         or metadata.get("version") != 1
-        or metadata.get("revision") != scan["target_revision"]
-        or not isinstance(tree, str)
-        or not OBJECT_ID.fullmatch(tree)
         or not isinstance(records, list)
         or not records
     ):
         return None
-    context = target_tree(target, scan["target_revision"])
-    if context is None or context[1] != tree:
+    expected = {
+        parsed.as_posix()
+        for value in selected_paths
+        if isinstance(value, str) and (parsed := relative_path(value)) is not None
+    }
+    if not expected:
         return None
-    repository, _ = context
+    context = target_tree(target, scan["target_revision"])
+    if context is None:
+        return None
+    repository, tree = context
     scopes: list[SourceScope] = []
+    seen: set[str] = set()
     for record in records:
-        if not isinstance(record, dict):
+        path = relative_path(record) if isinstance(record, str) else None
+        if path is None:
             return None
-        path = record.get("path")
-        kind = record.get("kind")
-        object_id = record.get("objectId")
-        requested_path = relative_path(path) if isinstance(path, str) else None
-        if (
-            requested_path is None
-            or kind not in {"file", "directory"}
-            or not isinstance(object_id, str)
-            or not OBJECT_ID.fullmatch(object_id)
-        ):
+        selected = path.as_posix()
+        if selected != record or selected not in expected or selected in seen:
+            return None
+        seen.add(selected)
+        entry = tree_path(repository, tree, selected)
+        if entry is None or entry[1] not in {"file", "directory"}:
             return None
         scope = {
-            "path": path,
-            "kind": kind,
-            "objectId": object_id,
+            "path": selected,
+            "kind": entry[1],
+            "objectId": entry[2],
         }
-        if tree_path(repository, tree, path) != (path, kind, object_id):
-            return None
         scopes.append(scope)
     return repository, tuple(scopes)
 
 
 def source_object_for_path(
     repository: Path,
-    target: Path,
     value: str,
     scope: SourceScope,
 ) -> str | None:
     path = relative_path(value)
-    if path is None or safe_source_path(target, value) is None:
+    if path is None:
         return None
     scope_path = PurePosixPath(scope["path"])
     scope_length = len(scope_path.parts)
@@ -284,6 +274,7 @@ def finding_source_excerpt(
     scan: sqlite3.Row,
     target: Path | None,
     locations: list[dict[str, Any]],
+    selected_paths: list[str],
 ) -> str | None:
     if scan["mode"] == "diff" and scan["diff_target_kind"] not in {"commit", "range"}:
         return None
@@ -293,54 +284,48 @@ def finding_source_excerpt(
     if snapshot is not None and snapshot != clean_worktree_content_digest():
         return None
     try:
-        context = load_source_scopes(scan, target)
+        context = load_source_scopes(scan, target, selected_paths)
     except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
         return None
     if context is None:
         return None
     repository, scopes = context
 
-    def priority(location: dict[str, Any]) -> int:
-        role = location.get("role")
-        if role == "root_control":
-            return 0
-        return 1 if "root_control" in str(role or "").lower() else 2
-
-    selected_location = None
-    object_id = None
-    for location in sorted(locations, key=priority):
-        path = location.get("path")
-        if not isinstance(path, str) or not isinstance(location.get("startLine"), int):
-            continue
-        try:
-            object_id = next(
-                (
-                    candidate
-                    for scope in scopes
-                    if (
-                        candidate := source_object_for_path(
-                            repository, target, path, scope
-                        )
-                    )
-                    is not None
-                ),
-                None,
-            )
-        except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
-            object_id = None
-        if object_id is not None:
-            selected_location = location
-            break
-    if selected_location is None or object_id is None:
+    location = next(
+        (
+            candidate
+            for candidate in locations
+            if "root_control" in str(candidate.get("role") or "").lower()
+        ),
+        locations[0],
+    )
+    path = location.get("path")
+    start_line = location.get("startLine")
+    if not isinstance(path, str) or not isinstance(start_line, int):
+        return None
+    try:
+        object_id = next(
+            (
+                candidate
+                for scope in scopes
+                if (
+                    candidate := source_object_for_path(repository, path, scope)
+                )
+                is not None
+            ),
+            None,
+        )
+    except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
+        return None
+    if object_id is None:
         return None
     source = scanned_source_text(repository, object_id)
     if not source or "\0" in source:
         return None
-    start_line = selected_location["startLine"]
     lines = source.splitlines()
     if start_line < 1 or start_line > len(lines):
         return None
-    end_line = selected_location.get("endLine")
+    end_line = location.get("endLine")
     last_affected_line = end_line if isinstance(end_line, int) else start_line
     excerpt_start = max(1, start_line - CONTEXT_LINES)
     excerpt_end = min(

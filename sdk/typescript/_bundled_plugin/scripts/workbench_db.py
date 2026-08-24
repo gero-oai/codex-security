@@ -4180,7 +4180,13 @@ def finding_result(
         result["knownSince"] = known_since
         result["knownScanIds"] = known_scan_ids
     result.pop("artifactPaths", None)
-    source_excerpt = finding_source_excerpt(scan, target, excerpt_locations)
+    try:
+        selected_paths = requested_scan_paths(scan)
+    except (IndexError, KeyError, TypeError, ValueError):
+        selected_paths = []
+    source_excerpt = finding_source_excerpt(
+        scan, target, excerpt_locations, selected_paths
+    )
     if source_excerpt:
         result["sourceExcerpt"] = source_excerpt
     artifact_paths = finding_artifact_paths(Path(scan["scan_dir"]), details)

@@ -93,6 +93,7 @@ function collisionRepository(root: string): {
   const rootTree = tree([
     ["040000", "tree", upperScope, "Scope"],
     ["040000", "tree", lowerScope, "scope"],
+    ["100644", "blob", blob("outside = True\n"), "outside.py"],
     ["040000", "tree", sourceTree, "src"],
   ]);
   const revision = git(repository, [
@@ -140,21 +141,6 @@ async function upgradedPlugin(root: string) {
   };
   manifest.version = "0.1.27";
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
-
-  const excerptPath = join(previous, "scripts", "workbench_source_excerpt.py");
-  const source = readFileSync(excerptPath, "utf8");
-  const strict = [
-    "        if len(aliases) != 1:",
-    "            return None",
-    "        entry = next((candidate for candidate in aliases if candidate[0] == name), None)",
-  ].join("\n");
-  const vulnerable = [
-    "        entry = next((candidate for candidate in aliases if candidate[0] == name), None)",
-    "        if entry is None and len(aliases) != 1:",
-    "            return None",
-  ].join("\n");
-  expect(source.split(strict)).toHaveLength(2);
-  writeFileSync(excerptPath, source.replace(strict, vulnerable));
 
   const home = join(root, "codex-home");
   const marketplace = join(home, "sdk-marketplace");
@@ -247,11 +233,12 @@ scan = {
     "target_snapshot_digest": clean_worktree_content_digest(),
     "source_scopes_json": authority_json,
 }
-def excerpt(path, saved=scan):
+def excerpt(path, saved=scan, selected_paths=("src",)):
     return excerpts.finding_source_excerpt(
         saved,
         repository,
         [{"path": path, "startLine": 1, "endLine": 1, "role": "root_control"}],
+        list(selected_paths),
     )
 original_git = excerpts.local_git_bytes
 blob_reads = []
@@ -268,6 +255,12 @@ collisions = {
 }
 collision_blob_reads = blob_reads[before:]
 outside = excerpt("outside.py")
+before = len(blob_reads)
+broadened = excerpt(
+    "outside.py",
+    {**scan, "source_scopes_json": json.dumps({"version": 1, "paths": ["."]})},
+)
+broadened_blob_reads = blob_reads[before:]
 excerpts.local_git_bytes = original_git
 legacy_scan = dict(scan)
 legacy_scan.pop("source_scopes_json")
@@ -299,16 +292,18 @@ immutable = {
 }
 print(json.dumps({
     "allowed": allowed,
+    "broadened": broadened,
+    "broadenedBlobReads": broadened_blob_reads,
     "collisionBlobReads": collision_blob_reads,
     "collisions": collisions,
-    "duplicateScopes": len(authority["scopes"]),
+    "duplicatePaths": len(authority["paths"]),
     "immutable": immutable,
     "invalid": invalid,
     "legacy": legacy,
     "mutable": {"excerpts": mutable, "gitCalls": len(git_calls)},
     "outside": outside,
-    "pathCollisionScopes": len(
-        excerpts.capture_source_scopes(repository, identity, ["Scope"])["scopes"]
+    "pathCollisionPaths": len(
+        excerpts.capture_source_scopes(repository, identity, ["Scope"])["paths"]
     ),
 }))
 `;
@@ -337,18 +332,12 @@ describe("workbench source excerpts", () => {
     temporaryRoots.push(root);
     const fixture = collisionRepository(root);
     const installation = await upgradedPlugin(root);
-    const stale = collisionProbe(
-      installation.predecessor.installedRoot,
-      fixture,
-    );
     const fixed = collisionProbe(installation.upgraded.installedRoot, fixture);
 
-    expect(
-      (stale["collisions"] as Record<string, string>)["src/LOWER.py"],
-    ).toContain("case_upper = True");
-    expect(stale["pathCollisionScopes"]).toBe(1);
     expect(fixed).toEqual({
       allowed: expect.stringContaining("allowed = True"),
+      broadened: null,
+      broadenedBlobReads: [],
       collisionBlobReads: [],
       collisions: {
         "src/LOWER.py": null,
@@ -356,7 +345,7 @@ describe("workbench source excerpts", () => {
         "src/é.py": null,
         "src/é.py": null,
       },
-      duplicateScopes: 1,
+      duplicatePaths: 1,
       immutable: {
         commit: expect.stringContaining("allowed = True"),
         range: expect.stringContaining("allowed = True"),
@@ -368,7 +357,7 @@ describe("workbench source excerpts", () => {
         gitCalls: 0,
       },
       outside: null,
-      pathCollisionScopes: 0,
+      pathCollisionPaths: 0,
     });
   }, 60_000);
 
@@ -377,7 +366,7 @@ describe("workbench source excerpts", () => {
       mkdtempSync(join(tmpdir(), "codex-security-source-writers-")),
     );
     temporaryRoots.push(root);
-    const { repository, revision } = ordinaryRepository(root);
+    const { repository } = ordinaryRepository(root);
     const scanRoot = join(root, "scans");
     const workspaceId = randomUUID();
     await workbench(root, [
@@ -471,7 +460,7 @@ describe("workbench source excerpts", () => {
     expect(query.status, query.stderr).toBe(0);
     const authorities = JSON.parse(query.stdout) as Record<
       string,
-      { revision: string; scopes: Array<{ path: string }>; targetTree: string }
+      { paths: string[]; version: number }
     >;
     const workspaceResults = workspace["results"] as Record<string, unknown>;
     const promptScan = prompt["scan"] as Record<string, unknown>;
@@ -487,12 +476,8 @@ describe("workbench source excerpts", () => {
     expect(Object.keys(authorities)).toHaveLength(expected.length);
     for (const [writer, scanId, paths] of expected) {
       const authority = authorities[String(scanId)];
-      expect(authority?.revision, writer).toBe(revision);
-      expect(authority?.targetTree, writer).toMatch(/^[a-f0-9]{40,64}$/u);
-      expect(
-        authority?.scopes.map(({ path }) => path),
-        writer,
-      ).toEqual([...paths]);
+      expect(authority?.version, writer).toBe(1);
+      expect(authority?.paths, writer).toEqual([...paths]);
     }
   }, 60_000);
 
@@ -571,13 +556,15 @@ workbench_db.finding_remediation_result = lambda database, occurrence_id: None
 workbench_db.finding_triage_result = lambda database, occurrence_id: None
 workbench_db.scan_history.finding_matches = lambda *arguments: ([], None, [])
 seen = []
-def source_excerpt(scan, selected, locations):
+selected_paths_seen = []
+def source_excerpt(scan, selected, locations, selected_paths):
     seen.extend(location["path"] for location in locations)
+    selected_paths_seen.extend(selected_paths)
     return "1  raw_path_authorized = True" if locations[0]["path"] == raw_path else None
 workbench_db.finding_source_excerpt = source_excerpt
 finding = workbench_db.finding_result(
     connection,
-    {"id": "scan", "started_at": "now", "scan_dir": str(target)},
+    {"id": "scan", "started_at": "now", "scan_dir": str(target), "scope": "."},
     {"id": "occurrence", "details_json": "{}", "confidence": "high", "severity": "high", "created_at": "now", "finding_id": "finding", "remediation": "fix", "summary": "summary", "title": "title"},
 )
 display_path = finding["locations"][0]["path"]
@@ -586,6 +573,7 @@ print(json.dumps({
     "displayDiffers": display_path != raw_path,
     "excerpt": finding.get("sourceExcerpt"),
     "sawRawPath": seen == [raw_path],
+    "sawSelectedPaths": selected_paths_seen == ["."],
 }))
 `;
     const result = spawnSync(
@@ -599,6 +587,7 @@ print(json.dumps({
       displayDiffers: true,
       excerpt: "1  raw_path_authorized = True",
       sawRawPath: true,
+      sawSelectedPaths: true,
     });
   });
 });
