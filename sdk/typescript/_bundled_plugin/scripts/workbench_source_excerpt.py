@@ -250,37 +250,6 @@ def load_source_scopes(
     return repository, tree, index
 
 
-def source_object_for_path(
-    repository: Path,
-    tree: str,
-    value: str,
-    scope: str,
-) -> str | None:
-    path = relative_path(value)
-    if path is None:
-        return None
-    scope_path = PurePosixPath(scope)
-    scope_length = len(scope_path.parts)
-    if len(path.parts) < scope_length:
-        return None
-    if path.parts[:scope_length] != scope_path.parts:
-        return None
-    suffix = path.parts[scope_length:]
-    selected = tree_path(repository, tree, scope)
-    if selected is None or selected[1] not in {"file", "directory"}:
-        return None
-    if selected[1] == "file":
-        return selected[2] if not suffix else None
-    if not suffix:
-        return None
-    entry = tree_path(
-        repository,
-        selected[2],
-        PurePosixPath(*suffix).as_posix(),
-    )
-    return entry[2] if entry is not None and entry[1] == "file" else None
-
-
 def source_scope_for_path(index: SourceScopeIndex, value: str) -> str | None:
     path = relative_path(value)
     if path is None:
@@ -338,9 +307,10 @@ def finding_source_excerpt_from_context(
         return None
     try:
         scope = source_scope_for_path(scopes, path)
+        selected = tree_path(repository, tree, path) if scope is not None else None
         object_id = (
-            source_object_for_path(repository, tree, path, scope)
-            if scope is not None
+            selected[2]
+            if selected is not None and selected[1] == "file"
             else None
         )
     except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):

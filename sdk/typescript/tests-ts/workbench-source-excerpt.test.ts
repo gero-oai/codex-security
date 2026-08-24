@@ -372,20 +372,13 @@ large_recipe_bytes = len(
 )
 original_target_tree = excerpts.target_tree
 original_tree_path = excerpts.tree_path
-original_source_object = excerpts.source_object_for_path
-scope_checks = 0
 tree_path_checks = 0
-def counted_source_object(*arguments, **kwargs):
-    global scope_checks
-    scope_checks += 1
-    return original_source_object(*arguments, **kwargs)
 def counted_tree_path(_, __, value):
     global tree_path_checks
     tree_path_checks += 1
     return (value, "file", "1" * 40)
 excerpts.target_tree = lambda *_: (repository, large_tree)
 excerpts.tree_path = counted_tree_path
-excerpts.source_object_for_path = counted_source_object
 try:
     large_context = excerpts.source_excerpt_context(
         large_scan, repository, large_paths
@@ -412,7 +405,6 @@ try:
 finally:
     excerpts.target_tree = original_target_tree
     excerpts.tree_path = original_tree_path
-    excerpts.source_object_for_path = original_source_object
 print(json.dumps({
     "allowed": allowed,
     "broadened": broadened,
@@ -424,7 +416,6 @@ print(json.dumps({
     "immutable": immutable,
     "largeExcerpt": large_excerpt,
     "largeRecipeFits": large_recipe_bytes < 256 * 1024,
-    "largeScopeChecks": scope_checks,
     "largeTreePathChecks": tree_path_checks,
     "invalid": invalid,
     "legacy": legacy,
@@ -490,7 +481,6 @@ describe("workbench source excerpts", () => {
       },
       largeExcerpt: null,
       largeRecipeFits: true,
-      largeScopeChecks: 0,
       largeTreePathChecks: 0,
       invalid: null,
       legacy: null,
