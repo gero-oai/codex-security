@@ -385,6 +385,8 @@ are preliminary until cross-component matching finishes. Use `--headless` for
 plain status lines; CI and redirected output use those automatically.
 Failed or incomplete components are also saved in `retry-components.json`.
 Pass that file to `--components-file` with a new output directory to retry them.
+The retry report covers only those components; it does not update the original
+combined report.
 
 Each component keeps its normal scan artifacts under `component-N/`.
 The combined `findings.json` uses the same root-cause matcher as `scans match`.
@@ -393,6 +395,9 @@ fingerprints differ. Each group keeps its highest-severity finding and all
 original scan and occurrence IDs. Match reasons and uncertain pairs are saved;
 uncertain findings stay separate. `summary.json` records scan coverage and
 whether matching finished. `report.md` links to the component reports.
+Large comparisons use bounded batches that cover every earlier/later finding
+pair. Overlapping confirmed groups are joined in code. Finding text is not
+truncated; pairs above Codex's input limit leave matching incomplete.
 These combined files are a project summary, not a new sealed scan. Use the
 individual scan folders with `export` and `publish`.
 
