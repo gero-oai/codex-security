@@ -367,6 +367,11 @@ review removes unnecessary or unrelated changes; style review checks project
 instructions, local conventions, and applicable style guides; final risk
 assessment examines applicability, blast radius, regression protection, and
 merge risk without merging the patch. Each stage is disabled by default.
+Set `--max-review-revisions 5` to allow up to five author revisions across the
+selected review stages, including actionable risk-assessment findings. After a
+later-stage revision, earlier selected reviews run again; blocked reviews still
+stop immediately. Without this option, minimality and style each permit one
+revision, and risk-assessment findings are not revised.
 JSON scan results include `patchSeverity`. Scan and
 saved-finding results include one `patches` entry per selected finding with
 status `verified`, `no_change`, `blocked`, or `failed`, plus `pullRequest` when

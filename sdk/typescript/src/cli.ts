@@ -229,6 +229,7 @@ const VALUE_OPTIONS = new Set([
   "--linear-filter",
   "--fail-on-severity",
   "--patch-severity",
+  "--max-review-revisions",
   "--resume-pr",
   "--scan",
   "--severity",
@@ -274,6 +275,14 @@ const ASSESS_PATCH_RISK_OPTION = z
   .boolean()
   .default(false)
   .describe("Assess the final patch's applicability, blast radius, and risk.");
+const MAX_REVIEW_REVISIONS_OPTION = z
+  .number()
+  .int()
+  .nonnegative()
+  .optional()
+  .describe(
+    "Maximum author revisions after actionable patch reviews; restarts selected reviews after later-stage revisions.",
+  );
 
 function optionValue(flag: string) {
   return z.string().min(1, `${flag} must not be empty.`);
@@ -840,6 +849,7 @@ interface PatchReviewOptions {
   reviewMinimality?: boolean;
   reviewStyle?: boolean;
   assessPatchRisk?: boolean;
+  maxReviewRevisions?: number;
 }
 
 type PatchReviewStage =
@@ -2320,6 +2330,7 @@ export async function main(
           reviewMinimality: REVIEW_MINIMALITY_OPTION,
           reviewStyle: REVIEW_STYLE_OPTION,
           assessPatchRisk: ASSESS_PATCH_RISK_OPTION,
+          maxReviewRevisions: MAX_REVIEW_REVISIONS_OPTION,
           createPr: CREATE_PR_OPTION,
           maxCost: z
             .number()
@@ -2374,7 +2385,8 @@ export async function main(
             options.patch ||
             (!options.reviewMinimality &&
               !options.reviewStyle &&
-              !options.assessPatchRisk),
+              !options.assessPatchRisk &&
+              options.maxReviewRevisions === undefined),
           { message: "Patch review options require --patch." },
         )
         .refine((options) => !options.createPr || options.patch, {
@@ -2453,6 +2465,7 @@ export async function main(
             reviewMinimality: options.reviewMinimality,
             reviewStyle: options.reviewStyle,
             assessPatchRisk: options.assessPatchRisk,
+            maxReviewRevisions: options.maxReviewRevisions,
             createPr: options.createPr,
             maxCostUsd: options.maxCost,
             headless: options.headless,
@@ -3095,6 +3108,7 @@ export async function main(
         reviewMinimality: REVIEW_MINIMALITY_OPTION,
         reviewStyle: REVIEW_STYLE_OPTION,
         assessPatchRisk: ASSESS_PATCH_RISK_OPTION,
+        maxReviewRevisions: MAX_REVIEW_REVISIONS_OPTION,
         createPr: CREATE_PR_OPTION,
         resumePr: optionValue("--resume-pr")
           .optional()
@@ -3125,6 +3139,7 @@ export async function main(
               options.reviewMinimality ||
               options.reviewStyle ||
               options.assessPatchRisk ||
+              options.maxReviewRevisions !== undefined ||
               options.effort !== undefined ||
               options.codex.length > 0
             ) {
@@ -3183,6 +3198,7 @@ export async function main(
                 reviewMinimality: options.reviewMinimality,
                 reviewStyle: options.reviewStyle,
                 assessPatchRisk: options.assessPatchRisk,
+                maxReviewRevisions: options.maxReviewRevisions,
               },
             );
             exitCode = patchExitCode(patches);
@@ -3260,6 +3276,7 @@ export async function main(
               reviewMinimality: options.reviewMinimality,
               reviewStyle: options.reviewStyle,
               assessPatchRisk: options.assessPatchRisk,
+              maxReviewRevisions: options.maxReviewRevisions,
             },
           );
         } catch (error) {
@@ -4367,6 +4384,7 @@ async function runSkill(
     return 0;
   }
 
+  let totalRevisions = 0;
   for (let stageIndex = 0; stageIndex < stages.length; stageIndex += 1) {
     const stage = stages[stageIndex]!;
     let stageRevisions = 0;
@@ -4426,14 +4444,16 @@ async function runSkill(
       if (verdict.status === "approved") break;
       if (
         verdict.status === "blocked" ||
-        stageRevisions >= 1 ||
-        stage === "patch-risk-assessment"
+        (options.maxReviewRevisions === undefined
+          ? stageRevisions >= 1 || stage === "patch-risk-assessment"
+          : totalRevisions >= options.maxReviewRevisions)
       ) {
         stderr.write(`${stage} review did not approve the patch.\n`);
         return 2;
       }
 
       stageRevisions += 1;
+      totalRevisions += 1;
       patchResponse = "";
       status = await run(patchOutput, {
         ...options,
@@ -4445,6 +4465,10 @@ async function runSkill(
           "The revised patch did not return a valid review subject.\n",
         );
         return 2;
+      }
+      if (options.maxReviewRevisions !== undefined && stageIndex > 0) {
+        stageIndex = -1;
+        break;
       }
     }
   }
@@ -5884,6 +5908,7 @@ async function executeScan(
           reviewMinimality: arguments_.reviewMinimality,
           reviewStyle: arguments_.reviewStyle,
           assessPatchRisk: arguments_.assessPatchRisk,
+          maxReviewRevisions: arguments_.maxReviewRevisions,
         },
       );
       scanData = { ...scanData, patchSeverity: patchThreshold, patches };

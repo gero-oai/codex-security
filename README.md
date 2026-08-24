@@ -44,6 +44,9 @@ Add `--review-minimality`, `--review-style`, or `--assess-patch-risk` to
 scope, local coding conventions, and final patch applicability and merge risk.
 Each review is optional and disabled by default; risk assessment never merges a
 pull request.
+Set `--max-review-revisions 5` to allow up to five author revisions across
+actionable review findings; later-stage revisions restart earlier reviews, and
+blocked reviews still stop immediately.
 
 Deep-scan discovery stops after 96 hours by default. Set `--max-time-hours` to
 any positive number of hours, including fractional hours, up to 96. Completed
