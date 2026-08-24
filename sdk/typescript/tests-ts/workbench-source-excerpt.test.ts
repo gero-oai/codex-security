@@ -229,7 +229,7 @@ function collisionProbe(
   },
 ) {
   const program = String.raw`
-import io, json, subprocess, sys
+import io, json, os, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import workbench_source_excerpt as excerpts
@@ -437,13 +437,44 @@ stream_responses = CappedRead(
     + wide_tree
     + b"\n"
 )
+name_limit = 255 * 4 if sys.platform == "win32" else os.pathconf(repository, "PC_NAME_MAX")
 streamed_aliases = excerpts.matching_tree_entries(
-    stream_requests, stream_responses, batch_object, "target.py"
+    stream_requests, stream_responses, batch_object, "target.py", name_limit
 )
+alias_tree = (b"100644 target.py\0" + entry_object) * 20_000
+alias_responses = CappedRead(
+    f"{batch_object} tree {len(alias_tree)}\n".encode()
+    + alias_tree
+    + b"\n"
+)
+ambiguous_alias = excerpts.matching_tree_entries(
+    io.BytesIO(), alias_responses, batch_object, "target.py", name_limit
+)
+oversized_name = b"x" * (name_limit + 1)
+oversized_tree = b"100644 " + oversized_name + b"\0" + entry_object
+try:
+    excerpts.matching_tree_entries(
+        io.BytesIO(),
+        io.BytesIO(
+            f"{batch_object} tree {len(oversized_tree)}\n".encode()
+            + oversized_tree
+            + b"\n"
+        ),
+        batch_object,
+        "target.py",
+        name_limit,
+    )
+except ValueError:
+    oversized_rejected = True
+else:
+    oversized_rejected = False
 streamed_wide_tree = (
-    streamed_aliases == (("target.py", "file", entry_object.hex()),)
+    streamed_aliases == ("target.py", "file", entry_object.hex())
     and stream_requests.getvalue() == batch_object.encode() + b"\0"
     and stream_responses.largest == 64 * 1024
+    and ambiguous_alias is None
+    and alias_responses.largest == 64 * 1024
+    and oversized_rejected
 )
 large_paths = [str(index) for index in range(20_000)]
 large_tree = "0" * 40

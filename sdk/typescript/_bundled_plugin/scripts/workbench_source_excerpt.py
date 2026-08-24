@@ -75,8 +75,12 @@ def local_git_bytes(repository: Path, *arguments: str) -> bytes | None:
 
 
 def matching_tree_entries(
-    requests: IO[bytes], responses: IO[bytes], object_id: str, name: str
-) -> tuple[TreeEntry, ...]:
+    requests: IO[bytes],
+    responses: IO[bytes],
+    object_id: str,
+    name: str,
+    name_bytes_limit: int,
+) -> TreeEntry | None:
     encoded_object = object_id.encode("ascii")
     requests.write(encoded_object + b"\0")
     requests.flush()
@@ -93,61 +97,77 @@ def matching_tree_entries(
         raise ValueError("invalid tree response")
     unread = int(fields[2])
     buffered = bytearray()
+    cursor = 0
 
     def read_more() -> None:
-        nonlocal unread
+        nonlocal cursor, unread
+        if cursor:
+            del buffered[:cursor]
+            cursor = 0
         chunk = responses.read(min(64 * 1024, unread))
         if not chunk:
             raise ValueError("truncated tree response")
         buffered.extend(chunk)
         unread -= len(chunk)
 
-    def read_field(delimiter: int) -> bytearray:
+    def read_field(delimiter: int, maximum_bytes: int) -> bytearray:
+        nonlocal cursor
         field = bytearray()
         while True:
             try:
-                end = buffered.index(delimiter)
+                end = buffered.index(delimiter, cursor)
             except ValueError:
-                field.extend(buffered)
-                buffered.clear()
+                available = len(buffered) - cursor
+                if len(field) + available > maximum_bytes:
+                    raise ValueError("oversized tree field") from None
+                field.extend(buffered[cursor:])
+                cursor = len(buffered)
                 if not unread:
                     raise ValueError("unterminated tree entry") from None
                 read_more()
                 continue
-            field.extend(buffered[:end])
-            del buffered[: end + 1]
+            if len(field) + end - cursor > maximum_bytes:
+                raise ValueError("oversized tree field")
+            field.extend(buffered[cursor:end])
+            cursor = end + 1
             return field
 
     def read_object_id(size: int) -> bytes:
-        while len(buffered) < size:
+        nonlocal cursor
+        while len(buffered) - cursor < size:
             if not unread:
                 raise ValueError("truncated tree entry")
             read_more()
-        value = bytes(buffered[:size])
-        del buffered[:size]
+        value = bytes(buffered[cursor : cursor + size])
+        cursor += size
         return value
 
     object_id_bytes = len(object_id) // 2
     expected_name = normalized_path_component(name)
-    matches = []
-    while buffered or unread:
-        mode = bytes(read_field(ord(" ")))
-        decoded_name = read_field(0).decode(
+    selected = None
+    ambiguous = False
+    while cursor < len(buffered) or unread:
+        mode = bytes(read_field(ord(" "), 6))
+        decoded_name = read_field(0, name_bytes_limit).decode(
             sys.getfilesystemencoding(), errors="surrogateescape"
         )
-        entry_object = read_object_id(object_id_bytes).hex()
-        kind = (
-            "directory"
-            if mode in {b"40000", b"040000"}
-            else "file"
-            if mode in {b"100644", b"100755"}
-            else "other"
-        )
-        if normalized_path_component(decoded_name) == expected_name:
-            matches.append((decoded_name, kind, entry_object))
+        entry_object = read_object_id(object_id_bytes)
+        if not ambiguous and normalized_path_component(decoded_name) == expected_name:
+            if selected is not None:
+                selected = None
+                ambiguous = True
+            else:
+                kind = (
+                    "directory"
+                    if mode in {b"40000", b"040000"}
+                    else "file"
+                    if mode in {b"100644", b"100755"}
+                    else "other"
+                )
+                selected = (decoded_name, kind, entry_object.hex())
     if responses.read(1) != b"\n":
         raise ValueError("missing tree terminator")
-    return tuple(matches)
+    return selected
 
 
 def tree_path(
@@ -165,6 +185,17 @@ def tree_path(
     kind, object_id = "directory", tree
     if not path.parts:
         return path.as_posix(), kind, object_id
+    try:
+        # Windows components are at most 255 UTF-16 units; Git stores path bytes.
+        name_bytes_limit = (
+            255 * 4
+            if os.name == "nt"
+            else os.pathconf(repository, "PC_NAME_MAX")
+        )
+    except (AttributeError, OSError, ValueError):
+        return None
+    if name_bytes_limit < 1:
+        return None
 
     environment = os.environ.copy()
     for variable in GIT_REPOSITORY_ENVIRONMENT:
@@ -199,18 +230,16 @@ def tree_path(
                 if kind != "directory":
                     return None
                 aliases = matching_tree_entries(
-                    process.stdin, process.stdout, object_id, name
+                    process.stdin,
+                    process.stdout,
+                    object_id,
+                    name,
+                    name_bytes_limit,
                 )
                 # The normalized name must be unique before an exact spelling can win.
-                if len(aliases) != 1:
+                if aliases is None or aliases[0] != name:
                     return None
-                entry = next(
-                    (candidate for candidate in aliases if candidate[0] == name),
-                    None,
-                )
-                if entry is None:
-                    return None
-                _, kind, object_id = entry
+                _, kind, object_id = aliases
                 if (
                     selected_kinds is not None
                     and (expected_kind := selected_kinds.get(depth)) is not None
