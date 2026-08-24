@@ -376,17 +376,29 @@ def git_directory_snapshot_paths(target: Path) -> list[Path] | None:
     repository, pathspec = git_worktree_context(target)
     scope = repository / pathspec
     scope_depth = len(Path(pathspec).parts)
-    resolved_prefixes: dict[str, tuple[str, ...] | None] = {}
-    # Git's icase pathspecs do not cover every filesystem case alias.
+    matching_prefixes: dict[str, bool] = {}
+    listing_args: list[str] = []
+    inventory_pathspec = pathspec
+    if scope_depth:
+        if any(
+            not character.isascii() and character.lower() != character.upper()
+            for character in pathspec
+        ):
+            # Git's icase pathspecs do not cover Unicode case aliases.
+            inventory_pathspec = "."
+        else:
+            listing_args.append("--no-literal-pathspecs")
+            inventory_pathspec = f":(icase,literal){pathspec}"
     listed = git_bytes(
         repository,
+        *listing_args,
         "ls-files",
         "--cached",
         "--others",
         "--exclude-standard",
         "-z",
         "--",
-        ".",
+        inventory_pathspec,
     )
     if listed is None:
         raise SystemExit("Could not inspect files in the selected Git working tree.")
@@ -398,17 +410,17 @@ def git_directory_snapshot_paths(target: Path) -> list[Path] | None:
             if len(relative.parts) <= scope_depth:
                 continue
             # Git's index spelling can differ after a case-only directory rename.
-            # Resolve each scope-depth prefix once, without following symlink leaves.
+            # Compare each scope-depth prefix once, without following symlink leaves.
             prefix = repository.joinpath(*relative.parts[:scope_depth])
             key = str(prefix)
-            if key not in resolved_prefixes:
+            if key not in matching_prefixes:
                 try:
-                    resolved_prefixes[key] = prefix.resolve(strict=True).parts
-                except FileNotFoundError:
-                    resolved_prefixes[key] = None
-            # Compare canonical strings, not WindowsPath's case-folded equality:
-            # Windows also supports genuinely case-sensitive directories.
-            if resolved_prefixes[key] != scope.parts:
+                    matching_prefixes[key] = prefix.samefile(scope)
+                except (FileNotFoundError, NotADirectoryError):
+                    matching_prefixes[key] = False
+            # realpath spelling is not a filesystem identity on case-insensitive
+            # POSIX volumes; WindowsPath equality also folds distinct names.
+            if not matching_prefixes[key]:
                 continue
             path = scope.joinpath(*relative.parts[scope_depth:])
         try:
