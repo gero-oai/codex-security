@@ -179,6 +179,20 @@ describe("CLI skill commands", () => {
             ),
           ),
       ).toEqual([...expected]);
+      for (const { prompt } of invocations.slice(1)) {
+        expect(prompt).not.toContain("Optional Sequential Patch Reviews");
+        if (prompt.includes("only the minimality review")) {
+          expect(prompt).toContain("each changed file, production change");
+          expect(prompt).not.toContain(
+            "nearest applicable repository instructions",
+          );
+        } else {
+          expect(prompt).toContain(
+            "nearest applicable repository instructions",
+          );
+          expect(prompt).not.toContain("each changed file, production change");
+        }
+      }
       expect(stdout.text()).toBe("Verified synthetic patch.\n");
     }
 

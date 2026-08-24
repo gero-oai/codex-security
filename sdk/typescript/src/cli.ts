@@ -867,6 +867,19 @@ const PATCH_REVIEW_POLICY = [
   "Request a structural change only when an applicable mandatory rule requires it, the current patch introduces a concrete problem, and no smaller compliant correction exists.",
 ].join("\n");
 
+const PATCH_REVIEW_ASSIGNMENTS = {
+  minimality: [
+    "Explain why each changed file, production change, regression test, dependency, helper, and abstraction is necessary to close or prove the reported security boundary.",
+    "Identify unrelated refactoring, formatting, new dependencies, avoidable helper-signature or data-type changes, unnecessary control-flow or error-semantics changes, and broader fixes when an equally complete narrower change exists.",
+    "Report only concrete, source-backed simplifications that preserve security closure, legitimate behavior, meaningful regression coverage, and unrelated pre-existing user changes.",
+  ].join("\n"),
+  "local-coding-style": [
+    "Inspect the nearest applicable repository instructions, organization- or project-specific style guides, existing helpers, and representative nearby code.",
+    "Check changed code for established naming, types, ownership, control flow, error handling, testing conventions, and formatter or linter requirements. Introduce exceptions or other uncommon mechanisms only when required and supported by local precedent.",
+    "Distinguish documented requirements and consistent local conventions from personal preferences. Suggest only the smallest in-scope correction; never request broad formatting, cleanup, redesign, or unrelated refactoring.",
+  ].join("\n"),
+};
+
 interface ScanArguments extends DeepScanOptions, PatchReviewOptions {
   auth?: ScanAuthMode;
   verbose?: boolean;
@@ -4622,7 +4635,8 @@ async function runSkillStage(
   }
   const plugin = await bundledPluginRoot();
   const verify = skill === "verify-fix";
-  const review = options.reviewStage !== undefined;
+  const reviewStage = options.reviewStage;
+  const review = reviewStage !== undefined;
   const readOnly = verify || review;
   const inputLabel = skill === "validation" || verify ? "Findings" : "Issues";
   const prompt = [
@@ -4644,10 +4658,10 @@ async function runSkillStage(
         ]
       : review
         ? [
-            `Independently perform only the ${options.reviewStage} review of the existing candidate patch. You are a read-only reviewer: do not edit, delegate, expand scope, or rely on the patch author's rationale.`,
-            options.reviewStage === "review-conflict-reconciliation"
+            `Independently perform only the ${reviewStage} review of the existing candidate patch. You are a read-only reviewer: do not edit, delegate, expand scope, or rely on the patch author's rationale.`,
+            reviewStage === "review-conflict-reconciliation"
               ? "Resolve the conflicting prior review decisions. Make one binding decision selecting the smallest behavior-preserving patch that fully fixes the finding and satisfies mandatory applicable project rules. Approve the current patch if it already meets those requirements; request a revision only for a concrete remaining issue."
-              : `Follow only the corresponding Optional Sequential Patch Reviews assignment in the bundled $codex-security:fix-finding skill at ${JSON.stringify(join(plugin, "skills", "fix-finding", "SKILL.md"))}.`,
+              : PATCH_REVIEW_ASSIGNMENTS[reviewStage],
             'Return exactly one JSON object: {"status":"approved|revise|blocked","findings":["concrete source-backed issue"]}. Use approved only when findings is empty; use revise only when findings is nonempty.',
           ]
         : [
