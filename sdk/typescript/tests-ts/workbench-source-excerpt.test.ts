@@ -221,10 +221,15 @@ async function upgradedPlugin(root: string) {
 
 function collisionProbe(
   pluginRoot: string,
-  fixture: { repository: string; replacement: string; revision: string },
+  fixture: {
+    deepPath: string;
+    repository: string;
+    replacement: string;
+    revision: string;
+  },
 ) {
   const program = String.raw`
-import json, subprocess, sys
+import io, json, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import workbench_source_excerpt as excerpts
@@ -245,6 +250,13 @@ scan = {
     "target_snapshot_digest": clean_worktree_content_digest(),
     "source_scopes_json": authority_json,
 }
+ordered_excerpt = excerpts.finding_source_excerpt_from_context(
+    excerpts.source_excerpt_context(scan, repository, ["src"]),
+    [
+        {"path": "src/allowed.py", "startLine": 1, "role": "evidence"},
+        {"path": "outside.py", "startLine": 1, "role": "not_root_control"},
+    ],
+)
 def excerpt(path, saved=scan, selected_paths=None):
     if selected_paths is None:
         selected_paths = ["src"]
@@ -406,6 +418,33 @@ try:
 finally:
     excerpts.local_git_bytes = original_git
     subprocess.Popen = original_popen
+batch_object = "1" * 40
+entry_object = b"\1" * 20
+wide_tree = b"".join(
+    b"100644 f%04d\0" % index + entry_object for index in range(5_000)
+)
+wide_tree += b"100644 target.py\0" + entry_object
+class CappedRead(io.BytesIO):
+    largest = 0
+    def read(self, size=-1):
+        if size < 0 or size > 64 * 1024:
+            raise AssertionError("tree response was buffered")
+        self.largest = max(self.largest, size)
+        return super().read(size)
+stream_requests = io.BytesIO()
+stream_responses = CappedRead(
+    f"{batch_object} tree {len(wide_tree)}\n".encode()
+    + wide_tree
+    + b"\n"
+)
+streamed_aliases = excerpts.matching_tree_entries(
+    stream_requests, stream_responses, batch_object, "target.py"
+)
+streamed_wide_tree = (
+    streamed_aliases == (("target.py", "file", entry_object.hex()),)
+    and stream_requests.getvalue() == batch_object.encode() + b"\0"
+    and stream_responses.largest == 64 * 1024
+)
 large_paths = [str(index) for index in range(20_000)]
 large_tree = "0" * 40
 large_scan = {
@@ -484,6 +523,7 @@ print(json.dumps({
     "mutable": {"excerpts": mutable, "gitCalls": len(git_calls)},
     "nestedBlobReads": nested_blob_reads,
     "nestedExcerpt": nested_excerpt,
+    "orderedExcerpt": ordered_excerpt,
     "subtargetPaths": subtarget_authority["paths"],
     "outside": outside,
     "pathCollisionBlobReads": scope_collision_blob_reads,
@@ -491,6 +531,7 @@ print(json.dumps({
     "pathCollisionPaths": len(scope_collision_authority["paths"]),
     "replaced": replaced,
     "replacementBlobReads": replacement_blob_reads,
+    "streamedWideTree": streamed_wide_tree,
 }))
 `;
   const result = spawnSync(
@@ -559,6 +600,7 @@ describe("workbench source excerpts", () => {
       },
       nestedBlobReads: [],
       nestedExcerpt: null,
+      orderedExcerpt: expect.stringContaining("allowed = True"),
       subtargetPaths: [{ kind: "directory", path: "." }],
       outside: null,
       pathCollisionBlobReads: [],
@@ -566,6 +608,7 @@ describe("workbench source excerpts", () => {
       pathCollisionPaths: 1,
       replaced: null,
       replacementBlobReads: [],
+      streamedWideTree: true,
     });
   }, 60_000);
 
@@ -712,7 +755,7 @@ print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headles
       const authority = authorities[String(scanId)];
       expect(authority?.version, writer).toBe(1);
       expect(authority?.targetTree, writer).toMatch(/^[0-9a-f]{40,64}$/);
-      expect(authority?.paths, writer).toEqual(paths);
+      expect(authority?.paths, writer).toEqual([...paths]);
     }
   }, 60_000);
 
@@ -780,12 +823,10 @@ sys.path.insert(0, sys.argv[1])
 import workbench_db
 
 raw_path = "segment/" * 300 + "source.py"
-overlong_role = "x" * 128 + "root_control"
 connection = sqlite3.connect(":memory:")
 connection.row_factory = sqlite3.Row
 connection.execute("CREATE TABLE finding_locations (occurrence_id TEXT, relative_path TEXT, start_line INTEGER, end_line INTEGER, role TEXT, sort_order INTEGER)")
-connection.execute("INSERT INTO finding_locations VALUES ('occurrence', ?, 1, 1, 'primary', 0)", (raw_path,))
-connection.execute("INSERT INTO finding_locations VALUES ('occurrence', 'other.py', 1, 1, ?, 1)", (overlong_role,))
+connection.execute("INSERT INTO finding_locations VALUES ('occurrence', ?, 1, 1, 'root_control', 0)", (raw_path,))
 target = Path(tempfile.mkdtemp()).resolve()
 workbench_db.require_scan_target_identity = lambda scan: target
 workbench_db.safe_source_path = lambda selected, value: None
@@ -799,22 +840,8 @@ def prepare_context(scan, selected, selected_paths):
     selected_paths_seen.append(selected_paths)
     return authority_context if selected_paths else None
 def source_excerpt(context, locations):
-    selected = next(
-        (
-            location
-            for location in locations
-            if "root_control" in str(location.get("role") or "").lower()
-        ),
-        locations[0],
-    )
-    seen.append({
-        "boundedRoles": all(
-            len(str(location.get("role") or "").encode()) <= 128
-            for location in locations
-        ),
-        "selectedPath": selected["path"],
-    })
-    if context is authority_context and selected["path"] == raw_path:
+    seen.append([location["path"] for location in locations])
+    if context is authority_context and locations[0]["path"] == raw_path:
         return "1  raw_path_authorized = True"
     return None
 workbench_db.source_excerpt_context = prepare_context
@@ -836,8 +863,7 @@ print(json.dumps({
     "malformedExcerpt": malformed.get("sourceExcerpt"),
     "malformedTitle": malformed.get("title"),
     "reusedExcerpt": findings[1].get("sourceExcerpt"),
-    "sawBoundedRoles": all(item["boundedRoles"] for item in seen),
-    "sawRawPath": all(item["selectedPath"] == raw_path for item in seen),
+    "sawRawPath": seen == [[raw_path], [raw_path], [raw_path]],
     "sawSelectedPaths": selected_paths_seen == [["."], []],
 }))
 `;
@@ -854,7 +880,6 @@ print(json.dumps({
       malformedExcerpt: null,
       malformedTitle: "title",
       reusedExcerpt: "1  raw_path_authorized = True",
-      sawBoundedRoles: true,
       sawRawPath: true,
       sawSelectedPaths: true,
     });

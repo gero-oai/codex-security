@@ -74,9 +74,9 @@ def local_git_bytes(repository: Path, *arguments: str) -> bytes | None:
     )
 
 
-def read_tree_object(
-    requests: IO[bytes], responses: IO[bytes], object_id: str
-) -> bytes:
+def matching_tree_entries(
+    requests: IO[bytes], responses: IO[bytes], object_id: str, name: str
+) -> tuple[TreeEntry, ...]:
     encoded_object = object_id.encode("ascii")
     requests.write(encoded_object + b"\0")
     requests.flush()
@@ -91,38 +91,51 @@ def read_tree_object(
         or not fields[2].isdigit()
     ):
         raise ValueError("invalid tree response")
-    remaining = int(fields[2])
-    chunks: list[bytes] = []
-    while remaining:
-        chunk = responses.read(min(1024 * 1024, remaining))
+    unread = int(fields[2])
+    buffered = bytearray()
+
+    def read_more() -> None:
+        nonlocal unread
+        chunk = responses.read(min(64 * 1024, unread))
         if not chunk:
             raise ValueError("truncated tree response")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    if responses.read(1) != b"\n":
-        raise ValueError("missing tree terminator")
-    return b"".join(chunks)
+        buffered.extend(chunk)
+        unread -= len(chunk)
 
+    def read_field(delimiter: int) -> bytearray:
+        field = bytearray()
+        while True:
+            try:
+                end = buffered.index(delimiter)
+            except ValueError:
+                field.extend(buffered)
+                buffered.clear()
+                if not unread:
+                    raise ValueError("unterminated tree entry") from None
+                read_more()
+                continue
+            field.extend(buffered[:end])
+            del buffered[: end + 1]
+            return field
 
-def matching_tree_entries(
-    content: bytes, name: str, object_id_bytes: int
-) -> tuple[TreeEntry, ...] | None:
+    def read_object_id(size: int) -> bytes:
+        while len(buffered) < size:
+            if not unread:
+                raise ValueError("truncated tree entry")
+            read_more()
+        value = bytes(buffered[:size])
+        del buffered[:size]
+        return value
+
+    object_id_bytes = len(object_id) // 2
     expected_name = normalized_path_component(name)
     matches = []
-    cursor = 0
-    while cursor < len(content):
-        mode_end = content.find(b" ", cursor)
-        name_end = content.find(b"\0", mode_end + 1)
-        object_start = name_end + 1
-        object_end = object_start + object_id_bytes
-        if (
-            mode_end <= cursor
-            or name_end < mode_end + 1
-            or object_end > len(content)
-        ):
-            return None
-        mode = content[cursor:mode_end]
-        decoded_name = os.fsdecode(content[mode_end + 1 : name_end])
+    while buffered or unread:
+        mode = bytes(read_field(ord(" ")))
+        decoded_name = read_field(0).decode(
+            sys.getfilesystemencoding(), errors="surrogateescape"
+        )
+        entry_object = read_object_id(object_id_bytes).hex()
         kind = (
             "directory"
             if mode in {b"40000", b"040000"}
@@ -131,8 +144,9 @@ def matching_tree_entries(
             else "other"
         )
         if normalized_path_component(decoded_name) == expected_name:
-            matches.append((decoded_name, kind, content[object_start:object_end].hex()))
-        cursor = object_end
+            matches.append((decoded_name, kind, entry_object))
+    if responses.read(1) != b"\n":
+        raise ValueError("missing tree terminator")
     return tuple(matches)
 
 
@@ -184,10 +198,11 @@ def tree_path(
             for depth, name in enumerate(path.parts, start=1):
                 if kind != "directory":
                     return None
-                content = read_tree_object(process.stdin, process.stdout, object_id)
-                aliases = matching_tree_entries(content, name, len(object_id) // 2)
+                aliases = matching_tree_entries(
+                    process.stdin, process.stdout, object_id, name
+                )
                 # The normalized name must be unique before an exact spelling can win.
-                if aliases is None or len(aliases) != 1:
+                if len(aliases) != 1:
                     return None
                 entry = next(
                     (candidate for candidate in aliases if candidate[0] == name),
@@ -205,7 +220,7 @@ def tree_path(
             process.stdin.close()
             if process.wait() != 0:
                 return None
-    except (OSError, ValueError):
+    except (MemoryError, OSError, ValueError):
         return None
     return path.as_posix(), kind, object_id
 
@@ -396,14 +411,7 @@ def finding_source_excerpt_from_context(
         return None
     repository, tree, scopes = context
 
-    location = next(
-        (
-            candidate
-            for candidate in locations
-            if "root_control" in str(candidate.get("role") or "").lower()
-        ),
-        locations[0],
-    )
+    location = locations[0]
     path = location.get("path")
     start_line = location.get("startLine")
     if not isinstance(path, str) or not isinstance(start_line, int):
