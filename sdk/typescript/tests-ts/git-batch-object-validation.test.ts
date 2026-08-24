@@ -341,16 +341,32 @@ describe("committed diff Git batch validation", () => {
       { encoding: "utf8", input: payload },
     );
     expect(hashed.status, hashed.stderr).toBe(0);
-    git(
-      repository,
-      "update-index",
-      "--add",
-      "--cacheinfo",
-      `100644,${hashed.stdout.trim()},${path}`,
+    const tree = spawnSync(
+      "git",
+      ["-C", repository, "hash-object", "-t", "tree", "-w", "--stdin"],
+      {
+        encoding: "utf8",
+        input: Buffer.concat([
+          Buffer.from(`100644 ${path}\0`),
+          Buffer.from(hashed.stdout.trim(), "hex"),
+        ]),
+      },
     );
+    expect(tree.status, tree.stderr).toBe(0);
     expect(existsSync(join(repository, path))).toBe(false);
-    commit(repository, "binary path");
-    const revision = git(repository, "rev-parse", "HEAD");
+    const revision = git(
+      repository,
+      "-c",
+      "user.name=synthetic-test",
+      "-c",
+      "user.email=synthetic-test@example.invalid",
+      "commit-tree",
+      tree.stdout.trim(),
+      "-p",
+      head,
+      "-m",
+      "binary path",
+    );
     const result = runPythonJson<{
       blobs: Array<string | null>;
       empty: unknown[];
@@ -668,6 +684,22 @@ describe("committed diff Git batch validation", () => {
       commit(repository, "head");
       const head = git(repository, "rev-parse", "HEAD");
       const originalBlob = git(repository, "rev-parse", `${head}:fixture.txt`);
+      const rawPrefixProbe = spawnSync(
+        "git",
+        ["-C", repository, "cat-file", "blob", originalBlob],
+        {
+          encoding: "utf8",
+          env: { ...process.env, ...environment },
+        },
+      );
+      if (rawPrefixProbe.status !== 0) {
+        expect(rawPrefixProbe.stdout).toBe("");
+        expect(rawPrefixProbe.stderr).toMatch(
+          /BUG: refs\.c:\d+: ref pattern must end in a trailing slash when trimming/u,
+        );
+        continue;
+      }
+      expect(rawPrefixProbe.stdout).toBe("head\n");
       const before = [
         committedDigest(repository, state, base, head, environment),
         committedObjectIdentity(repository, base, head, environment),
@@ -2512,12 +2544,14 @@ describe("committed diff Git batch validation", () => {
 
     expect(result).toMatchObject({
       allConfined: true,
-      privateMode: true,
       residue: [],
       rootRemoved: true,
       roots: 1,
       spools: 3,
     });
+    if (process.platform !== "win32") {
+      expect(result.privateMode).toBeTrue();
+    }
     expect(result.digest).toMatch(
       /^codex-security-snapshot\/v1:sha256:[a-f0-9]{64}$/u,
     );
