@@ -22,6 +22,13 @@ later. Python 3.10 also requires `tomli`. Use `--python` with `scan`,
 `bulk-scan`, or `export`; use `pythonPath` with the SDK. Set `PYTHON` to select
 an interpreter for any Python-backed command.
 
+On Windows, long tracked paths may require Git's existing
+`git config --global core.longpaths true` setting or shorter checkout paths.
+Bulk scans add checkout directories beneath `--output-dir`, so choose a short
+output root if Git reports "Filename too long". If Git fails on its own
+metadata, such as `.git/config`, shorten the output root even when
+`core.longpaths` is enabled.
+
 When a newer version is available, the CLI shows the update command for your
 installation method. Set `CODEX_SECURITY_NO_UPDATE_NOTICE=1` to hide the
 notice. Notices are also disabled in CI and when stderr is not a terminal.

@@ -374,6 +374,10 @@ def git_directory_snapshot_paths(target: Path) -> list[Path] | None:
     if repository_root is None:
         return None
     repository, pathspec = git_worktree_context(target)
+    scope = repository / pathspec
+    scope_depth = len(Path(pathspec).parts)
+    resolved_prefixes: dict[str, tuple[str, ...] | None] = {}
+    # Git's icase pathspecs do not cover every filesystem case alias.
     listed = git_bytes(
         repository,
         "ls-files",
@@ -382,13 +386,31 @@ def git_directory_snapshot_paths(target: Path) -> list[Path] | None:
         "--exclude-standard",
         "-z",
         "--",
-        pathspec,
+        ".",
     )
     if listed is None:
         raise SystemExit("Could not inspect files in the selected Git working tree.")
     paths: list[Path] = []
     for raw_path in (raw_path for raw_path in listed.split(b"\0") if raw_path):
-        path = repository / os.fsdecode(raw_path)
+        relative = Path(os.fsdecode(raw_path))
+        path = repository / relative
+        if scope_depth:
+            if len(relative.parts) <= scope_depth:
+                continue
+            # Git's index spelling can differ after a case-only directory rename.
+            # Resolve each scope-depth prefix once, without following symlink leaves.
+            prefix = repository.joinpath(*relative.parts[:scope_depth])
+            key = str(prefix)
+            if key not in resolved_prefixes:
+                try:
+                    resolved_prefixes[key] = prefix.resolve(strict=True).parts
+                except FileNotFoundError:
+                    resolved_prefixes[key] = None
+            # Compare canonical strings, not WindowsPath's case-folded equality:
+            # Windows also supports genuinely case-sensitive directories.
+            if resolved_prefixes[key] != scope.parts:
+                continue
+            path = scope.joinpath(*relative.parts[scope_depth:])
         try:
             metadata = path.lstat()
         except FileNotFoundError:
@@ -411,7 +433,7 @@ def git_directory_snapshot_paths(target: Path) -> list[Path] | None:
             for nested_path in path.rglob("*")
             if ".git" not in nested_path.relative_to(path).parts
         )
-    return sorted(set(paths))
+    return sorted({str(path): path for path in paths}.values(), key=str)
 
 
 def directory_content_digest(target: Path, *, excluded: tuple[Path, ...] = ()) -> str:

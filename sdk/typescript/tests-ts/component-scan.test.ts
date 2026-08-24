@@ -3,6 +3,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rm,
   symlink,
@@ -26,6 +27,7 @@ import {
 } from "../src/component-scan.js";
 import type { Finding, SeverityLevel } from "../src/models.js";
 import { ScanResult } from "../src/result.js";
+import { normalizeTarget } from "../src/targets.js";
 import {
   matchScanFindings,
   type ScanComparisonInput,
@@ -39,6 +41,7 @@ import {
   fakeResult,
   FakeSignals,
 } from "./cli-fixtures.js";
+import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporary: string[] = [];
 const components: ComponentPlan["components"] = [
@@ -731,6 +734,16 @@ test("plans from a Git inventory without tools or ignored files", async () => {
       paths: [".gitignore", "apps/web", "package.json", "shared"],
     },
   ]);
+  await mkdir(join(paths.repository, "~"));
+  await writeFile(join(paths.repository, "~", "app.ts"), "export {};\n");
+  const wholeRepository = {
+    components: [{ name: "Repository", paths: ["."] }],
+  };
+  expect(
+    await planComponents(paths.repository, {
+      codex: fakeCodex(() => wholeRepository),
+    }),
+  ).toEqual(wholeRepository);
   for (const path of ["ignored", "ignored/secret.txt"]) {
     const proposed = { components: [{ name: "Ignored", paths: [path] }] };
     await expect(
@@ -739,6 +752,162 @@ test("plans from a Git inventory without tools or ignored files", async () => {
     expect(await normalizeComponentPlan(paths.repository, proposed)).toEqual(
       proposed,
     );
+  }
+});
+
+test("keeps scoped inventories and plans aligned after a case-only Git rename", async () => {
+  const paths = await fixture();
+  const source = "src";
+  const uppercase = source.toUpperCase();
+  const git = (...args: string[]) =>
+    execFileSync(
+      "git",
+      [
+        "-C",
+        paths.repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "core.hooksPath=" + join(paths.root, "hooks"),
+        ...args,
+      ],
+      {
+        encoding: "utf8",
+        stdio: "pipe",
+        env: {
+          ...process.env,
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: join(paths.root, "gitconfig"),
+        },
+      },
+    ).trim();
+  await mkdir(join(paths.repository, source, "nested"), { recursive: true });
+  await writeFile(join(paths.repository, source, "app.ts"), "export {};\n");
+  await writeFile(
+    join(paths.repository, source, "nested", "util.ts"),
+    "export {};\n",
+  );
+  await writeFile(join(paths.repository, ".gitignore"), "build/\n");
+  git("init", "-q", "-b", "main");
+  git("add", ".");
+  git("commit", "-qm", "Initial fixture");
+  git("switch", "-c", "case-rename");
+  git("mv", source, "renaming");
+  git("mv", "renaming", uppercase);
+  git("commit", "-qm", "Rename source directory");
+  await mkdir(join(paths.repository, uppercase, "build"));
+  await writeFile(
+    join(paths.repository, uppercase, "build", "cache.tmp"),
+    "ignored build output\n",
+  );
+  git("switch", "main");
+  expect(git("status", "--porcelain")).toBe("");
+  expect(
+    git("ls-files", "-z", "--", source).split("\0").filter(Boolean),
+  ).toEqual([source + "/app.ts", source + "/nested/util.ts"]);
+  expect(await readdir(paths.repository)).toContain(uppercase);
+
+  const python =
+    process.env["PYTHON"] ?? Bun.which("python3") ?? Bun.which("python");
+  expect(python).not.toBeNull();
+  const scopesFile = join(paths.root, "scopes.json");
+  const output = join(paths.root, "scoped-source-input.jsonl");
+  const inventory = async (scope: string) => {
+    await writeFile(scopesFile, JSON.stringify([scope]));
+    const stdout = execFileSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import json, sys",
+          "from argparse import Namespace",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from generate_rank_input import make_repo_scope_input",
+          "from workbench_target import directory_snapshot_regular_file_count",
+          "repo, scope, scopes, output = sys.argv[2:]",
+          "make_repo_scope_input(Namespace(repo=repo, scopes_file=scopes, out=output))",
+          "rows = [json.loads(line)['path'] for line in Path(output).read_text().splitlines()]",
+          "count = directory_snapshot_regular_file_count((Path(repo) / scope).resolve())",
+          "print(json.dumps({'paths': rows, 'count': count}))",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        paths.repository,
+        scope,
+        scopesFile,
+        output,
+      ],
+      { encoding: "utf8", stdio: "pipe" },
+    );
+    return JSON.parse(stdout.trim().split("\n").at(-1)!) as {
+      paths: string[];
+      count: number;
+    };
+  };
+
+  const target = await normalizeTarget(paths.repository, [source]);
+  const scope = target.paths[0]!;
+  const expectedInventory = {
+    paths: [scope + "/app.ts", scope + "/nested/util.ts"],
+    count: 2,
+  };
+  expect(await inventory(scope)).toEqual(expectedInventory);
+  const repositoryInventory = {
+    paths: [
+      ".gitignore",
+      "apps/api/app.ts",
+      "apps/web/app.ts",
+      "package.json",
+      "shared/util.ts",
+      ...expectedInventory.paths,
+    ].sort(),
+    count: 7,
+  };
+  expect(await inventory(".")).toEqual(repositoryInventory);
+  const proposed = { components: [{ name: "Source", paths: [source] }] };
+  const other = {
+    name: "Other files",
+    paths: [".gitignore", "apps", "package.json", "shared"],
+  };
+  expect(
+    await planComponents(paths.repository, {
+      codex: fakeCodex(() => proposed),
+    }),
+  ).toEqual({
+    components: [{ name: "Source", paths: [scope] }, other],
+  });
+
+  if (
+    (await realpath(join(paths.repository, uppercase))) !==
+    (await realpath(join(paths.repository, source)))
+  ) {
+    await writeFile(
+      join(paths.repository, uppercase, "app.ts"),
+      "export {};\n",
+    );
+    expect(await inventory(source)).toEqual(expectedInventory);
+    expect(await inventory(uppercase)).toEqual({
+      paths: [uppercase + "/app.ts"],
+      count: 1,
+    });
+    expect(await inventory(".")).toEqual({
+      paths: [...repositoryInventory.paths, uppercase + "/app.ts"].sort(),
+      count: 8,
+    });
+    const separate = { name: "Separate source", paths: [uppercase] };
+    expect(
+      await planComponents(paths.repository, {
+        codex: fakeCodex(() => ({
+          components: [...proposed.components, separate],
+        })),
+      }),
+    ).toEqual({ components: [...proposed.components, separate, other] });
   }
 });
 
