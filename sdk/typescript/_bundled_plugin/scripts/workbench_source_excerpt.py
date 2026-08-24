@@ -33,7 +33,7 @@ SourceContext = tuple[Path, tuple[SourceScope, ...]]
 
 
 def normalized_path_component(value: str) -> str:
-    return normalize("NFC", normalize("NFD", value).casefold())
+    return normalize("NFC", normalize("NFD", value).casefold()).rstrip(" .")
 
 
 def relative_path(value: str) -> PurePosixPath | None:
@@ -167,6 +167,7 @@ def capture_source_scopes(
         if context is None:
             return authority
         repository, tree = context
+        authority["targetTree"] = tree
         captured: set[str] = set()
         for requested in paths:
             parsed = relative_path(requested)
@@ -206,11 +207,14 @@ def load_source_scopes(
         return None
     metadata = json.loads(saved)
     records = metadata.get("paths") if isinstance(metadata, dict) else None
+    expected_tree = metadata.get("targetTree") if isinstance(metadata, dict) else None
     if (
         not isinstance(metadata, dict)
         or metadata.get("version") != 1
         or not isinstance(records, list)
         or not records
+        or not isinstance(expected_tree, str)
+        or not OBJECT_ID.fullmatch(expected_tree)
     ):
         return None
     expected = {
@@ -224,6 +228,8 @@ def load_source_scopes(
     if context is None:
         return None
     repository, tree = context
+    if tree != expected_tree:
+        return None
     scopes: list[SourceScope] = []
     seen: set[str] = set()
     for record in records:

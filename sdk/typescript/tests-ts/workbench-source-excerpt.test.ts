@@ -83,6 +83,8 @@ function collisionRepository(root: string): {
     ["100644", "blob", blob("case_lower = True\n"), "lower.py"],
     ["100644", "blob", blob("unicode_composed = True\n"), "é.py"],
     ["100644", "blob", blob("unicode_decomposed = True\n"), "é.py"],
+    ["100644", "blob", blob("plain_name = True\n"), "trailing.py"],
+    ["100644", "blob", blob("trailing_dot = True\n"), "trailing.py."],
   ]);
   const upperScope = tree([
     ["100644", "blob", blob("selected_scope = True\n"), "selected.py"],
@@ -118,6 +120,7 @@ function collisionRepository(root: string): {
   writeFileSync(join(repository, "src", "allowed.py"), "allowed = True\n");
   writeFileSync(join(repository, "src", "LOWER.py"), "case_upper = True\n");
   writeFileSync(join(repository, "src", "é.py"), "unicode_composed = True\n");
+  writeFileSync(join(repository, "src", "trailing.py"), "plain_name = True\n");
   writeFileSync(
     join(repository, "Scope", "selected.py"),
     "selected_scope = True\n",
@@ -246,16 +249,59 @@ allowed = excerpt("src/allowed.py")
 before = len(blob_reads)
 collisions = {
     path: excerpt(path)
-    for path in ("src/LOWER.py", "src/lower.py", "src/é.py", "src/é.py")
+    for path in (
+        "src/LOWER.py",
+        "src/lower.py",
+        "src/é.py",
+        "src/é.py",
+        "src/trailing.py",
+        "src/trailing.py.",
+    )
 }
 collision_blob_reads = blob_reads[before:]
 outside = excerpt("outside.py")
 before = len(blob_reads)
 broadened = excerpt(
     "outside.py",
-    {**scan, "source_scopes_json": json.dumps({"version": 1, "paths": ["."]})},
+    {**scan, "source_scopes_json": json.dumps({**authority, "paths": ["."]})},
 )
 broadened_blob_reads = blob_reads[before:]
+subtarget = repository / "src"
+subtarget_metadata = subtarget.stat()
+subtarget_authority = excerpts.capture_source_scopes(
+    subtarget,
+    (
+        revision,
+        clean_worktree_content_digest(),
+        subtarget_metadata.st_dev,
+        subtarget_metadata.st_ino,
+    ),
+    ["."],
+)
+subprocess.run(["git", "-C", str(subtarget), "init", "-q"], check=True)
+outer_git_dir = Path(
+    subprocess.check_output(
+        ["git", "-C", str(repository), "rev-parse", "--absolute-git-dir"],
+        text=True,
+    ).strip()
+)
+alternates = subtarget / ".git" / "objects" / "info" / "alternates"
+alternates.write_text(str(outer_git_dir / "objects") + "\n")
+subprocess.run(
+    ["git", "-C", str(subtarget), "update-ref", "refs/heads/main", revision],
+    check=True,
+)
+subtarget_scan = {
+    **scan,
+    "source_scopes_json": json.dumps(subtarget_authority),
+}
+nested_context = excerpts.source_excerpt_context(subtarget_scan, subtarget, ["."])
+before = len(blob_reads)
+nested_excerpt = excerpts.finding_source_excerpt_from_context(
+    nested_context,
+    [{"path": "outside.py", "startLine": 1, "endLine": 1, "role": "root_control"}],
+)
+nested_blob_reads = blob_reads[before:]
 subprocess.run(
     ["git", "-C", str(repository), "update-ref", f"refs/replace/{revision}", replacement],
     check=True,
@@ -311,6 +357,9 @@ print(json.dumps({
     "legacy": legacy,
     "malformedRevision": malformed_revision,
     "mutable": {"excerpts": mutable, "gitCalls": len(git_calls)},
+    "nestedBlobReads": nested_blob_reads,
+    "nestedExcerpt": nested_excerpt,
+    "subtargetPaths": subtarget_authority["paths"],
     "outside": outside,
     "pathCollisionPaths": len(
         excerpts.capture_source_scopes(repository, identity, ["Scope"])["paths"]
@@ -357,6 +406,8 @@ describe("workbench source excerpts", () => {
         "src/lower.py": null,
         "src/é.py": null,
         "src/é.py": null,
+        "src/trailing.py": null,
+        "src/trailing.py.": null,
       },
       duplicatePaths: 1,
       immutable: {
@@ -370,6 +421,9 @@ describe("workbench source excerpts", () => {
         excerpts: { working_tree: null, None: null },
         gitCalls: 0,
       },
+      nestedBlobReads: [],
+      nestedExcerpt: null,
+      subtargetPaths: ["."],
       outside: null,
       pathCollisionPaths: 0,
       replaced: null,
@@ -478,7 +532,7 @@ print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headles
     );
     const authorities = writers["authorities"] as Record<
       string,
-      { paths: string[]; version: number }
+      { paths: string[]; targetTree: string; version: number }
     >;
     const workspace = writers["workspace"] as Record<string, unknown>;
     const prompt = writers["prompt"] as Record<string, unknown>;
@@ -500,6 +554,7 @@ print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headles
     for (const [writer, scanId, paths] of expected) {
       const authority = authorities[String(scanId)];
       expect(authority?.version, writer).toBe(1);
+      expect(authority?.targetTree, writer).toMatch(/^[0-9a-f]{40,64}$/);
       expect(authority?.paths, writer).toEqual([...paths]);
     }
   }, 60_000);
