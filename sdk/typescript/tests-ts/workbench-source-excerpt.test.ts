@@ -1,0 +1,604 @@
+import { execFileSync, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, test } from "bun:test";
+import { BUNDLED_PLUGIN_VERSION, bootstrapPlugin } from "../src/index.js";
+import { runWorkbench } from "../src/runtime.js";
+import { PLUGIN_ROOT } from "./plugin-root.js";
+
+const temporaryRoots: string[] = [];
+
+afterEach(() => {
+  for (const root of temporaryRoots.splice(0)) {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function python(): string {
+  const command =
+    process.env["PYTHON"] ??
+    Bun.which("python3") ??
+    Bun.which("python") ??
+    Bun.which("py");
+  expect(command).not.toBeNull();
+  return command!;
+}
+
+function git(
+  repository: string,
+  args: string[],
+  input?: Buffer | string,
+): string {
+  return execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=Synthetic Fixture",
+      "-c",
+      "user.email=fixture@example.invalid",
+      ...args,
+    ],
+    { cwd: repository, encoding: "utf8", input },
+  ).trim();
+}
+
+function collisionRepository(root: string): {
+  repository: string;
+  revision: string;
+} {
+  const repository = join(root, "repository");
+  mkdirSync(repository);
+  git(repository, ["init", "-q"]);
+  const blob = (content: string) =>
+    git(repository, ["hash-object", "-w", "--stdin"], content);
+  const tree = (
+    entries: Array<[mode: string, type: string, oid: string, name: string]>,
+  ) => {
+    const records = entries
+      .toSorted((left, right) =>
+        Buffer.from(left[3]).compare(Buffer.from(right[3])),
+      )
+      .map(([mode, type, oid, name]) =>
+        Buffer.concat([
+          Buffer.from(`${mode} ${type} ${oid}\t`),
+          Buffer.from(name),
+          Buffer.from([0]),
+        ]),
+      );
+    return git(repository, ["mktree", "-z"], Buffer.concat(records));
+  };
+  const sourceTree = tree([
+    ["100644", "blob", blob("allowed = True\n"), "allowed.py"],
+    ["100644", "blob", blob("case_upper = True\n"), "LOWER.py"],
+    ["100644", "blob", blob("case_lower = True\n"), "lower.py"],
+    ["100644", "blob", blob("unicode_composed = True\n"), "é.py"],
+    ["100644", "blob", blob("unicode_decomposed = True\n"), "é.py"],
+  ]);
+  const upperScope = tree([
+    ["100644", "blob", blob("selected_scope = True\n"), "selected.py"],
+  ]);
+  const lowerScope = tree([
+    ["100644", "blob", blob("colliding_scope = True\n"), "sibling.py"],
+  ]);
+  const rootTree = tree([
+    ["040000", "tree", upperScope, "Scope"],
+    ["040000", "tree", lowerScope, "scope"],
+    ["040000", "tree", sourceTree, "src"],
+  ]);
+  const revision = git(repository, [
+    "commit-tree",
+    rootTree,
+    "-m",
+    "synthetic source tree",
+  ]);
+  git(repository, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+  git(repository, ["update-ref", "refs/heads/main", revision]);
+  mkdirSync(join(repository, "src"));
+  mkdirSync(join(repository, "Scope"));
+  writeFileSync(join(repository, "src", "allowed.py"), "allowed = True\n");
+  writeFileSync(join(repository, "src", "LOWER.py"), "case_upper = True\n");
+  writeFileSync(join(repository, "src", "é.py"), "unicode_composed = True\n");
+  writeFileSync(
+    join(repository, "Scope", "selected.py"),
+    "selected_scope = True\n",
+  );
+  return { repository, revision };
+}
+
+function ordinaryRepository(root: string): {
+  repository: string;
+  revision: string;
+} {
+  const repository = join(root, "ordinary-repository");
+  mkdirSync(join(repository, "src"), { recursive: true });
+  mkdirSync(join(repository, "other"));
+  writeFileSync(join(repository, "src", "allowed.py"), "allowed = True\n");
+  writeFileSync(join(repository, "other", "example.py"), "example = True\n");
+  git(repository, ["init", "-q"]);
+  git(repository, ["add", "."]);
+  git(repository, ["commit", "-qm", "synthetic source tree"]);
+  return { repository, revision: git(repository, ["rev-parse", "HEAD"]) };
+}
+
+async function upgradedPlugin(root: string) {
+  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.28");
+  const previous = join(root, "previous-plugin");
+  cpSync(PLUGIN_ROOT, previous, { recursive: true });
+  const manifestPath = join(previous, ".codex-plugin", "plugin.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+    version: string;
+  };
+  manifest.version = "0.1.27";
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+
+  const excerptPath = join(previous, "scripts", "workbench_source_excerpt.py");
+  const source = readFileSync(excerptPath, "utf8");
+  const strict = [
+    "        if len(aliases) != 1:",
+    "            return None",
+    "        entry = next((candidate for candidate in aliases if candidate[0] == name), None)",
+  ].join("\n");
+  const vulnerable = [
+    "        entry = next((candidate for candidate in aliases if candidate[0] == name), None)",
+    "        if entry is None and len(aliases) != 1:",
+    "            return None",
+  ].join("\n");
+  expect(source.split(strict)).toHaveLength(2);
+  writeFileSync(excerptPath, source.replace(strict, vulnerable));
+
+  const home = join(root, "codex-home");
+  const marketplace = join(home, "sdk-marketplace");
+  mkdirSync(home, { mode: 0o700 });
+  const runCodex = async (_command: unknown, args: readonly string[]) => {
+    if (args[1] === "marketplace") {
+      writeFileSync(
+        join(home, "config.toml"),
+        `[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(marketplace)}\n`,
+      );
+      return "";
+    }
+    const selected = join(marketplace, "plugins", "codex-security");
+    const selectedManifest = JSON.parse(
+      readFileSync(join(selected, ".codex-plugin", "plugin.json"), "utf8"),
+    ) as { version: string };
+    const installed = join(home, "installed", selectedManifest.version);
+    rmSync(installed, { recursive: true, force: true });
+    mkdirSync(join(home, "installed"), { recursive: true });
+    cpSync(selected, installed, { recursive: true });
+    return JSON.stringify({
+      installedPath: installed,
+      version: selectedManifest.version,
+    });
+  };
+  const options = {
+    codexCommand: { command: "/synthetic-codex" },
+    runCodex,
+  };
+  const predecessor = await bootstrapPlugin(home, previous, options);
+  const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
+  const installedMcp = JSON.parse(
+    readFileSync(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
+  ) as { mcpServers: Record<string, { env_vars?: string[] }> };
+  expect(predecessor.version).toBe("0.1.27");
+  expect(upgraded.version).toBe("0.1.28");
+  expect(upgraded.installedRoot).not.toBe(predecessor.installedRoot);
+  expect(
+    installedMcp.mcpServers["codex-security"]?.env_vars?.find(
+      (name) => name === "CODEX_SAFETY_IDENTIFIER",
+    ),
+  ).toBe("CODEX_SAFETY_IDENTIFIER");
+  expect(
+    readFileSync(
+      join(upgraded.installedRoot, "scripts", "workbench_source_excerpt.py"),
+    ),
+  ).toEqual(
+    readFileSync(join(PLUGIN_ROOT, "scripts", "workbench_source_excerpt.py")),
+  );
+  return { predecessor, upgraded };
+}
+
+function workbench(root: string, args: string[], input?: string) {
+  return runWorkbench(
+    {
+      python: python(),
+      pluginRoot: PLUGIN_ROOT,
+      environment: {
+        ...process.env,
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+        PYTHONDONTWRITEBYTECODE: "1",
+      },
+    },
+    args,
+    input,
+  );
+}
+
+function collisionProbe(
+  pluginRoot: string,
+  fixture: { repository: string; revision: string },
+) {
+  const program = String.raw`
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import workbench_source_excerpt as excerpts
+from workbench_target import clean_worktree_content_digest
+
+repository = Path(sys.argv[2]).resolve()
+revision = sys.argv[3]
+metadata = repository.stat()
+identity = (revision, clean_worktree_content_digest(), metadata.st_dev, metadata.st_ino)
+authority = excerpts.capture_source_scopes(repository, identity, ["src", "src"])
+authority_json = json.dumps(authority)
+scan = {
+    "mode": "standard",
+    "diff_target_kind": None,
+    "target_revision": revision,
+    "target_snapshot_digest": clean_worktree_content_digest(),
+    "source_scopes_json": authority_json,
+}
+def excerpt(path, saved=scan):
+    return excerpts.finding_source_excerpt(
+        saved,
+        repository,
+        [{"path": path, "startLine": 1, "endLine": 1, "role": "root_control"}],
+    )
+original_git = excerpts.local_git_bytes
+blob_reads = []
+def watched_git(*arguments, **kwargs):
+    if len(arguments) >= 4 and arguments[1:3] == ("cat-file", "blob"):
+        blob_reads.append(arguments[3])
+    return original_git(*arguments, **kwargs)
+excerpts.local_git_bytes = watched_git
+allowed = excerpt("src/allowed.py")
+before = len(blob_reads)
+collisions = {
+    path: excerpt(path)
+    for path in ("src/LOWER.py", "src/lower.py", "src/é.py", "src/é.py")
+}
+collision_blob_reads = blob_reads[before:]
+outside = excerpt("outside.py")
+excerpts.local_git_bytes = original_git
+legacy_scan = dict(scan)
+legacy_scan.pop("source_scopes_json")
+legacy = excerpt("src/allowed.py", legacy_scan)
+invalid = excerpt("src/allowed.py", {**scan, "source_scopes_json": "{"})
+
+original_context = excerpts.git_worktree_context
+git_calls = []
+def forbidden_git(*arguments, **kwargs):
+    git_calls.append(arguments)
+    raise AssertionError("ineligible diff mode reached Git")
+excerpts.local_git_bytes = forbidden_git
+excerpts.git_worktree_context = forbidden_git
+try:
+    mutable = {
+        str(kind): excerpt(
+            "src/allowed.py", {**scan, "mode": "diff", "diff_target_kind": kind}
+        )
+        for kind in ("working_tree", None)
+    }
+finally:
+    excerpts.local_git_bytes = original_git
+    excerpts.git_worktree_context = original_context
+immutable = {
+    kind: excerpt(
+        "src/allowed.py", {**scan, "mode": "diff", "diff_target_kind": kind}
+    )
+    for kind in ("commit", "range")
+}
+print(json.dumps({
+    "allowed": allowed,
+    "collisionBlobReads": collision_blob_reads,
+    "collisions": collisions,
+    "duplicateScopes": len(authority["scopes"]),
+    "immutable": immutable,
+    "invalid": invalid,
+    "legacy": legacy,
+    "mutable": {"excerpts": mutable, "gitCalls": len(git_calls)},
+    "outside": outside,
+    "pathCollisionScopes": len(
+        excerpts.capture_source_scopes(repository, identity, ["Scope"])["scopes"]
+    ),
+}))
+`;
+  const result = spawnSync(
+    python(),
+    [
+      "-I",
+      "-B",
+      "-c",
+      program,
+      join(pluginRoot, "scripts"),
+      fixture.repository,
+      fixture.revision,
+    ],
+    { encoding: "utf8" },
+  );
+  expect(result.status, result.stderr).toBe(0);
+  return JSON.parse(result.stdout) as Record<string, unknown>;
+}
+
+describe("workbench source excerpts", () => {
+  test("fails closed on normalized collisions after a cached upgrade", async () => {
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), "codex-security-source-collision-")),
+    );
+    temporaryRoots.push(root);
+    const fixture = collisionRepository(root);
+    const installation = await upgradedPlugin(root);
+    const stale = collisionProbe(
+      installation.predecessor.installedRoot,
+      fixture,
+    );
+    const fixed = collisionProbe(installation.upgraded.installedRoot, fixture);
+
+    expect(
+      (stale["collisions"] as Record<string, string>)["src/LOWER.py"],
+    ).toContain("case_upper = True");
+    expect(stale["pathCollisionScopes"]).toBe(1);
+    expect(fixed).toEqual({
+      allowed: expect.stringContaining("allowed = True"),
+      collisionBlobReads: [],
+      collisions: {
+        "src/LOWER.py": null,
+        "src/lower.py": null,
+        "src/é.py": null,
+        "src/é.py": null,
+      },
+      duplicateScopes: 1,
+      immutable: {
+        commit: expect.stringContaining("allowed = True"),
+        range: expect.stringContaining("allowed = True"),
+      },
+      invalid: null,
+      legacy: null,
+      mutable: {
+        excerpts: { working_tree: null, None: null },
+        gitCalls: 0,
+      },
+      outside: null,
+      pathCollisionScopes: 0,
+    });
+  }, 60_000);
+
+  test("persists selected source authority from every scan writer", async () => {
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), "codex-security-source-writers-")),
+    );
+    temporaryRoots.push(root);
+    const { repository, revision } = ordinaryRepository(root);
+    const scanRoot = join(root, "scans");
+    const workspaceId = randomUUID();
+    await workbench(root, [
+      "create-workspace",
+      "--workspace-id",
+      workspaceId,
+      "--thread-id",
+      "workspace-writer",
+    ]);
+    await workbench(root, [
+      "save-workspace",
+      "--workspace-id",
+      workspaceId,
+      "--target-path",
+      repository,
+      "--scope",
+      "src",
+      "--mode",
+      "standard",
+    ]);
+    const workspace = await workbench(root, [
+      "start-scan",
+      "--workspace-id",
+      workspaceId,
+      "--scan-root",
+      scanRoot,
+    ]);
+    const prompt = await workbench(root, [
+      "start-prompt-only-scan",
+      "--thread-id",
+      "prompt-writer",
+      "--target-path",
+      repository,
+      "--scope",
+      "src",
+      "--mode",
+      "standard",
+      "--scan-root",
+      scanRoot,
+    ]);
+    const headless = await workbench(root, [
+      "start-headless-standard-scan",
+      "--thread-id",
+      "headless-writer",
+      "--target-path",
+      repository,
+      "--scope",
+      "src",
+      "--scan-root",
+      scanRoot,
+    ]);
+    const cliScanDirectory = join(root, "cli-scan");
+    mkdirSync(cliScanDirectory, { mode: 0o700 });
+    const cli = await workbench(root, [
+      "register-cli-scan",
+      "--repository",
+      repository,
+      "--scan-dir",
+      cliScanDirectory,
+      "--recipe-json",
+      JSON.stringify({
+        config: {},
+        mode: "standard",
+        repository,
+        target: { kind: "paths", paths: ["src/allowed.py", "other"] },
+      }),
+    ]);
+    const deep = await workbench(root, [
+      "begin-deep-scan",
+      "--thread-id",
+      "deep-writer",
+      "--target-path",
+      repository,
+      "--scan-root",
+      scanRoot,
+      "--available-parallelism",
+      "4",
+    ]);
+    const database = await workbench(root, ["database-info"]);
+    const query = spawnSync(
+      python(),
+      [
+        "-I",
+        "-B",
+        "-c",
+        "import json, sqlite3, sys; c = sqlite3.connect(sys.argv[1]); print(json.dumps({row[0]: json.loads(row[1]) for row in c.execute('SELECT id, source_scopes_json FROM scans')}))",
+        String(database["databasePath"]),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(query.status, query.stderr).toBe(0);
+    const authorities = JSON.parse(query.stdout) as Record<
+      string,
+      { revision: string; scopes: Array<{ path: string }>; targetTree: string }
+    >;
+    const workspaceResults = workspace["results"] as Record<string, unknown>;
+    const promptScan = prompt["scan"] as Record<string, unknown>;
+    const headlessScan = headless["scan"] as Record<string, unknown>;
+    const deepScan = deep["deepScan"] as Record<string, unknown>;
+    const expected = [
+      ["workspace", workspaceResults["scanId"], ["src"]],
+      ["prompt", promptScan["scanId"], ["src"]],
+      ["headless", headlessScan["scanId"], ["src"]],
+      ["CLI", cli["scanId"], ["src/allowed.py", "other"]],
+      ["deep", deepScan["scanId"], ["."]],
+    ] as const;
+    expect(Object.keys(authorities)).toHaveLength(expected.length);
+    for (const [writer, scanId, paths] of expected) {
+      const authority = authorities[String(scanId)];
+      expect(authority?.revision, writer).toBe(revision);
+      expect(authority?.targetTree, writer).toMatch(/^[a-f0-9]{40,64}$/u);
+      expect(
+        authority?.scopes.map(({ path }) => path),
+        writer,
+      ).toEqual([...paths]);
+    }
+  }, 60_000);
+
+  test("migration 33 appends once over the exact predecessor", () => {
+    const program = String.raw`
+import json, sqlite3, sys
+sys.path.insert(0, sys.argv[1])
+from workbench_schema import MIGRATIONS, apply_migrations
+
+connection = sqlite3.connect(":memory:")
+connection.row_factory = sqlite3.Row
+counter = 0
+def now():
+    global counter
+    counter += 1
+    return f"2026-08-24T00:00:{counter:02d}Z"
+def rows():
+    return [tuple(row) for row in connection.execute(
+        "SELECT version, name, applied_at FROM schema_migrations WHERE version >= 29 ORDER BY version"
+    )]
+
+predecessor = MIGRATIONS[:-1]
+apply_migrations(connection, predecessor, now, lambda database: None)
+before = rows()
+apply_migrations(connection, MIGRATIONS, now, lambda database: None)
+once = rows()
+column_count = sum(
+    row[1] == "source_scopes_json"
+    for row in connection.execute("PRAGMA table_info(scans)")
+)
+apply_migrations(connection, MIGRATIONS, now, lambda database: None)
+twice = rows()
+print(json.dumps({
+    "predecessorMax": predecessor[-1][0],
+    "beforeVersions": [row[0] for row in before],
+    "onceVersions": [row[0] for row in once],
+    "oldRowsPreserved": once[:-1] == before,
+    "secondApplyUnchanged": twice == once,
+    "columnCount": column_count,
+    "newName": once[-1][1],
+}))
+`;
+    const result = spawnSync(
+      python(),
+      ["-I", "-B", "-c", program, join(PLUGIN_ROOT, "scripts")],
+      { encoding: "utf8" },
+    );
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      predecessorMax: 32,
+      beforeVersions: [29, 30, 31, 32],
+      onceVersions: [29, 30, 31, 32, 33],
+      oldRowsPreserved: true,
+      secondApplyUnchanged: true,
+      columnCount: 1,
+      newName: "persist selected source excerpt authority",
+    });
+  });
+
+  test("authorizes raw finding paths before bounding display output", () => {
+    const program = String.raw`
+import json, sqlite3, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import workbench_db
+
+raw_path = "segment/" * 300 + "source.py"
+connection = sqlite3.connect(":memory:")
+connection.row_factory = sqlite3.Row
+connection.execute("CREATE TABLE finding_locations (occurrence_id TEXT, relative_path TEXT, start_line INTEGER, end_line INTEGER, role TEXT, sort_order INTEGER)")
+connection.execute("INSERT INTO finding_locations VALUES ('occurrence', ?, 1, 1, 'root_control', 0)", (raw_path,))
+target = Path(tempfile.mkdtemp()).resolve()
+workbench_db.require_scan_target_identity = lambda scan: target
+workbench_db.safe_source_path = lambda selected, value: None
+workbench_db.finding_remediation_result = lambda database, occurrence_id: None
+workbench_db.finding_triage_result = lambda database, occurrence_id: None
+workbench_db.scan_history.finding_matches = lambda *arguments: ([], None, [])
+seen = []
+def source_excerpt(scan, selected, locations):
+    seen.extend(location["path"] for location in locations)
+    return "1  raw_path_authorized = True" if locations[0]["path"] == raw_path else None
+workbench_db.finding_source_excerpt = source_excerpt
+finding = workbench_db.finding_result(
+    connection,
+    {"id": "scan", "started_at": "now", "scan_dir": str(target)},
+    {"id": "occurrence", "details_json": "{}", "confidence": "high", "severity": "high", "created_at": "now", "finding_id": "finding", "remediation": "fix", "summary": "summary", "title": "title"},
+)
+display_path = finding["locations"][0]["path"]
+print(json.dumps({
+    "displayBytes": len(display_path.encode()),
+    "displayDiffers": display_path != raw_path,
+    "excerpt": finding.get("sourceExcerpt"),
+    "sawRawPath": seen == [raw_path],
+}))
+`;
+    const result = spawnSync(
+      python(),
+      ["-I", "-B", "-c", program, join(PLUGIN_ROOT, "scripts")],
+      { encoding: "utf8" },
+    );
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      displayBytes: 2_048,
+      displayDiffers: true,
+      excerpt: "1  raw_path_authorized = True",
+      sawRawPath: true,
+    });
+  });
+});

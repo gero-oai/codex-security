@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from filesystem_identity import serialize_filesystem_identity
 from finalize_scan_contract import write_scan_local_bytes
 from workbench_feedback import get_scan_feedback
+from workbench_source_excerpt import capture_source_scopes
 from workbench_target import (
     directory_content_digest,
     git_revision,
@@ -165,6 +166,7 @@ def insert_running_scan(
     model: str | None = None,
     reasoning_effort: str | None = None,
     scan_dir: Path | None = None,
+    source_paths: list[str] | None = None,
 ) -> str:
     revision = target_identity[0]
     native_scan = scan_dir is None
@@ -176,15 +178,21 @@ def insert_running_scan(
                 dir=target_root,
             )
         ).resolve()
+    source_scopes = capture_source_scopes(
+        target,
+        target_identity,
+        source_paths or [scope],
+        diff_target_kind=diff_target["kind"] if diff_target is not None else None,
+    )
     connection.execute(
         """
         INSERT INTO scans (
             id, workspace_id, target_id, target_path, target_revision, target_snapshot_digest,
-            target_device, target_inode, scope, mode, user_context,
+            target_device, target_inode, source_scopes_json, scope, mode, user_context,
             deep_scan_owner_thread_id, diff_target_kind, diff_base_revision,
             diff_head_revision, diff_content_digest, target_summary, scan_dir, model,
             reasoning_effort, status, phase, handoff_status, started_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             'running', 'preflight', ?, ?, ?, ?)
         """,
         (
@@ -193,6 +201,7 @@ def insert_running_scan(
             workspace["target_id"],
             str(target),
             *target_identity,
+            json.dumps(source_scopes, allow_nan=False, separators=(",", ":"), sort_keys=True),
             scope,
             workspace["default_mode"],
             user_context,

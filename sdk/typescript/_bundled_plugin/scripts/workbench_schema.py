@@ -697,6 +697,13 @@ MIGRATIONS = (
         ALTER TABLE deep_scan_runs ADD COLUMN publication_error_message TEXT;
         """,
     ),
+    (
+        33,
+        "persist selected source excerpt authority",
+        """
+        ALTER TABLE scans ADD COLUMN source_scopes_json TEXT;
+        """,
+    ),
 )
 
 

@@ -2394,6 +2394,7 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
             timestamp=timestamp,
             handoff_status="delivered",
             scan_dir=scan_dir,
+            source_paths=paths or ["."],
         )
         connection.execute(
             "UPDATE scans SET recipe_json = ?, parent_scan_id = ?, user_context = ? WHERE id = ?",
@@ -4111,6 +4112,7 @@ def finding_result(
     confidence = confidence if isinstance(confidence, dict) else {}
     severity = details.get("severity")
     severity = severity if isinstance(severity, dict) else {}
+    excerpt_locations = []
     locations = []
     try:
         target = require_scan_target_identity(scan)
@@ -4126,6 +4128,14 @@ def finding_result(
         """,
         (occurrence["id"], FINDING_LOCATIONS_LIMIT),
     ):
+        excerpt_locations.append(
+            {
+                "endLine": row["end_line"],
+                "path": row["relative_path"],
+                "role": row["role"],
+                "startLine": row["start_line"],
+            }
+        )
         absolute_path = safe_source_path(target, row["relative_path"]) if target else None
         location = {
             "endLine": row["end_line"],
@@ -4170,7 +4180,7 @@ def finding_result(
         result["knownSince"] = known_since
         result["knownScanIds"] = known_scan_ids
     result.pop("artifactPaths", None)
-    source_excerpt = finding_source_excerpt(scan, target, locations)
+    source_excerpt = finding_source_excerpt(scan, target, excerpt_locations)
     if source_excerpt:
         result["sourceExcerpt"] = source_excerpt
     artifact_paths = finding_artifact_paths(Path(scan["scan_dir"]), details)

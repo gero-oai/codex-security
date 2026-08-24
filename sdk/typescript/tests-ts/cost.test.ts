@@ -1383,7 +1383,7 @@ describe("live scan cost tracking", () => {
       usage,
     }).toEqual({
       predecessorVersion: "0.1.25",
-      upgradedVersion: "0.1.27",
+      upgradedVersion: "0.1.28",
       installedRootChanged: true,
       safetyIdentifierKey: "CODEX_SAFETY_IDENTIFIER",
       usage: {
@@ -1391,7 +1391,7 @@ describe("live scan cost tracking", () => {
         warnings: [],
       },
     });
-    expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.27");
+    expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.28");
   });
 
   test("forwards actions from this scan's delegated workers only", async () => {
