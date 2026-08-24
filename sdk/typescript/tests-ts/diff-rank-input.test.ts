@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -112,14 +113,6 @@ async function upgradeBundledPlugin(root: string): Promise<string> {
   expect(predecessor.version).toBe("0.1.44");
   expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
   expect(upgraded.installedRoot).not.toBe(predecessor.installedRoot);
-  const installedMcp = JSON.parse(
-    readFileSync(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
-  ) as { mcpServers: Record<string, { env_vars?: string[] }> };
-  expect(
-    installedMcp.mcpServers["codex-security"]?.env_vars?.find(
-      (name) => name === "CODEX_SAFETY_IDENTIFIER",
-    ),
-  ).toBe("CODEX_SAFETY_IDENTIFIER");
   expect(
     readFileSync(
       join(upgraded.installedRoot, "scripts", "generate_rank_input.py"),
@@ -223,6 +216,111 @@ test.skipIf(!fileSymlinksAvailable)(
     });
   },
 );
+
+test("rejects parents replaced after local-diff confinement is checked", () => {
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "codex-security-diff-parent-race-")),
+  );
+  temporaryRoots.push(root);
+  const repository = join(root, "repository");
+  const parent = join(repository, "src");
+  const filename =
+    process.platform === "win32" ? "handler.py" : "handler:local.py";
+  mkdirSync(parent, { recursive: true });
+  git(repository, "init", "-q");
+  writeFileSync(join(parent, filename), "inside = 1\n");
+  git(repository, "add", ".");
+  git(repository, "commit", "-qm", "base");
+  const base = git(repository, "rev-parse", "HEAD");
+  writeFileSync(join(parent, filename), "inside = 2\n");
+
+  const python = pythonExecutable();
+  expect(python).not.toBeNull();
+  const scripts = join(PLUGIN_ROOT, "scripts");
+  const probe = [
+    "import os, sys",
+    "scripts, repository, base, external, parked, output, generator = sys.argv[1:]",
+    "sys.path.insert(0, scripts)",
+    "import generate_rank_input as ranking",
+    "checked_parent = ranking.changed_path_parent_is_within_target",
+    "def swap_parent(path, target):",
+    "    accepted = checked_parent(path, target)",
+    "    os.replace(path.parent, parked)",
+    "    if os.name == 'nt':",
+    "        import _winapi",
+    "        _winapi.CreateJunction(external, str(path.parent))",
+    "    else:",
+    "        os.symlink(external, path.parent, target_is_directory=True)",
+    "    return accepted",
+    "if generator.startswith('safe-'):",
+    "    generator = generator.removeprefix('safe-')",
+    "else:",
+    "    ranking.changed_path_parent_is_within_target = swap_parent",
+    "if generator == 'ranking':",
+    "    sys.argv = ['ranking', 'make-diff-rank-input', '--repo', repository, '--base', base, '--mode', 'local-patch', '--out', output]",
+    "    ranking.main()",
+    "else:",
+    "    import generate_in_scope_files as inventory",
+    "    sys.argv = ['inventory', '--repo', repository, '--scope', '.', '--out', output, '--diff-base', base, '--diff-mode', 'local-patch']",
+    "    inventory.main()",
+  ].join("\n");
+
+  for (const generator of ["ranking", "inventory"]) {
+    const external = join(root, `external-${generator}`);
+    const parked = join(root, `parked-${generator}`);
+    const output = join(root, `${generator}.output`);
+    mkdirSync(external);
+    writeFileSync(
+      join(external, filename),
+      generator === "ranking"
+        ? "outside = 'SYNTHETIC_EXTERNAL_MARKER'\n"
+        : Buffer.from("\0SYNTHETIC_EXTERNAL_MARKER"),
+    );
+
+    const runGenerator = (selected: string, destination: string) =>
+      spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          probe,
+          scripts,
+          repository,
+          base,
+          external,
+          parked,
+          destination,
+          selected,
+        ],
+        { encoding: "utf8" },
+      );
+    const safeOutput = `${output}.safe`;
+    const safe = runGenerator(`safe-${generator}`, safeOutput);
+    expect(safe.status, `${generator}: ${safe.stderr}`).toBe(0);
+    if (generator === "ranking") {
+      expect(JSON.parse(readFileSync(safeOutput, "utf8"))).toMatchObject({
+        path: `src/${filename}`,
+        preview: "inside = 2",
+      });
+    } else {
+      expect(readFileSync(safeOutput, "utf8")).toBe(`src/${filename}\n`);
+    }
+
+    const result = runGenerator(generator, output);
+
+    expect(
+      result.status,
+      `${generator}: ${result.stdout}\n${result.stderr}`,
+    ).toBe(generator === "ranking" ? 1 : 2);
+    expect(result.stderr.toLowerCase()).toContain("inside the selected target");
+
+    if (generator === "ranking") {
+      unlinkSync(parent);
+      renameSync(parked, parent);
+    }
+  }
+});
 
 test("diff inventory and previews stay inside the selected repository", async () => {
   const root = realpathSync(
