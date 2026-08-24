@@ -4191,11 +4191,16 @@ def finding_result(
         """,
         (occurrence["id"], FINDING_LOCATIONS_LIMIT),
     ):
+        role = (
+            bounded_output_text(row["role"], FINDING_LOCATION_ROLE_BYTES)
+            if row["role"] is not None
+            else None
+        )
         excerpt_locations.append(
             {
                 "endLine": row["end_line"],
                 "path": row["relative_path"],
-                "role": row["role"],
+                "role": role,
                 "startLine": row["start_line"],
             }
         )
@@ -4203,11 +4208,7 @@ def finding_result(
         location = {
             "endLine": row["end_line"],
             "path": bounded_output_text(row["relative_path"], FINDING_LOCATION_PATH_BYTES),
-            "role": (
-                bounded_output_text(row["role"], FINDING_LOCATION_ROLE_BYTES)
-                if row["role"] is not None
-                else None
-            ),
+            "role": role,
             "startLine": row["start_line"],
         }
         if absolute_path is not None:

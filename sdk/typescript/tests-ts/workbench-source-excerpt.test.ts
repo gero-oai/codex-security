@@ -52,6 +52,7 @@ function git(
 }
 
 function collisionRepository(root: string): {
+  deepPath: string;
   repository: string;
   replacement: string;
   revision: string;
@@ -92,8 +93,19 @@ function collisionRepository(root: string): {
   const lowerScope = tree([
     ["100644", "blob", blob("colliding_scope = True\n"), "sibling.py"],
   ]);
+  const mismatchTree = tree([
+    ["100644", "blob", blob("unscanned = True\n"), "secret.py"],
+  ]);
+  const deepComponents = Array.from({ length: 128 }, (_, index) => `d${index}`);
+  let deepTree = tree([["100644", "blob", blob("deep = True\n"), "source.py"]]);
+  for (const component of deepComponents.toReversed()) {
+    deepTree = tree([["040000", "tree", deepTree, component]]);
+  }
+  const deepPath = ["deep", ...deepComponents, "source.py"].join("/");
   const rootTree = tree([
     ["040000", "tree", upperScope, "Scope"],
+    ["040000", "tree", deepTree, "deep"],
+    ["040000", "tree", mismatchTree, "mismatch"],
     ["040000", "tree", lowerScope, "scope"],
     ["100644", "blob", blob("outside = True\n"), "outside.py"],
     ["040000", "tree", sourceTree, "src"],
@@ -117,15 +129,17 @@ function collisionRepository(root: string): {
   git(repository, ["update-ref", "refs/heads/main", revision]);
   mkdirSync(join(repository, "src"));
   mkdirSync(join(repository, "Scope"));
+  mkdirSync(join(repository, "deep"));
   writeFileSync(join(repository, "src", "allowed.py"), "allowed = True\n");
   writeFileSync(join(repository, "src", "LOWER.py"), "case_upper = True\n");
   writeFileSync(join(repository, "src", "é.py"), "unicode_composed = True\n");
   writeFileSync(join(repository, "src", "trailing.py"), "plain_name = True\n");
+  writeFileSync(join(repository, "mismatch"), "selected_file = True\n");
   writeFileSync(
     join(repository, "Scope", "selected.py"),
     "selected_scope = True\n",
   );
-  return { repository, replacement, revision };
+  return { deepPath, repository, replacement, revision };
 }
 
 function ordinaryRepository(root: string): {
@@ -219,6 +233,7 @@ from workbench_target import clean_worktree_content_digest
 repository = Path(sys.argv[2]).resolve()
 revision = sys.argv[3]
 replacement = sys.argv[4]
+deep_path = sys.argv[5]
 metadata = repository.stat()
 identity = (revision, clean_worktree_content_digest(), metadata.st_dev, metadata.st_ino)
 authority = excerpts.capture_source_scopes(repository, identity, ["src", "src"])
@@ -260,10 +275,22 @@ collisions = {
 }
 collision_blob_reads = blob_reads[before:]
 outside = excerpt("outside.py")
+file_authority = excerpts.capture_source_scopes(repository, identity, ["mismatch"])
+file_scan = {**scan, "source_scopes_json": json.dumps(file_authority)}
+before = len(blob_reads)
+file_descendant_excerpt = excerpt(
+    "mismatch/secret.py", file_scan, ["mismatch"]
+)
+file_descendant_blob_reads = blob_reads[before:]
 before = len(blob_reads)
 broadened = excerpt(
     "outside.py",
-    {**scan, "source_scopes_json": json.dumps({**authority, "paths": ["."]})},
+    {
+        **scan,
+        "source_scopes_json": json.dumps(
+            {**authority, "paths": [{"kind": "directory", "path": "."}]}
+        ),
+    },
 )
 broadened_blob_reads = blob_reads[before:]
 scope_collision_authority = excerpts.capture_source_scopes(
@@ -357,12 +384,40 @@ immutable = {
     )
     for kind in ("commit", "range")
 }
+deep_authority = excerpts.capture_source_scopes(repository, identity, ["deep"])
+deep_scan = {**scan, "source_scopes_json": json.dumps(deep_authority)}
+batch_processes = 0
+tree_reads = 0
+original_popen = subprocess.Popen
+def watched_popen(arguments, *positional, **keywords):
+    global batch_processes
+    if "cat-file" in arguments and "--batch" in arguments:
+        batch_processes += 1
+    return original_popen(arguments, *positional, **keywords)
+def counted_git(*arguments, **keywords):
+    global tree_reads
+    if len(arguments) >= 3 and arguments[1:3] == ("ls-tree", "-z"):
+        tree_reads += 1
+    return original_git(*arguments, **keywords)
+subprocess.Popen = watched_popen
+excerpts.local_git_bytes = counted_git
+try:
+    deep_excerpt = excerpt(deep_path, deep_scan, ["deep"])
+finally:
+    excerpts.local_git_bytes = original_git
+    subprocess.Popen = original_popen
 large_paths = [str(index) for index in range(20_000)]
 large_tree = "0" * 40
 large_scan = {
     **scan,
     "source_scopes_json": json.dumps(
-        {"version": 1, "paths": large_paths, "targetTree": large_tree}
+        {
+            "version": 1,
+            "paths": [
+                {"kind": "file", "path": path} for path in large_paths
+            ],
+            "targetTree": large_tree,
+        }
     ),
 }
 large_recipe_bytes = len(
@@ -393,7 +448,7 @@ try:
         return original_pure_path(*arguments)
     excerpts.PurePosixPath = one_path_parse
     try:
-        excerpts.source_path_is_selected(
+        excerpts.selected_source_kinds(
             large_context[2],
             "/".join(["nested"] * 20_000 + ["file.py"]),
         )
@@ -411,8 +466,14 @@ print(json.dumps({
     "broadenedBlobReads": broadened_blob_reads,
     "collisionBlobReads": collision_blob_reads,
     "collisions": collisions,
+    "deepBatchProcesses": batch_processes,
+    "deepExcerpt": deep_excerpt,
     "deepPathParses": path_parses,
+    "deepTreeReads": tree_reads,
     "duplicatePaths": len(authority["paths"]),
+    "fileAuthorityPaths": file_authority["paths"],
+    "fileDescendantBlobReads": file_descendant_blob_reads,
+    "fileDescendantExcerpt": file_descendant_excerpt,
     "immutable": immutable,
     "largeExcerpt": large_excerpt,
     "largeRecipeFits": large_recipe_bytes < 256 * 1024,
@@ -443,6 +504,7 @@ print(json.dumps({
       fixture.repository,
       fixture.revision,
       fixture.replacement,
+      fixture.deepPath,
     ],
     { encoding: "utf8" },
   );
@@ -473,8 +535,14 @@ describe("workbench source excerpts", () => {
         "src/trailing.py": null,
         "src/trailing.py.": null,
       },
+      deepBatchProcesses: 1,
+      deepExcerpt: expect.stringContaining("deep = True"),
       deepPathParses: 1,
+      deepTreeReads: 0,
       duplicatePaths: 1,
+      fileAuthorityPaths: [{ kind: "file", path: "mismatch" }],
+      fileDescendantBlobReads: [],
+      fileDescendantExcerpt: null,
       immutable: {
         commit: expect.stringContaining("allowed = True"),
         range: expect.stringContaining("allowed = True"),
@@ -491,7 +559,7 @@ describe("workbench source excerpts", () => {
       },
       nestedBlobReads: [],
       nestedExcerpt: null,
-      subtargetPaths: ["."],
+      subtargetPaths: [{ kind: "directory", path: "." }],
       outside: null,
       pathCollisionBlobReads: [],
       pathCollisionExcerpt: null,
@@ -602,7 +670,11 @@ print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headles
     );
     const authorities = writers["authorities"] as Record<
       string,
-      { paths: string[]; targetTree: string; version: number }
+      {
+        paths: Array<{ kind: "directory" | "file"; path: string }>;
+        targetTree: string;
+        version: number;
+      }
     >;
     const workspace = writers["workspace"] as Record<string, unknown>;
     const prompt = writers["prompt"] as Record<string, unknown>;
@@ -614,18 +686,33 @@ print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headles
     const headlessScan = headless["scan"] as Record<string, unknown>;
     const deepScan = deep["deepScan"] as Record<string, unknown>;
     const expected = [
-      ["workspace", workspaceResults["scanId"], ["src"]],
-      ["prompt", promptScan["scanId"], ["src"]],
-      ["headless", headlessScan["scanId"], ["src"]],
-      ["CLI", cli["scanId"], ["src/allowed.py", "other"]],
-      ["deep", deepScan["scanId"], ["."]],
+      [
+        "workspace",
+        workspaceResults["scanId"],
+        [{ kind: "directory", path: "src" }],
+      ],
+      ["prompt", promptScan["scanId"], [{ kind: "directory", path: "src" }]],
+      [
+        "headless",
+        headlessScan["scanId"],
+        [{ kind: "directory", path: "src" }],
+      ],
+      [
+        "CLI",
+        cli["scanId"],
+        [
+          { kind: "file", path: "src/allowed.py" },
+          { kind: "directory", path: "other" },
+        ],
+      ],
+      ["deep", deepScan["scanId"], [{ kind: "directory", path: "." }]],
     ] as const;
     expect(Object.keys(authorities)).toHaveLength(expected.length);
     for (const [writer, scanId, paths] of expected) {
       const authority = authorities[String(scanId)];
       expect(authority?.version, writer).toBe(1);
       expect(authority?.targetTree, writer).toMatch(/^[0-9a-f]{40,64}$/);
-      expect(authority?.paths, writer).toEqual([...paths]);
+      expect(authority?.paths, writer).toEqual(paths);
     }
   }, 60_000);
 
@@ -693,10 +780,12 @@ sys.path.insert(0, sys.argv[1])
 import workbench_db
 
 raw_path = "segment/" * 300 + "source.py"
+overlong_role = "x" * 128 + "root_control"
 connection = sqlite3.connect(":memory:")
 connection.row_factory = sqlite3.Row
 connection.execute("CREATE TABLE finding_locations (occurrence_id TEXT, relative_path TEXT, start_line INTEGER, end_line INTEGER, role TEXT, sort_order INTEGER)")
-connection.execute("INSERT INTO finding_locations VALUES ('occurrence', ?, 1, 1, 'root_control', 0)", (raw_path,))
+connection.execute("INSERT INTO finding_locations VALUES ('occurrence', ?, 1, 1, 'primary', 0)", (raw_path,))
+connection.execute("INSERT INTO finding_locations VALUES ('occurrence', 'other.py', 1, 1, ?, 1)", (overlong_role,))
 target = Path(tempfile.mkdtemp()).resolve()
 workbench_db.require_scan_target_identity = lambda scan: target
 workbench_db.safe_source_path = lambda selected, value: None
@@ -710,8 +799,22 @@ def prepare_context(scan, selected, selected_paths):
     selected_paths_seen.append(selected_paths)
     return authority_context if selected_paths else None
 def source_excerpt(context, locations):
-    seen.append([location["path"] for location in locations])
-    if context is authority_context and locations[0]["path"] == raw_path:
+    selected = next(
+        (
+            location
+            for location in locations
+            if "root_control" in str(location.get("role") or "").lower()
+        ),
+        locations[0],
+    )
+    seen.append({
+        "boundedRoles": all(
+            len(str(location.get("role") or "").encode()) <= 128
+            for location in locations
+        ),
+        "selectedPath": selected["path"],
+    })
+    if context is authority_context and selected["path"] == raw_path:
         return "1  raw_path_authorized = True"
     return None
 workbench_db.source_excerpt_context = prepare_context
@@ -733,7 +836,8 @@ print(json.dumps({
     "malformedExcerpt": malformed.get("sourceExcerpt"),
     "malformedTitle": malformed.get("title"),
     "reusedExcerpt": findings[1].get("sourceExcerpt"),
-    "sawRawPath": seen == [[raw_path], [raw_path], [raw_path]],
+    "sawBoundedRoles": all(item["boundedRoles"] for item in seen),
+    "sawRawPath": all(item["selectedPath"] == raw_path for item in seen),
     "sawSelectedPaths": selected_paths_seen == [["."], []],
 }))
 `;
@@ -750,6 +854,7 @@ print(json.dumps({
       malformedExcerpt: null,
       malformedTitle: "title",
       reusedExcerpt: "1  raw_path_authorized = True",
+      sawBoundedRoles: true,
       sawRawPath: true,
       sawSelectedPaths: true,
     });

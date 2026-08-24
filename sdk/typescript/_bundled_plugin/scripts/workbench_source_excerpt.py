@@ -8,15 +8,16 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass, field
-from functools import cache
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import IO, Any
 from unicodedata import normalize
 
 # Some plugin hosts launch Python with safe-path isolation enabled.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workbench_constants import GIT_REPOSITORY_ENVIRONMENT
 from workbench_target import (
     clean_worktree_content_digest,
     git_bytes,
@@ -33,7 +34,7 @@ TreeEntry = tuple[str, str, str]
 
 @dataclass
 class SourceScopeIndex:
-    selected: bool = False
+    kind: str | None = None
     children: dict[str, SourceScopeIndex] = field(default_factory=dict)
 
 
@@ -73,58 +74,139 @@ def local_git_bytes(repository: Path, *arguments: str) -> bytes | None:
     )
 
 
-@cache
-def tree_entries(repository: Path, tree: str) -> dict[str, tuple[TreeEntry, ...]] | None:
-    content = local_git_bytes(repository, "ls-tree", "-z", tree)
-    if content is None:
-        return None
-    entries: dict[str, list[TreeEntry]] = {}
-    for record in content.split(b"\0"):
-        if not record:
-            continue
-        metadata, separator, name = record.partition(b"\t")
-        fields = metadata.split(b" ")
-        if not separator or len(fields) != 3:
+def read_tree_object(
+    requests: IO[bytes], responses: IO[bytes], object_id: str
+) -> bytes:
+    encoded_object = object_id.encode("ascii")
+    requests.write(encoded_object + b"\0")
+    requests.flush()
+    header = responses.readline()
+    if not header.endswith(b"\n"):
+        raise ValueError("unterminated batch header")
+    fields = header[:-1].split(b" ")
+    if (
+        len(fields) != 3
+        or fields[0] != encoded_object
+        or fields[1] != b"tree"
+        or not fields[2].isdigit()
+    ):
+        raise ValueError("invalid tree response")
+    remaining = int(fields[2])
+    chunks: list[bytes] = []
+    while remaining:
+        chunk = responses.read(min(1024 * 1024, remaining))
+        if not chunk:
+            raise ValueError("truncated tree response")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if responses.read(1) != b"\n":
+        raise ValueError("missing tree terminator")
+    return b"".join(chunks)
+
+
+def matching_tree_entries(
+    content: bytes, name: str, object_id_bytes: int
+) -> tuple[TreeEntry, ...] | None:
+    expected_name = normalized_path_component(name)
+    matches = []
+    cursor = 0
+    while cursor < len(content):
+        mode_end = content.find(b" ", cursor)
+        name_end = content.find(b"\0", mode_end + 1)
+        object_start = name_end + 1
+        object_end = object_start + object_id_bytes
+        if (
+            mode_end <= cursor
+            or name_end < mode_end + 1
+            or object_end > len(content)
+        ):
             return None
-        mode, object_type, raw_object = fields
-        try:
-            object_id = raw_object.decode("ascii")
-        except UnicodeDecodeError:
-            return None
-        if not OBJECT_ID.fullmatch(object_id):
-            return None
+        mode = content[cursor:mode_end]
+        decoded_name = os.fsdecode(content[mode_end + 1 : name_end])
         kind = (
             "directory"
-            if mode == b"040000" and object_type == b"tree"
+            if mode in {b"40000", b"040000"}
             else "file"
-            if mode in {b"100644", b"100755"} and object_type == b"blob"
+            if mode in {b"100644", b"100755"}
             else "other"
         )
-        decoded_name = os.fsdecode(name)
-        entries.setdefault(normalized_path_component(decoded_name), []).append(
-            (decoded_name, kind, object_id)
-        )
-    return {name: tuple(matches) for name, matches in entries.items()}
+        if normalized_path_component(decoded_name) == expected_name:
+            matches.append((decoded_name, kind, content[object_start:object_end].hex()))
+        cursor = object_end
+    return tuple(matches)
 
 
-def tree_path(repository: Path, tree: str, value: str) -> TreeEntry | None:
+def tree_path(
+    repository: Path,
+    tree: str,
+    value: str,
+    *,
+    selected_kinds: dict[int, str] | None = None,
+) -> TreeEntry | None:
     path = relative_path(value)
     if path is None:
         return None
+    if selected_kinds is not None and selected_kinds.get(0, "directory") != "directory":
+        return None
     kind, object_id = "directory", tree
-    for name in path.parts:
-        if kind != "directory":
-            return None
-        aliases = (tree_entries(repository, object_id) or {}).get(
-            normalized_path_component(name), ()
-        )
-        # The normalized name must be unique before an exact spelling can win.
-        if len(aliases) != 1:
-            return None
-        entry = next((candidate for candidate in aliases if candidate[0] == name), None)
-        if entry is None:
-            return None
-        _, kind, object_id = entry
+    if not path.parts:
+        return path.as_posix(), kind, object_id
+
+    environment = os.environ.copy()
+    for variable in GIT_REPOSITORY_ENVIRONMENT:
+        environment.pop(variable, None)
+    environment["GIT_ALLOW_PROTOCOL"] = ""
+    environment["GIT_LITERAL_PATHSPECS"] = "1"
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    command = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "i18n.logOutputEncoding=UTF-8",
+        "-C",
+        str(repository),
+        "--no-replace-objects",
+        "cat-file",
+        "--batch",
+        "-z",
+    ]
+    try:
+        with subprocess.Popen(
+            command,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ) as process:
+            if process.stdin is None or process.stdout is None:
+                return None
+            for depth, name in enumerate(path.parts, start=1):
+                if kind != "directory":
+                    return None
+                content = read_tree_object(process.stdin, process.stdout, object_id)
+                aliases = matching_tree_entries(content, name, len(object_id) // 2)
+                # The normalized name must be unique before an exact spelling can win.
+                if aliases is None or len(aliases) != 1:
+                    return None
+                entry = next(
+                    (candidate for candidate in aliases if candidate[0] == name),
+                    None,
+                )
+                if entry is None:
+                    return None
+                _, kind, object_id = entry
+                if (
+                    selected_kinds is not None
+                    and (expected_kind := selected_kinds.get(depth)) is not None
+                    and kind != expected_kind
+                ):
+                    return None
+            process.stdin.close()
+            if process.wait() != 0:
+                return None
+    except (OSError, ValueError):
+        return None
     return path.as_posix(), kind, object_id
 
 
@@ -187,13 +269,19 @@ def capture_source_scopes(
                 metadata = raw_selected.lstat()
             except OSError:
                 continue
-            ordinary = stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
-            if not ordinary:
+            kind = (
+                "directory"
+                if stat.S_ISDIR(metadata.st_mode)
+                else "file"
+                if stat.S_ISREG(metadata.st_mode)
+                else None
+            )
+            if kind is None:
                 continue
             selected = parsed.as_posix()
             if selected not in captured:
                 captured.add(selected)
-                authority["paths"].append(selected)
+                authority["paths"].append({"kind": kind, "path": selected})
     except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
         return {"version": 1, "paths": []}
     return authority
@@ -235,36 +323,50 @@ def load_source_scopes(
         return None
     index = SourceScopeIndex()
     for record in records:
-        path = relative_path(record) if isinstance(record, str) else None
+        if not isinstance(record, dict) or set(record) != {"kind", "path"}:
+            return None
+        kind = record.get("kind")
+        saved_path = record.get("path")
+        path = relative_path(saved_path) if isinstance(saved_path, str) else None
         if path is None:
             return None
         selected = path.as_posix()
-        if selected != record or selected not in expected:
+        if (
+            kind not in {"directory", "file"}
+            or selected != saved_path
+            or selected not in expected
+        ):
             return None
         node = index
         for component in path.parts:
             node = node.children.setdefault(component, SourceScopeIndex())
-        if node.selected:
+        if node.kind is not None:
             return None
-        node.selected = True
+        node.kind = kind
     return repository, tree, index
 
 
-def source_path_is_selected(index: SourceScopeIndex, value: str) -> bool:
+def selected_source_kinds(
+    index: SourceScopeIndex, value: str
+) -> dict[int, str] | None:
     path = relative_path(value)
     if path is None:
-        return False
+        return None
     node = index
-    if node.selected:
-        return True
-    for component in path.parts:
+    kinds = {0: node.kind} if node.kind is not None else {}
+    authorized = node.kind == "directory"
+    for depth, component in enumerate(path.parts, start=1):
         child = node.children.get(component)
         if child is None:
-            return False
+            return kinds if authorized else None
         node = child
-        if node.selected:
-            return True
-    return False
+        if node.kind is not None:
+            kinds[depth] = node.kind
+        if node.kind == "directory" or (
+            node.kind == "file" and depth == len(path.parts)
+        ):
+            authorized = True
+    return kinds if authorized else None
 
 
 def source_excerpt_context(
@@ -307,9 +409,10 @@ def finding_source_excerpt_from_context(
     if not isinstance(path, str) or not isinstance(start_line, int):
         return None
     try:
+        selected_kinds = selected_source_kinds(scopes, path)
         selected = (
-            tree_path(repository, tree, path)
-            if source_path_is_selected(scopes, path)
+            tree_path(repository, tree, path, selected_kinds=selected_kinds)
+            if selected_kinds is not None
             else None
         )
         object_id = (
