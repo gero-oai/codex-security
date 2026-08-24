@@ -54,6 +54,7 @@ function git(
 
 function collisionRepository(root: string): {
   repository: string;
+  replacement: string;
   revision: string;
 } {
   const repository = join(root, "repository");
@@ -102,6 +103,15 @@ function collisionRepository(root: string): {
     "-m",
     "synthetic source tree",
   ]);
+  const replacementTree = tree([
+    ["100644", "blob", blob("replacement = True\n"), "replacement.py"],
+  ]);
+  const replacement = git(repository, [
+    "commit-tree",
+    replacementTree,
+    "-m",
+    "synthetic replacement tree",
+  ]);
   git(repository, ["symbolic-ref", "HEAD", "refs/heads/main"]);
   git(repository, ["update-ref", "refs/heads/main", revision]);
   mkdirSync(join(repository, "src"));
@@ -113,7 +123,7 @@ function collisionRepository(root: string): {
     join(repository, "Scope", "selected.py"),
     "selected_scope = True\n",
   );
-  return { repository, revision };
+  return { repository, replacement, revision };
 }
 
 function ordinaryRepository(root: string): {
@@ -211,10 +221,10 @@ function workbench(root: string, args: string[], input?: string) {
 
 function collisionProbe(
   pluginRoot: string,
-  fixture: { repository: string; revision: string },
+  fixture: { repository: string; replacement: string; revision: string },
 ) {
   const program = String.raw`
-import json, sys
+import json, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import workbench_source_excerpt as excerpts
@@ -222,6 +232,7 @@ from workbench_target import clean_worktree_content_digest
 
 repository = Path(sys.argv[2]).resolve()
 revision = sys.argv[3]
+replacement = sys.argv[4]
 metadata = repository.stat()
 identity = (revision, clean_worktree_content_digest(), metadata.st_dev, metadata.st_ino)
 authority = excerpts.capture_source_scopes(repository, identity, ["src", "src"])
@@ -233,12 +244,14 @@ scan = {
     "target_snapshot_digest": clean_worktree_content_digest(),
     "source_scopes_json": authority_json,
 }
-def excerpt(path, saved=scan, selected_paths=("src",)):
+def excerpt(path, saved=scan, selected_paths=None):
+    if selected_paths is None:
+        selected_paths = ["src"]
     return excerpts.finding_source_excerpt(
         saved,
         repository,
         [{"path": path, "startLine": 1, "endLine": 1, "role": "root_control"}],
-        list(selected_paths),
+        selected_paths,
     )
 original_git = excerpts.local_git_bytes
 blob_reads = []
@@ -261,11 +274,28 @@ broadened = excerpt(
     {**scan, "source_scopes_json": json.dumps({"version": 1, "paths": ["."]})},
 )
 broadened_blob_reads = blob_reads[before:]
+subprocess.run(
+    ["git", "-C", str(repository), "update-ref", f"refs/replace/{revision}", replacement],
+    check=True,
+)
+before = len(blob_reads)
+try:
+    replaced = excerpt("src/allowed.py")
+finally:
+    subprocess.run(
+        ["git", "-C", str(repository), "update-ref", "-d", f"refs/replace/{revision}"],
+        check=True,
+    )
+replacement_blob_reads = blob_reads[before:]
 excerpts.local_git_bytes = original_git
 legacy_scan = dict(scan)
 legacy_scan.pop("source_scopes_json")
 legacy = excerpt("src/allowed.py", legacy_scan)
 invalid = excerpt("src/allowed.py", {**scan, "source_scopes_json": "{"})
+malformed = {
+    "paths": excerpt("src/allowed.py", selected_paths=42),
+    "revision": excerpt("src/allowed.py", {**scan, "target_revision": 42}),
+}
 
 original_context = excerpts.git_worktree_context
 git_calls = []
@@ -300,11 +330,14 @@ print(json.dumps({
     "immutable": immutable,
     "invalid": invalid,
     "legacy": legacy,
+    "malformed": malformed,
     "mutable": {"excerpts": mutable, "gitCalls": len(git_calls)},
     "outside": outside,
     "pathCollisionPaths": len(
         excerpts.capture_source_scopes(repository, identity, ["Scope"])["paths"]
     ),
+    "replaced": replaced,
+    "replacementBlobReads": replacement_blob_reads,
 }))
 `;
   const result = spawnSync(
@@ -317,6 +350,7 @@ print(json.dumps({
       join(pluginRoot, "scripts"),
       fixture.repository,
       fixture.revision,
+      fixture.replacement,
     ],
     { encoding: "utf8" },
   );
@@ -352,12 +386,15 @@ describe("workbench source excerpts", () => {
       },
       invalid: null,
       legacy: null,
+      malformed: { paths: null, revision: null },
       mutable: {
         excerpts: { working_tree: null, None: null },
         gitCalls: 0,
       },
       outside: null,
       pathCollisionPaths: 0,
+      replaced: null,
+      replacementBlobReads: [],
     });
   }, 60_000);
 
@@ -558,22 +595,33 @@ workbench_db.scan_history.finding_matches = lambda *arguments: ([], None, [])
 seen = []
 selected_paths_seen = []
 def source_excerpt(scan, selected, locations, selected_paths):
-    seen.extend(location["path"] for location in locations)
-    selected_paths_seen.extend(selected_paths)
-    return "1  raw_path_authorized = True" if locations[0]["path"] == raw_path else None
+    seen.append([location["path"] for location in locations])
+    selected_paths_seen.append(selected_paths)
+    if selected_paths and locations[0]["path"] == raw_path:
+        return "1  raw_path_authorized = True"
+    return None
 workbench_db.finding_source_excerpt = source_excerpt
+scan = {"id": "scan", "started_at": "now", "scan_dir": str(target), "scope": "."}
+occurrence = {"id": "occurrence", "details_json": "{}", "confidence": "high", "severity": "high", "created_at": "now", "finding_id": "finding", "remediation": "fix", "summary": "summary", "title": "title"}
 finding = workbench_db.finding_result(
     connection,
-    {"id": "scan", "started_at": "now", "scan_dir": str(target), "scope": "."},
-    {"id": "occurrence", "details_json": "{}", "confidence": "high", "severity": "high", "created_at": "now", "finding_id": "finding", "remediation": "fix", "summary": "summary", "title": "title"},
+    scan,
+    occurrence,
+)
+malformed = workbench_db.finding_result(
+    connection,
+    {**scan, "recipe_json": json.dumps({"target": {"kind": "paths", "paths": 42}})},
+    occurrence,
 )
 display_path = finding["locations"][0]["path"]
 print(json.dumps({
     "displayBytes": len(display_path.encode()),
     "displayDiffers": display_path != raw_path,
     "excerpt": finding.get("sourceExcerpt"),
-    "sawRawPath": seen == [raw_path],
-    "sawSelectedPaths": selected_paths_seen == ["."],
+    "malformedExcerpt": malformed.get("sourceExcerpt"),
+    "malformedTitle": malformed.get("title"),
+    "sawRawPath": seen == [[raw_path], [raw_path]],
+    "sawSelectedPaths": selected_paths_seen == [["."], []],
 }))
 `;
     const result = spawnSync(
@@ -586,6 +634,8 @@ print(json.dumps({
       displayBytes: 2_048,
       displayDiffers: true,
       excerpt: "1  raw_path_authorized = True",
+      malformedExcerpt: null,
+      malformedTitle: "title",
       sawRawPath: true,
       sawSelectedPaths: true,
     });

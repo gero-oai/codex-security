@@ -120,9 +120,11 @@ def tree_path(repository: Path, tree: str, value: str) -> TreeEntry | None:
 
 
 def target_tree(target: Path, revision: str) -> tuple[Path, str] | None:
-    if not OBJECT_ID.fullmatch(revision):
+    if not isinstance(revision, str) or not OBJECT_ID.fullmatch(revision):
         return None
     repository, prefix = git_worktree_context(target)
+    if local_git_bytes(repository, "replace", "--list") != b"":
+        return None
     raw_tree = local_git_bytes(
         repository,
         "rev-parse",
@@ -210,10 +212,14 @@ def load_source_scopes(
         or not records
     ):
         return None
+    if not isinstance(selected_paths, list) or not all(
+        isinstance(value, str) for value in selected_paths
+    ):
+        return None
     expected = {
         parsed.as_posix()
         for value in selected_paths
-        if isinstance(value, str) and (parsed := relative_path(value)) is not None
+        if (parsed := relative_path(value)) is not None
     }
     if not expected:
         return None
@@ -285,7 +291,7 @@ def finding_source_excerpt(
         return None
     try:
         context = load_source_scopes(scan, target, selected_paths)
-    except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
+    except (OSError, RuntimeError, SystemExit, TypeError, UnicodeError, ValueError):
         return None
     if context is None:
         return None

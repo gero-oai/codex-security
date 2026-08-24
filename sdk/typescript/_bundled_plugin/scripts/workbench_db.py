@@ -4184,6 +4184,10 @@ def finding_result(
         selected_paths = requested_scan_paths(scan)
     except (IndexError, KeyError, TypeError, ValueError):
         selected_paths = []
+    if not isinstance(selected_paths, list) or not all(
+        isinstance(path, str) for path in selected_paths
+    ):
+        selected_paths = []
     source_excerpt = finding_source_excerpt(
         scan, target, excerpt_locations, selected_paths
     )
