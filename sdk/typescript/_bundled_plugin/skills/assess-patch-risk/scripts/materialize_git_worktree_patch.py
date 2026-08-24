@@ -152,8 +152,20 @@ def publish_outputs(outputs: list[tuple[Path, bytes]]) -> None:
 def validate_index_state(repository: Path, status_payload: bytes) -> None:
     if run_git(repository, "ls-files", "--unmerged", "-z"):
         raise MaterializationError("unmerged index entries require a supplied immutable patch")
+    sparse_checkout = (
+        run_git(
+            repository,
+            "config",
+            "--bool",
+            "core.sparseCheckout",
+            expected_returncodes=(0, 1),
+        ).strip()
+        == b"true"
+    )
     for entry in relative_paths(run_git(repository, "ls-files", "-v", "-z")):
         marker = entry[:1]
+        if marker == b"S" and sparse_checkout:
+            continue
         if marker == b"S" or marker.islower():
             path = decode_path(entry[2:])
             raise MaterializationError(
