@@ -286,10 +286,7 @@ def watched_popen(arguments, *positional, **keywords):
         blob_reads.append(arguments[-1])
         process.stdout = WatchedBlobOutput(process.stdout)
     return process
-def watched_git(*arguments, **kwargs):
-    return original_git(*arguments, **kwargs)
 subprocess.Popen = watched_popen
-excerpts.local_git_bytes = watched_git
 allowed = excerpt("src/allowed.py")
 before = len(blob_read_sizes)
 large_blob_excerpt = excerpt("src/large.py")
@@ -395,7 +392,6 @@ finally:
         check=True,
     )
 replacement_blob_reads = blob_reads[before:]
-excerpts.local_git_bytes = original_git
 subprocess.Popen = original_popen
 legacy_scan = dict(scan)
 legacy_scan.pop("source_scopes_json")
