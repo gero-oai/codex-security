@@ -4317,6 +4317,254 @@ async function runFindingPatches(
   return patches;
 }
 
+const PATCH_REVIEW_EXIT_CODE = {
+  success: 0,
+  failure: 2,
+} as const;
+
+type PatchReviewVerdict = z.infer<typeof patchReviewSchema>;
+
+type SkillStageRunner = (
+  output: Writable,
+  options?: SkillRunOptions,
+) => Promise<number>;
+
+type PatchReviewSubject =
+  | { status: "ready"; paths?: string[] }
+  | { status: "empty" }
+  | { status: "invalid" };
+
+type PatchReviewerResult =
+  | { status: "reviewed"; verdict: PatchReviewVerdict }
+  | { status: "failed"; exitCode: number };
+
+interface PatchReviewWorkflowContext {
+  run: SkillStageRunner;
+  options: SkillRunOptions;
+  stderr: Writable;
+  history: PatchReviewDecision[];
+  paths?: string[];
+}
+
+async function captureSkillStage(
+  run: SkillStageRunner,
+  options?: SkillRunOptions,
+): Promise<{ exitCode: number; response: string }> {
+  let response = "";
+  const output: Writable = {
+    write(value: string | Uint8Array): boolean {
+      response += value.toString();
+      return true;
+    },
+  };
+  const exitCode = await run(output, options);
+  return { exitCode, response };
+}
+
+function parsePatchReviewSubject(
+  response: string,
+  scopedToFindings: boolean,
+): PatchReviewSubject {
+  if (!scopedToFindings) return { status: "ready" };
+  try {
+    const reported = JSON.parse(response) as { patches?: unknown[] };
+    if (!Array.isArray(reported.patches)) return { status: "invalid" };
+
+    const paths: string[] = [];
+    for (const patch of reported.patches) {
+      const parsed = findingPatchSchema.safeParse(patch);
+      if (!parsed.success) return { status: "invalid" };
+      if (parsed.data.status === "verified") paths.push(...parsed.data.files);
+    }
+    return paths.length === 0
+      ? { status: "empty" }
+      : { status: "ready", paths };
+  } catch {
+    return { status: "invalid" };
+  }
+}
+
+function parsePatchReviewVerdict(
+  response: string,
+  stage: PatchReviewRole,
+  stderr: Writable,
+): PatchReviewVerdict | undefined {
+  let verdict: PatchReviewVerdict;
+  try {
+    verdict = patchReviewSchema.parse(JSON.parse(response));
+  } catch {
+    stderr.write(`${stage} review returned an invalid verdict.\n`);
+    return undefined;
+  }
+  if (
+    (verdict.status === "approved" && verdict.findings.length !== 0) ||
+    (verdict.status === "revise" && verdict.findings.length === 0)
+  ) {
+    stderr.write(`${stage} review returned an inconsistent verdict.\n`);
+    return undefined;
+  }
+  return verdict;
+}
+
+async function runIndependentPatchReview(
+  stage: PatchReviewRole,
+  context: PatchReviewWorkflowContext,
+): Promise<PatchReviewerResult> {
+  const reconciliation = stage === "review-conflict-reconciliation";
+  context.stderr.write(
+    reconciliation
+      ? "Reconciling conflicting patch review decisions...\n"
+      : `Running independent ${stage} review...\n`,
+  );
+  const review = await captureSkillStage(context.run, {
+    ...context.options,
+    reviewPaths: context.paths,
+    reviewStage: stage,
+    reviewHistory: context.history,
+  });
+  if (review.exitCode !== PATCH_REVIEW_EXIT_CODE.success) {
+    context.stderr.write(
+      `${stage} review exited with status ${review.exitCode}.\n`,
+    );
+    return { status: "failed", exitCode: review.exitCode };
+  }
+
+  const verdict = parsePatchReviewVerdict(
+    review.response,
+    stage,
+    context.stderr,
+  );
+  if (verdict === undefined) {
+    return { status: "failed", exitCode: PATCH_REVIEW_EXIT_CODE.failure };
+  }
+
+  context.history.push({
+    stage,
+    status: verdict.status,
+    findings: verdict.findings,
+  });
+  const label = reconciliation ? "verdict" : "review verdict";
+  context.stderr.write(
+    `${stage} ${label}: ${JSON.stringify({
+      status: verdict.status,
+      findings: verdict.findings.length,
+    })}\n`,
+  );
+  return { status: "reviewed", verdict };
+}
+
+function patchReviewDecisionsConflict(
+  history: readonly PatchReviewDecision[],
+): boolean {
+  const decisions = history
+    .filter(({ status }) => status === "revise")
+    .slice(-3);
+  return (
+    decisions.length === 3 &&
+    decisions[0]!.stage === decisions[2]!.stage &&
+    decisions[0]!.stage !== decisions[1]!.stage
+  );
+}
+
+function canRevisePatch(
+  stageRevisions: number,
+  totalRevisions: number,
+  options: PatchReviewOptions,
+): boolean {
+  return options.maxReviewRevisions === undefined
+    ? stageRevisions < 1
+    : totalRevisions < options.maxReviewRevisions;
+}
+
+async function runPatchReviewWorkflow(
+  stages: readonly PatchReviewStage[],
+  stdout: Writable,
+  context: PatchReviewWorkflowContext,
+): Promise<number> {
+  let patch = await captureSkillStage(context.run);
+  if (patch.exitCode !== PATCH_REVIEW_EXIT_CODE.success) return patch.exitCode;
+
+  let subject = parsePatchReviewSubject(
+    patch.response,
+    context.options.findings !== undefined,
+  );
+  if (subject.status === "invalid") {
+    context.stderr.write(
+      "The generated patch did not return a valid review subject.\n",
+    );
+    return PATCH_REVIEW_EXIT_CODE.failure;
+  }
+  if (subject.status === "empty") {
+    stdout.write(patch.response);
+    return PATCH_REVIEW_EXIT_CODE.success;
+  }
+  context.paths = subject.paths;
+
+  let reconciled = false;
+  let totalRevisions = 0;
+  for (let stageIndex = 0; stageIndex < stages.length; stageIndex += 1) {
+    const stage = stages[stageIndex]!;
+    let stageRevisions = 0;
+    while (true) {
+      const review = await runIndependentPatchReview(stage, context);
+      if (review.status === "failed") return review.exitCode;
+
+      let verdict = review.verdict;
+      if (verdict.status === "approved") break;
+      if (
+        verdict.status === "revise" &&
+        !reconciled &&
+        patchReviewDecisionsConflict(context.history)
+      ) {
+        reconciled = true;
+        const reconciliation = await runIndependentPatchReview(
+          "review-conflict-reconciliation",
+          context,
+        );
+        if (reconciliation.status === "failed") return reconciliation.exitCode;
+        if (reconciliation.verdict.status === "approved") break;
+        verdict = reconciliation.verdict;
+      }
+      if (
+        verdict.status === "blocked" ||
+        !canRevisePatch(stageRevisions, totalRevisions, context.options)
+      ) {
+        context.stderr.write(`${stage} review did not approve the patch.\n`);
+        return PATCH_REVIEW_EXIT_CODE.failure;
+      }
+
+      stageRevisions += 1;
+      totalRevisions += 1;
+      patch = await captureSkillStage(context.run, {
+        ...context.options,
+        reviewFindings: verdict.findings,
+        reviewHistory: context.history,
+      });
+      if (patch.exitCode !== PATCH_REVIEW_EXIT_CODE.success) {
+        return patch.exitCode;
+      }
+      subject = parsePatchReviewSubject(
+        patch.response,
+        context.options.findings !== undefined,
+      );
+      if (subject.status !== "ready") {
+        context.stderr.write(
+          "The revised patch did not return a valid review subject.\n",
+        );
+        return PATCH_REVIEW_EXIT_CODE.failure;
+      }
+      context.paths = subject.paths;
+      if (context.options.maxReviewRevisions !== undefined && stageIndex > 0) {
+        stageIndex = -1;
+        break;
+      }
+    }
+  }
+
+  stdout.write(patch.response);
+  return PATCH_REVIEW_EXIT_CODE.success;
+}
+
 async function runSkill(
   skill: "validation" | "fix-finding" | "verify-fix",
   inputs: readonly (string | ImportedIssue)[],
@@ -4347,190 +4595,12 @@ async function runSkill(
     );
   if (stages.length === 0) return run(stdout);
 
-  let patchResponse = "";
-  const patchOutput: Writable = {
-    write(value: string | Uint8Array): boolean {
-      patchResponse += value.toString();
-      return true;
-    },
-  };
-  let status = await run(patchOutput);
-  if (status !== 0) return status;
-
-  let reviewPaths: string[] | undefined;
-  const updateReviewPaths = (): boolean => {
-    if (options.findings === undefined) return true;
-    try {
-      const reported = JSON.parse(patchResponse) as { patches?: unknown[] };
-      if (!Array.isArray(reported.patches)) return false;
-      reviewPaths = [];
-      for (const patch of reported.patches) {
-        const parsed = findingPatchSchema.safeParse(patch);
-        if (!parsed.success) return false;
-        if (parsed.data.status === "verified") {
-          reviewPaths.push(...parsed.data.files);
-        }
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  if (!updateReviewPaths()) {
-    stderr.write(
-      "The generated patch did not return a valid review subject.\n",
-    );
-    return 2;
-  }
-  if (reviewPaths?.length === 0) {
-    stdout.write(patchResponse);
-    return 0;
-  }
-
-  const reviewHistory: PatchReviewDecision[] = [];
-  const parseReviewVerdict = (
-    response: string,
-    stage: PatchReviewRole,
-  ): z.infer<typeof patchReviewSchema> | undefined => {
-    let verdict: z.infer<typeof patchReviewSchema>;
-    try {
-      verdict = patchReviewSchema.parse(JSON.parse(response));
-    } catch {
-      stderr.write(`${stage} review returned an invalid verdict.\n`);
-      return undefined;
-    }
-    if (
-      (verdict.status === "approved" && verdict.findings.length !== 0) ||
-      (verdict.status === "revise" && verdict.findings.length === 0)
-    ) {
-      stderr.write(`${stage} review returned an inconsistent verdict.\n`);
-      return undefined;
-    }
-    return verdict;
-  };
-  let reconciled = false;
-  let totalRevisions = 0;
-  for (let stageIndex = 0; stageIndex < stages.length; stageIndex += 1) {
-    const stage = stages[stageIndex]!;
-    let stageRevisions = 0;
-    while (true) {
-      stderr.write(`Running independent ${stage} review...\n`);
-      let response = "";
-      const reviewOutput: Writable = {
-        write(value: string | Uint8Array): boolean {
-          response += value.toString();
-          return true;
-        },
-      };
-      status = await run(reviewOutput, {
-        ...options,
-        reviewPaths,
-        reviewStage: stage,
-        reviewHistory,
-      });
-      if (status !== 0) {
-        stderr.write(`${stage} review exited with status ${status}.\n`);
-        return status;
-      }
-
-      let verdict = parseReviewVerdict(response, stage);
-      if (verdict === undefined) return 2;
-      reviewHistory.push({
-        stage,
-        status: verdict.status,
-        findings: verdict.findings,
-      });
-      stderr.write(
-        `${stage} review verdict: ${JSON.stringify({
-          status: verdict.status,
-          findings: verdict.findings.length,
-        })}\n`,
-      );
-      if (verdict.status === "approved") break;
-      if (verdict.status === "revise" && !reconciled) {
-        const alternating = reviewHistory
-          .filter((decision) => decision.status === "revise")
-          .slice(-3);
-        if (
-          alternating.length === 3 &&
-          alternating[0]!.stage === alternating[2]!.stage &&
-          alternating[0]!.stage !== alternating[1]!.stage
-        ) {
-          reconciled = true;
-          stderr.write("Reconciling conflicting patch review decisions...\n");
-          let reconciliationResponse = "";
-          const reconciliationOutput: Writable = {
-            write(value: string | Uint8Array): boolean {
-              reconciliationResponse += value.toString();
-              return true;
-            },
-          };
-          status = await run(reconciliationOutput, {
-            ...options,
-            reviewPaths,
-            reviewStage: "review-conflict-reconciliation",
-            reviewHistory,
-          });
-          if (status !== 0) {
-            stderr.write(
-              `review-conflict-reconciliation review exited with status ${status}.\n`,
-            );
-            return status;
-          }
-          const reconciliation = parseReviewVerdict(
-            reconciliationResponse,
-            "review-conflict-reconciliation",
-          );
-          if (reconciliation === undefined) return 2;
-          reviewHistory.push({
-            stage: "review-conflict-reconciliation",
-            status: reconciliation.status,
-            findings: reconciliation.findings,
-          });
-          stderr.write(
-            `review-conflict-reconciliation verdict: ${JSON.stringify({
-              status: reconciliation.status,
-              findings: reconciliation.findings.length,
-            })}\n`,
-          );
-          if (reconciliation.status === "approved") break;
-          verdict = reconciliation;
-        }
-      }
-      if (
-        verdict.status === "blocked" ||
-        (options.maxReviewRevisions === undefined
-          ? stageRevisions >= 1
-          : totalRevisions >= options.maxReviewRevisions)
-      ) {
-        stderr.write(`${stage} review did not approve the patch.\n`);
-        return 2;
-      }
-
-      stageRevisions += 1;
-      totalRevisions += 1;
-      patchResponse = "";
-      status = await run(patchOutput, {
-        ...options,
-        reviewFindings: verdict.findings,
-        reviewHistory,
-      });
-      if (status !== 0) return status;
-      if (!updateReviewPaths() || reviewPaths?.length === 0) {
-        stderr.write(
-          "The revised patch did not return a valid review subject.\n",
-        );
-        return 2;
-      }
-      if (options.maxReviewRevisions !== undefined && stageIndex > 0) {
-        stageIndex = -1;
-        break;
-      }
-    }
-  }
-
-  stdout.write(patchResponse);
-  return 0;
+  return runPatchReviewWorkflow(stages, stdout, {
+    run,
+    options,
+    stderr,
+    history: [],
+  });
 }
 
 async function runSkillStage(
