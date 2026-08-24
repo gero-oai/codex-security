@@ -300,6 +300,26 @@ describe("full CLI manifest", () => {
     }
   });
 
+  test("includes bulk-scan output restrictions in scoped discovery", async () => {
+    const stderr = capture();
+    expect(
+      await main(
+        ["bulk-scan", "--output-dir", "results"],
+        capture().stream,
+        stderr.stream,
+        dependencies(),
+      ),
+    ).toBe(2);
+
+    const restriction = stderr
+      .text()
+      .replace(/^codex-security:\s*/u, "")
+      .trim();
+    expect(restriction).toContain("--output-dir");
+    expect(restriction).toContain("repository CSV");
+    expect(await invoke(["bulk-scan", "--llms-full"])).toContain(restriction);
+  });
+
   test("keeps built-in operands out of the shared command-argument view", () => {
     for (const [option, value] of [
       ["--format", "md"],

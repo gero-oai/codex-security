@@ -2683,7 +2683,9 @@ export async function main(
         },
       ],
       hint:
-        "A repository CSV requires --output-dir. For example: " +
+        "A repository CSV requires --output-dir. " +
+        "--output-dir can only be used with a repository CSV; omit it to " +
+        "choose an output directory interactively. For example: " +
         "`codex-security bulk-scan repositories.csv " +
         "--output-dir /path/outside/repositories/results " +
         "--workers 4 --max-attempts 3`.",
