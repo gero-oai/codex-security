@@ -33,7 +33,7 @@ TreeEntry = tuple[str, str, str]
 
 @dataclass
 class SourceScopeIndex:
-    scope: str | None = None
+    selected: bool = False
     children: dict[str, SourceScopeIndex] = field(default_factory=dict)
 
 
@@ -233,37 +233,38 @@ def load_source_scopes(
     repository, tree = context
     if tree != expected_tree:
         return None
-    scopes: set[str] = set()
     index = SourceScopeIndex()
     for record in records:
         path = relative_path(record) if isinstance(record, str) else None
         if path is None:
             return None
         selected = path.as_posix()
-        if selected != record or selected not in expected or selected in scopes:
+        if selected != record or selected not in expected:
             return None
-        scopes.add(selected)
         node = index
         for component in path.parts:
             node = node.children.setdefault(component, SourceScopeIndex())
-        node.scope = selected
+        if node.selected:
+            return None
+        node.selected = True
     return repository, tree, index
 
 
-def source_scope_for_path(index: SourceScopeIndex, value: str) -> str | None:
+def source_path_is_selected(index: SourceScopeIndex, value: str) -> bool:
     path = relative_path(value)
     if path is None:
-        return None
+        return False
     node = index
-    scope = node.scope
+    if node.selected:
+        return True
     for component in path.parts:
         child = node.children.get(component)
         if child is None:
-            break
+            return False
         node = child
-        if node.scope is not None:
-            scope = node.scope
-    return scope
+        if node.selected:
+            return True
+    return False
 
 
 def source_excerpt_context(
@@ -306,8 +307,11 @@ def finding_source_excerpt_from_context(
     if not isinstance(path, str) or not isinstance(start_line, int):
         return None
     try:
-        scope = source_scope_for_path(scopes, path)
-        selected = tree_path(repository, tree, path) if scope is not None else None
+        selected = (
+            tree_path(repository, tree, path)
+            if source_path_is_selected(scopes, path)
+            else None
+        )
         object_id = (
             selected[2]
             if selected is not None and selected[1] == "file"

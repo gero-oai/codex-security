@@ -393,7 +393,7 @@ try:
         return original_pure_path(*arguments)
     excerpts.PurePosixPath = one_path_parse
     try:
-        excerpts.source_scope_for_path(
+        excerpts.source_path_is_selected(
             large_context[2],
             "/".join(["nested"] * 20_000 + ["file.py"]),
         )
