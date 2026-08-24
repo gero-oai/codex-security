@@ -366,6 +366,10 @@ for optional, independent reviews in that order. Minimality review removes
 unnecessary or unrelated changes; style review checks project instructions,
 local conventions, and applicable style guides. Both stages are disabled by
 default.
+Set `--max-review-revisions 5` to allow up to five author revisions across the
+selected review stages. After a later-stage revision, earlier selected reviews
+run again; blocked reviews still stop immediately. Without this option,
+minimality and style each permit one revision.
 JSON scan results include `patchSeverity`. Scan and
 saved-finding results include one `patches` entry per selected finding with
 status `verified`, `no_change`, `blocked`, or `failed`, plus `pullRequest` when

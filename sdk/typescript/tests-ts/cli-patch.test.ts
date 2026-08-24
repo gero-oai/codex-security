@@ -194,6 +194,48 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("passes the configured revision budget to scan and saved-finding patching", async () => {
+    for (const arguments_ of [
+      ["scan", "--patch"],
+      ["patch", "--scan", "scan-1"],
+    ]) {
+      const result = resultWithFindings(["high"]);
+      let reviews = 0;
+      const outcome = await runWorkflow(
+        [...arguments_, "--review-minimality", "--max-review-revisions", "2"],
+        {
+          result,
+          onWorkbench: () => savedScan(result),
+          onCodex: (args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+              output!.stdout.write(
+                JSON.stringify(
+                  reviews < 3
+                    ? {
+                        status: "revise",
+                        findings: [`Remove unrelated change ${reviews}.`],
+                      }
+                    : { status: "approved", findings: [] },
+                ),
+              );
+            } else {
+              completePatches(args, output);
+            }
+            return 0;
+          },
+        },
+      );
+
+      expect({
+        arguments_,
+        exitCode: outcome.exitCode,
+        stderr: outcome.stderr,
+      }).toMatchObject({ exitCode: 0 });
+      expect(reviews).toBe(3);
+    }
+  });
+
   test("updates the independent review scope after an author revision", async () => {
     const result = resultWithFindings(["high"]);
     const scopes: string[][] = [];
@@ -629,6 +671,7 @@ describe("scan and patch workflow", () => {
       ["--create-pr"],
       ["--review-minimality"],
       ["--review-style"],
+      ["--max-review-revisions", "5"],
       ["occ_1"],
     ]) {
       let commandStarted = false;

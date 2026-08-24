@@ -42,6 +42,9 @@ change repository files.
 Add `--review-minimality` or `--review-style` to `scan --patch` or `patch`
 to enable independent, sequential reviews of patch scope and local coding
 conventions. Both reviews are optional and disabled by default.
+Set `--max-review-revisions 5` to allow up to five author revisions across
+actionable review findings; later-stage revisions restart earlier reviews, and
+blocked reviews still stop immediately.
 
 Deep-scan discovery stops after 96 hours by default. Set `--max-time-hours` to
 any positive number of hours, including fractional hours, up to 96. Completed

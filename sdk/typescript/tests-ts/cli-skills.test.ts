@@ -193,6 +193,7 @@ describe("CLI skill commands", () => {
     ).toBe(0);
     expect(help.text()).toContain("--review-minimality");
     expect(help.text()).toContain("--review-style");
+    expect(help.text()).toContain("--max-review-revisions <number>");
   });
 
   test("revises a rejected patch once before independently reviewing it again", async () => {
@@ -237,6 +238,137 @@ describe("CLI skill commands", () => {
     expect(stdout.text()).toBe("Patch 3.\n");
     expect(stderr.text()).toContain('"status":"revise"');
     expect(stderr.text()).toContain('"status":"approved"');
+  });
+
+  test("allows the configured number of actionable review revisions", async () => {
+    let reviews = 0;
+    let revisions = 0;
+    const stdout = capture();
+    expect(
+      await main(
+        [
+          "patch",
+          "Synthetic security issue",
+          "--review-minimality",
+          "--max-review-revisions",
+          "2",
+        ],
+        stdout.stream,
+        capture().stream,
+        dependencies({
+          onCodex: (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+              output!.stdout.write(
+                JSON.stringify(
+                  reviews < 3
+                    ? {
+                        status: "revise",
+                        findings: [`Remove unrelated change ${reviews}.`],
+                      }
+                    : { status: "approved", findings: [] },
+                ),
+              );
+            } else {
+              if (reviews === 0) {
+                expect(
+                  JSON.parse(output!.appServer!.prompt.split("\n").at(-1)!),
+                ).toEqual(["Synthetic security issue"]);
+              }
+              if (reviews > 0) revisions += 1;
+              output!.stdout.write(`Patch ${revisions}.`);
+            }
+            return 0;
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(reviews).toBe(3);
+    expect(revisions).toBe(2);
+    expect(stdout.text()).toBe("Patch 2.");
+  });
+
+  test("restarts earlier reviews after an actionable style revision", async () => {
+    const stages: string[] = [];
+    let styleReviews = 0;
+    expect(
+      await main(
+        [
+          "patch",
+          "Synthetic security issue",
+          "--review-minimality",
+          "--review-style",
+          "--max-review-revisions",
+          "5",
+        ],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          onCodex: (_args, output) => {
+            const { prompt, sandbox } = output!.appServer!;
+            if (sandbox !== "read-only") {
+              stages.push(stages.length === 0 ? "author" : "revision");
+              output!.stdout.write("Verified patch.");
+              return 0;
+            }
+            const stage = ["minimality", "local-coding-style"].find((value) =>
+              prompt.includes(`only the ${value} review`),
+            )!;
+            stages.push(stage);
+            const style = stage === "local-coding-style";
+            if (style) styleReviews += 1;
+            const revise = style && styleReviews === 1;
+            output!.stdout.write(
+              JSON.stringify({
+                status: revise ? "revise" : "approved",
+                findings: revise ? ["Add the missing regression test."] : [],
+              }),
+            );
+            return 0;
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(stages).toEqual([
+      "author",
+      "minimality",
+      "local-coding-style",
+      "revision",
+      "minimality",
+      "local-coding-style",
+    ]);
+  });
+
+  test("never retries a blocked review even when revisions remain", async () => {
+    let invocations = 0;
+    expect(
+      await main(
+        [
+          "patch",
+          "Synthetic security issue",
+          "--review-minimality",
+          "--max-review-revisions",
+          "5",
+        ],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          onCodex: (_args, output) => {
+            invocations += 1;
+            output!.stdout.write(
+              output!.appServer!.sandbox === "read-only"
+                ? JSON.stringify({
+                    status: "blocked",
+                    findings: ["Required source evidence is unavailable."],
+                  })
+                : "Patch.",
+            );
+            return 0;
+          },
+        }),
+      ),
+    ).toBe(2);
+    expect(invocations).toBe(2);
   });
 
   test("fails closed when an independent review is invalid or remains rejected", async () => {
