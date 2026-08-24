@@ -768,6 +768,112 @@ describe("committed diff Git batch validation", () => {
     }
   });
 
+  test("freezes packed replacement refs without Windows-reserved loose paths", () => {
+    const { root, state } = createRepository();
+    const replacementRefBase = "refs/replace/AUX/";
+    const environment = { GIT_REPLACE_REF_BASE: replacementRefBase };
+
+    for (const objectFormat of ["sha1", "sha256"] as const) {
+      const repository = join(root, `packed-replacement-${objectFormat}`);
+      const initialized = spawnSync(
+        "git",
+        ["init", "--quiet", `--object-format=${objectFormat}`, repository],
+        { encoding: "utf8" },
+      );
+      if (objectFormat === "sha256" && initialized.status !== 0) continue;
+      expect(initialized.status, initialized.stderr).toBe(0);
+      writeFileSync(join(repository, "fixture.txt"), "base\n");
+      git(repository, "add", "fixture.txt");
+      commit(repository, "base");
+      const base = git(repository, "rev-parse", "HEAD");
+      writeFileSync(join(repository, "fixture.txt"), "head\n");
+      git(repository, "add", "fixture.txt");
+      commit(repository, "head");
+      const head = git(repository, "rev-parse", "HEAD");
+      const originalBlob = git(repository, "rev-parse", `${head}:fixture.txt`);
+      const originalDigest = committedDigest(
+        repository,
+        state,
+        base,
+        head,
+        environment,
+      );
+      const replacement = spawnSync(
+        "git",
+        ["-C", repository, "hash-object", "-w", "--stdin"],
+        { encoding: "utf8", input: "packed replacement\n" },
+      );
+      expect(replacement.status, replacement.stderr).toBe(0);
+      const replacementBlob = replacement.stdout.trim();
+      const replacementRef = `${replacementRefBase}${originalBlob}`;
+      const gitDirectory = git(repository, "rev-parse", "--absolute-git-dir");
+      const packedRefs = join(gitDirectory, "packed-refs");
+      expect(existsSync(packedRefs)).toBeFalse();
+      writeFileSync(
+        packedRefs,
+        `# pack-refs with: sorted\n${replacementBlob} ${replacementRef}\n`,
+      );
+      expect(
+        existsSync(join(gitDirectory, ...replacementRef.split("/"))),
+      ).toBeFalse();
+      expect(readFileSync(packedRefs, "utf8")).toContain(
+        `${replacementBlob} ${replacementRef}\n`,
+      );
+
+      const selected = spawnSync(
+        "git",
+        ["-C", repository, "cat-file", "blob", originalBlob],
+        {
+          encoding: "utf8",
+          env: { ...process.env, ...environment },
+        },
+      );
+      expect(selected.status, selected.stderr).toBe(0);
+      expect(selected.stdout).toBe("packed replacement\n");
+      const expectedDigest = committedDigest(
+        repository,
+        state,
+        base,
+        head,
+        environment,
+      );
+      expect(expectedDigest).not.toBe(originalDigest);
+
+      const result = runPythonJson<{ digest: string }>(
+        [
+          "import json",
+          "from pathlib import Path",
+          "import workbench_target as target",
+          "reserved = {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}",
+          "original_mkdir = Path.mkdir",
+          "original_write_bytes = Path.write_bytes",
+          "def reject_reserved(path):",
+          "    for part in path.parts:",
+          "        if part.rstrip(' .').split('.', 1)[0].upper() in reserved:",
+          "            raise OSError('synthetic Windows-reserved path')",
+          "def windows_mkdir(path, *args, **kwargs):",
+          "    reject_reserved(path)",
+          "    return original_mkdir(path, *args, **kwargs)",
+          "def windows_write_bytes(path, data):",
+          "    reject_reserved(path)",
+          "    return original_write_bytes(path, data)",
+          "Path.mkdir = windows_mkdir",
+          "Path.write_bytes = windows_write_bytes",
+          "try:",
+          "    digest = target.committed_diff_content_digest(Path(sys.argv[2]), sys.argv[3], sys.argv[4])",
+          "finally:",
+          "    Path.mkdir = original_mkdir",
+          "    Path.write_bytes = original_write_bytes",
+          "print(json.dumps({'digest': digest}))",
+        ],
+        [repository, base, head],
+        state,
+        environment,
+      );
+      expect(result.digest).toBe(expectedDigest);
+    }
+  });
+
   test.each([
     ["a repository-local disable", false, false],
     ["a repository-local enable over a global disable", true, true],

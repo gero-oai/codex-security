@@ -386,7 +386,7 @@ def _create_committed_diff_view(repository: Path, view: Path) -> Path:
         object_id_length=object_id_length,
     )
     replacements_enabled = _replacement_refs_enabled(repository)
-    parsed_replacements: list[tuple[list[str], bytes]] = []
+    parsed_replacements: list[tuple[bytes, bytes]] = []
     for record in replacements.splitlines():
         fields = record.split(b"\0")
         if (
@@ -404,7 +404,7 @@ def _create_committed_diff_view(repository: Path, view: Path) -> Path:
             or any(part in {"", ".", ".."} for part in parts)
         ):
             raise SystemExit("Could not snapshot the selected committed changes.")
-        parsed_replacements.append((parts, fields[1]))
+        parsed_replacements.append((fields[0], fields[1]))
 
     try:
         view.mkdir(mode=0o700)
@@ -426,10 +426,13 @@ def _create_committed_diff_view(repository: Path, view: Path) -> Path:
         )
         (view / "config").write_bytes(config)
         (view / "HEAD").write_bytes(b"ref: refs/heads/codex-security-snapshot\n")
-        for parts, object_id in parsed_replacements:
-            ref = view.joinpath(*parts)
-            ref.parent.mkdir(parents=True, exist_ok=True)
-            ref.write_bytes(object_id + b"\n")
+        packed_refs = bytearray(b"# pack-refs with: sorted\n")
+        for refname, object_id in parsed_replacements:
+            packed_refs.extend(object_id)
+            packed_refs.extend(b" ")
+            packed_refs.extend(refname)
+            packed_refs.extend(b"\n")
+        (view / "packed-refs").write_bytes(packed_refs)
     except OSError as exc:
         raise SystemExit("Could not snapshot the selected committed changes.") from exc
     return object_directory
