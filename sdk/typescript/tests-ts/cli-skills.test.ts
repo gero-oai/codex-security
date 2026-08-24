@@ -378,6 +378,149 @@ describe("CLI skill commands", () => {
     ]);
   });
 
+  test("reconciles alternating reviewer decisions once in a read-only stage", async () => {
+    const roles: string[] = [];
+    let minimalityReviews = 0;
+    let styleReviews = 0;
+    expect(
+      await main(
+        [
+          "patch",
+          "Synthetic security issue",
+          "--review-minimality",
+          "--review-style",
+          "--max-review-revisions",
+          "5",
+        ],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          onCodex: (_args, output) => {
+            const { prompt, sandbox } = output!.appServer!;
+            if (sandbox !== "read-only") {
+              roles.push(roles.length === 0 ? "author" : "revision");
+              if (roles.includes("reconciliation")) {
+                expect(prompt).toContain("reconciliation decision is binding");
+                expect(prompt).toContain("No mandatory rule requires a helper");
+              }
+              output!.stdout.write("Verified synthetic patch.");
+              return 0;
+            }
+            if (
+              prompt.includes("only the review-conflict-reconciliation review")
+            ) {
+              roles.push("reconciliation");
+              expect(prompt).toContain("smallest behavior-preserving patch");
+              expect(prompt).toContain("Keep the existing lambda.");
+              expect(prompt).toContain("Introduce a named helper.");
+              output!.stdout.write(
+                JSON.stringify({
+                  status: "revise",
+                  findings: [
+                    "No mandatory rule requires a helper; keep the lambda.",
+                  ],
+                }),
+              );
+              return 0;
+            }
+            const minimality = prompt.includes("only the minimality review");
+            roles.push(minimality ? "minimality" : "style");
+            if (minimality) minimalityReviews += 1;
+            else styleReviews += 1;
+            const revise = minimality
+              ? minimalityReviews === 1 || minimalityReviews === 3
+              : styleReviews === 1;
+            output!.stdout.write(
+              JSON.stringify({
+                status: revise ? "revise" : "approved",
+                findings: revise
+                  ? [
+                      minimality
+                        ? "Keep the existing lambda."
+                        : "Introduce a named helper.",
+                    ]
+                  : [],
+              }),
+            );
+            return 0;
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(roles).toEqual([
+      "author",
+      "minimality",
+      "revision",
+      "minimality",
+      "style",
+      "revision",
+      "minimality",
+      "reconciliation",
+      "revision",
+      "minimality",
+      "style",
+    ]);
+  });
+
+  test("fails closed when a reconciliation verdict is malformed or inconsistent", async () => {
+    for (const reconciliationVerdict of [
+      "not json",
+      JSON.stringify({ status: "approved", findings: ["Unexpected finding"] }),
+      JSON.stringify({ status: "revise", findings: [] }),
+    ]) {
+      let minimalityReviews = 0;
+      let styleReviews = 0;
+      const stderr = capture();
+      expect(
+        await main(
+          [
+            "patch",
+            "Synthetic security issue",
+            "--review-minimality",
+            "--review-style",
+            "--max-review-revisions",
+            "5",
+          ],
+          capture().stream,
+          stderr.stream,
+          dependencies({
+            onCodex: (_args, output) => {
+              const { prompt, sandbox } = output!.appServer!;
+              if (sandbox !== "read-only") {
+                output!.stdout.write("Verified synthetic patch.");
+                return 0;
+              }
+              if (
+                prompt.includes(
+                  "only the review-conflict-reconciliation review",
+                )
+              ) {
+                output!.stdout.write(reconciliationVerdict);
+                return 0;
+              }
+              const minimality = prompt.includes("only the minimality review");
+              if (minimality) minimalityReviews += 1;
+              else styleReviews += 1;
+              const revise = minimality
+                ? minimalityReviews === 1 || minimalityReviews === 3
+                : styleReviews === 1;
+              output!.stdout.write(
+                JSON.stringify({
+                  status: revise ? "revise" : "approved",
+                  findings: revise ? ["Resolve reviewer disagreement."] : [],
+                }),
+              );
+              return 0;
+            },
+          }),
+        ),
+      ).toBe(2);
+      expect(stderr.text()).toContain(
+        "review-conflict-reconciliation review returned an",
+      );
+    }
+  });
+
   test("allows the configured number of actionable review revisions", async () => {
     let reviews = 0;
     let revisions = 0;
