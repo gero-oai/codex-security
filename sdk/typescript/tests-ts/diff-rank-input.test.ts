@@ -68,14 +68,14 @@ function git(repository: string, ...args: string[]): string {
 }
 
 async function upgradeBundledPlugin(root: string): Promise<string> {
-  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.27");
+  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.46");
   const previous = join(root, "previous-plugin");
   cpSync(PLUGIN_ROOT, previous, { recursive: true });
   const previousManifestPath = join(previous, ".codex-plugin", "plugin.json");
   const previousManifest = JSON.parse(
     readFileSync(previousManifestPath, "utf8"),
   ) as { version: string };
-  previousManifest.version = "0.1.24";
+  previousManifest.version = "0.1.44";
   writeFileSync(previousManifestPath, JSON.stringify(previousManifest));
 
   const home = join(root, "codex-home");
@@ -109,7 +109,7 @@ async function upgradeBundledPlugin(root: string): Promise<string> {
 
   const predecessor = await bootstrapPlugin(home, previous, options);
   const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
-  expect(predecessor.version).toBe("0.1.24");
+  expect(predecessor.version).toBe("0.1.44");
   expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
   expect(upgraded.installedRoot).not.toBe(predecessor.installedRoot);
   const installedMcp = JSON.parse(
