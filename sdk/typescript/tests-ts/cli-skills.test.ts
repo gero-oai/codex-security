@@ -240,6 +240,57 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).toContain('"status":"approved"');
   });
 
+  test("shares behavior-preserving patch policy with authors, reviewers, and revisions", async () => {
+    const prompts: string[] = [];
+    let minimalityReviews = 0;
+    expect(
+      await main(
+        [
+          "patch",
+          "Synthetic security issue",
+          "--review-minimality",
+          "--review-style",
+        ],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          onCodex: (_args, output) => {
+            const { prompt, sandbox } = output!.appServer!;
+            prompts.push(prompt);
+            if (sandbox !== "read-only") {
+              output!.stdout.write("Verified synthetic patch.");
+              return 0;
+            }
+            const minimality = prompt.includes("only the minimality review");
+            if (minimality) minimalityReviews += 1;
+            output!.stdout.write(
+              JSON.stringify(
+                minimality && minimalityReviews === 1
+                  ? {
+                      status: "revise",
+                      findings: ["Preserve the existing serialization format."],
+                    }
+                  : { status: "approved", findings: [] },
+              ),
+            );
+            return 0;
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(prompts).toHaveLength(5);
+    for (const prompt of prompts) {
+      expect(prompt).toContain("Shared patching policy, in priority order:");
+      expect(prompt).toContain("Preserve existing observable behavior");
+      expect(prompt).toContain("do not redesign protocols");
+      expect(prompt).toContain(
+        "existing helpers, tests, build targets, and CI",
+      );
+      expect(prompt).toContain("an applicable mandatory rule");
+      expect(prompt).toContain("introduces a concrete problem");
+    }
+  });
+
   test("allows the configured number of actionable review revisions", async () => {
     let reviews = 0;
     let revisions = 0;

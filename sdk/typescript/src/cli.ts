@@ -849,6 +849,16 @@ interface PatchReviewOptions {
 
 type PatchReviewStage = "minimality" | "local-coding-style";
 
+const PATCH_REVIEW_POLICY = [
+  "Shared patching policy, in priority order:",
+  "1. Fully fix the reported security finding.",
+  "2. Preserve existing observable behavior unless changing it is required to close the finding.",
+  "3. Make the smallest complete, reviewable change; do not redesign protocols, serialization formats, public interfaces, or architecture.",
+  "4. Reuse applicable existing helpers, tests, build targets, and CI infrastructure; treat broader hardening as separate follow-up work.",
+  "5. Follow the nearest applicable project guidance without expanding the patch for an optional stylistic preference.",
+  "Request a structural change only when an applicable mandatory rule requires it, the current patch introduces a concrete problem, and no smaller compliant correction exists.",
+].join("\n");
+
 interface ScanArguments extends DeepScanOptions, PatchReviewOptions {
   auth?: ScanAuthMode;
   verbose?: boolean;
@@ -4540,6 +4550,7 @@ async function runSkillStage(
   const readOnly = verify || review;
   const inputLabel = skill === "validation" || verify ? "Findings" : "Issues";
   const prompt = [
+    ...(skill === "fix-finding" ? [PATCH_REVIEW_POLICY] : []),
     ...(verify
       ? [
           "Use the bundled $codex-security:verify-fix skill. Its complete instructions and shared assessment reference are provided below; do not reread either file.",
