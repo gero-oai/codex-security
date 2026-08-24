@@ -40,8 +40,9 @@ verified files and open a draft GitHub pull request. Ordinary scans do not
 change repository files.
 
 Add `--review-minimality` or `--review-style` to `scan --patch` or `patch`
-to enable independent, sequential reviews of patch scope and local coding
-conventions. Both reviews are optional and disabled by default.
+to trigger a deterministic review workflow. The CLI runs each selected review
+as a separate, independent, read-only model invocation: minimality first, then
+local coding style. Both reviews are optional and disabled by default.
 Set `--max-review-revisions 5` to allow up to five author revisions across
 actionable review findings; later-stage revisions restart earlier reviews, and
 blocked reviews still stop immediately.

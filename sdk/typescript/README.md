@@ -362,10 +362,11 @@ draft pull request with `gh`. If the push or pull request fails, run the printed
 `patch --resume-pr BRANCH` command from the same repository. It uses the saved
 commit without running Codex again and refuses to publish if the branch changed.
 Add `--review-minimality` or `--review-style` to either patching workflow
-for optional, independent reviews in that order. Minimality review removes
-unnecessary or unrelated changes; style review checks project instructions,
-local conventions, and applicable style guides. Both stages are disabled by
-default.
+to trigger a deterministic review workflow. The CLI runs each selected stage
+as a separate, independent, read-only model invocation, in minimality-then-style
+order. Minimality review removes unnecessary or unrelated changes; style review
+checks project instructions, local conventions, and applicable style guides.
+Both stages are disabled by default.
 Set `--max-review-revisions 5` to allow up to five author revisions across the
 selected review stages. After a later-stage revision, earlier selected reviews
 run again; blocked reviews still stop immediately. Without this option,
