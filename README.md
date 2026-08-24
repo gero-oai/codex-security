@@ -4,6 +4,9 @@
 
 **See the [Codex Security documentation](https://learn.chatgpt.com/docs/security/cli)** for more details.
 
+See [GitHub Releases](https://github.com/openai/codex-security/releases) for
+the canonical changelog and upgrade notes.
+
 Some cybersecurity requests and protected findings require approval through
 Trusted Access for Cyber. To apply or check your access, visit
 [chatgpt.com/cyber](https://chatgpt.com/cyber).
@@ -48,6 +51,19 @@ Deep-scan discovery stops after 96 hours by default. Set `--max-time-hours` to
 any positive number of hours, including fractional hours, up to 96. Completed
 findings are preserved and returned when the limit is reached.
 
+For a monorepo, run separate standard scans and combine their results by root
+cause:
+
+```bash
+npx @openai/codex-security scan-components . \
+  --component apps/api --component apps/web \
+  --output-dir /path/outside/repository/results
+```
+
+Use `--auto` to let Codex choose the components, or `--auto --plan-only` to
+review the split first. See [component scans](sdk/typescript/README.md#scan-project-components)
+for reusable plans, combined reports, and coverage details.
+
 To use another inference provider, set its API key and select a model:
 
 ```bash
@@ -88,6 +104,10 @@ unset OPENAI_API_KEY CODEX_API_KEY
 Scan history is stored in the Codex Security workbench state directory. If that
 directory cannot be written, set `CODEX_SECURITY_STATE_DIR` to a writable
 directory outside the repository.
+
+Applications can attribute API-key scans to an end user with
+`scan --safety-identifier ID` or the SDK's per-run `safetyIdentifier` option.
+See [Safety ID setup and runtime requirements](sdk/typescript/README.md#attribute-scans-to-end-users).
 
 `findings list [repository]` shows open findings across a repository's scans
 and identifies findings not confirmed in its latest scan.

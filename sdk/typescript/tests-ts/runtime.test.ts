@@ -1995,10 +1995,13 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
-  test("upgrades a plugin with the real bundled Codex executable", async () => {
+  test("refreshes released workbench scripts with the real bundled Codex executable", async () => {
     const root = await temporaryDirectory();
-    const previous = await plugin(join(root, "previous"), "1.2.3");
-    const next = await plugin(join(root, "next"), "1.2.4");
+    const previous = await plugin(join(root, "previous"), "0.1.22");
+    await writeFile(
+      join(previous, "scripts", "workbench_scan_history.py"),
+      "print('previous bundled scan history')\n",
+    );
     const home = join(root, "home");
     await mkdir(home, { mode: 0o700 });
     await writeFile(
@@ -2024,11 +2027,35 @@ describe("plugin runtime preparation", () => {
 
     const options = { codexCommand: command, environment };
     expect((await bootstrapPlugin(home, previous, options)).version).toBe(
-      "1.2.3",
+      "0.1.22",
     );
-    const upgraded = await bootstrapPlugin(home, next, options);
+    const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
+    const expectedHistory = await readFile(
+      join(PLUGIN_ROOT, "scripts", "workbench_scan_history.py"),
+      "utf8",
+    );
 
-    expect(upgraded.version).toBe("1.2.4");
+    expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
+    expect(upgraded.version).not.toBe("0.1.22");
+    expect(
+      await readFile(
+        join(
+          home,
+          "sdk-marketplace",
+          "plugins",
+          "codex-security",
+          "scripts",
+          "workbench_scan_history.py",
+        ),
+        "utf8",
+      ),
+    ).toBe(expectedHistory);
+    expect(
+      await readFile(
+        join(upgraded.installedRoot, "scripts", "workbench_scan_history.py"),
+        "utf8",
+      ),
+    ).toBe(expectedHistory);
     expect(await readFile(join(home, "auth.json"), "utf8")).toBe(credentials);
     expect(
       spawnSync(command.command, ["login", "status"], {
