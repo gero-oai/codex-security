@@ -212,10 +212,6 @@ def load_source_scopes(
         or not records
     ):
         return None
-    if not isinstance(selected_paths, list) or not all(
-        isinstance(value, str) for value in selected_paths
-    ):
-        return None
     expected = {
         parsed.as_posix()
         for value in selected_paths
@@ -291,7 +287,7 @@ def finding_source_excerpt(
         return None
     try:
         context = load_source_scopes(scan, target, selected_paths)
-    except (OSError, RuntimeError, SystemExit, TypeError, UnicodeError, ValueError):
+    except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
         return None
     if context is None:
         return None

@@ -292,10 +292,7 @@ legacy_scan = dict(scan)
 legacy_scan.pop("source_scopes_json")
 legacy = excerpt("src/allowed.py", legacy_scan)
 invalid = excerpt("src/allowed.py", {**scan, "source_scopes_json": "{"})
-malformed = {
-    "paths": excerpt("src/allowed.py", selected_paths=42),
-    "revision": excerpt("src/allowed.py", {**scan, "target_revision": 42}),
-}
+malformed_revision = excerpt("src/allowed.py", {**scan, "target_revision": 42})
 
 original_context = excerpts.git_worktree_context
 git_calls = []
@@ -330,7 +327,7 @@ print(json.dumps({
     "immutable": immutable,
     "invalid": invalid,
     "legacy": legacy,
-    "malformed": malformed,
+    "malformedRevision": malformed_revision,
     "mutable": {"excerpts": mutable, "gitCalls": len(git_calls)},
     "outside": outside,
     "pathCollisionPaths": len(
@@ -386,7 +383,7 @@ describe("workbench source excerpts", () => {
       },
       invalid: null,
       legacy: null,
-      malformed: { paths: null, revision: null },
+      malformedRevision: null,
       mutable: {
         excerpts: { working_tree: null, None: null },
         gitCalls: 0,
