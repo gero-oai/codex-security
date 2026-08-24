@@ -1334,6 +1334,12 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
             diff_target,
             metadata=target_metadata,
         )
+        source_scopes = capture_source_scopes(
+            target,
+            target_identity,
+            [scope],
+            diff_target_kind=diff_target["kind"] if diff_target is not None else None,
+        )
         match_committed_diff_identity: (
             Callable[[Path, dict[str, str], str], bool] | None
         ) = None
@@ -1443,6 +1449,7 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
             target_root=target_root,
             target_summary=target_summary,
             scope_file_count=scope_file_count,
+            source_scopes=source_scopes,
             timestamp=timestamp,
             model=args.model,
             reasoning_effort=args.reasoning_effort,
@@ -1498,6 +1505,12 @@ def _start_prompt_driven_scan(
     )
     diff_identity = scan_diff_identity(diff_target)
     target_identity = scan_target_identity(target, diff_target)
+    source_scopes = capture_source_scopes(
+        target,
+        target_identity,
+        [scope],
+        diff_target_kind=diff_target["kind"] if diff_target is not None else None,
+    )
     match_committed_diff_identity: (
         Callable[[Path, dict[str, str], str], bool] | None
     ) = None
@@ -1659,6 +1672,7 @@ def _start_prompt_driven_scan(
             target_root=target_root,
             target_summary=target_summary,
             scope_file_count=scope_file_count,
+            source_scopes=source_scopes,
             timestamp=timestamp,
             handoff_status="delivered",
             model=args.model,

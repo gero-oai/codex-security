@@ -13,7 +13,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { BUNDLED_PLUGIN_VERSION, bootstrapPlugin } from "../src/index.js";
-import { runWorkbench } from "../src/runtime.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryRoots: string[] = [];
@@ -203,22 +202,6 @@ async function upgradedPlugin(root: string) {
   return { predecessor, upgraded };
 }
 
-function workbench(root: string, args: string[], input?: string) {
-  return runWorkbench(
-    {
-      python: python(),
-      pluginRoot: PLUGIN_ROOT,
-      environment: {
-        ...process.env,
-        CODEX_SECURITY_STATE_DIR: join(root, "state"),
-        PYTHONDONTWRITEBYTECODE: "1",
-      },
-    },
-    args,
-    input,
-  );
-}
-
 function collisionProbe(
   pluginRoot: string,
   fixture: { repository: string; replacement: string; revision: string },
@@ -247,11 +230,10 @@ scan = {
 def excerpt(path, saved=scan, selected_paths=None):
     if selected_paths is None:
         selected_paths = ["src"]
-    return excerpts.finding_source_excerpt(
-        saved,
-        repository,
+    context = excerpts.source_excerpt_context(saved, repository, selected_paths)
+    return excerpts.finding_source_excerpt_from_context(
+        context,
         [{"path": path, "startLine": 1, "endLine": 1, "role": "root_control"}],
-        selected_paths,
     )
 original_git = excerpts.local_git_bytes
 blob_reads = []
@@ -395,147 +377,97 @@ describe("workbench source excerpts", () => {
     });
   }, 60_000);
 
-  test("persists selected source authority from every scan writer", async () => {
+  test("persists source authority outside every writer transaction", () => {
     const root = realpathSync(
       mkdtempSync(join(tmpdir(), "codex-security-source-writers-")),
     );
     temporaryRoots.push(root);
     const { repository } = ordinaryRepository(root);
     const scanRoot = join(root, "scans");
-    const workspaceId = randomUUID();
-    await workbench(root, [
-      "create-workspace",
-      "--workspace-id",
-      workspaceId,
-      "--thread-id",
-      "workspace-writer",
-    ]);
-    await workbench(root, [
-      "save-workspace",
-      "--workspace-id",
-      workspaceId,
-      "--target-path",
-      repository,
-      "--scope",
-      "src",
-      "--mode",
-      "standard",
-    ]);
-    const workspace = await workbench(root, [
-      "start-scan",
-      "--workspace-id",
-      workspaceId,
-      "--scan-root",
-      scanRoot,
-    ]);
-    const prompt = await workbench(root, [
-      "start-prompt-only-scan",
-      "--thread-id",
-      "prompt-writer",
-      "--target-path",
-      repository,
-      "--scope",
-      "src",
-      "--mode",
-      "standard",
-      "--scan-root",
-      scanRoot,
-    ]);
-    const headless = await workbench(root, [
-      "start-headless-standard-scan",
-      "--thread-id",
-      "headless-writer",
-      "--target-path",
-      repository,
-      "--scope",
-      "src",
-      "--scan-root",
-      scanRoot,
-    ]);
     const cliScanDirectory = join(root, "cli-scan");
     mkdirSync(cliScanDirectory, { mode: 0o700 });
-    const recipe = JSON.stringify({
-      config: {},
-      mode: "standard",
-      repository,
-      target: { kind: "paths", paths: ["src/allowed.py", "other"] },
-    });
-    const cliProgram = String.raw`
-import argparse, json, os, sys
+    const workspaceId = randomUUID();
+    const program = String.raw`
+import contextlib, io, json, os, sqlite3, sys
 os.environ["CODEX_SECURITY_STATE_DIR"] = sys.argv[2]
 sys.path.insert(0, sys.argv[1])
 import workbench_db
 
-connection = workbench_db.connect()
-original_capture = workbench_db.capture_source_scopes
+active_connection = None
+current_command = None
 transaction_states = []
+original_connect = workbench_db.connect
+original_capture = workbench_db.capture_source_scopes
+original_deep_capture = workbench_db.deep_scan.capture_source_scopes
+def connect():
+    global active_connection
+    active_connection = original_connect()
+    return active_connection
 def capture(*arguments, **keywords):
-    transaction_states.append(connection.in_transaction)
+    transaction_states.append([current_command, active_connection.in_transaction])
     return original_capture(*arguments, **keywords)
+def deep_capture(*arguments, **keywords):
+    transaction_states.append([current_command, active_connection.in_transaction])
+    return original_deep_capture(*arguments, **keywords)
+def run(arguments):
+    global current_command
+    current_command = arguments[0]
+    sys.argv = ["workbench_db.py", *arguments]
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        workbench_db.main()
+    return json.loads(output.getvalue())
+workbench_db.connect = connect
 workbench_db.capture_source_scopes = capture
-try:
-    result = workbench_db.register_cli_scan(connection, argparse.Namespace(
-        archive_existing=False,
-        archived_scan_dir=None,
-        parent_scan_id=None,
-        recipe_json=sys.argv[5],
-        recipe_json_stdin=False,
-        registration_json_stdin=False,
-        repository=sys.argv[3],
-        scan_dir=sys.argv[4],
-    ))
-finally:
-    workbench_db.capture_source_scopes = original_capture
-    connection.close()
-result["capturedOutsideTransaction"] = transaction_states == [False]
-print(json.dumps(result))
+workbench_db.deep_scan.capture_source_scopes = deep_capture
+
+repository, scan_root, cli_scan_dir, workspace_id = sys.argv[3:7]
+run(["create-workspace", "--workspace-id", workspace_id, "--thread-id", "workspace-writer"])
+run(["save-workspace", "--workspace-id", workspace_id, "--target-path", repository, "--scope", "src", "--mode", "standard"])
+workspace = run(["start-scan", "--workspace-id", workspace_id, "--scan-root", scan_root])
+prompt = run(["start-prompt-only-scan", "--thread-id", "prompt-writer", "--target-path", repository, "--scope", "src", "--mode", "standard", "--scan-root", scan_root])
+headless = run(["start-headless-standard-scan", "--thread-id", "headless-writer", "--target-path", repository, "--scope", "src", "--scan-root", scan_root])
+recipe = json.dumps({"config": {}, "mode": "standard", "repository": repository, "target": {"kind": "paths", "paths": ["src/allowed.py", "other"]}})
+cli = run(["register-cli-scan", "--repository", repository, "--scan-dir", cli_scan_dir, "--recipe-json", recipe])
+deep = run(["begin-deep-scan", "--thread-id", "deep-writer", "--target-path", repository, "--scan-root", scan_root, "--available-parallelism", "4"])
+with sqlite3.connect(workbench_db.database_path()) as connection:
+    authorities = {row[0]: json.loads(row[1]) for row in connection.execute("SELECT id, source_scopes_json FROM scans")}
+print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headless": headless, "prompt": prompt, "transactionStates": transaction_states, "workspace": workspace}))
 `;
-    const cliResult = spawnSync(
+    const result = spawnSync(
       python(),
       [
         "-I",
         "-B",
         "-c",
-        cliProgram,
+        program,
         join(PLUGIN_ROOT, "scripts"),
         join(root, "state"),
         repository,
+        scanRoot,
         cliScanDirectory,
-        recipe,
+        workspaceId,
       ],
       { encoding: "utf8" },
     );
-    expect(cliResult.status, cliResult.stderr).toBe(0);
-    const cli = JSON.parse(cliResult.stdout) as Record<string, unknown>;
-    expect(cli["capturedOutsideTransaction"]).toBe(true);
-    const deep = await workbench(root, [
-      "begin-deep-scan",
-      "--thread-id",
-      "deep-writer",
-      "--target-path",
-      repository,
-      "--scan-root",
-      scanRoot,
-      "--available-parallelism",
-      "4",
+    expect(result.status, result.stderr).toBe(0);
+    const writers = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(writers["transactionStates"]).toEqual([
+      ["start-scan", false],
+      ["start-prompt-only-scan", false],
+      ["start-headless-standard-scan", false],
+      ["register-cli-scan", false],
+      ["begin-deep-scan", false],
     ]);
-    const database = await workbench(root, ["database-info"]);
-    const query = spawnSync(
-      python(),
-      [
-        "-I",
-        "-B",
-        "-c",
-        "import json, sqlite3, sys; c = sqlite3.connect(sys.argv[1]); print(json.dumps({row[0]: json.loads(row[1]) for row in c.execute('SELECT id, source_scopes_json FROM scans')}))",
-        String(database["databasePath"]),
-      ],
-      { encoding: "utf8" },
-    );
-    expect(query.status, query.stderr).toBe(0);
-    const authorities = JSON.parse(query.stdout) as Record<
+    const authorities = writers["authorities"] as Record<
       string,
       { paths: string[]; version: number }
     >;
+    const workspace = writers["workspace"] as Record<string, unknown>;
+    const prompt = writers["prompt"] as Record<string, unknown>;
+    const headless = writers["headless"] as Record<string, unknown>;
+    const cli = writers["cli"] as Record<string, unknown>;
+    const deep = writers["deep"] as Record<string, unknown>;
     const workspaceResults = workspace["results"] as Record<string, unknown>;
     const promptScan = prompt["scan"] as Record<string, unknown>;
     const headlessScan = headless["scan"] as Record<string, unknown>;

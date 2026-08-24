@@ -776,6 +776,11 @@ def begin_deep_scan_for_target(
     )
     target_device = serialize_filesystem_identity(target_metadata.st_dev)
     target_inode = serialize_filesystem_identity(target_metadata.st_ino)
+    source_scopes = capture_source_scopes(
+        target,
+        (revision, target_snapshot_digest, target_device, target_inode),
+        [scope],
+    )
     scope_file_count = directory_snapshot_regular_file_count(
         target if scope == "." else target / scope
     )
@@ -842,11 +847,6 @@ def begin_deep_scan_for_target(
         scan_id = str(uuid.uuid4())
         timestamp = now()
         target_id = ensure_security_target(connection, target_path)
-        source_scopes = capture_source_scopes(
-            target,
-            (revision, target_snapshot_digest, target_device, target_inode),
-            [scope],
-        )
         scan_dir = Path(
             tempfile.mkdtemp(
                 prefix=f"{safe_segment(revision)}_{compact_timestamp()}_",

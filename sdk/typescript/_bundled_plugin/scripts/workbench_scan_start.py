@@ -18,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from filesystem_identity import serialize_filesystem_identity
 from finalize_scan_contract import write_scan_local_bytes
 from workbench_feedback import get_scan_feedback
-from workbench_source_excerpt import capture_source_scopes
 from workbench_target import (
     directory_content_digest,
     git_revision,
@@ -162,12 +161,12 @@ def insert_running_scan(
     target_root: Path,
     target_summary: str | None,
     scope_file_count: int,
+    source_scopes: dict[str, Any],
     timestamp: str,
     handoff_status: str = "pending",
     model: str | None = None,
     reasoning_effort: str | None = None,
     scan_dir: Path | None = None,
-    source_scopes: dict[str, Any] | None = None,
 ) -> str:
     revision = target_identity[0]
     native_scan = scan_dir is None
@@ -179,13 +178,6 @@ def insert_running_scan(
                 dir=target_root,
             )
         ).resolve()
-    if source_scopes is None:
-        source_scopes = capture_source_scopes(
-            target,
-            target_identity,
-            [scope],
-            diff_target_kind=diff_target["kind"] if diff_target is not None else None,
-        )
     connection.execute(
         """
         INSERT INTO scans (

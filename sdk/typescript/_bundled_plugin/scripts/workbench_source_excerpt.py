@@ -275,12 +275,12 @@ def source_object_for_path(
 
 def source_excerpt_context(
     scan: sqlite3.Row,
-    target: Path | None,
+    target: Path,
     selected_paths: list[str],
 ) -> SourceContext | None:
     if scan["mode"] == "diff" and scan["diff_target_kind"] not in {"commit", "range"}:
         return None
-    if target is None or scan["target_revision"] == "unversioned":
+    if scan["target_revision"] == "unversioned":
         return None
     snapshot = scan["target_snapshot_digest"]
     if snapshot is not None and snapshot != clean_worktree_content_digest():
@@ -348,18 +348,6 @@ def finding_source_excerpt_from_context(
         for line_number in range(excerpt_start, excerpt_end + 1)
     )
     return excerpt.encode("utf-8")[:MAX_BYTES].decode("utf-8", errors="ignore")
-
-
-def finding_source_excerpt(
-    scan: sqlite3.Row,
-    target: Path | None,
-    locations: list[dict[str, Any]],
-    selected_paths: list[str],
-) -> str | None:
-    return finding_source_excerpt_from_context(
-        source_excerpt_context(scan, target, selected_paths),
-        locations,
-    )
 
 
 def scanned_source_text(repository: Path, object_id: str) -> str | None:
