@@ -74,7 +74,6 @@ interface MultiscanReceipt extends MultiscanTask {
   cost?: ScanCost;
   error?: string;
   warning?: string;
-  warnings?: string[];
 }
 
 export interface MultiscanOptions {
@@ -111,7 +110,6 @@ export interface MultiscanResult {
   completed: number;
   incomplete: number;
   failed: number;
-  warned: number;
   skipped: number;
   resultsPath: string;
 }
@@ -179,7 +177,7 @@ async function runCampaign(
   await ensureOutputDirectory(join(output, "checkouts"));
   await ensureOutputDirectory(join(output, "artifacts"));
   await ensureManifest(join(output, "manifest.json"), tasks, options);
-  const { receipts, warnedIds } = await readReceipts(ledger, tasks);
+  const receipts = await readReceipts(ledger);
   const pending: MultiscanTask[] = [];
   let reportRuntime: Promise<[TrustedExecutable, string]> | undefined;
   const restoreReport = async (
@@ -327,7 +325,6 @@ async function runCampaign(
       completed,
       incomplete,
       failed: 0,
-      warned: warnedIds.size,
       skipped,
       resultsPath: ledger,
     };
@@ -342,8 +339,7 @@ async function runCampaign(
       options.signal?.throwIfAborted();
       const task = pending[next++];
       if (task === undefined) return;
-      const taskId = task.id.toLowerCase();
-      let attempt = receipts.get(taskId)?.attempt ?? 0;
+      let attempt = receipts.get(task.id.toLowerCase())?.attempt ?? 0;
       for (let retry = 0; retry < options.maxAttempts; retry += 1) {
         options.signal?.throwIfAborted();
         attempt += 1;
@@ -369,17 +365,6 @@ async function runCampaign(
         let coverage: CoverageDocument["completeness"] | undefined;
         let cost: Readonly<ScanCost> | null = null;
         let exhaustedBudget = false;
-        const warnings: string[] = [];
-        const recordWarning = (message: unknown): void => {
-          const safeWarning = safeErrorMessage(message);
-          warnings.push(safeWarning);
-          warnedIds.add(taskId);
-          notifyProgress(options, {
-            ...progress,
-            status: "started",
-            warning: safeWarning,
-          });
-        };
         try {
           await ensureOutputDirectory(dirname(scanDir));
           await rm(checkout, { recursive: true, force: true });
@@ -420,7 +405,12 @@ async function runCampaign(
             ...(options.maxCostUsd === undefined
               ? {}
               : { maxCostUsd: options.maxCostUsd }),
-            onWarning: recordWarning,
+            onWarning: (warning) =>
+              notifyProgress(options, {
+                ...progress,
+                status: "started",
+                warning,
+              }),
             ...(options.signal === undefined ? {} : { signal: options.signal }),
           });
           cost = result.cost;
@@ -443,13 +433,7 @@ async function runCampaign(
           }
           failure = safeErrorMessage(error);
         } finally {
-          await rm(checkout, { recursive: true, force: true }).catch(
-            (error: unknown) => {
-              recordWarning(
-                `Multiscan checkout cleanup failed: ${safeErrorMessage(error)}`,
-              );
-            },
-          );
+          await rm(checkout, { recursive: true, force: true });
         }
         const status =
           failure !== undefined
@@ -471,7 +455,6 @@ async function runCampaign(
             ...(cost === null ? {} : { cost }),
             ...(failure === undefined ? {} : { error: failure }),
             ...(warning === undefined ? {} : { warning }),
-            ...(warnings.length === 0 ? {} : { warnings }),
           })}\n`,
         );
         notifyProgress(options, {
@@ -513,7 +496,6 @@ async function runCampaign(
     completed,
     incomplete,
     failed,
-    warned: warnedIds.size,
     skipped,
     resultsPath: ledger,
   };
@@ -842,9 +824,6 @@ function parseReceipt(line: string, lineNumber: number): MultiscanReceipt {
       !["complete", "partial", "unknown"].includes(
         value["coverage"] as string,
       )) ||
-    (value["warnings"] !== undefined &&
-      (!Array.isArray(value["warnings"]) ||
-        !value["warnings"].every((warning) => typeof warning === "string"))) ||
     (cost !== undefined &&
       (!isReceiptRecord(cost) ||
         typeof cost["model"] !== "string" ||
@@ -868,17 +847,13 @@ function parseReceipt(line: string, lineNumber: number): MultiscanReceipt {
 
 async function readReceipts(
   path: string,
-  tasks: readonly MultiscanTask[],
-): Promise<{
-  receipts: Map<string, MultiscanReceipt>;
-  warnedIds: Set<string>;
-}> {
+): Promise<Map<string, MultiscanReceipt>> {
   let contents: string;
   try {
     contents = await readFile(path, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { receipts: new Map(), warnedIds: new Set() };
+      return new Map();
     }
     throw error;
   }
@@ -891,26 +866,12 @@ async function readReceipts(
     );
   }
   const receipts = new Map<string, MultiscanReceipt>();
-  const warnedIds = new Set<string>();
-  const indexedTasks = new Map(
-    tasks.map((task) => [task.id.toLowerCase(), task]),
-  );
   for (const [index, line] of lines.entries()) {
     if (!line) continue;
     const receipt = parseReceipt(line, index + 1);
-    const id = receipt.id.toLowerCase();
-    receipts.set(id, receipt);
-    const task = indexedTasks.get(id);
-    if (
-      task !== undefined &&
-      matchesTask(receipt, task) &&
-      Array.isArray(receipt.warnings) &&
-      receipt.warnings.length > 0
-    ) {
-      warnedIds.add(id);
-    }
+    receipts.set(receipt.id.toLowerCase(), receipt);
   }
-  return { receipts, warnedIds };
+  return receipts;
 }
 
 async function loadResumableScan(

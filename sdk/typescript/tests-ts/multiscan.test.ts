@@ -473,151 +473,35 @@ describe("multiscan", () => {
     expect(invalid.text()).toContain("expected number to be >0");
   });
 
-  test("persists redacted scan warnings without failing completed scans", async () => {
+  test("surfaces optional post-scan warnings without failing completed scans", async () => {
     const paths = await fixture();
     const source = await repository(paths.root, "follow-up-warning");
-    const quiet = await repository(paths.root, "quiet");
-    const secret = "sk-proj-SYNTHETIC_MULTISCAN_WARNING_123";
     await writeFile(
       paths.input,
-      [
-        "id,repository,revision",
-        `follow-up-warning,${source.path},${source.revision}`,
-        `quiet,${quiet.path},${quiet.revision}`,
-        "",
-      ].join("\n"),
+      `id,repository,revision\nfollow-up-warning,${source.path},${source.revision}\n`,
     );
     const progress: Parameters<
       NonNullable<MultiscanOptions["onProgress"]>
     >[0][] = [];
-    let scans = 0;
-    const security = client(async (checkout, scanOptions = {}) => {
-      scans += 1;
-      if (basename(checkout) === "follow-up-warning") {
-        scanOptions.onWarning?.("Could not run post-scan instructions.");
-        scanOptions.onWarning?.(`Scan target changed after ${secret}.`);
-      }
-      return await completedScan(scanOptions.outputDir!);
-    });
+
     const summary = await runMultiscan(
-      options(paths, security, { onProgress: (event) => progress.push(event) }),
+      options(
+        paths,
+        client(async (_repository, scanOptions = {}) => {
+          scanOptions.onWarning?.("Could not run post-scan instructions.");
+          return await completedScan(scanOptions.outputDir!);
+        }),
+        { onProgress: (event) => progress.push(event) },
+      ),
     );
 
-    expect(summary).toMatchObject({
-      completed: 2,
-      incomplete: 0,
-      failed: 0,
-      warned: 1,
-    });
+    expect(summary).toMatchObject({ completed: 1, incomplete: 0, failed: 0 });
     expect(progress).toContainEqual({
       repository: "follow-up-warning",
       attempt: 1,
       status: "started",
       warning: "Could not run post-scan instructions.",
     });
-    const receipts = await results(summary.resultsPath);
-    expect(receipts).toMatchObject([
-      {
-        id: "follow-up-warning",
-        status: "completed",
-        warnings: ["Could not run post-scan instructions.", "[redacted]"],
-      },
-      { id: "quiet", status: "completed" },
-    ]);
-    expect(receipts[1]).not.toHaveProperty("warnings");
-    expect(await readFile(summary.resultsPath, "utf8")).not.toContain(secret);
-
-    const ledger = await readFile(summary.resultsPath, "utf8");
-    const unrelatedWarning = {
-      id: "OUTSIDE-CAMPAIGN",
-      warnings: ["Unrelated historical warning."],
-    };
-    await appendFile(
-      summary.resultsPath,
-      `${JSON.stringify(unrelatedWarning)}\n`,
-    );
-    const malformedLedger = await readFile(summary.resultsPath, "utf8");
-    await expect(runMultiscan(options(paths, security))).rejects.toThrow(
-      "Multiscan recovery is required",
-    );
-    expect(scans).toBe(2);
-    expect(await readFile(summary.resultsPath, "utf8")).toBe(malformedLedger);
-    await writeFile(summary.resultsPath, ledger);
-    await appendFile(
-      summary.resultsPath,
-      `${JSON.stringify({
-        ...receipts[0],
-        ...unrelatedWarning,
-      })}\n`,
-    );
-    for (const identity of [{ id: "QUIET" }, { repository: source.path }]) {
-      const previous = (await results(summary.resultsPath)).findLast(
-        (receipt) => receipt["id"] === "quiet",
-      );
-      await appendFile(
-        summary.resultsPath,
-        `${JSON.stringify({
-          ...previous,
-          ...identity,
-          warnings: ["Warning from another scan identity."],
-        })}\n`,
-      );
-      expect(await runMultiscan(options(paths, security))).toMatchObject({
-        completed: 2,
-        warned: 1,
-        skipped: 1,
-      });
-    }
-  });
-
-  test("keeps warnings from failed attempts across retries and resumes", async () => {
-    const paths = await fixture();
-    const source = await repository(paths.root, "warned-retry");
-    await writeFile(
-      paths.input,
-      `id,repository,revision\nwarned-retry,${source.path},${source.revision}\n`,
-    );
-    let attempts = 0;
-    const security = client(async (_repository, scanOptions = {}) => {
-      attempts += 1;
-      if (attempts === 1) {
-        scanOptions.onWarning?.("Scan target changed while it was running.");
-        throw new Error("temporary failure");
-      }
-      return await completedScan(scanOptions.outputDir!);
-    });
-
-    const first = await runMultiscan(
-      options(paths, security, { maxAttempts: 1 }),
-    );
-    expect(first).toMatchObject({ completed: 0, failed: 1, warned: 1 });
-
-    const retried = await runMultiscan(
-      options(paths, security, { maxAttempts: 1 }),
-    );
-    expect(retried).toMatchObject({
-      completed: 1,
-      failed: 0,
-      warned: 1,
-      skipped: 0,
-    });
-    expect(await results(retried.resultsPath)).toMatchObject([
-      {
-        status: "failed",
-        attempt: 1,
-        warnings: ["Scan target changed while it was running."],
-      },
-      { status: "completed", attempt: 2 },
-    ]);
-
-    const resumed = await runMultiscan(options(paths, security));
-    expect(resumed).toMatchObject({
-      completed: 1,
-      failed: 0,
-      warned: 1,
-      skipped: 1,
-    });
-    expect(attempts).toBe(2);
   });
 
   test.each([false, true])(
@@ -1735,91 +1619,6 @@ describe("multiscan", () => {
     expect(ledger).not.toContain("SYNTHETIC");
   });
 
-  test.each(["complete", "partial", "failed"] as const)(
-    "preserves the %s scan outcome when checkout cleanup fails",
-    async (outcome) => {
-      const failed = outcome === "failed";
-      const expected = {
-        completed: outcome === "complete" ? 1 : 0,
-        incomplete: outcome === "partial" ? 1 : 0,
-        failed: failed ? 1 : 0,
-        warned: 1,
-      };
-      const paths = await fixture();
-      const source = await repository(paths.root, "cleanup-failure");
-      await writeFile(
-        paths.input,
-        `id,repository,revision\ncleanup,${source.path},${source.revision}\n`,
-      );
-      const checkout = join(paths.output, "checkouts", "cleanup");
-      const originalRm = filesystem.rm;
-      let scanned = false;
-      const remove = spyOn(filesystem, "rm").mockImplementation(
-        async (...args: Parameters<typeof originalRm>) => {
-          if (scanned && String(args[0]) === checkout) {
-            throw Object.assign(new Error("EACCES: checkout is in use"), {
-              code: "EACCES",
-            });
-          }
-          return await originalRm(...args);
-        },
-      );
-
-      try {
-        const summary = await runMultiscan(
-          options(
-            paths,
-            client(async (_repository, scanOptions = {}) => {
-              scanned = true;
-              if (outcome === "failed") {
-                throw new Error("Original scan failure.");
-              }
-              return await completedScan(scanOptions.outputDir!, outcome);
-            }),
-            { maxAttempts: 1 },
-          ),
-        );
-
-        expect(summary).toMatchObject(expected);
-        expect(await results(summary.resultsPath)).toMatchObject([
-          {
-            status: failed
-              ? "failed"
-              : outcome === "complete"
-                ? "completed"
-                : "completed_with_incomplete_coverage",
-            attempt: 1,
-            ...(failed ? { error: "Original scan failure." } : {}),
-            warnings: [
-              "Multiscan checkout cleanup failed: EACCES: checkout is in use",
-            ],
-          },
-        ]);
-      } finally {
-        remove.mockRestore();
-      }
-
-      if (!failed) {
-        const ledgerPath = join(paths.output, "results.jsonl");
-        const ledger = await readFile(ledgerPath, "utf8");
-        const resumed = await runMultiscan(
-          options(
-            paths,
-            client(async (_repository, scanOptions = {}) =>
-              completedScan(scanOptions.outputDir!),
-            ),
-          ),
-        );
-        expect(resumed).toMatchObject({
-          ...expected,
-          skipped: 1,
-        });
-        expect(await readdir(join(paths.output, "checkouts"))).toEqual([]);
-        expect(await readFile(ledgerPath, "utf8")).toBe(ledger);
-      }
-    },
-  );
-
   test("rescans corrupt, modified, and mismatched sealed repository artifacts", async () => {
     const paths = await fixture();
     const source = await repository(paths.root, "resume-integrity");
@@ -2099,7 +1898,6 @@ describe("multiscan", () => {
       const first = await runMultiscan(options(paths, security));
       expect(await runMultiscan(options(paths, security))).toMatchObject({
         completed: 1,
-        warned: 0,
         skipped: 1,
       });
 
@@ -2110,7 +1908,6 @@ describe("multiscan", () => {
       await writeFile(first.resultsPath, ledger);
       expect(await runMultiscan(options(paths, security))).toMatchObject({
         completed: 1,
-        warned: 0,
         skipped: 1,
       });
       expect(await readFile(first.resultsPath, "utf8")).toBe(ledger);
@@ -2199,7 +1996,6 @@ describe("multiscan", () => {
     await runMultiscan(campaign);
     expect(await runMultiscan(campaign)).toMatchObject({
       completed: 1,
-      warned: 0,
       skipped: 1,
     });
     expect(attempts).toBe(1);
