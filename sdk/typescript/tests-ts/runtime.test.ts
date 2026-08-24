@@ -1667,10 +1667,15 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
-  test("upgrades a plugin with the real bundled Codex executable", async () => {
+  test("upgrades a cached workbench with the real bundled Codex executable", async () => {
     const root = await temporaryDirectory();
-    const previous = await plugin(join(root, "previous"), "1.2.3");
-    const next = await plugin(join(root, "next"), "1.2.4");
+    const previous = await plugin(join(root, "previous"), "0.1.20");
+    const previousWorkbench =
+      "def require_finding_open(connection, occurrence_id):\n    return None\n";
+    await writeFile(
+      join(previous, "scripts", "workbench_db.py"),
+      previousWorkbench,
+    );
     const home = join(root, "home");
     await mkdir(home, { mode: 0o700 });
     await writeFile(
@@ -1695,12 +1700,29 @@ describe("plugin runtime preparation", () => {
     const credentials = await readFile(join(home, "auth.json"), "utf8");
 
     const options = { codexCommand: command, environment };
-    expect((await bootstrapPlugin(home, previous, options)).version).toBe(
-      "1.2.3",
-    );
-    const upgraded = await bootstrapPlugin(home, next, options);
+    const installedPrevious = await bootstrapPlugin(home, previous, options);
+    expect(installedPrevious.version).toBe("0.1.20");
+    expect(
+      await readFile(
+        join(installedPrevious.installedRoot, "scripts", "workbench_db.py"),
+        "utf8",
+      ),
+    ).toBe(previousWorkbench);
 
-    expect(upgraded.version).toBe("1.2.4");
+    const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
+    const upgradedWorkbench = await readFile(
+      join(upgraded.installedRoot, "scripts", "workbench_db.py"),
+      "utf8",
+    );
+
+    expect(upgradedWorkbench).toContain(
+      "_indexed_scan_findings(connection, scan)",
+    );
+    expect(upgradedWorkbench).toBe(
+      await readFile(join(PLUGIN_ROOT, "scripts", "workbench_db.py"), "utf8"),
+    );
+    expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
+    expect(upgraded.version).not.toBe(installedPrevious.version);
     expect(await readFile(join(home, "auth.json"), "utf8")).toBe(credentials);
     expect(
       spawnSync(command.command, ["login", "status"], {
