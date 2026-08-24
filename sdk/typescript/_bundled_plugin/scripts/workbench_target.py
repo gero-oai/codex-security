@@ -221,8 +221,8 @@ def git_command(
     local_objects_only: bool = False,
     object_directory: Path | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
-    if (git_dir is None) != (work_tree is None):
-        raise ValueError("git_dir and work_tree must be provided together")
+    if work_tree is not None and git_dir is None:
+        raise ValueError("work_tree requires git_dir")
     environment = os.environ.copy()
     for name in GIT_REPOSITORY_ENVIRONMENT:
         environment.pop(name, None)
@@ -242,8 +242,10 @@ def git_command(
         "-C",
         str(target),
     ]
-    if git_dir is not None and work_tree is not None:
-        command.extend(["--git-dir", str(git_dir), "--work-tree", str(work_tree)])
+    if git_dir is not None:
+        command.extend(["--git-dir", str(git_dir)])
+        if work_tree is not None:
+            command.extend(["--work-tree", str(work_tree)])
     full_command = [*command, *args]
     try:
         return subprocess.run(
@@ -297,6 +299,7 @@ def _replacement_refs(
     repository: Path,
     *,
     object_id_length: int,
+    git_dir: Path | None = None,
     object_directory: Path | None = None,
 ) -> bytes:
     replacement_ref_base = os.fsencode(
@@ -309,6 +312,7 @@ def _replacement_refs(
         "--format=%(refname)%00%(objectname)",
         text=False,
         local_objects_only=True,
+        git_dir=git_dir,
         object_directory=object_directory,
     )
     if replacements.returncode != 0:
@@ -337,6 +341,7 @@ def _replacement_refs(
 def _replacement_refs_enabled(
     repository: Path,
     *,
+    git_dir: Path | None = None,
     object_directory: Path | None = None,
 ) -> bool:
     if "GIT_NO_REPLACE_OBJECTS" in os.environ:
@@ -349,6 +354,7 @@ def _replacement_refs_enabled(
         "core.useReplaceRefs",
         text=False,
         local_objects_only=True,
+        git_dir=git_dir,
         object_directory=object_directory,
     )
     value = configured.stdout.strip()
@@ -481,6 +487,7 @@ def _committed_diff_object_identity(
     base: str,
     head: str,
     *,
+    git_dir: Path | None = None,
     object_directory: Path | None = None,
 ) -> str:
     digest = hashlib.sha256()
@@ -501,6 +508,7 @@ def _committed_diff_object_identity(
                 "--end-of-options",
                 f"{revision}^{{tree}}",
                 local_objects_only=True,
+                git_dir=git_dir,
                 object_directory=object_directory,
             )
             if tree is None:
@@ -514,17 +522,20 @@ def _committed_diff_object_identity(
         "rev-parse",
         "--show-object-format",
         local_objects_only=True,
+        git_dir=git_dir,
         object_directory=object_directory,
     )
     if object_format not in {"sha1", "sha256"}:
         raise SystemExit("Could not inspect the selected committed changes.")
     replacements_enabled = _replacement_refs_enabled(
         repository,
+        git_dir=git_dir,
         object_directory=object_directory,
     )
     replacements = _replacement_refs(
         repository,
         object_id_length=40 if object_format == "sha1" else 64,
+        git_dir=git_dir,
         object_directory=object_directory,
     )
     update_digest_field(
@@ -566,6 +577,7 @@ def _committed_diff_content_snapshot(
         pathspec,
         base,
         head,
+        git_dir=view,
         object_directory=object_directory,
     )
     content_digest = _committed_diff_content_digest(
@@ -574,6 +586,7 @@ def _committed_diff_content_snapshot(
         base,
         head,
         operation_directory,
+        git_dir=view,
         object_directory=object_directory,
     )
     after = _committed_diff_object_identity(
@@ -581,6 +594,7 @@ def _committed_diff_content_snapshot(
         pathspec,
         base,
         head,
+        git_dir=view,
         object_directory=object_directory,
     )
     if before != after:
@@ -595,6 +609,7 @@ def _committed_diff_content_digest(
     head: str,
     state_directory: Path,
     *,
+    git_dir: Path | None = None,
     object_directory: Path | None = None,
 ) -> str:
     digest = hashlib.sha256()
@@ -625,6 +640,7 @@ def _committed_diff_content_digest(
             text=False,
             stdout=metadata,
             local_objects_only=True,
+            git_dir=git_dir,
             object_directory=object_directory,
         )
         if diff.returncode != 0:
@@ -648,6 +664,7 @@ def _committed_diff_content_digest(
                 stdin=requests,
                 stdout=objects,
                 local_objects_only=True,
+                git_dir=git_dir,
                 object_directory=object_directory,
             )
             if batch.returncode != 0:

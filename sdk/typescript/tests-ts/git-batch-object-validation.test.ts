@@ -911,6 +911,19 @@ describe("committed diff Git batch validation", () => {
     },
   );
 
+  test("opens frozen committed views explicitly", () => {
+    const { base, head, repository, root, state } = createRepository();
+    const globalConfig = join(root, "global.gitconfig");
+    writeFileSync(globalConfig, "[safe]\n\tbareRepository = explicit\n");
+
+    expect(
+      committedDigest(repository, state, base, head, {
+        GIT_CONFIG_GLOBAL: globalConfig,
+        GIT_CONFIG_NOSYSTEM: "1",
+      }),
+    ).toMatch(/^codex-security-snapshot\/v1:sha256:[a-f0-9]{64}$/u);
+  });
+
   test.skipIf(process.platform === "win32")(
     "supports line-break-bearing quoted repository paths",
     () => {
