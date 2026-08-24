@@ -125,7 +125,7 @@ describe("CLI skill commands", () => {
     }
   });
 
-  test("requests only selected patch review stages in their fixed order", async () => {
+  test("runs only selected independent patch review stages in their fixed order", async () => {
     for (const [flags, expected] of [
       [[], []],
       [["--review-minimality"], ["minimality"]],
@@ -135,30 +135,51 @@ describe("CLI skill commands", () => {
         ["minimality", "local-coding-style"],
       ],
     ] as const) {
-      let prompt = "";
+      const invocations: Array<{
+        prompt: string;
+        sandbox: "read-only" | "workspace-write" | undefined;
+      }> = [];
+      const stdout = capture();
       expect(
         await main(
           ["patch", "Synthetic security issue", ...flags],
-          capture().stream,
+          stdout.stream,
           capture().stream,
           dependencies({
             onCodex: (_args, output) => {
-              prompt = output!.appServer!.prompt;
+              const server = output!.appServer!;
+              invocations.push({
+                prompt: server.prompt,
+                sandbox: server.sandbox,
+              });
+              output!.stdout.write(
+                server.sandbox === "read-only"
+                  ? JSON.stringify({
+                      status: "approved",
+                      findings: [],
+                    })
+                  : "Verified synthetic patch.\n",
+              );
               return 0;
             },
           }),
         ),
       ).toBe(0);
-
-      const lines = prompt.split("\n");
-      const stageLine = lines.findIndex((line) =>
-        line.startsWith("After the existing security review"),
+      expect(invocations).toHaveLength(expected.length + 1);
+      expect(invocations[0]!.sandbox).toBeUndefined();
+      expect(invocations.slice(1).map(({ sandbox }) => sandbox)).toEqual(
+        expected.map(() => "read-only"),
       );
-      if (expected.length === 0) {
-        expect(stageLine).toBe(-1);
-      } else {
-        expect(JSON.parse(lines[stageLine + 1]!)).toEqual(expected);
-      }
+      expect(
+        invocations
+          .slice(1)
+          .map(({ prompt }) =>
+            expected.find((stage) =>
+              prompt.includes(`only the ${stage} review`),
+            ),
+          ),
+      ).toEqual([...expected]);
+      expect(stdout.text()).toBe("Verified synthetic patch.\n");
     }
 
     const help = capture();
@@ -172,6 +193,90 @@ describe("CLI skill commands", () => {
     ).toBe(0);
     expect(help.text()).toContain("--review-minimality");
     expect(help.text()).toContain("--review-style");
+  });
+
+  test("revises a rejected patch once before independently reviewing it again", async () => {
+    const stages: string[] = [];
+    const stdout = capture();
+    const stderr = capture();
+    expect(
+      await main(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        stdout.stream,
+        stderr.stream,
+        dependencies({
+          onCodex: (_args, output) => {
+            const { prompt, sandbox } = output!.appServer!;
+            if (sandbox === "read-only") {
+              stages.push("review");
+              output!.stdout.write(
+                JSON.stringify(
+                  stages.length === 2
+                    ? {
+                        status: "revise",
+                        findings: ["Remove the unrelated helper refactor."],
+                      }
+                    : { status: "approved", findings: [] },
+                ),
+              );
+            } else {
+              stages.push(stages.length === 0 ? "author" : "revise");
+              if (stages.length > 1) {
+                expect(prompt).toContain(
+                  "Remove the unrelated helper refactor.",
+                );
+              }
+              output!.stdout.write(`Patch ${stages.length}.\n`);
+            }
+            return 0;
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(stages).toEqual(["author", "review", "revise", "review"]);
+    expect(stdout.text()).toBe("Patch 3.\n");
+    expect(stderr.text()).toContain('"status":"revise"');
+    expect(stderr.text()).toContain('"status":"approved"');
+  });
+
+  test("fails closed when an independent review is invalid or remains rejected", async () => {
+    for (const verdict of [
+      "not json",
+      JSON.stringify({ status: "approved", findings: ["Unexpected finding"] }),
+      JSON.stringify({
+        status: "blocked",
+        findings: ["Missing source evidence"],
+      }),
+      JSON.stringify({ status: "revise", findings: ["Unrelated refactor"] }),
+    ]) {
+      let invocations = 0;
+      const stdout = capture();
+      const stderr = capture();
+      expect(
+        await main(
+          [
+            "patch",
+            "Synthetic security issue",
+            "--review-minimality",
+            "--review-style",
+          ],
+          stdout.stream,
+          stderr.stream,
+          dependencies({
+            onCodex: (_args, output) => {
+              invocations += 1;
+              output!.stdout.write(
+                output!.appServer!.sandbox === "read-only" ? verdict : "Patch",
+              );
+              return 0;
+            },
+          }),
+        ),
+      ).toBe(2);
+      expect(stdout.text()).toBe("");
+      expect(stderr.text()).not.toContain("local-coding-style review");
+      expect(invocations).toBe(verdict.includes('"status":"revise"') ? 4 : 2);
+    }
   });
 
   test("imports selected Linear issues without exposing its credential to Codex", async () => {
