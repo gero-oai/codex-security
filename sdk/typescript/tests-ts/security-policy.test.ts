@@ -1497,6 +1497,20 @@ describe("security policy review and application", () => {
         "v1.0",
         "powershell.exe",
       );
+      const powershellEnvironment = {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([name]) => name.toUpperCase() !== "PSMODULEPATH",
+          ),
+        ),
+        CODEX_SECURITY_TEST_ACL_PATH: target,
+        PSModulePath: join(
+          systemDirectory,
+          "WindowsPowerShell",
+          "v1.0",
+          "Modules",
+        ),
+      };
       execFileSync(
         powershell,
         [
@@ -1511,14 +1525,15 @@ describe("security policy review and application", () => {
             "$acl.SetAccessRuleProtection($true, $false)",
             "$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($identity.User, 'Read', 'Allow')",
             "$acl.AddAccessRule($rule)",
+            "$acl.SetAuditRuleProtection($true, $false)",
+            "$audit = [System.Security.AccessControl.FileSystemAuditRule]::new($identity.User, 'Read', 'Success')",
+            "$acl.AddAuditRule($audit)",
+            "$acl.SetSecurityDescriptorSddlForm($acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All) + '(ML;;NW;;;LW)')",
             "Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -AclObject $acl",
           ].join("; "),
         ],
         {
-          env: {
-            ...process.env,
-            CODEX_SECURITY_TEST_ACL_PATH: target,
-          },
+          env: powershellEnvironment,
           windowsHide: true,
         },
       );
@@ -1530,12 +1545,12 @@ describe("security policy review and application", () => {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+            "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -Audit | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
           ],
           {
             encoding: "utf8",
             env: {
-              ...process.env,
+              ...powershellEnvironment,
               CODEX_SECURITY_TEST_ACL_PATH: path,
             },
             windowsHide: true,
@@ -1543,6 +1558,9 @@ describe("security policy review and application", () => {
         ).trim();
       const before = descriptor();
       expect(before).toContain("D:P");
+      expect(before).toContain("S:P");
+      expect(before).toContain("(AU;SA;");
+      expect(before).toContain("(ML;;NW;;;LW)");
       const draft = await f.generate();
       const originalLink = fsPromises.link;
       const originalRename = fsPromises.rename;
@@ -1591,6 +1609,55 @@ describe("security policy review and application", () => {
           ...fsPromises,
           link: originalLink,
           rename: originalRename,
+        }));
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "leaves an existing Windows policy unchanged when its security descriptor cannot be copied",
+    async () => {
+      const name =
+        "leaves an existing Windows policy unchanged when its security descriptor cannot be copied";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      const original = "# Existing policy\n";
+      await writeFile(target, original);
+      const draft = await f.generate();
+      const originalOpen = fsPromises.open;
+      const systemRoot = process.env["SystemRoot"];
+      let attemptedCopy = false;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        open: async (...args: Parameters<typeof originalOpen>) => {
+          const handle = await originalOpen(...args);
+          if (String(args[0]).startsWith(join(f.repository, ".SECURITY.md."))) {
+            attemptedCopy = true;
+            process.env["SystemRoot"] = join(f.root, "unavailable-system");
+          }
+          return handle;
+        },
+      }));
+
+      try {
+        await expect(applySecurityPolicy(draft)).rejects.toThrow(
+          "Cannot preserve the existing SECURITY.md security descriptor and audit settings",
+        );
+        expect(attemptedCopy).toBe(true);
+        expect(await readFile(target, "utf8")).toBe(original);
+        expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
+        expect(
+          (await readdir(f.outputDir)).some((entry) =>
+            entry.startsWith("recovery-SECURITY-"),
+          ),
+        ).toBe(false);
+      } finally {
+        if (systemRoot === undefined) delete process.env["SystemRoot"];
+        else process.env["SystemRoot"] = systemRoot;
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          open: originalOpen,
         }));
       }
     },
@@ -1829,6 +1896,29 @@ describe("security policy review and application", () => {
       "changed after",
     );
     await expect(applySecurityPolicy(draft)).rejects.toThrow("changed after");
+  });
+
+  test("rejects new out-of-scope aliases when applying an unchanged draft", async () => {
+    for (const [directory, message] of [
+      ["sibling", "outside the selected component"],
+      [".github", "separate vulnerability-reporting policy"],
+    ] as const) {
+      const f = await fixture();
+      const component = join(f.repository, "component");
+      const target = join(component, "SECURITY.md");
+      await mkdir(component);
+      await writeFile(target, POLICY);
+      const draft = await f.generate({ path: "component" });
+      const alias = join(f.repository, directory, "SECURITY.md");
+      await mkdir(dirname(alias));
+      await symlink(target, alias, "file");
+
+      await expect(
+        applySecurityPolicy(draft, { pythonPath: "missing-python" }),
+      ).rejects.toThrow(message);
+      expect(await readFile(target, "utf8")).toBe(POLICY);
+      expect((await lstat(alias)).isSymbolicLink()).toBe(true);
+    }
   });
 
   test("rechecks policy changes made while preparing a diff", async () => {

@@ -283,6 +283,10 @@ before retrying. Once a write commits, SDK cancellation does not skip the
 remaining checks. A terminal interrupt or process failure can still leave a
 `written_unverified` result. A later Ctrl-C or SIGTERM forces the CLI to stop.
 
+On Windows, updates preserve the existing policy's complete security descriptor,
+including audit rules and integrity labels. If the current account cannot read or
+copy that descriptor, the existing policy is left unchanged.
+
 Save edited drafts as UTF-8. If generation used a custom `--plugin-path`, select
 it again when applying a saved draft. Saved metadata cannot choose executable
 plugin code. Both plugin directories and ZIP files are supported.

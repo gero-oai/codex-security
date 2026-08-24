@@ -1436,6 +1436,40 @@ describe("policy CLI", () => {
     }
   });
 
+  test("does not report an unchanged policy as verified when its scope changed", async () => {
+    const f = await fixture();
+    const component = join(f.repository, "component");
+    const target = join(component, "SECURITY.md");
+    await mkdir(component);
+    await writeFile(target, POLICY);
+    await f.generate({ path: "component" });
+    const alias = join(f.repository, "sibling", "SECURITY.md");
+    await mkdir(dirname(alias));
+    await symlink(target, alias, "file");
+
+    const stdout = capture();
+    const stderr = capture();
+    const deps = policyDependencies(f);
+    deps.createPolicySecurity = () => {
+      throw new Error("Must not initialize Codex for --apply");
+    };
+    deps.resolvePolicyPython = async () => {
+      throw new Error("Must not resolve Python for an unchanged draft");
+    };
+
+    expect(
+      await main(
+        ["policy", "--path", "component", "--apply", f.outputDir, "--write"],
+        stdout.stream,
+        stderr.stream,
+        deps,
+      ),
+    ).toBe(2);
+    expect(stderr.text()).toContain("outside the selected component");
+    expect(stdout.text()).not.toContain("Verified");
+    expect(await readFile(target, "utf8")).toBe(POLICY);
+  });
+
   test("does not overwrite source edited during the confirmation", async () => {
     const f = await fixture();
     const draft = await f.generate();

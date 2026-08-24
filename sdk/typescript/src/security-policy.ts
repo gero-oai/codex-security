@@ -1119,13 +1119,13 @@ export async function applySecurityPolicy(
   let pluginWorkspace: string | undefined;
   try {
     await readDraftContent(target, draft, options.signal);
+    await validatePolicyLinks(target, options.signal);
     if (draft.previousContent === draft.content)
       return {
         status: "unchanged",
         targetPath: target.targetPath,
         recoveryPath: null,
       };
-    await validatePolicyLinks(target, options.signal);
     const protectedRoots = await securityPolicyProtectedRoots(
       target,
       options.signal,
@@ -1331,36 +1331,44 @@ async function copyWindowsSecurityDescriptor(
     process.env["SystemRoot"] ?? "C:\\Windows",
     "System32",
   );
-  await execFileAsync(
-    join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"),
-    [
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
+  try {
+    await execFileAsync(
+      join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"),
       [
-        "$ErrorActionPreference = 'Stop'",
-        `$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${sourceVariable}`,
-        `Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl`,
-      ].join("; "),
-    ],
-    {
-      encoding: "utf8",
-      env: {
-        ...inheritedEnvironment,
-        [sourceVariable]: source,
-        [destinationVariable]: destination,
-        PSModulePath: join(
-          systemDirectory,
-          "WindowsPowerShell",
-          "v1.0",
-          "Modules",
-        ),
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        [
+          "$ErrorActionPreference = 'Stop'",
+          `$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${sourceVariable} -Audit`,
+          `Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl`,
+        ].join("; "),
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...inheritedEnvironment,
+          [sourceVariable]: source,
+          [destinationVariable]: destination,
+          PSModulePath: join(
+            systemDirectory,
+            "WindowsPowerShell",
+            "v1.0",
+            "Modules",
+          ),
+        },
+        signal,
+        windowsHide: true,
       },
-      signal,
-      windowsHide: true,
-    },
-  );
+    );
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw new CodexSecurityError(
+      "Cannot preserve the existing SECURITY.md security descriptor and audit settings. Use a Windows account permitted to read and write those settings.",
+      { cause: error },
+    );
+  }
 }
 
 async function replaceExistingPolicy(
