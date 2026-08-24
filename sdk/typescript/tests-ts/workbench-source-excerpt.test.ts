@@ -400,13 +400,10 @@ try:
         return original_pure_path(*arguments)
     excerpts.PurePosixPath = one_path_parse
     try:
-        excerpts.source_scopes_for_path(
+        excerpts.source_scope_for_path(
             large_context[2],
             "/".join(["nested"] * 20_000 + ["file.py"]),
         )
-        deep_lookup_linear = True
-    except RuntimeError:
-        deep_lookup_linear = False
     finally:
         excerpts.PurePosixPath = original_pure_path
     large_excerpt = excerpts.finding_source_excerpt_from_context(
@@ -422,7 +419,6 @@ print(json.dumps({
     "broadenedBlobReads": broadened_blob_reads,
     "collisionBlobReads": collision_blob_reads,
     "collisions": collisions,
-    "deepLookupLinear": deep_lookup_linear,
     "deepPathParses": path_parses,
     "duplicatePaths": len(authority["paths"]),
     "immutable": immutable,
@@ -486,7 +482,6 @@ describe("workbench source excerpts", () => {
         "src/trailing.py": null,
         "src/trailing.py.": null,
       },
-      deepLookupLinear: true,
       deepPathParses: 1,
       duplicatePaths: 1,
       immutable: {

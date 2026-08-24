@@ -281,24 +281,20 @@ def source_object_for_path(
     return entry[2] if entry is not None and entry[1] == "file" else None
 
 
-def source_scopes_for_path(
-    index: SourceScopeIndex, value: str
-) -> tuple[str, ...]:
+def source_scope_for_path(index: SourceScopeIndex, value: str) -> str | None:
     path = relative_path(value)
     if path is None:
-        return ()
-    scopes: list[str] = []
+        return None
     node = index
-    if node.scope is not None:
-        scopes.append(node.scope)
+    scope = node.scope
     for component in path.parts:
         child = node.children.get(component)
         if child is None:
             break
         node = child
         if node.scope is not None:
-            scopes.append(node.scope)
-    return tuple(reversed(scopes))
+            scope = node.scope
+    return scope
 
 
 def source_excerpt_context(
@@ -341,18 +337,11 @@ def finding_source_excerpt_from_context(
     if not isinstance(path, str) or not isinstance(start_line, int):
         return None
     try:
-        object_id = next(
-            (
-                candidate
-                for scope in source_scopes_for_path(scopes, path)
-                if (
-                    candidate := source_object_for_path(
-                        repository, tree, path, scope
-                    )
-                )
-                is not None
-            ),
-            None,
+        scope = source_scope_for_path(scopes, path)
+        object_id = (
+            source_object_for_path(repository, tree, path, scope)
+            if scope is not None
+            else None
         )
     except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
         return None
