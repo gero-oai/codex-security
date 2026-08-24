@@ -861,8 +861,8 @@ const PATCH_REVIEW_POLICY = [
   "Shared patching policy, in priority order:",
   "1. Fully fix the reported security finding.",
   "2. Preserve existing observable behavior unless changing it is required to close the finding.",
-  "3. Make the smallest complete, concise, easy-to-review change; do not redesign protocols, serialization formats, public interfaces, or architecture when a narrower fix closes the finding.",
-  "4. Reuse applicable existing helpers, tests, build targets, and CI infrastructure. Record broader hardening or redesign suggestions in a PR comment, or the patch summary when no PR exists; do not implement them in the patch.",
+  "3. Make the smallest complete, concise, easy-to-review change; treat broad issue descriptions and remediation suggestions as leads, not a checklist. Do not redesign protocols, serialization formats, public interfaces, or architecture when a narrower fix closes the finding.",
+  "4. Reuse applicable existing helpers, tests, build targets, and CI infrastructure. Do not add extensive testing infrastructure or move, extract, or export production code solely to improve testability. Record testability improvements, broader hardening, and redesign suggestions in a PR comment, or the patch summary when no PR exists; do not implement them in the patch.",
   "5. Follow the nearest applicable project guidance without expanding the patch for an optional stylistic preference.",
   "Request a structural change only when an applicable mandatory rule requires it, the current patch introduces a concrete problem, and no smaller compliant correction exists.",
 ].join("\n");
@@ -870,7 +870,7 @@ const PATCH_REVIEW_POLICY = [
 const PATCH_REVIEW_ASSIGNMENTS = {
   minimality: [
     "Explain why each changed file, production change, regression test, dependency, helper, and abstraction is necessary to close or prove the reported security boundary.",
-    "Identify unrelated refactoring, formatting, new dependencies, avoidable helper-signature or data-type changes, unnecessary control-flow or error-semantics changes, and broader fixes when an equally complete narrower change exists.",
+    "Identify unrelated refactoring, formatting, new dependencies, avoidable testing infrastructure or testability-driven extraction, avoidable helper-signature or data-type changes, unnecessary control-flow or error-semantics changes, and broader fixes when an equally complete narrower change exists.",
     "Report only concrete, source-backed simplifications that preserve security closure, legitimate behavior, meaningful regression coverage, and unrelated pre-existing user changes.",
   ].join("\n"),
   "local-coding-style": [
