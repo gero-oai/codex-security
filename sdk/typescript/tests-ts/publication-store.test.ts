@@ -236,7 +236,7 @@ connection.close()
     databaseRows(fixture, "DROP TABLE finding_publications");
     databaseRows(
       fixture,
-      "DELETE FROM schema_migrations WHERE version BETWEEN ? AND ?",
+      "DELETE FROM schema_migrations WHERE version IN (?, ?)",
       [29, 30],
     );
 
@@ -263,6 +263,51 @@ connection.close()
         "SELECT COUNT(*) AS count FROM finding_publications",
       ),
     ).toEqual([{ count: 0 }]);
+  });
+
+  test("upgrades scan history from before stopped-result preservation", async () => {
+    const fixture = await publicationFixture();
+    databaseRows(
+      fixture,
+      "ALTER TABLE scans DROP COLUMN retained_source_digests_json",
+    );
+    databaseRows(
+      fixture,
+      "ALTER TABLE deep_scan_runs DROP COLUMN publication_error_message",
+    );
+    databaseRows(fixture, "DROP INDEX finding_occurrences_by_finding");
+    databaseRows(fixture, "DROP INDEX scan_comparisons_by_after_scan");
+    databaseRows(fixture, "DELETE FROM schema_migrations WHERE version >= ?", [
+      31,
+    ]);
+
+    await expect(
+      preparePublicationStore(fixture.publication, fixture.environment),
+    ).resolves.toBeUndefined();
+
+    expect(
+      databaseRows(
+        fixture,
+        "SELECT version, name FROM schema_migrations WHERE version >= ? ORDER BY version",
+        [31],
+      ),
+    ).toEqual([
+      { version: 31, name: "freeze stopped scan source digests" },
+      { version: 32, name: "separate deep scan publication failures" },
+      { version: 33, name: "index finding identity and comparison history" },
+    ]);
+    expect(
+      databaseRows(
+        fixture,
+        "SELECT name FROM pragma_table_info('scans') WHERE name = 'retained_source_digests_json'",
+      ),
+    ).toEqual([{ name: "retained_source_digests_json" }]);
+    expect(
+      databaseRows(
+        fixture,
+        "SELECT name FROM pragma_table_info('deep_scan_runs') WHERE name = 'publication_error_message'",
+      ),
+    ).toEqual([{ name: "publication_error_message" }]);
   });
 
   test("upgrades existing project-scoped associations without changing recorded issues", async () => {

@@ -1,10 +1,22 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Codex, type ThreadOptions, type TurnOptions } from "@openai/codex-sdk";
+import {
+  Codex,
+  type CodexOptions,
+  type ModelReasoningEffort,
+  type ThreadOptions,
+  type TurnOptions,
+} from "@openai/codex-sdk";
 import { z } from "incur";
 import type { CodexSecuritySurface } from "./api.js";
 import { accountStatus } from "./auth.js";
+import {
+  mergedCodexConfig,
+  scanModelConfiguration,
+  type CodexSecurityConfig,
+  type JsonObject,
+} from "./config.js";
 import { CodexSecurityError } from "./errors.js";
 import {
   compactFinding,
@@ -17,6 +29,8 @@ import {
   expandHome,
   prepareCodexSecurityCredentialHome,
   resolveCodexCommand,
+  runCodexCommand,
+  type CodexCommand,
 } from "./runtime.js";
 
 type Finding = ComparisonFinding;
@@ -64,7 +78,7 @@ export interface ScanComparisonResult {
 }
 
 /** @internal */
-interface ComparisonCodex {
+interface ReadOnlyCodex {
   startThread(options: ThreadOptions): {
     run(
       input: string,
@@ -73,17 +87,21 @@ interface ComparisonCodex {
   };
 }
 
-export interface ScanComparisonOptions {
+export interface ReadOnlyCodexOptions {
+  config?: CodexSecurityConfig;
   /** @internal */
-  allowHistoricalUncertainty?: boolean;
-  /** @internal */
-  codex?: ComparisonCodex;
+  codex?: ReadOnlyCodex;
   environment?: NodeJS.ProcessEnv;
   model?: string;
-  onProgress?: (progress: ScanComparisonProgress) => void;
-  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoningEffort?: ModelReasoningEffort;
   signal?: AbortSignal;
   workingDirectory?: string;
+}
+
+export interface ScanComparisonOptions extends ReadOnlyCodexOptions {
+  /** @internal */
+  allowHistoricalUncertainty?: boolean;
+  onProgress?: (progress: ScanComparisonProgress) => void;
 }
 
 interface CompletedScanMatchingOptions
@@ -225,46 +243,7 @@ export async function matchScanFindingsInternal(
       }
     }
   }
-  const codex =
-    options.codex ??
-    new Codex({
-      env: await comparisonEnvironment(
-        options.environment,
-        accountStatus,
-        options.signal,
-      ),
-      config: {
-        allow_login_shell: false,
-        project_doc_max_bytes: 0,
-        responses_api_metadata: {
-          codex_security_surface: runtimeOptions.surface,
-        },
-        "features.apps": false,
-        "features.code_mode": false,
-        "features.code_mode_only": false,
-        "features.js_repl": false,
-        "features.multi_agent": false,
-        "features.multi_agent_v2": false,
-        "features.plugins": false,
-        "features.shell_tool": false,
-        "features.unified_exec": false,
-        shell_environment_policy: {
-          inherit: "core",
-          ignore_default_excludes: false,
-          exclude: ["CODEX_HOME", "*KEY*", "*SECRET*", "*TOKEN*"],
-        },
-      },
-    });
-  const thread = codex.startThread({
-    ...(options.model === undefined ? {} : { model: options.model }),
-    modelReasoningEffort: options.reasoningEffort ?? "medium",
-    sandboxMode: "read-only",
-    approvalPolicy: "never",
-    networkAccessEnabled: false,
-    webSearchMode: "disabled",
-    workingDirectory: options.workingDirectory ?? process.cwd(),
-    skipGitRepoCheck: true,
-  });
+  const thread = await startReadOnlyCodexThread(options, runtimeOptions);
   const remainingPages = new Set(pages.keys());
   remainingPages.delete(0);
   const evidenceCursors = new Map<string, EvidenceCursor>();
@@ -466,6 +445,132 @@ export async function matchScanFindingsInternal(
     progress("complete");
     return expanded.comparison;
   }
+}
+
+async function startReadOnlyCodexThread(
+  options: ReadOnlyCodexOptions,
+  runtimeOptions: { surface: CodexSecuritySurface },
+): Promise<ReturnType<ReadOnlyCodex["startThread"]>> {
+  const config =
+    options.config === undefined
+      ? undefined
+      : await mergedCodexConfig(options.config);
+  const configuredModel =
+    config === undefined ? undefined : scanModelConfiguration(config);
+  const model = options.model ?? configuredModel?.model;
+  const reasoningEffort =
+    options.reasoningEffort ??
+    (configuredModel?.reasoningEffort as ModelReasoningEffort | undefined) ??
+    "medium";
+  const environment =
+    options.codex === undefined
+      ? await comparisonEnvironment(
+          options.environment,
+          accountStatus,
+          options.signal,
+        )
+      : undefined;
+  const command =
+    environment === undefined ? undefined : resolveCodexCommand(environment);
+  const codex =
+    options.codex ??
+    new Codex({
+      codexPathOverride: command!.command,
+      env: environment,
+      config: {
+        ...config,
+        mcp_servers: await disabledMcpServers(
+          command!,
+          config,
+          environment!,
+          options,
+        ),
+        allow_login_shell: false,
+        project_doc_max_bytes: 0,
+        responses_api_metadata: {
+          codex_security_surface: runtimeOptions.surface,
+        },
+        features: {
+          apps: false,
+          code_mode: false,
+          code_mode_only: false,
+          js_repl: false,
+          multi_agent: false,
+          multi_agent_v2: false,
+          plugins: false,
+          shell_tool: false,
+          unified_exec: false,
+        },
+        shell_environment_policy: {
+          inherit: "core",
+          ignore_default_excludes: false,
+          exclude: ["CODEX_HOME", "*KEY*", "*SECRET*", "*TOKEN*"],
+        },
+      } as NonNullable<CodexOptions["config"]>,
+    });
+  return codex.startThread({
+    ...(model === undefined ? {} : { model }),
+    modelReasoningEffort: reasoningEffort,
+    sandboxMode: "read-only",
+    approvalPolicy: "never",
+    networkAccessEnabled: false,
+    webSearchMode: "disabled",
+    workingDirectory: options.workingDirectory ?? process.cwd(),
+    skipGitRepoCheck: true,
+  });
+}
+
+export async function runReadOnlyCodex(
+  prompt: string,
+  outputSchema: unknown,
+  options: ReadOnlyCodexOptions,
+  runtimeOptions: { surface: CodexSecuritySurface },
+): Promise<string> {
+  const thread = await startReadOnlyCodexThread(options, runtimeOptions);
+  const turn = await thread.run(prompt, {
+    outputSchema,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  return turn.finalResponse;
+}
+
+async function disabledMcpServers(
+  command: CodexCommand,
+  config: JsonObject | undefined,
+  environment: Record<string, string>,
+  options: ReadOnlyCodexOptions,
+): Promise<JsonObject> {
+  const { success, stdout, stderr } = await runCodexCommand(
+    command,
+    [
+      "-C",
+      options.workingDirectory ?? process.cwd(),
+      "-c",
+      "features.plugins=false",
+      "mcp",
+      "list",
+      "--json",
+    ],
+    environment,
+    undefined,
+    options.signal,
+  );
+  if (!success)
+    throw new CodexSecurityError(
+      `Could not read MCP configuration for a read-only helper: ${stderr.trim()}`,
+    );
+  const inherited = JSON.parse(stdout) as { name: string }[];
+  const configured = (config?.["mcp_servers"] ?? {}) as JsonObject;
+  const names = new Set([
+    ...Object.keys(configured),
+    ...inherited.map(({ name }) => name),
+  ]);
+  return Object.fromEntries(
+    [...names].map((name) => [
+      name,
+      { ...(configured[name] as JsonObject), enabled: false },
+    ]),
+  );
 }
 
 export async function matchCompletedScan(

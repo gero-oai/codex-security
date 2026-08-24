@@ -3,6 +3,9 @@ import {
   DiffTarget,
   estimateScanCost,
   matchScanFindings,
+  planComponents,
+  runComponentScans,
+  type ComponentScanOptions,
   type Finding,
   type ScanCost,
   type ScanComparisonInput,
@@ -85,3 +88,16 @@ const codex = {
 };
 // @ts-expect-error Codex injection is internal.
 matchScanFindings(comparisonInput, { codex });
+
+export async function scanComponents(repository: string, outputDir: string) {
+  const plan = await planComponents(repository);
+  const options: ComponentScanOptions = {
+    repository,
+    outputDir,
+    components: plan.components,
+  };
+  return await runComponentScans(options);
+}
+
+// @ts-expect-error The model client is an internal test dependency.
+planComponents("synthetic-repository", { codex: {} });
