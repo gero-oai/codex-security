@@ -752,7 +752,7 @@ function readSessionChunk(
   }
 }
 
-function uuid7Timestamp(value: unknown): number | null {
+function uuid7Order(value: unknown): bigint | null {
   if (
     typeof value !== "string" ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
@@ -761,7 +761,7 @@ function uuid7Timestamp(value: unknown): number | null {
   ) {
     return null;
   }
-  return Number.parseInt(value.slice(0, 8) + value.slice(9, 13), 16);
+  return BigInt(`0x${value.replaceAll("-", "")}`);
 }
 
 function readSessionEvent(
@@ -825,14 +825,14 @@ function readSessionEvent(
       }
     }
     if (payload["type"] === "task_started") {
-      const threadStartedAt = uuid7Timestamp(session.threadId);
-      const turnStartedAt = uuid7Timestamp(payload["turn_id"]);
+      const threadOrder = uuid7Order(session.threadId);
+      const turnOrder = uuid7Order(payload["turn_id"]);
       const owned =
-        threadStartedAt === null
+        threadOrder === null
           ? typeof payload["started_at"] === "number" &&
             session.startedAt !== null &&
             payload["started_at"] >= session.startedAt
-          : turnStartedAt !== null && turnStartedAt >= threadStartedAt;
+          : turnOrder !== null && turnOrder >= threadOrder;
       if (owned) {
         session.replaying = false;
         session.taskCompleted = false;

@@ -127,10 +127,10 @@ function accountingEvent(
 }
 
 const accountingFork = {
-  // The inherited turn, child, and owned turn start within the same second.
-  inheritedTurnId: "019f9e4d-b324-7000-8000-000000000001",
+  // The inherited turn, child, and owned turn share a UUID7 millisecond.
+  inheritedTurnId: "019f9e4d-b3ba-7000-8000-000000000001",
   threadId: "019f9e4d-b3ba-7000-8000-000000000002",
-  ownedTurnId: "019f9e4d-b3ec-7000-8000-000000000003",
+  ownedTurnId: "019f9e4d-b3ba-7000-8000-000000000003",
   pendingTurnId: "019f9e4d-b450-4000-8000-000000000004",
   timestamp: "2026-07-26T12:02:00.250Z",
   startedAt: 1_785_067_320,
@@ -2563,6 +2563,63 @@ describe("live scan cost tracking", () => {
     }
   });
 
+  test("keeps same-millisecond inherited UUID7 turns below an explicit worker budget", async () => {
+    if (
+      runMockInSubprocess(
+        import.meta.path,
+        "keeps same-millisecond inherited UUID7 turns below an explicit worker budget",
+      )
+    ) {
+      return;
+    }
+    const rootUsage = { input_tokens: 0, output_tokens: 0 };
+    const inherited = { input_tokens: 1_000, output_tokens: 100 };
+    const final = { input_tokens: 1_100, output_tokens: 110 };
+    const observedCosts: number[] = [];
+    const maxCostUsd = 0.001;
+
+    await withMockAccountingSessions(
+      {
+        "scan-thread": accountingSession("scan-thread", [
+          accountingEvent(rootUsage),
+        ]),
+        [accountingFork.threadId]: accountingSession(
+          accountingFork.threadId,
+          [
+            accountingTaskStart(
+              accountingFork.inheritedTurnId,
+              accountingFork.startedAt,
+            ),
+            accountingEvent(inherited),
+            accountingTaskStart(
+              accountingFork.ownedTurnId,
+              accountingFork.startedAt,
+            ),
+            accountingEvent(final),
+          ],
+          "scan-thread",
+          {
+            timestamp: accountingFork.timestamp,
+            forked_from_id: "scan-thread",
+          },
+        ),
+      },
+      {
+        model: "gpt-5.6-sol",
+        maxCostUsd,
+        onCost: (cost) => observedCosts.push(cost.estimatedUsd),
+      },
+      async (tracker) => {
+        await expect(tracker.stop(rootUsage)).resolves.toMatchObject({
+          usage: { input_tokens: 100, output_tokens: 10 },
+          cost: { estimatedUsd: 0.0008 },
+        });
+        expect(observedCosts).toEqual([0.0008]);
+        expect(observedCosts.every((cost) => cost < maxCostUsd)).toBe(true);
+      },
+    );
+  });
+
   test("keeps unstarted fork usage out of budget totals", async () => {
     if (
       runMockInSubprocess(
@@ -4373,6 +4430,58 @@ describe("live scan cost tracking", () => {
       if (shouldReject) {
         await expect(completed).rejects.toThrow(
           "The scan cost limit could not be verified because model pricing or token usage is unavailable.",
+        );
+      } else {
+        await expect(completed).resolves.toMatchObject({
+          cost: { inputTokens: 200, outputTokens: 20 },
+        });
+      }
+    },
+  );
+
+  test.each([
+    ["budgeted root without completed usage", "root", 0.001, false, true],
+    ["budgeted root with completed usage", "root", 0.001, true, false],
+    ["budgeted delegated worker", "worker", 0.001, true, true],
+    ["budgeted unrelated session", "unrelated", 0.001, true, false],
+    ["unbudgeted delegated worker", "worker", undefined, true, false],
+  ] as const)(
+    "handles a malformed complete session record from a %s",
+    async (_description, session, maxCostUsd, authoritative, shouldReject) => {
+      const { home, root, worker, tracker } = await workerScan({ maxCostUsd });
+      expect((await tracker.refresh()).cost?.inputTokens).toBe(200);
+      const path =
+        session === "root"
+          ? root
+          : session === "worker"
+            ? worker
+            : await writeSession(home, "unrelated-thread", {
+                input_tokens: 100,
+                output_tokens: 10,
+              });
+      await appendFile(
+        path,
+        '{"type":"event_msg","payload":{"type":"token_count"\n' +
+          `${taskEvent("task_complete")}\n`,
+      );
+
+      const refreshed = tracker.refresh();
+      if (maxCostUsd !== undefined && session !== "unrelated") {
+        await expect(refreshed).rejects.toThrow(
+          "tracked session record could not be read",
+        );
+      } else {
+        await expect(refreshed).resolves.toMatchObject({
+          cost: { inputTokens: 200 },
+        });
+      }
+
+      const completed = authoritative
+        ? tracker.stop({ input_tokens: 100, output_tokens: 10 })
+        : tracker.stop();
+      if (shouldReject) {
+        await expect(completed).rejects.toThrow(
+          "tracked session record could not be read",
         );
       } else {
         await expect(completed).resolves.toMatchObject({
