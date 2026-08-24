@@ -1,8 +1,10 @@
 import { spawnSync } from "node:child_process";
 import {
   appendFile,
+  cp,
   mkdir,
   mkdtemp,
+  readFile,
   realpath,
   rm,
   writeFile,
@@ -18,11 +20,35 @@ import {
 import type { ScanActivity } from "../src/scan-activity.js";
 import { readScanLogs } from "../src/scan-logs.js";
 import { sessionParentThreadId } from "../src/scan-sessions.js";
+import { bootstrapPlugin } from "../src/runtime.js";
+import { BUNDLED_PLUGIN_VERSION } from "../src/version.js";
 import type { ScanProgress } from "../src/worker-progress.js";
+import { PLUGIN_ROOT as BUNDLED_PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryDirectories: string[] = [];
 const parentFields = ["source", "parent_thread_id", "forked_from_id"] as const;
 type SessionParentField = (typeof parentFields)[number];
+const scanThreadId = "scan-thread";
+const lowerUuid7Turn = "019f9e4d-b3ba-7000-8000-000000000001";
+const childUuid7Thread = "019f9e4d-b3ba-7000-8000-000000000002";
+const higherUuid7Turn = "019f9e4d-b3ba-7000-8000-000000000003";
+const uuid7EventTimestamp = "2026-07-26T12:02:00.250Z";
+const ownedSdkUsage = {
+  input_tokens: 100,
+  cached_input_tokens: 0,
+  cache_write_input_tokens: 0,
+  output_tokens: 10,
+  reasoning_output_tokens: 0,
+  total_tokens: 110,
+};
+const ownedPythonUsage = {
+  inputTokens: 100,
+  cachedInputTokens: 0,
+  cacheWriteInputTokens: 0,
+  outputTokens: 10,
+  reasoningOutputTokens: 0,
+  totalTokens: 110,
+};
 
 function parentMetadata(parentThreadId: string, field: SessionParentField) {
   return field === "source"
@@ -126,6 +152,169 @@ function progressMessage(
       },
     ],
   };
+}
+
+function uuid7TaskStarted(turnId: string): Record<string, unknown> {
+  return {
+    type: "event_msg",
+    timestamp: uuid7EventTimestamp,
+    payload: {
+      type: "task_started",
+      turn_id: turnId,
+      started_at: 1_785_067_320,
+    },
+  };
+}
+
+function uuid7TokenSnapshot(
+  inputTokens: number,
+  outputTokens: number,
+): Record<string, unknown> {
+  return {
+    type: "event_msg",
+    timestamp: uuid7EventTimestamp,
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: {
+          input_tokens: inputTokens,
+          cached_input_tokens: 0,
+          cache_write_input_tokens: 0,
+          output_tokens: outputTokens,
+          reasoning_output_tokens: 0,
+          total_tokens: inputTokens + outputTokens,
+        },
+      },
+    },
+  };
+}
+
+function ownershipRollout(
+  replayedTurnIds: readonly string[],
+): Record<string, unknown>[] {
+  return [
+    {
+      type: "session_meta",
+      payload: {
+        id: childUuid7Thread,
+        timestamp: uuid7EventTimestamp,
+        ...parentMetadata(scanThreadId, "source"),
+      },
+    },
+    {
+      type: "session_meta",
+      payload: {
+        id: scanThreadId,
+        timestamp: "2026-07-26T12:00:00.000Z",
+        source: "exec",
+      },
+    },
+    ...replayedTurnIds.map(uuid7TaskStarted),
+    uuid7TokenSnapshot(1_000, 100),
+    uuid7TaskStarted(higherUuid7Turn),
+    uuid7TokenSnapshot(1_100, 110),
+  ];
+}
+
+async function readPythonRolloutUsage(
+  pluginRoot: string,
+  rolloutPath: string,
+): Promise<unknown> {
+  const python = Bun.which("python3") ?? Bun.which("python");
+  expect(python).not.toBeNull();
+  const probe = [
+    "import json, sys",
+    "from datetime import datetime, timezone",
+    "from pathlib import Path",
+    "sys.path.insert(0, sys.argv[1])",
+    "import workbench_scan_usage",
+    "session = workbench_scan_usage.RolloutSession(sys.argv[3], sys.argv[4], Path(sys.argv[2]))",
+    "usage, warnings = workbench_scan_usage._read_rollout_usage(",
+    "    session,",
+    "    started_at=datetime(2026, 7, 26, 12, tzinfo=timezone.utc),",
+    "    completed_at=None,",
+    ")",
+    "print(json.dumps({'usage': usage, 'warnings': sorted(warnings)}, sort_keys=True))",
+  ].join("\n");
+  const result = spawnSync(
+    python!,
+    [
+      "-I",
+      "-B",
+      "-c",
+      probe,
+      join(pluginRoot, "scripts"),
+      rolloutPath,
+      childUuid7Thread,
+      scanThreadId,
+    ],
+    { encoding: "utf8" },
+  );
+
+  expect(result.status, result.stderr).toBe(0);
+  return JSON.parse(result.stdout) as unknown;
+}
+
+async function bootstrapUpgradedUsagePlugin(root: string) {
+  const previous = join(root, "previous-plugin");
+  await cp(BUNDLED_PLUGIN_ROOT, previous, { recursive: true });
+  const previousManifestPath = join(previous, ".codex-plugin", "plugin.json");
+  const previousManifest = JSON.parse(
+    await readFile(previousManifestPath, "utf8"),
+  ) as { version: string };
+  previousManifest.version = "0.1.25";
+  await writeFile(
+    previousManifestPath,
+    JSON.stringify(previousManifest, null, 2) + "\n",
+  );
+
+  const usagePath = join(previous, "scripts", "workbench_scan_usage.py");
+  const usageSource = await readFile(usagePath, "utf8");
+  const fullOrder = "    return parsed.int if parsed.version == 7 else None";
+  const timestampOrder =
+    "    return parsed.int >> 80 if parsed.version == 7 else None";
+  expect(usageSource.split(fullOrder)).toHaveLength(2);
+  await writeFile(usagePath, usageSource.replace(fullOrder, timestampOrder));
+
+  const home = join(root, "plugin-home");
+  const marketplace = join(home, "sdk-marketplace");
+  await mkdir(home, { mode: 0o700 });
+  const runCodex = async (_command: unknown, args: readonly string[]) => {
+    if (args[1] === "marketplace") {
+      await writeFile(
+        join(home, "config.toml"),
+        '[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ' +
+          JSON.stringify(marketplace) +
+          "\n",
+      );
+      return "";
+    }
+    const selected = join(marketplace, "plugins", "codex-security");
+    const manifest = JSON.parse(
+      await readFile(join(selected, ".codex-plugin", "plugin.json"), "utf8"),
+    ) as { version: string };
+    const installed = join(home, "installed", manifest.version);
+    await rm(installed, { recursive: true, force: true });
+    await mkdir(join(home, "installed"), { recursive: true });
+    await cp(selected, installed, { recursive: true });
+    return JSON.stringify({
+      installedPath: installed,
+      version: manifest.version,
+    });
+  };
+  const options = {
+    codexCommand: { command: "/synthetic-codex" },
+    runCodex,
+  };
+  const predecessor = await bootstrapPlugin(home, previous, options);
+  const upgraded = await bootstrapPlugin(home, BUNDLED_PLUGIN_ROOT, options);
+  const installedMcp = JSON.parse(
+    await readFile(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
+  ) as { mcpServers: Record<string, { env_vars?: string[] }> };
+  const safetyIdentifierKey = installedMcp.mcpServers[
+    "codex-security"
+  ]?.env_vars?.find((name) => name === "CODEX_SAFETY_IDENTIFIER");
+  return { predecessor, upgraded, safetyIdentifierKey };
 }
 
 test.each([
@@ -1106,6 +1295,104 @@ describe("live scan cost tracking", () => {
       );
     },
   );
+
+  test.each([
+    [
+      "keeps a same-millisecond lower UUIDv7 turn in inherited history",
+      [lowerUuid7Turn],
+    ],
+    ["accepts a same-millisecond higher UUIDv7 turn as child-owned", []],
+  ] as const)("%s", async (_name, replayedTurnIds) => {
+    const home = await codexHome();
+    const rolloutPath = await writeSession(
+      home,
+      childUuid7Thread,
+      { input_tokens: 1_100, output_tokens: 110 },
+      scanThreadId,
+    );
+    const rollout = ownershipRollout(replayedTurnIds);
+    await writeFile(
+      rolloutPath,
+      rollout.map((event) => JSON.stringify(event)).join("\n") + "\n",
+    );
+
+    const maxCostUsd = 0.001;
+    const observedCosts: number[] = [];
+    const forwardedEvents: ScanSessionEvent[] = [];
+    const tracker = new ScanCostTracker({
+      codexHome: home,
+      model: "gpt-5.6-sol",
+      maxCostUsd,
+      onCost: ({ estimatedUsd }) => observedCosts.push(estimatedUsd),
+      onSessionEvent: (event) => forwardedEvents.push(event),
+    });
+    tracker.start(scanThreadId);
+    const tracked = await tracker.stop();
+    const python = await readPythonRolloutUsage(
+      BUNDLED_PLUGIN_ROOT,
+      rolloutPath,
+    );
+
+    expect({
+      trackedUsage: tracked.usage,
+      estimatedUsd: tracked.cost?.estimatedUsd,
+      python,
+    }).toEqual({
+      trackedUsage: ownedSdkUsage,
+      estimatedUsd: 0.0008,
+      python: {
+        usage: ownedPythonUsage,
+        warnings: [],
+      },
+    });
+    expect(observedCosts.length).toBeGreaterThan(0);
+    expect(observedCosts.every((cost) => cost < maxCostUsd)).toBe(true);
+    const forwardedTurnIds = forwardedEvents.flatMap(({ event }) => {
+      const payload = event["payload"];
+      return typeof payload === "object" &&
+        payload !== null &&
+        (payload as Record<string, unknown>)["type"] === "task_started"
+        ? [(payload as Record<string, unknown>)["turn_id"]]
+        : [];
+    });
+    expect(forwardedTurnIds).toEqual([higherUuid7Turn]);
+  });
+
+  test("upgrades cached timestamp-only UUIDv7 attribution before reading scan usage", async () => {
+    const root = await codexHome();
+    const rolloutPath = join(root, "cached-rollout.jsonl");
+    await writeFile(
+      rolloutPath,
+      ownershipRollout([lowerUuid7Turn])
+        .map((event) => JSON.stringify(event))
+        .join("\n") + "\n",
+    );
+    const installation = await bootstrapUpgradedUsagePlugin(root);
+    const usage = await readPythonRolloutUsage(
+      installation.upgraded.installedRoot,
+      rolloutPath,
+    );
+
+    expect({
+      predecessorVersion: installation.predecessor.version,
+      upgradedVersion: installation.upgraded.version,
+      installedRootChanged:
+        installation.upgraded.installedRoot !==
+        installation.predecessor.installedRoot,
+      safetyIdentifierKey: installation.safetyIdentifierKey,
+      usage,
+    }).toEqual({
+      predecessorVersion: "0.1.25",
+      upgradedVersion: "0.1.27",
+      installedRootChanged: true,
+      safetyIdentifierKey: "CODEX_SAFETY_IDENTIFIER",
+      usage: {
+        usage: ownedPythonUsage,
+        warnings: [],
+      },
+    });
+    expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.27");
+  });
 
   test("forwards actions from this scan's delegated workers only", async () => {
     const home = await codexHome();

@@ -68,7 +68,7 @@ function git(repository: string, ...args: string[]): string {
 }
 
 async function upgradeBundledPlugin(root: string): Promise<string> {
-  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.25");
+  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.27");
   const previous = join(root, "previous-plugin");
   cpSync(PLUGIN_ROOT, previous, { recursive: true });
   const previousManifestPath = join(previous, ".codex-plugin", "plugin.json");
