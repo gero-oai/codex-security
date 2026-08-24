@@ -776,9 +776,10 @@ def begin_deep_scan_for_target(
     )
     target_device = serialize_filesystem_identity(target_metadata.st_dev)
     target_inode = serialize_filesystem_identity(target_metadata.st_ino)
+    target_identity = (revision, target_snapshot_digest, target_device, target_inode)
     source_scopes = capture_source_scopes(
         target,
-        (revision, target_snapshot_digest, target_device, target_inode),
+        target_identity,
         [scope],
     )
     scope_file_count = directory_snapshot_regular_file_count(
@@ -805,10 +806,18 @@ def begin_deep_scan_for_target(
             )
         current_target = require_remediation_target(target_path)
         current_metadata = current_target.stat()
-        if (current_metadata.st_dev, current_metadata.st_ino) != (
-            target_metadata.st_dev,
-            target_metadata.st_ino,
-        ):
+        current_revision = git_revision(current_target)
+        current_snapshot_digest = (
+            directory_content_digest(current_target)
+            if current_revision == "unversioned"
+            else worktree_content_digest(current_target)
+        )
+        if (
+            current_revision,
+            current_snapshot_digest,
+            serialize_filesystem_identity(current_metadata.st_dev),
+            serialize_filesystem_identity(current_metadata.st_ino),
+        ) != target_identity:
             raise SystemExit(
                 "The selected scan target changed while the scan was starting. Try again."
             )

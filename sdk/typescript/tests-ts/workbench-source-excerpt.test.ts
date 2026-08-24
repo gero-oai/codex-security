@@ -389,12 +389,14 @@ describe("workbench source excerpts", () => {
     const workspaceId = randomUUID();
     const program = String.raw`
 import contextlib, io, json, os, sqlite3, sys
+from pathlib import Path
 os.environ["CODEX_SECURITY_STATE_DIR"] = sys.argv[2]
 sys.path.insert(0, sys.argv[1])
 import workbench_db
 
 active_connection = None
 current_command = None
+race_mutation = False
 transaction_states = []
 original_connect = workbench_db.connect
 original_capture = workbench_db.capture_source_scopes
@@ -408,7 +410,10 @@ def capture(*arguments, **keywords):
     return original_capture(*arguments, **keywords)
 def deep_capture(*arguments, **keywords):
     transaction_states.append([current_command, active_connection.in_transaction])
-    return original_deep_capture(*arguments, **keywords)
+    authority = original_deep_capture(*arguments, **keywords)
+    if race_mutation:
+        (Path(repository) / "src" / "allowed.py").write_text("changed_after_capture = True\n")
+    return authority
 def run(arguments):
     global current_command
     current_command = arguments[0]
@@ -430,9 +435,17 @@ headless = run(["start-headless-standard-scan", "--thread-id", "headless-writer"
 recipe = json.dumps({"config": {}, "mode": "standard", "repository": repository, "target": {"kind": "paths", "paths": ["src/allowed.py", "other"]}})
 cli = run(["register-cli-scan", "--repository", repository, "--scan-dir", cli_scan_dir, "--recipe-json", recipe])
 deep = run(["begin-deep-scan", "--thread-id", "deep-writer", "--target-path", repository, "--scan-root", scan_root, "--available-parallelism", "4"])
+race_mutation = True
+try:
+    run(["begin-deep-scan", "--thread-id", "raced-deep-writer", "--target-path", repository, "--scan-root", scan_root, "--available-parallelism", "4"])
+except SystemExit as error:
+    race_error = str(error)
+else:
+    race_error = None
+(Path(repository) / "src" / "allowed.py").write_text("allowed = True\n")
 with sqlite3.connect(workbench_db.database_path()) as connection:
     authorities = {row[0]: json.loads(row[1]) for row in connection.execute("SELECT id, source_scopes_json FROM scans")}
-print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headless": headless, "prompt": prompt, "transactionStates": transaction_states, "workspace": workspace}))
+print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headless": headless, "prompt": prompt, "raceError": race_error, "transactionStates": transaction_states, "workspace": workspace}))
 `;
     const result = spawnSync(
       python(),
@@ -458,7 +471,11 @@ print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headles
       ["start-headless-standard-scan", false],
       ["register-cli-scan", false],
       ["begin-deep-scan", false],
+      ["begin-deep-scan", false],
     ]);
+    expect(writers["raceError"]).toBe(
+      "The selected scan target changed while the scan was starting. Try again.",
+    );
     const authorities = writers["authorities"] as Record<
       string,
       { paths: string[]; version: number }
