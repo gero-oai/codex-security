@@ -428,6 +428,34 @@ finally:
         check=True,
     )
 replacement_blob_reads = blob_reads[before:]
+custom_replacement_base = "refs/synthetic-replacements/"
+custom_replacement_ref = f"{custom_replacement_base}{revision}"
+subprocess.run(
+    ["git", "-C", str(repository), "update-ref", custom_replacement_ref, replacement],
+    check=True,
+)
+original_replacement_base = os.environ.get("GIT_REPLACE_REF_BASE")
+before = len(blob_reads)
+try:
+    os.environ["GIT_REPLACE_REF_BASE"] = custom_replacement_base
+    custom_replacement_paths = excerpts.capture_source_scopes(
+        repository, identity, ["src"]
+    )["paths"]
+    custom_replaced = excerpt("src/allowed.py")
+    os.environ["GIT_REPLACE_REF_BASE"] = "--count=0"
+    invalid_replacement_base_paths = excerpts.capture_source_scopes(
+        repository, identity, ["src"]
+    )["paths"]
+finally:
+    if original_replacement_base is None:
+        os.environ.pop("GIT_REPLACE_REF_BASE", None)
+    else:
+        os.environ["GIT_REPLACE_REF_BASE"] = original_replacement_base
+    subprocess.run(
+        ["git", "-C", str(repository), "update-ref", "-d", custom_replacement_ref],
+        check=True,
+    )
+custom_replacement_blob_reads = blob_reads[before:]
 replace_directory = outer_git_dir / "refs" / "replace"
 replace_directory.mkdir(parents=True, exist_ok=True)
 broken_replacements = []
@@ -625,6 +653,9 @@ print(json.dumps({
     "broadenedBlobReads": broadened_blob_reads,
     "collisionBlobReads": collision_blob_reads,
     "collisions": collisions,
+    "customReplaced": custom_replaced,
+    "customReplacementBlobReads": custom_replacement_blob_reads,
+    "customReplacementPaths": custom_replacement_paths,
     "deepBatchProcesses": batch_processes,
     "deepExcerpt": deep_excerpt,
     "deepPathParses": path_parses,
@@ -633,6 +664,7 @@ print(json.dumps({
     "fileAuthorityPaths": file_authority["paths"],
     "fileDescendantBlobReads": file_descendant_blob_reads,
     "fileDescendantExcerpt": file_descendant_excerpt,
+    "invalidReplacementBasePaths": invalid_replacement_base_paths,
     "immutable": immutable,
     "largeExcerpt": large_excerpt,
     "largeBlobStreamed": (
@@ -709,6 +741,9 @@ describe("workbench source excerpts", () => {
         "src/trailing.py": null,
         "src/trailing.py.": null,
       },
+      customReplaced: null,
+      customReplacementBlobReads: [],
+      customReplacementPaths: [],
       deepBatchProcesses: 1,
       deepExcerpt: expect.stringContaining("deep = True"),
       deepPathParses: 1,
@@ -717,6 +752,7 @@ describe("workbench source excerpts", () => {
       fileAuthorityPaths: [{ kind: "file", path: "mismatch" }],
       fileDescendantBlobReads: [],
       fileDescendantExcerpt: null,
+      invalidReplacementBasePaths: [],
       immutable: {
         commit: expect.stringContaining("allowed = True"),
         range: expect.stringContaining("allowed = True"),
@@ -749,7 +785,7 @@ describe("workbench source excerpts", () => {
       replacementBlobReads: [],
       replacementMemoryPaths: [],
       replacementProbeCommands: [
-        ["for-each-ref", "--count=1", "--format=", "refs/replace/"],
+        ["for-each-ref", "--count=1", "--format=", "refs/replace/*"],
       ],
       replacementProbeReadSizes: [1],
       streamedWideTree: true,

@@ -257,13 +257,14 @@ def tree_path(
 
 
 def replacement_refs_absent(repository: Path) -> bool:
+    replacement_ref_base = os.environ.get("GIT_REPLACE_REF_BASE", "refs/replace/")
     environment = os.environ.copy()
     for variable in GIT_REPOSITORY_ENVIRONMENT:
         environment.pop(variable, None)
     environment["GIT_ALLOW_PROTOCOL"] = ""
     environment["GIT_LITERAL_PATHSPECS"] = "1"
     environment["GIT_NO_LAZY_FETCH"] = "1"
-    command = [
+    git_command = [
         "git",
         "-c",
         "core.fsmonitor=false",
@@ -272,12 +273,30 @@ def replacement_refs_absent(repository: Path) -> bool:
         "-C",
         str(repository),
         "--no-replace-objects",
-        "for-each-ref",
-        "--count=1",
-        "--format=",
-        "refs/replace/",
     ]
     try:
+        if (
+            subprocess.run(
+                [
+                    *git_command,
+                    "check-ref-format",
+                    f"{replacement_ref_base}{'0' * 64}",
+                ],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode
+            != 0
+        ):
+            return False
+        command = [
+            *git_command,
+            "for-each-ref",
+            "--count=1",
+            "--format=",
+            f"{replacement_ref_base}*",
+        ]
         with subprocess.Popen(
             command,
             env=environment,
