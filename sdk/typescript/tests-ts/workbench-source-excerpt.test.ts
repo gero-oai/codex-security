@@ -80,6 +80,7 @@ function collisionRepository(root: string): {
   };
   const sourceTree = tree([
     ["100644", "blob", blob("allowed = True\n"), "allowed.py"],
+    ["100644", "blob", blob("x".repeat(256 * 1024)), "large.py"],
     ["100644", "blob", blob("case_upper = True\n"), "LOWER.py"],
     ["100644", "blob", blob("case_lower = True\n"), "lower.py"],
     ["100644", "blob", blob("unicode_composed = True\n"), "é.py"],
@@ -266,13 +267,41 @@ def excerpt(path, saved=scan, selected_paths=None):
         [{"path": path, "startLine": 1, "endLine": 1, "role": "root_control"}],
     )
 original_git = excerpts.local_git_bytes
+original_popen = subprocess.Popen
 blob_reads = []
+blob_read_sizes = []
+class WatchedBlobOutput:
+    def __init__(self, output):
+        self.output = output
+    def read(self, size=-1):
+        if size < 0 or size > 64 * 1024:
+            raise AssertionError("blob response was buffered")
+        blob_read_sizes.append(size)
+        return self.output.read(size)
+    def __getattr__(self, name):
+        return getattr(self.output, name)
+def watched_popen(arguments, *positional, **keywords):
+    process = original_popen(arguments, *positional, **keywords)
+    if len(arguments) >= 3 and arguments[-3:-1] == ["cat-file", "blob"]:
+        blob_reads.append(arguments[-1])
+        process.stdout = WatchedBlobOutput(process.stdout)
+    return process
 def watched_git(*arguments, **kwargs):
-    if len(arguments) >= 4 and arguments[1:3] == ("cat-file", "blob"):
-        blob_reads.append(arguments[3])
     return original_git(*arguments, **kwargs)
+subprocess.Popen = watched_popen
 excerpts.local_git_bytes = watched_git
 allowed = excerpt("src/allowed.py")
+before = len(blob_read_sizes)
+large_blob_excerpt = excerpt("src/large.py")
+large_blob_sizes = blob_read_sizes[before:]
+original_excerpt_reader = excerpts.scanned_source_excerpt
+def exhausted_blob(*arguments, **keywords):
+    raise MemoryError("synthetic blob exhaustion")
+excerpts.scanned_source_excerpt = exhausted_blob
+try:
+    blob_memory_error = excerpt("src/allowed.py")
+finally:
+    excerpts.scanned_source_excerpt = original_excerpt_reader
 before = len(blob_reads)
 collisions = {
     path: excerpt(path)
@@ -367,6 +396,7 @@ finally:
     )
 replacement_blob_reads = blob_reads[before:]
 excerpts.local_git_bytes = original_git
+subprocess.Popen = original_popen
 legacy_scan = dict(scan)
 legacy_scan.pop("source_scopes_json")
 legacy = excerpt("src/allowed.py", legacy_scan)
@@ -546,6 +576,12 @@ print(json.dumps({
     "fileDescendantExcerpt": file_descendant_excerpt,
     "immutable": immutable,
     "largeExcerpt": large_excerpt,
+    "largeBlobStreamed": (
+        len(large_blob_excerpt.encode()) == 16_000
+        and len(large_blob_sizes) >= 4
+        and max(large_blob_sizes) == 64 * 1024
+    ),
+    "blobMemoryError": blob_memory_error,
     "largeRecipeFits": large_recipe_bytes < 256 * 1024,
     "largeTreePathChecks": tree_path_checks,
     "invalid": invalid,
@@ -620,6 +656,8 @@ describe("workbench source excerpts", () => {
         range: expect.stringContaining("allowed = True"),
       },
       largeExcerpt: null,
+      largeBlobStreamed: true,
+      blobMemoryError: null,
       largeRecipeFits: true,
       largeTreePathChecks: 0,
       invalid: null,

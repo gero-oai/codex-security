@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import re
@@ -28,6 +29,7 @@ CONTEXT_LINES = 3
 MAX_BYTES = 16_000
 MAX_LINES = 60
 OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+LINE_BREAK = re.compile(r"\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]")
 
 TreeEntry = tuple[str, str, str]
 
@@ -457,38 +459,138 @@ def finding_source_excerpt_from_context(
             if selected is not None and selected[1] == "file"
             else None
         )
-    except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
+        if object_id is None:
+            return None
+        end_line = location.get("endLine")
+        last_affected_line = end_line if isinstance(end_line, int) else start_line
+        return scanned_source_excerpt(
+            repository,
+            object_id,
+            start_line,
+            last_affected_line,
+        )
+    except (
+        MemoryError,
+        OSError,
+        RuntimeError,
+        SystemExit,
+        UnicodeError,
+        ValueError,
+    ):
         return None
-    if object_id is None:
+
+
+def scanned_source_excerpt(
+    repository: Path,
+    object_id: str,
+    start_line: int,
+    last_affected_line: int,
+) -> str | None:
+    if start_line < 1 or OBJECT_ID.fullmatch(object_id) is None:
         return None
-    source = scanned_source_text(repository, object_id)
-    if not source or "\0" in source:
-        return None
-    lines = source.splitlines()
-    if start_line < 1 or start_line > len(lines):
-        return None
-    end_line = location.get("endLine")
-    last_affected_line = end_line if isinstance(end_line, int) else start_line
     excerpt_start = max(1, start_line - CONTEXT_LINES)
-    excerpt_end = min(
-        len(lines),
+    excerpt_limit = min(
         max(start_line, last_affected_line) + CONTEXT_LINES,
         excerpt_start + MAX_LINES - 1,
     )
-    width = len(str(excerpt_end))
+
+    environment = os.environ.copy()
+    for variable in GIT_REPOSITORY_ENVIRONMENT:
+        environment.pop(variable, None)
+    environment["GIT_ALLOW_PROTOCOL"] = ""
+    environment["GIT_LITERAL_PATHSPECS"] = "1"
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    command = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "i18n.logOutputEncoding=UTF-8",
+        "-C",
+        str(repository),
+        "--no-replace-objects",
+        "cat-file",
+        "blob",
+        object_id,
+    ]
+
+    captured_lines: list[tuple[int, str]] = []
+    fragments: list[str] = []
+    captured_bytes = 0
+    line_number = 1
+    last_line = 0
+    line_has_content = False
+    pending_carriage_return = False
+
+    def capture(value: str) -> None:
+        nonlocal captured_bytes, line_has_content
+        if not value:
+            return
+        line_has_content = True
+        if (
+            line_number < excerpt_start
+            or line_number > excerpt_limit
+            or captured_bytes >= MAX_BYTES
+        ):
+            return
+        remaining = MAX_BYTES - captured_bytes
+        selected = value.encode("utf-8")[:remaining]
+        fragments.append(selected.decode("utf-8", errors="ignore"))
+        captured_bytes += len(selected)
+
+    def finish_line() -> None:
+        nonlocal fragments, last_line, line_has_content, line_number
+        if excerpt_start <= line_number <= excerpt_limit:
+            captured_lines.append((line_number, "".join(fragments)))
+        last_line = line_number
+        line_number += 1
+        fragments = []
+        line_has_content = False
+
+    def consume(value: str, *, final: bool = False) -> None:
+        nonlocal pending_carriage_return
+        if pending_carriage_return:
+            value = "\r" + value
+            pending_carriage_return = False
+        if not final and value.endswith("\r"):
+            value = value[:-1]
+            pending_carriage_return = True
+        cursor = 0
+        for match in LINE_BREAK.finditer(value):
+            capture(value[cursor : match.start()])
+            finish_line()
+            cursor = match.end()
+        capture(value[cursor:])
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    invalid = False
+    with subprocess.Popen(
+        command,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    ) as process:
+        if process.stdout is None:
+            return None
+        while chunk := process.stdout.read(64 * 1024):
+            if b"\0" in chunk:
+                invalid = True
+            if not invalid:
+                consume(decoder.decode(chunk))
+        if not invalid:
+            consume(decoder.decode(b"", final=True), final=True)
+            if line_has_content:
+                finish_line()
+        if process.wait() != 0:
+            return None
+
+    if invalid or last_line < start_line or not captured_lines:
+        return None
+    width = len(str(captured_lines[-1][0]))
     excerpt = "\n".join(
-        f"{line_number:>{width}}  {lines[line_number - 1]}"
-        for line_number in range(excerpt_start, excerpt_end + 1)
+        f"{number:>{width}}  {line}" for number, line in captured_lines
     )
     return excerpt.encode("utf-8")[:MAX_BYTES].decode("utf-8", errors="ignore")
-
-
-def scanned_source_text(repository: Path, object_id: str) -> str | None:
-    try:
-        content = local_git_bytes(repository, "cat-file", "blob", object_id)
-    except (OSError, RuntimeError, SystemExit):
-        return None
-    return content.decode("utf-8", errors="replace") if content is not None else None
 
 
 def main() -> None:
