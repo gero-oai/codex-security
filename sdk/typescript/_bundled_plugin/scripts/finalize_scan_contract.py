@@ -598,7 +598,10 @@ def write_scan_local_bytes(
                         raise ContractError(
                             f"{relative_path}: changed while it was being opened"
                         )
-                    if opened.st_size == len(payload):
+                    if (
+                        expected_root_identity is not None
+                        and opened.st_size == len(payload)
+                    ):
                         try:
                             with os.fdopen(existing_fd, "rb") as handle:
                                 existing_fd = -1

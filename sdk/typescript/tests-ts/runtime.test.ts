@@ -1996,7 +1996,7 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
-  test("upgrades the predecessor bundled cache and restores with the installed plugin", async () => {
+  test("upgrades the predecessor bundled cache and restores with the SDK-owned helper", async () => {
     const root = await temporaryDirectory();
     const previous = await plugin(join(root, "previous"), "0.1.23");
     await copyFile(join(PLUGIN_ROOT, ".mcp.json"), join(previous, ".mcp.json"));
@@ -2054,6 +2054,13 @@ describe("plugin runtime preparation", () => {
       ),
     ).toEqual(
       await readFile(join(PLUGIN_ROOT, "scripts", "workbench_target.py")),
+    );
+    expect(
+      await readFile(
+        join(upgraded.installedRoot, "scripts", "finalize_scan_contract.py"),
+      ),
+    ).toEqual(
+      await readFile(join(PLUGIN_ROOT, "scripts", "finalize_scan_contract.py")),
     );
     expect(await readFile(join(home, "auth.json"), "utf8")).toBe(credentials);
     expect(await readFile(join(home, "unrelated-state"), "utf8")).toBe(

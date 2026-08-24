@@ -628,7 +628,9 @@ def atomic_write(
     ) as (parent_path, leaf_name):
         destination_path = parent_path / leaf_name
         _validate_existing_output(destination_path)
-        if _existing_output_matches(destination_path, payload):
+        if expected_root_identity is not None and _existing_output_matches(
+            destination_path, payload
+        ):
             return
 
         temp_handle: _OwnedHandle | None = None

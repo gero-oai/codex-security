@@ -1592,10 +1592,16 @@ export async function prepareScanArtifactRestorer(
   options: WorkbenchCommandOptions,
   scanDirectory: string,
 ): Promise<ScanArtifactRestorer> {
+  let helperPath: string;
   let canonicalPath: string;
   let dev: string;
   let ino: string;
   try {
+    helperPath = join(
+      await bundledPluginRoot(),
+      "scripts",
+      "finalize_scan_contract.py",
+    );
     const result = await runCodexCommand(
       { command: options.python },
       [
@@ -1605,7 +1611,7 @@ export async function prepareScanArtifactRestorer(
         "-B",
         "-c",
         PREPARE_SCAN_ARTIFACT_RESTORER_PROGRAM,
-        join(options.pluginRoot, "scripts", "finalize_scan_contract.py"),
+        helperPath,
         scanDirectory,
       ],
       pluginHelperEnvironment(options.environment),
@@ -1654,7 +1660,7 @@ export async function prepareScanArtifactRestorer(
             "-B",
             "-c",
             RESTORE_SCAN_ARTIFACT_PROGRAM,
-            join(options.pluginRoot, "scripts", "finalize_scan_contract.py"),
+            helperPath,
             canonicalPath,
             relativePath,
             dev,

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   chmod,
+  cp,
   mkdir,
   open,
   readFile,
@@ -39,6 +40,7 @@ interface FailedPostScanContext {
 interface FailedPostScanScenario {
   artifact: string;
   initialContents?: string | Uint8Array;
+  selectedPluginFinalizer?: string;
   mutate(context: FailedPostScanContext): Promise<void>;
   wrapRestorer?(
     restorer: ScanArtifactRestorer,
@@ -66,13 +68,27 @@ async function startFailedPostScan(scenario: FailedPostScanScenario) {
   await mkdir(repository);
   await mkdir(codexHome);
   await mkdir(scanDir, { mode: 0o700 });
+  const runtime = preparedRuntime(codexHome);
+  if (scenario.selectedPluginFinalizer !== undefined) {
+    const selectedPluginRoot = join(root, "selected-plugin");
+    await cp(PLUGIN_ROOT, selectedPluginRoot, { recursive: true });
+    await writeFile(
+      join(selectedPluginRoot, "scripts", "finalize_scan_contract.py"),
+      scenario.selectedPluginFinalizer,
+    );
+    runtime.plugin = {
+      ...runtime.plugin,
+      pluginRoot: selectedPluginRoot,
+      installedRoot: selectedPluginRoot,
+    };
+  }
   let turns = 0;
   let original = Buffer.alloc(0);
   const client = new TestClient(
     {},
     {
       environment: {},
-      prepareRuntime: async () => preparedRuntime(codexHome),
+      prepareRuntime: async () => runtime,
       resolvePluginPython: async () => python!,
       prepareOutputDir: async () => scanDir,
       repositoryRevision: async () => "deadbeef",
@@ -124,6 +140,9 @@ async function startFailedPostScan(scenario: FailedPostScanScenario) {
     scanDir,
     artifactPath,
     outside,
+    get turns() {
+      return turns;
+    },
     get original() {
       return original;
     },
@@ -198,6 +217,22 @@ describe("completed scan follow-up instructions", () => {
     },
   );
 
+  test("uses the SDK-owned restorer with a selected custom plugin", async () => {
+    const fixture = await startFailedPostScan({
+      artifact: "report.md",
+      selectedPluginFinalizer:
+        "raise RuntimeError('selected plugin helper must not run')\n",
+      mutate: async ({ artifactPath }) => {
+        await writeFile(artifactPath, "# Incomplete draft\n");
+      },
+    });
+
+    expect(await fixture.scan).toMatchObject({ scanDir: fixture.scanDir });
+    expect(fixture.turns).toBe(2);
+    expect(await readFile(fixture.artifactPath)).toEqual(fixture.original);
+    await fixture.client.close();
+  });
+
   test("restores a nested artifact and its missing parent", async () => {
     const fixture = await startFailedPostScan({
       artifact: "artifacts/worker.json",
@@ -235,6 +270,48 @@ describe("completed scan follow-up instructions", () => {
     await fixture.client.close();
   });
 
+  test.skipIf(process.platform === "win32")(
+    "ordinary identical writes retain private replacement semantics",
+    async () => {
+      const root = await temporaryDirectory();
+      const scanDir = join(root, "scan");
+      const artifactPath = join(scanDir, "artifact.bin");
+      const payload = Buffer.from("unchanged\n");
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      await mkdir(scanDir, { mode: 0o700 });
+      await writeFile(artifactPath, payload);
+      await chmod(artifactPath, 0o644);
+      const before = await stat(artifactPath);
+      const script = [
+        "from pathlib import Path",
+        "from runpy import run_path",
+        "import sys",
+        "module = run_path(sys.argv[1])",
+        "scan_dir = Path(sys.argv[2])",
+        "module['write_scan_local_bytes'](scan_dir, 'artifact.bin', b'unchanged\\n')",
+      ].join("\n");
+      const execution = Bun.spawnSync([
+        python!,
+        "-I",
+        "-B",
+        "-c",
+        script,
+        join(PLUGIN_ROOT, "scripts", "finalize_scan_contract.py"),
+        scanDir,
+      ]);
+
+      expect(
+        execution.exitCode,
+        new TextDecoder().decode(execution.stderr),
+      ).toBe(0);
+      const after = await stat(artifactPath);
+      expect(after.mode & 0o777).toBe(0o600);
+      expect(after.ino).not.toBe(before.ino);
+      expect(await readFile(artifactPath)).toEqual(payload);
+    },
+  );
+
   test.skipIf(process.platform !== "linux")(
     "replaces a large sparse artifact within bounded comparison memory",
     async () => {
@@ -258,11 +335,12 @@ describe("completed scan follow-up instructions", () => {
         "payload = b'x' * size",
         "with artifact.open('wb') as stream:",
         "    stream.truncate(size)",
+        "canonical, identity = module['scan_root_identity'](scan_dir)",
         "pages = int(Path('/proc/self/statm').read_text().split()[0])",
         "current_vms = pages * os.sysconf('SC_PAGE_SIZE')",
         "_, hard_limit = resource.getrlimit(resource.RLIMIT_AS)",
         "resource.setrlimit(resource.RLIMIT_AS, (current_vms + 8 * 1024 * 1024, hard_limit))",
-        "module['write_scan_local_bytes'](scan_dir, 'artifact.bin', payload)",
+        "module['write_scan_local_bytes'](canonical, 'artifact.bin', payload, expected_root_identity=identity)",
       ].join("\n");
       const execution = Bun.spawnSync([
         python!,
