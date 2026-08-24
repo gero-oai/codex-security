@@ -266,6 +266,18 @@ broadened = excerpt(
     {**scan, "source_scopes_json": json.dumps({**authority, "paths": ["."]})},
 )
 broadened_blob_reads = blob_reads[before:]
+scope_collision_authority = excerpts.capture_source_scopes(
+    repository, identity, ["Scope"]
+)
+scope_collision_scan = {
+    **scan,
+    "source_scopes_json": json.dumps(scope_collision_authority),
+}
+before = len(blob_reads)
+scope_collision_excerpt = excerpt(
+    "Scope/selected.py", scope_collision_scan, ["Scope"]
+)
+scope_collision_blob_reads = blob_reads[before:]
 subtarget = repository / "src"
 subtarget_metadata = subtarget.stat()
 subtarget_authority = excerpts.capture_source_scopes(
@@ -362,17 +374,41 @@ original_target_tree = excerpts.target_tree
 original_tree_path = excerpts.tree_path
 original_source_object = excerpts.source_object_for_path
 scope_checks = 0
+tree_path_checks = 0
 def counted_source_object(*arguments, **kwargs):
     global scope_checks
     scope_checks += 1
     return original_source_object(*arguments, **kwargs)
+def counted_tree_path(_, __, value):
+    global tree_path_checks
+    tree_path_checks += 1
+    return (value, "file", "1" * 40)
 excerpts.target_tree = lambda *_: (repository, large_tree)
-excerpts.tree_path = lambda _, __, value: (value, "file", "1" * 40)
+excerpts.tree_path = counted_tree_path
 excerpts.source_object_for_path = counted_source_object
 try:
     large_context = excerpts.source_excerpt_context(
         large_scan, repository, large_paths
     )
+    original_pure_path = excerpts.PurePosixPath
+    path_parses = 0
+    def one_path_parse(*arguments):
+        global path_parses
+        path_parses += 1
+        if path_parses > 1:
+            raise RuntimeError("source scope lookup rebuilt the path")
+        return original_pure_path(*arguments)
+    excerpts.PurePosixPath = one_path_parse
+    try:
+        excerpts.source_scopes_for_path(
+            large_context[2],
+            "/".join(["nested"] * 20_000 + ["file.py"]),
+        )
+        deep_lookup_linear = True
+    except RuntimeError:
+        deep_lookup_linear = False
+    finally:
+        excerpts.PurePosixPath = original_pure_path
     large_excerpt = excerpts.finding_source_excerpt_from_context(
         large_context, [{"path": "unmatched/path.py", "startLine": 1}]
     )
@@ -386,11 +422,14 @@ print(json.dumps({
     "broadenedBlobReads": broadened_blob_reads,
     "collisionBlobReads": collision_blob_reads,
     "collisions": collisions,
+    "deepLookupLinear": deep_lookup_linear,
+    "deepPathParses": path_parses,
     "duplicatePaths": len(authority["paths"]),
     "immutable": immutable,
     "largeExcerpt": large_excerpt,
     "largeRecipeFits": large_recipe_bytes < 256 * 1024,
     "largeScopeChecks": scope_checks,
+    "largeTreePathChecks": tree_path_checks,
     "invalid": invalid,
     "legacy": legacy,
     "malformedRevision": malformed_revision,
@@ -399,9 +438,9 @@ print(json.dumps({
     "nestedExcerpt": nested_excerpt,
     "subtargetPaths": subtarget_authority["paths"],
     "outside": outside,
-    "pathCollisionPaths": len(
-        excerpts.capture_source_scopes(repository, identity, ["Scope"])["paths"]
-    ),
+    "pathCollisionBlobReads": scope_collision_blob_reads,
+    "pathCollisionExcerpt": scope_collision_excerpt,
+    "pathCollisionPaths": len(scope_collision_authority["paths"]),
     "replaced": replaced,
     "replacementBlobReads": replacement_blob_reads,
 }))
@@ -447,6 +486,8 @@ describe("workbench source excerpts", () => {
         "src/trailing.py": null,
         "src/trailing.py.": null,
       },
+      deepLookupLinear: true,
+      deepPathParses: 1,
       duplicatePaths: 1,
       immutable: {
         commit: expect.stringContaining("allowed = True"),
@@ -455,6 +496,7 @@ describe("workbench source excerpts", () => {
       largeExcerpt: null,
       largeRecipeFits: true,
       largeScopeChecks: 0,
+      largeTreePathChecks: 0,
       invalid: null,
       legacy: null,
       malformedRevision: null,
@@ -466,7 +508,9 @@ describe("workbench source excerpts", () => {
       nestedExcerpt: null,
       subtargetPaths: ["."],
       outside: null,
-      pathCollisionPaths: 0,
+      pathCollisionBlobReads: [],
+      pathCollisionExcerpt: null,
+      pathCollisionPaths: 1,
       replaced: null,
       replacementBlobReads: [],
     });

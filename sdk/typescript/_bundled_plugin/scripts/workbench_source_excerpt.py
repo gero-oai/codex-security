@@ -9,6 +9,7 @@ import re
 import sqlite3
 import stat
 import sys
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -28,8 +29,15 @@ MAX_LINES = 60
 OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 TreeEntry = tuple[str, str, str]
-SourceScope = dict[str, str]
-SourceContext = tuple[Path, dict[str, SourceScope]]
+
+
+@dataclass
+class SourceScopeIndex:
+    scope: str | None = None
+    children: dict[str, SourceScopeIndex] = field(default_factory=dict)
+
+
+SourceContext = tuple[Path, str, SourceScopeIndex]
 
 
 def normalized_path_component(value: str) -> str:
@@ -166,7 +174,7 @@ def capture_source_scopes(
         context = target_tree(target, revision)
         if context is None:
             return authority
-        repository, tree = context
+        _, tree = context
         authority["targetTree"] = tree
         captured: set[str] = set()
         for requested in paths:
@@ -174,18 +182,13 @@ def capture_source_scopes(
             selected_path = safe_source_path(target, requested)
             if parsed is None or selected_path is None:
                 continue
-            entry = tree_path(repository, tree, requested)
-            if entry is None or entry[1] not in {"file", "directory"}:
-                continue
             raw_selected = target / parsed.as_posix()
             try:
                 metadata = raw_selected.lstat()
             except OSError:
                 continue
             ordinary = stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
-            if not ordinary or (entry[1] == "directory") != stat.S_ISDIR(
-                metadata.st_mode
-            ):
+            if not ordinary:
                 continue
             selected = parsed.as_posix()
             if selected not in captured:
@@ -230,7 +233,8 @@ def load_source_scopes(
     repository, tree = context
     if tree != expected_tree:
         return None
-    scopes: dict[str, SourceScope] = {}
+    scopes: set[str] = set()
+    index = SourceScopeIndex()
     for record in records:
         path = relative_path(record) if isinstance(record, str) else None
         if path is None:
@@ -238,59 +242,63 @@ def load_source_scopes(
         selected = path.as_posix()
         if selected != record or selected not in expected or selected in scopes:
             return None
-        entry = tree_path(repository, tree, selected)
-        if entry is None or entry[1] not in {"file", "directory"}:
-            return None
-        scope = {
-            "path": selected,
-            "kind": entry[1],
-            "objectId": entry[2],
-        }
-        scopes[selected] = scope
-    return repository, scopes
+        scopes.add(selected)
+        node = index
+        for component in path.parts:
+            node = node.children.setdefault(component, SourceScopeIndex())
+        node.scope = selected
+    return repository, tree, index
 
 
 def source_object_for_path(
     repository: Path,
+    tree: str,
     value: str,
-    scope: SourceScope,
+    scope: str,
 ) -> str | None:
     path = relative_path(value)
     if path is None:
         return None
-    scope_path = PurePosixPath(scope["path"])
+    scope_path = PurePosixPath(scope)
     scope_length = len(scope_path.parts)
     if len(path.parts) < scope_length:
         return None
     if path.parts[:scope_length] != scope_path.parts:
         return None
     suffix = path.parts[scope_length:]
-    if scope["kind"] == "file":
-        return scope["objectId"] if not suffix else None
+    selected = tree_path(repository, tree, scope)
+    if selected is None or selected[1] not in {"file", "directory"}:
+        return None
+    if selected[1] == "file":
+        return selected[2] if not suffix else None
     if not suffix:
         return None
     entry = tree_path(
         repository,
-        scope["objectId"],
+        selected[2],
         PurePosixPath(*suffix).as_posix(),
     )
     return entry[2] if entry is not None and entry[1] == "file" else None
 
 
 def source_scopes_for_path(
-    scopes: dict[str, SourceScope], value: str
-) -> tuple[SourceScope, ...]:
+    index: SourceScopeIndex, value: str
+) -> tuple[str, ...]:
     path = relative_path(value)
     if path is None:
         return ()
-    return tuple(
-        scope
-        for length in range(len(path.parts), -1, -1)
-        if (
-            scope := scopes.get(PurePosixPath(*path.parts[:length]).as_posix())
-        )
-        is not None
-    )
+    scopes: list[str] = []
+    node = index
+    if node.scope is not None:
+        scopes.append(node.scope)
+    for component in path.parts:
+        child = node.children.get(component)
+        if child is None:
+            break
+        node = child
+        if node.scope is not None:
+            scopes.append(node.scope)
+    return tuple(reversed(scopes))
 
 
 def source_excerpt_context(
@@ -318,7 +326,7 @@ def finding_source_excerpt_from_context(
 ) -> str | None:
     if context is None or not locations:
         return None
-    repository, scopes = context
+    repository, tree, scopes = context
 
     location = next(
         (
@@ -338,7 +346,9 @@ def finding_source_excerpt_from_context(
                 candidate
                 for scope in source_scopes_for_path(scopes, path)
                 if (
-                    candidate := source_object_for_path(repository, path, scope)
+                    candidate := source_object_for_path(
+                        repository, tree, path, scope
+                    )
                 )
                 is not None
             ),
