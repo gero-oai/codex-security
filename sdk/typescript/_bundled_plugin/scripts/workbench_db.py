@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -65,7 +66,7 @@ from workbench_constants import (
     CLAIM_LEASE_SECONDS,
     DELIVERED_ACTION_LEASE_SECONDS,
     DIFF_TARGET_KINDS,
-    EMPTY_GIT_TREE,
+    EMPTY_GIT_TREES,
     FINDING_ABSOLUTE_PATH_BYTES,
     FINDING_LEVEL_BYTES,
     FINDING_LOCATION_PATH_BYTES,
@@ -103,10 +104,13 @@ from workbench_schema import (
 from workbench_source_excerpt import finding_source_excerpt, safe_source_path
 from workbench_target import (
     clean_worktree_content_digest,
+    committed_diff_content_snapshot,
+    committed_diff_object_identity,
     copy_directory_excluding,
     copy_git_worktree_files,
     directory_content_digest,
     directory_snapshot_regular_file_count,
+    empty_git_tree,
     git_bytes,
     git_command,
     git_output,
@@ -248,6 +252,82 @@ def connect() -> sqlite3.Connection:
     raise AssertionError("SQLite retry loop exhausted unexpectedly.")
 
 
+def begin_immediate_after_external_inspection(
+    connection: sqlite3.Connection,
+    inspect: Callable[[], bool],
+    validate: Callable[[], bool],
+    inspection_unnecessary: Callable[[], bool] | None = None,
+) -> bool:
+    """Inspect outside the lock, then validate immutable Git coordinates under it."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if inspection_unnecessary is not None and inspection_unnecessary():
+            return True
+    except BaseException:
+        connection.rollback()
+        raise
+    connection.rollback()
+    busy_timeout = int(connection.execute("PRAGMA busy_timeout").fetchone()[0])
+    while True:
+        try:
+            inspected = inspect()
+        except (Exception, SystemExit):
+            if inspection_unnecessary is None:
+                raise
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if inspection_unnecessary():
+                    return True
+            except BaseException:
+                connection.rollback()
+                raise
+            connection.rollback()
+            raise
+        blocked = False
+        connection.execute("PRAGMA busy_timeout = 0")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if not sqlite_busy(exc):
+                raise
+            blocked = True
+        finally:
+            connection.execute(f"PRAGMA busy_timeout = {busy_timeout}")
+        if not blocked:
+            try:
+                if inspection_unnecessary is not None and inspection_unnecessary():
+                    return True
+                return bool(inspected and validate())
+            except BaseException:
+                connection.rollback()
+                raise
+
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if inspection_unnecessary is not None and inspection_unnecessary():
+                return True
+        except BaseException:
+            connection.rollback()
+            raise
+        connection.rollback()
+
+
+def begin_immediate_with_target_inspection(
+    connection: sqlite3.Connection,
+    inspect: Callable[[], bool],
+    inspection_unnecessary: Callable[[], bool] | None = None,
+) -> bool:
+    """Inspect a mutable target while holding the writer transaction."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if inspection_unnecessary is not None and inspection_unnecessary():
+            return True
+        return inspect()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
 def apply_migrations(connection: sqlite3.Connection) -> None:
     apply_schema_migrations(connection, MIGRATIONS, now, backfill_security_targets)
 
@@ -271,7 +351,13 @@ def inspect_target(target_path: str) -> dict[str, Any]:
     }
 
 
-def resolve_git_commit(target: Path, revision: str, label: str) -> str:
+def resolve_git_commit(
+    target: Path,
+    revision: str,
+    label: str,
+    *,
+    local_objects_only: bool = False,
+) -> str:
     value = optional_text(revision, maximum=512)
     if not value:
         raise SystemExit(f"{label} is required.")
@@ -281,10 +367,252 @@ def resolve_git_commit(target: Path, revision: str, label: str) -> str:
         "--verify",
         "--end-of-options",
         f"{value}^{{commit}}",
+        local_objects_only=local_objects_only,
     )
     if resolved is None:
         raise SystemExit(f"{label} does not resolve to a local Git commit: {value}")
     return resolved
+
+
+def is_canonical_git_object_id(value: Any, object_id_length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == object_id_length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def require_committed_diff_digest(
+    target: Path,
+    base: str,
+    head: str,
+    selected_digest: str | None,
+) -> str:
+    return require_committed_diff_snapshot(target, base, head, selected_digest)[0]
+
+
+def require_committed_diff_snapshot(
+    target: Path,
+    base: str,
+    head: str,
+    selected_digest: str | None,
+) -> tuple[str, str]:
+    current_digest, object_identity = committed_diff_content_snapshot(target, base, head)
+    if selected_digest is not None and selected_digest != current_digest:
+        raise SystemExit(
+            "The committed changes selected for review no longer produce the same "
+            "diff. Select the changes to review again."
+        )
+    return current_digest, object_identity
+
+
+class ResolvedDiffTargetError(SystemExit):
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str,
+        base_revision: str | None,
+        head_revision: str,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.base_revision = base_revision
+        self.head_revision = head_revision
+
+
+def require_resolved_committed_diff_target(
+    target: Path,
+    kind: str,
+    base: str,
+    head: str,
+    content_digest: str | None,
+    *,
+    persisted_base: str | None,
+) -> dict[str, str]:
+    return require_resolved_committed_diff_snapshot(
+        target,
+        kind,
+        base,
+        head,
+        content_digest,
+        persisted_base=persisted_base,
+    )[0]
+
+
+def require_resolved_committed_diff_snapshot(
+    target: Path,
+    kind: str,
+    base: str,
+    head: str,
+    content_digest: str | None,
+    *,
+    persisted_base: str | None,
+) -> tuple[dict[str, str], str]:
+    try:
+        digest, object_identity = require_committed_diff_snapshot(
+            target,
+            base,
+            head,
+            content_digest,
+        )
+    except SystemExit as exc:
+        raise ResolvedDiffTargetError(
+            str(exc),
+            kind=kind,
+            base_revision=persisted_base,
+            head_revision=head,
+        ) from None
+    return (
+        {
+            "kind": kind,
+            "baseRevision": base,
+            "headRevision": head,
+            "contentDigest": digest,
+        },
+        object_identity,
+    )
+
+
+def resolve_committed_diff_coordinates(
+    target: Path,
+    kind: str,
+    base_revision: str | None,
+    head_revision: str | None,
+    *,
+    allow_equal_range: bool = False,
+    local_objects_only: bool = False,
+) -> tuple[str, str, str | None]:
+    if kind == "commit":
+        head = resolve_git_commit(
+            target,
+            head_revision or "",
+            "Commit",
+            local_objects_only=local_objects_only,
+        )
+        commit = git_bytes(
+            target,
+            "cat-file",
+            "-p",
+            head,
+            local_objects_only=local_objects_only,
+        )
+        if commit is None:
+            raise SystemExit(f"Commit is not available in the local checkout: {head}")
+        parent_line = next(
+            (line for line in commit.splitlines() if line.startswith(b"parent ")),
+            None,
+        )
+        if parent_line is None:
+            parent = empty_git_tree(target)
+        else:
+            parent = resolve_git_commit(
+                target,
+                parent_line.removeprefix(b"parent ").decode("ascii").strip(),
+                "Commit parent",
+                local_objects_only=local_objects_only,
+            )
+        if base_revision and base_revision != parent:
+            supplied_base = (
+                base_revision
+                if base_revision in EMPTY_GIT_TREES.values()
+                else resolve_git_commit(
+                    target,
+                    base_revision,
+                    "Commit base",
+                    local_objects_only=local_objects_only,
+                )
+            )
+            if supplied_base != parent:
+                raise SystemExit("Commit base revision must match the selected commit's parent.")
+        return parent, head, parent if base_revision is not None else None
+    if kind != "range":
+        raise ValueError(f"Unsupported committed diff kind: {kind}")
+    base = resolve_git_commit(
+        target,
+        base_revision or "",
+        "Base revision",
+        local_objects_only=local_objects_only,
+    )
+    head = resolve_git_commit(
+        target,
+        head_revision or "",
+        "Head revision",
+        local_objects_only=local_objects_only,
+    )
+    if base == head and not allow_equal_range:
+        raise SystemExit("Base and head revisions must identify different commits.")
+    return base, head, base
+
+
+def committed_diff_lock_identity(
+    target: Path,
+    kind: str,
+    base: str,
+    head: str,
+    object_identity: str | None = None,
+) -> tuple[int, int, str, str, str, str]:
+    metadata = target.stat()
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        kind,
+        base,
+        head,
+        object_identity
+        if object_identity is not None
+        else committed_diff_object_identity(target, base, head),
+    )
+
+
+def committed_diff_lock_validator(
+    target: Path,
+    diff_target: dict[str, str],
+    object_identity: str,
+    base_revision: str | None,
+    head_revision: str | None,
+    *,
+    allow_equal_range: bool = False,
+) -> tuple[
+    Callable[[Path, dict[str, str], str], bool],
+    Callable[[], bool],
+]:
+    target_path = str(target)
+    kind = diff_target["kind"]
+    inspected_identity = committed_diff_lock_identity(
+        target,
+        kind,
+        diff_target["baseRevision"],
+        diff_target["headRevision"],
+        object_identity,
+    )
+
+    def matches_inspected_identity(
+        target: Path,
+        diff_target: dict[str, str],
+        object_identity: str,
+    ) -> bool:
+        return committed_diff_lock_identity(
+            target,
+            diff_target["kind"],
+            diff_target["baseRevision"],
+            diff_target["headRevision"],
+            object_identity,
+        ) == inspected_identity
+
+    def validate() -> bool:
+        target = require_remediation_target(target_path)
+        base, head, _ = resolve_committed_diff_coordinates(
+            target,
+            kind,
+            base_revision,
+            head_revision,
+            allow_equal_range=allow_equal_range,
+            local_objects_only=True,
+        )
+        return committed_diff_lock_identity(target, kind, base, head) == inspected_identity
+
+    return matches_inspected_identity, validate
 
 
 def require_diff_target(
@@ -317,37 +645,96 @@ def require_diff_target(
             "headRevision": current_head,
             "contentDigest": current_digest,
         }
-    if kind == "commit":
-        head = resolve_git_commit(target, head_revision or "", "Commit")
-        commit = git_bytes(target, "cat-file", "-p", head)
-        if commit is None:
-            raise SystemExit(f"Commit is not available in the local checkout: {head}")
-        parent_line = next(
-            (line for line in commit.splitlines() if line.startswith(b"parent ")),
+    base, head, persisted_base = resolve_committed_diff_coordinates(
+        target,
+        kind,
+        base_revision,
+        head_revision,
+    )
+    return require_resolved_committed_diff_snapshot(
+        target,
+        kind,
+        base,
+        head,
+        content_digest,
+        persisted_base=persisted_base,
+    )[0]
+
+
+def require_diff_target_snapshot(
+    target: Path,
+    kind: str | None,
+    base_revision: str | None,
+    head_revision: str | None,
+    content_digest: str | None,
+) -> tuple[dict[str, str], str | None]:
+    if kind not in {"commit", "range"}:
+        return (
+            require_diff_target(
+                target,
+                kind,
+                base_revision,
+                head_revision,
+                content_digest,
+            ),
             None,
         )
-        if parent_line is None:
-            parent = EMPTY_GIT_TREE
-        else:
-            parent = resolve_git_commit(
-                target,
-                parent_line.removeprefix(b"parent ").decode("ascii").strip(),
-                "Commit parent",
+    require_review_changes_target(target)
+    base, head, persisted_base = resolve_committed_diff_coordinates(
+        target,
+        kind,
+        base_revision,
+        head_revision,
+    )
+    return require_resolved_committed_diff_snapshot(
+        target,
+        kind,
+        base,
+        head,
+        content_digest,
+        persisted_base=persisted_base,
+    )
+
+
+def require_registered_diff_target(
+    target: Path,
+    diff_target: dict[str, str],
+) -> dict[str, str]:
+    return require_registered_diff_target_snapshot(target, diff_target)[0]
+
+
+def require_registered_diff_target_snapshot(
+    target: Path,
+    diff_target: dict[str, str],
+) -> tuple[dict[str, str], str | None]:
+    kind = diff_target["kind"]
+    base = resolve_git_commit(target, diff_target["baseRevision"], "Base revision")
+    head = resolve_git_commit(target, diff_target["headRevision"], "Head revision")
+    if kind == "working_tree":
+        if head != require_review_changes_target(target):
+            raise SystemExit("Working-tree HEAD changed before the scan started.")
+        current_digest = worktree_content_digest(target)
+        if current_digest != diff_target["contentDigest"]:
+            raise SystemExit(
+                "Working-tree contents changed after they were selected. "
+                "Select Uncommitted changes again."
             )
-        if base_revision and base_revision != parent:
-            supplied_base = (
-                base_revision
-                if base_revision == EMPTY_GIT_TREE
-                else resolve_git_commit(target, base_revision, "Commit base")
-            )
-            if supplied_base != parent:
-                raise SystemExit("Commit base revision must match the selected commit's parent.")
-        return {"kind": kind, "baseRevision": parent, "headRevision": head}
-    base = resolve_git_commit(target, base_revision or "", "Base revision")
-    head = resolve_git_commit(target, head_revision or "", "Head revision")
-    if base == head:
-        raise SystemExit("Base and head revisions must identify different commits.")
-    return {"kind": kind, "baseRevision": base, "headRevision": head}
+    else:
+        current_digest, object_identity = require_committed_diff_snapshot(
+            target,
+            base,
+            head,
+            diff_target["contentDigest"],
+        )
+    return (
+        {
+            "kind": kind,
+            "baseRevision": base,
+            "headRevision": head,
+            "contentDigest": current_digest,
+        },
+        None if kind == "working_tree" else object_identity,
+    )
 
 
 def inspect_setup_values(
@@ -358,6 +745,8 @@ def inspect_setup_values(
     diff_base_revision: str | None,
     diff_head_revision: str | None,
     diff_content_digest: str | None,
+    *,
+    include_committed_identity: bool = False,
 ) -> dict[str, Any]:
     target = require_target(target_path)
     require_scannable_target(target)
@@ -374,8 +763,8 @@ def inspect_setup_values(
         )
     ):
         raise SystemExit("A Git diff target requires Review changes mode.")
-    diff_target = (
-        require_diff_target(
+    diff_target, committed_identity = (
+        require_diff_target_snapshot(
             target,
             diff_target_kind,
             diff_base_revision,
@@ -383,13 +772,16 @@ def inspect_setup_values(
             diff_content_digest,
         )
         if mode == "diff"
-        else None
+        else (None, None)
     )
-    return {
+    inspected = {
         "diffTarget": diff_target,
         "scope": normalized_scope,
         "target": inspect_target(str(target)),
     }
+    if include_committed_identity:
+        inspected["committedDiffIdentity"] = committed_identity
+    return inspected
 
 
 def inspect_setup(args: argparse.Namespace) -> dict[str, Any]:
@@ -509,7 +901,7 @@ def workbench_completion_binding(scan: sqlite3.Row, completed_at: str) -> dict[s
     if scan["mode"] == "diff":
         target["baseRevision"] = scan["diff_base_revision"]
         target["headRevision"] = scan["diff_head_revision"]
-        if scan["diff_target_kind"] == "working_tree" and scan["diff_content_digest"]:
+        if scan["diff_content_digest"]:
             target["snapshotDigest"] = scan["diff_content_digest"]
     else:
         if scan["target_revision"] != "unversioned":
@@ -579,11 +971,11 @@ def verify_manifest_binding(scan: sqlite3.Row, manifest: dict[str, Any]) -> None
             )
         if (
             scan["diff_target_kind"] == "working_tree"
-            and target.get("snapshotDigest") != scan["diff_content_digest"]
-        ):
+            or scan["diff_content_digest"] is not None
+        ) and target.get("snapshotDigest") != scan["diff_content_digest"]:
             raise SystemExit(
                 "scan-manifest.json target snapshotDigest must match the selected "
-                "working-tree contents."
+                "reviewed contents."
             )
     scope = manifest_scan.get("scope")
     if not isinstance(scope, dict):
@@ -677,6 +1069,9 @@ def create_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -
     diff_content_digest = (
         optional_text(args.diff_content_digest, maximum=128) if args.mode == "diff" else None
     )
+    inspected = None
+    inspection_error = None
+    inspected_target_metadata = None
     if target_path:
         try:
             inspected = inspect_setup_values(
@@ -695,8 +1090,18 @@ def create_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -
                 diff_base_revision = inspected["diffTarget"]["baseRevision"]
                 diff_head_revision = inspected["diffTarget"]["headRevision"]
                 diff_content_digest = inspected["diffTarget"].get("contentDigest")
-        except SystemExit:
-            pass
+        except SystemExit as exc:
+            inspection_error = str(exc)
+            if isinstance(exc, ResolvedDiffTargetError):
+                diff_target_kind = exc.kind
+                diff_base_revision = exc.base_revision
+                diff_head_revision = exc.head_revision
+            try:
+                inspected_target = require_target(target_path)
+                target_path = str(inspected_target)
+                inspected_target_metadata = git_target_metadata(inspected_target)
+            except SystemExit:
+                pass
     with connection:
         target_id = (
             ensure_security_target(connection, target_path) if target_path is not None else None
@@ -728,7 +1133,15 @@ def create_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -
                 timestamp,
             ),
         )
-    return workspace_state(connection, workspace_id)
+        result = inspected_workspace_state(
+            connection,
+            workspace_id,
+            expected_updated_at=timestamp,
+            inspection_error=inspection_error,
+            inspected_setup=inspected,
+            inspected_target_metadata=inspected_target_metadata,
+        )
+    return result
 
 
 def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
@@ -747,6 +1160,63 @@ def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> 
     target = Path(inspected["target"]["targetPath"])
     scope = inspected["scope"]
     target_path = str(target)
+    diff_target = inspected["diffTarget"]
+    stored_committed_selection = (
+        diff_target is not None
+        and diff_target["kind"] != "working_tree"
+        and workspace["target_path"] == target_path
+        and workspace["diff_target_kind"] == diff_target["kind"]
+    )
+    if stored_committed_selection and workspace["submitted"]:
+        object_id_length = len(empty_git_tree(target))
+        if (
+            not is_canonical_git_object_id(
+                workspace["diff_head_revision"], object_id_length
+            )
+            or (
+                workspace["diff_base_revision"] is not None
+                and not is_canonical_git_object_id(
+                    workspace["diff_base_revision"], object_id_length
+                )
+            )
+            or (
+                diff_target["kind"] == "range"
+                and workspace["diff_base_revision"] is None
+            )
+        ):
+            raise SystemExit(
+                "The committed changes selected for review no longer produce the same "
+                "diff. Select the changes to review again."
+            )
+    same_committed_identity = (
+        diff_target is not None
+        and diff_target["kind"] != "working_tree"
+        and workspace["target_path"] == target_path
+        and workspace["diff_target_kind"] == diff_target["kind"]
+        and workspace["diff_head_revision"] == diff_target["headRevision"]
+        and (
+            diff_target["kind"] == "commit"
+            or workspace["diff_base_revision"] == diff_target["baseRevision"]
+        )
+    )
+    if same_committed_identity:
+        stored_digest = workspace["diff_content_digest"]
+        base_compatible = workspace["diff_base_revision"] == diff_target[
+            "baseRevision"
+        ] or (
+            diff_target["kind"] == "commit"
+            and workspace["diff_base_revision"] is None
+            and stored_digest is None
+        )
+        digest_compatible = stored_digest == diff_target["contentDigest"] or (
+            stored_digest is None
+            and args.diff_content_digest == diff_target["contentDigest"]
+        )
+        if not base_compatible or not digest_compatible:
+            raise SystemExit(
+                "The committed changes selected for review no longer produce the same "
+                "diff. Select the changes to review again."
+            )
     target_changed = workspace["target_path"] != target_path
     target_title = target.name if target_changed else workspace["target_title"]
     target_summary = (
@@ -756,7 +1226,6 @@ def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> 
         if target_changed
         else workspace["target_summary"]
     )
-    diff_target = inspected["diffTarget"]
     if diff_target and not target_summary:
         target_summary = diff_target_summary(diff_target)
     timestamp = now()
@@ -791,7 +1260,13 @@ def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> 
             raise SystemExit(
                 "This workspace already has a scan. Open a new workspace to change setup."
             )
-    return workspace_state(connection, workspace["id"])
+        result = inspected_workspace_state(
+            connection,
+            workspace["id"],
+            expected_updated_at=timestamp,
+            inspected_setup=inspected,
+        )
+    return result
 
 
 def scan_target_root(scan_root: str | None, target: Path) -> Path:
@@ -809,14 +1284,18 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
         workspace = require_workspace(connection, workspace_id)
         if not workspace["submitted"] or not workspace["target_path"]:
             raise SystemExit("Save the Codex Security setup before starting the scan.")
-        active = connection.execute(
-            """
-            SELECT *
-            FROM scans
-            WHERE workspace_id = ? AND status = 'running' AND canceled_at IS NULL
-            """,
-            (workspace["id"],),
-        ).fetchone()
+
+        def active_scan() -> sqlite3.Row | None:
+            return connection.execute(
+                """
+                SELECT *
+                FROM scans
+                WHERE workspace_id = ? AND status = 'running' AND canceled_at IS NULL
+                """,
+                (workspace_id,),
+            ).fetchone()
+
+        active = active_scan()
         if active is not None:
             return workspace_state(connection, workspace["id"])
         workspace_version = workspace["updated_at"]
@@ -827,8 +1306,9 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
         target_metadata = target.stat()
         scope = require_scope(workspace["default_scope"], workspace["default_mode"], target)
         diff_target = None
+        committed_object_identity = None
         if workspace["default_mode"] == "diff":
-            diff_target = require_diff_target(
+            diff_target, committed_object_identity = require_diff_target_snapshot(
                 target,
                 workspace["diff_target_kind"],
                 workspace["diff_base_revision"],
@@ -848,31 +1328,89 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
             diff_target,
             metadata=target_metadata,
         )
+        match_committed_diff_identity: (
+            Callable[[Path, dict[str, str], str], bool] | None
+        ) = None
+        validate_committed_diff: Callable[[], bool] | None = None
+        if diff_target is not None and diff_target["kind"] in {"commit", "range"}:
+            assert committed_object_identity is not None
+            match_committed_diff_identity, validate_committed_diff = (
+                committed_diff_lock_validator(
+                    target,
+                    diff_target,
+                    committed_object_identity,
+                    workspace["diff_base_revision"],
+                    workspace["diff_head_revision"],
+                )
+            )
+
+        def target_matches_initial_snapshot() -> bool:
+            current_target = require_remediation_target(str(target))
+            current_target_metadata = current_target.stat()
+            if (current_target_metadata.st_dev, current_target_metadata.st_ino) != (
+                target_metadata.st_dev,
+                target_metadata.st_ino,
+            ):
+                return False
+            current_diff_target, current_object_identity = (
+                require_diff_target_snapshot(
+                    current_target,
+                    workspace["diff_target_kind"],
+                    workspace["diff_base_revision"],
+                    workspace["diff_head_revision"],
+                    workspace["diff_content_digest"],
+                )
+                if workspace["default_mode"] == "diff"
+                else (None, None)
+            )
+            matches = (
+                scan_target_identity(
+                    current_target,
+                    current_diff_target,
+                    metadata=current_target_metadata,
+                )
+                == target_identity
+                and scan_diff_identity(current_diff_target) == scan_diff_identity(diff_target)
+            )
+            if matches and match_committed_diff_identity is not None:
+                assert current_diff_target is not None
+                assert current_object_identity is not None
+                matches = match_committed_diff_identity(
+                    current_target,
+                    current_diff_target,
+                    current_object_identity,
+                )
+            return matches
+
         target_root = scan_target_root(args.scan_root, target)
         target_root.mkdir(parents=True, exist_ok=True)
         if manages_transaction:
-            connection.execute("BEGIN IMMEDIATE")
+            if validate_committed_diff is None:
+                target_is_current = begin_immediate_with_target_inspection(
+                    connection,
+                    target_matches_initial_snapshot,
+                    active_scan,
+                )
+            else:
+                target_is_current = begin_immediate_after_external_inspection(
+                    connection,
+                    target_matches_initial_snapshot,
+                    validate_committed_diff,
+                    active_scan,
+                )
+        else:
+            target_is_current = (
+                True if active_scan() is not None else target_matches_initial_snapshot()
+            )
         workspace = require_workspace(connection, workspace_id)
-        active = connection.execute(
-            """
-            SELECT *
-            FROM scans
-            WHERE workspace_id = ? AND status = 'running' AND canceled_at IS NULL
-            """,
-            (workspace["id"],),
-        ).fetchone()
+        active = active_scan()
         if active is not None:
             if manages_transaction:
                 connection.commit()
             return workspace_state(connection, workspace["id"])
         if workspace["updated_at"] != workspace_version:
             raise SystemExit("Codex Security setup changed while the scan was starting. Try again.")
-        current_target = require_remediation_target(str(target))
-        current_target_metadata = current_target.stat()
-        if (current_target_metadata.st_dev, current_target_metadata.st_ino) != (
-            target_metadata.st_dev,
-            target_metadata.st_ino,
-        ):
+        if not target_is_current:
             raise SystemExit(
                 "The selected scan target changed while the scan was starting. Try again."
             )
@@ -938,11 +1476,13 @@ def _start_prompt_driven_scan(
         args.diff_base_revision,
         args.diff_head_revision,
         args.diff_content_digest,
+        include_committed_identity=True,
     )
     target = Path(inspected["target"]["targetPath"])
     target_path = str(target)
     scope = inspected["scope"]
     diff_target = inspected["diffTarget"]
+    committed_object_identity = inspected["committedDiffIdentity"]
     user_context = user_context_argument(args)
     target_summary = optional_text(args.target_summary, maximum=2400)
     if diff_target is not None and not target_summary:
@@ -952,13 +1492,26 @@ def _start_prompt_driven_scan(
     )
     diff_identity = scan_diff_identity(diff_target)
     target_identity = scan_target_identity(target, diff_target)
-    target_root = scan_target_root(args.scan_root, target)
+    match_committed_diff_identity: (
+        Callable[[Path, dict[str, str], str], bool] | None
+    ) = None
+    validate_committed_diff: Callable[[], bool] | None = None
+    if diff_target is not None and diff_target["kind"] in {"commit", "range"}:
+        assert committed_object_identity is not None
+        match_committed_diff_identity, validate_committed_diff = (
+            committed_diff_lock_validator(
+                target,
+                diff_target,
+                committed_object_identity,
+                args.diff_base_revision,
+                args.diff_head_revision,
+            )
+        )
 
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+    def target_matches_initial_snapshot() -> bool:
         current_target = require_remediation_target(target_path)
-        current_diff_target = (
-            require_diff_target(
+        current_diff_target, current_object_identity = (
+            require_diff_target_snapshot(
                 current_target,
                 args.diff_target_kind,
                 args.diff_base_revision,
@@ -966,12 +1519,40 @@ def _start_prompt_driven_scan(
                 args.diff_content_digest,
             )
             if args.mode == "diff"
-            else None
+            else (None, None)
         )
-        if (
-            scan_target_identity(current_target, current_diff_target) != target_identity
-            or scan_diff_identity(current_diff_target) != diff_identity
-        ):
+        matches = (
+            scan_target_identity(current_target, current_diff_target) == target_identity
+            and scan_diff_identity(current_diff_target) == diff_identity
+        )
+        if matches and match_committed_diff_identity is not None:
+            assert current_diff_target is not None
+            assert current_object_identity is not None
+            matches = match_committed_diff_identity(
+                current_target,
+                current_diff_target,
+                current_object_identity,
+            )
+        return matches
+
+    target_root = scan_target_root(args.scan_root, target)
+    allow_legacy_digest = int(
+        diff_target is not None
+        and diff_target["kind"] in {"commit", "range"}
+        and args.diff_content_digest is None
+    )
+    if validate_committed_diff is None:
+        target_is_current = begin_immediate_with_target_inspection(
+            connection, target_matches_initial_snapshot
+        )
+    else:
+        target_is_current = begin_immediate_after_external_inspection(
+            connection,
+            target_matches_initial_snapshot,
+            validate_committed_diff,
+        )
+    try:
+        if not target_is_current:
             raise SystemExit(
                 "The selected scan target changed while the scan was starting. Try again."
             )
@@ -983,7 +1564,17 @@ def _start_prompt_driven_scan(
                 AND workspaces.default_scope = ? AND workspaces.default_mode = ?
                 AND workspaces.user_context IS ? AND workspaces.target_summary IS ?
                 AND workspaces.diff_target_kind IS ? AND workspaces.diff_base_revision IS ?
-                AND workspaces.diff_head_revision IS ? AND workspaces.diff_content_digest IS ?
+                AND workspaces.diff_head_revision IS ?
+                AND (
+                    (
+                        workspaces.diff_content_digest IS ?
+                        AND scans.diff_content_digest IS ?
+                    )
+                    OR (
+                        ? = 1 AND workspaces.diff_content_digest IS NULL
+                        AND scans.diff_content_digest IS NULL
+                    )
+                )
                 AND workspaces.submitted = 1 AND scans.target_revision = ?
                 AND scans.target_snapshot_digest IS ? AND scans.target_device = ?
                 AND scans.target_inode = ? AND scans.status = 'running'
@@ -995,7 +1586,10 @@ def _start_prompt_driven_scan(
                         AND scans.continuation_thread_id = ?
                     )
                 )
-            ORDER BY scans.updated_at DESC, scans.started_at DESC, scans.id LIMIT 1
+            ORDER BY
+                CASE WHEN workspaces.diff_content_digest IS ?
+                    AND scans.diff_content_digest IS ? THEN 0 ELSE 1 END,
+                scans.updated_at DESC, scans.started_at DESC, scans.id LIMIT 1
             """,
             (
                 thread_id,
@@ -1004,11 +1598,16 @@ def _start_prompt_driven_scan(
                 args.mode,
                 user_context,
                 target_summary,
-                *diff_identity,
+                *diff_identity[:3],
+                diff_identity[3],
+                diff_identity[3],
+                allow_legacy_digest,
                 *target_identity,
                 int(headless_standard),
                 int(headless_standard),
                 thread_id,
+                diff_identity[3],
+                diff_identity[3],
             ),
         ).fetchone()
         if existing is not None:
@@ -1466,7 +2065,6 @@ def complete_scan_locked(
                 if warning not in items:
                     items.append(warning)
 
-    add_warning()
     scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
     completion_timestamp = now()
     completion_binding = workbench_completion_binding(scan, completion_timestamp)
@@ -1661,6 +2259,7 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
     paths = requested_target["paths"]
     scope = paths[0] if len(paths) == 1 else "."
     diff_target = None
+    committed_object_identity = None
     if requested_target["kind"] in {"refs", "working_tree"}:
         current_head = require_review_changes_target(repository)
         base = resolve_git_commit(repository, requested_target["base"], "Base revision")
@@ -1674,6 +2273,11 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
             if head != current_head:
                 raise SystemExit("Working-tree HEAD changed before the scan started.")
             diff_target["contentDigest"] = worktree_content_digest(repository)
+        else:
+            (
+                diff_target["contentDigest"],
+                committed_object_identity,
+            ) = committed_diff_content_snapshot(repository, base, head)
     mode = "diff" if diff_target is not None else recipe["mode"]
     target_identity = scan_target_identity(repository, diff_target)
     scope_file_count = (
@@ -1695,8 +2299,59 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
     scan_id = str(uuid.uuid4())
     workspace_id = str(uuid.uuid4())
 
-    connection.execute("BEGIN IMMEDIATE")
+    match_committed_diff_identity: (
+        Callable[[Path, dict[str, str], str], bool] | None
+    ) = None
+    validate_committed_diff: Callable[[], bool] | None = None
+    if diff_target is not None and diff_target["kind"] == "range":
+        assert committed_object_identity is not None
+        match_committed_diff_identity, validate_committed_diff = (
+            committed_diff_lock_validator(
+                repository,
+                diff_target,
+                committed_object_identity,
+                requested_target["base"],
+                requested_target["head"],
+                allow_equal_range=True,
+            )
+        )
+
+    def target_matches_initial_snapshot() -> bool:
+        current_repository = require_remediation_target(str(repository))
+        current_diff_target, current_object_identity = (
+            require_registered_diff_target_snapshot(current_repository, diff_target)
+            if diff_target is not None
+            else (None, None)
+        )
+        matches = (
+            scan_target_identity(current_repository, current_diff_target) == target_identity
+            and scan_diff_identity(current_diff_target) == scan_diff_identity(diff_target)
+        )
+        if matches and match_committed_diff_identity is not None:
+            assert current_diff_target is not None
+            assert current_object_identity is not None
+            matches = match_committed_diff_identity(
+                current_repository,
+                current_diff_target,
+                current_object_identity,
+            )
+        return matches
+
+    if validate_committed_diff is None:
+        target_is_current = begin_immediate_with_target_inspection(
+            connection, target_matches_initial_snapshot
+        )
+    else:
+        target_is_current = begin_immediate_after_external_inspection(
+            connection,
+            target_matches_initial_snapshot,
+            validate_committed_diff,
+        )
     try:
+        if not target_is_current:
+            raise SystemExit(
+                "The selected scan target changed while the scan was starting. Try again."
+            )
         archive_scan(connection, args, scan_dir, timestamp, require_canonical_scan_directory)
         target_id = ensure_security_target(connection, str(repository))
         if parent_scan_id is not None:
@@ -3032,6 +3687,63 @@ def workspace_state(
     refresh_stopped: bool = False,
 ) -> dict[str, Any]:
     workspace = require_workspace(connection, workspace_id)
+    return render_workspace_state(
+        connection,
+        workspace,
+        result_scan_id=result_scan_id,
+        thread_id=thread_id,
+        refresh_stopped=refresh_stopped,
+    )
+
+
+def inspected_workspace_state(
+    connection: sqlite3.Connection,
+    workspace_id: str,
+    *,
+    expected_updated_at: str,
+    inspection_error: str | None = None,
+    inspected_setup: dict[str, Any] | None,
+    inspected_target_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    manages_transaction = not connection.in_transaction
+    if manages_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        workspace = require_workspace(connection, workspace_id)
+        if (
+            workspace["updated_at"] != expected_updated_at
+            or workspace["active_scan_id"] is not None
+        ):
+            raise SystemExit("Codex Security setup changed while it was being saved. Try again.")
+        result = render_workspace_state(
+            connection,
+            workspace,
+            inspection_complete=True,
+            inspection_error=inspection_error,
+            inspected_setup=inspected_setup,
+            inspected_target_metadata=inspected_target_metadata,
+        )
+        if manages_transaction:
+            connection.commit()
+        return result
+    except BaseException:
+        if manages_transaction:
+            connection.rollback()
+        raise
+
+
+def render_workspace_state(
+    connection: sqlite3.Connection,
+    workspace: sqlite3.Row,
+    *,
+    result_scan_id: str | None = None,
+    thread_id: str | None = None,
+    refresh_stopped: bool = False,
+    inspection_complete: bool = False,
+    inspection_error: str | None = None,
+    inspected_setup: dict[str, Any] | None = None,
+    inspected_target_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if thread_id is not None and workspace["thread_id"] != optional_text(thread_id, maximum=512):
         raise SystemExit("Codex Security workspace not found in this thread.")
     persisted_diff_target = stored_diff_target(workspace)
@@ -3060,7 +3772,13 @@ def workspace_state(
     target_metadata = None
     setup_error = None
     validated_diff_target = None
-    if workspace["target_path"]:
+    if inspected_setup is not None:
+        target_metadata = inspected_setup["target"]["targetMetadata"]
+        validated_diff_target = inspected_setup["diffTarget"]
+    elif inspection_complete:
+        setup_error = inspection_error
+        target_metadata = inspected_target_metadata
+    elif workspace["target_path"]:
         try:
             inspected = inspect_setup_values(
                 workspace["target_path"],

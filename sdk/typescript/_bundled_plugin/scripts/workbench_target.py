@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import os
 import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 # Some plugin hosts launch Python with safe-path isolation enabled.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from filesystem_identity import stored_filesystem_identity_matches
-from workbench_constants import GIT_REPOSITORY_ENVIRONMENT
+from workbench_constants import (
+    EMPTY_GIT_TREES,
+    GIT_REPOSITORY_ENVIRONMENT,
+)
 
 
 def git_output(
@@ -24,8 +29,18 @@ def git_output(
     *args: str,
     git_dir: Path | None = None,
     work_tree: Path | None = None,
+    local_objects_only: bool = False,
+    object_directory: Path | None = None,
 ) -> str | None:
-    completed = git_command(target, *args, text=False, git_dir=git_dir, work_tree=work_tree)
+    completed = git_command(
+        target,
+        *args,
+        text=False,
+        git_dir=git_dir,
+        work_tree=work_tree,
+        local_objects_only=local_objects_only,
+        object_directory=object_directory,
+    )
     output = os.fsdecode(completed.stdout).strip()
     return output if completed.returncode == 0 and output else None
 
@@ -35,9 +50,115 @@ def git_bytes(
     *args: str,
     git_dir: Path | None = None,
     work_tree: Path | None = None,
+    local_objects_only: bool = False,
 ) -> bytes | None:
-    completed = git_command(target, *args, text=False, git_dir=git_dir, work_tree=work_tree)
+    completed = git_command(
+        target,
+        *args,
+        text=False,
+        git_dir=git_dir,
+        work_tree=work_tree,
+        local_objects_only=local_objects_only,
+    )
     return completed.stdout if completed.returncode == 0 else None
+
+
+def read_stream_nul_field(stream: IO[bytes]) -> bytes | None:
+    """Read one NUL-terminated field, returning ``None`` only at clean EOF."""
+    field = bytearray()
+    while character := stream.read(1):
+        if character == b"\0":
+            return bytes(field)
+        field.extend(character)
+    if field:
+        raise ValueError("missing NUL terminator")
+    return None
+
+
+def write_committed_diff_object_requests(
+    metadata: IO[bytes],
+    requests: IO[bytes],
+) -> None:
+    """Write ordered changed-blob requests from NUL-framed raw diff records."""
+    seen: set[bytes] = set()
+    while (header := read_stream_nul_field(metadata)) is not None:
+        if not header or not read_stream_nul_field(metadata):
+            raise ValueError("invalid raw Git diff record")
+        fields = header.split()
+        if len(fields) != 5 or not fields[0].startswith(b":"):
+            raise ValueError("invalid raw Git diff record")
+        for mode, object_name in (
+            (fields[0][1:], fields[2]),
+            (fields[1], fields[3]),
+        ):
+            if mode in {b"000000", b"160000"}:
+                continue
+            if (
+                len(object_name) not in {40, 64}
+                or any(
+                    character not in b"0123456789abcdef"
+                    for character in object_name
+                )
+            ):
+                raise ValueError("invalid raw Git diff record")
+            if object_name in seen:
+                continue
+            seen.add(object_name)
+            requests.write(object_name + b"\0")
+
+
+def validate_git_batch_blob_stream(
+    requests: IO[bytes],
+    output: IO[bytes],
+) -> None:
+    """Require one exact, ordered blob response for every object request."""
+    while (expected_object := read_stream_nul_field(requests)) is not None:
+        if not expected_object:
+            raise ValueError("invalid empty object request")
+        if _read_git_batch_blob(output, expected_object, require_object_match=True) is None:
+            raise ValueError("missing batch object")
+    if output.read(1):
+        raise ValueError("unexpected batch response")
+
+
+def _read_git_batch_blob(
+    output: IO[bytes],
+    expected_request: bytes,
+    *,
+    require_object_match: bool,
+    collect: bool = False,
+) -> bytes | None:
+    """Read one strict newline-framed response for a NUL-terminated request."""
+    start = output.tell()
+    missing = expected_request + b" missing\n"
+    if output.read(len(missing)) == missing:
+        return None
+    output.seek(start)
+    header = output.readline()
+    if not header.endswith(b"\n"):
+        raise ValueError("unterminated batch header")
+    fields = header[:-1].split(b" ")
+    if (
+        len(fields) != 3
+        or len(fields[0]) not in {40, 64}
+        or any(character not in b"0123456789abcdef" for character in fields[0])
+        or (require_object_match and fields[0] != expected_request)
+        or fields[1] != b"blob"
+        or not fields[2].isdigit()
+    ):
+        raise ValueError("invalid batch response")
+    remaining = int(fields[2])
+    chunks: list[bytes] = []
+    while remaining:
+        chunk = output.read(min(1024 * 1024, remaining))
+        if not chunk:
+            raise ValueError("truncated blob response")
+        if collect:
+            chunks.append(chunk)
+        remaining -= len(chunk)
+    if output.read(1) != b"\n":
+        raise ValueError("missing blob terminator")
+    return b"".join(chunks)
 
 
 def git_blob_bytes(
@@ -47,77 +168,45 @@ def git_blob_bytes(
     git_dir: Path | None = None,
     work_tree: Path | None = None,
 ) -> list[bytes | None]:
-    """Read ordered raw blobs with one NUL-framed ``git cat-file --batch`` call."""
+    """Read ordered raw blobs with one NUL-request ``git cat-file --batch`` call."""
     if not object_names:
         return []
 
-    request = b"\0".join(os.fsencode(name) for name in object_names) + b"\0"
+    encoded_names = [os.fsencode(name) for name in object_names]
+    request = b"\0".join(encoded_names) + b"\0"
     completed = git_command(
         target,
         "cat-file",
         "--batch",
-        "-Z",
+        "-z",
         text=False,
         input_data=request,
         git_dir=git_dir,
         work_tree=work_tree,
+        local_objects_only=True,
     )
     if completed.returncode != 0:
         return [None] * len(object_names)
 
     try:
-        return _decode_git_batch_blobs(completed.stdout, len(object_names))
+        return _decode_git_batch_blobs(completed.stdout, encoded_names)
     except ValueError:
         return [None] * len(object_names)
 
 
-def _decode_git_batch_blobs(output: bytes, count: int) -> list[bytes | None]:
-    """Decode ordered ``cat-file --batch -Z`` records without scanning blob bytes."""
-    blobs: list[bytes | None] = []
-    offset = 0
-    for _ in range(count):
-        header, offset = _read_nul_field(output, offset)
-        size = _git_batch_blob_size(header)
-        if size is None:
-            blobs.append(None)
-            continue
-        blob, offset = _read_sized_nul_field(output, offset, size)
-        blobs.append(blob)
-    return blobs
-
-
-def _read_nul_field(output: bytes, offset: int) -> tuple[bytes, int]:
-    """Read one NUL-terminated protocol field and return the next offset."""
-    end = output.find(b"\0", offset)
-    if end < 0:
-        raise ValueError("missing NUL terminator")
-    return output[offset:end], end + 1
-
-
-def _git_batch_blob_size(header: bytes) -> int | None:
-    """Return a blob header's byte count, or ``None`` for a non-blob record."""
-    fields = header.rsplit(b" ", 2)
-    if len(fields) != 3 or fields[1] != b"blob":
-        return None
-    try:
-        size = int(fields[2])
-    except ValueError as error:
-        raise ValueError("invalid blob size") from error
-    if size < 0:
-        raise ValueError("invalid blob size")
-    return size
-
-
-def _read_sized_nul_field(
+def _decode_git_batch_blobs(
     output: bytes,
-    offset: int,
-    size: int,
-) -> tuple[bytes, int]:
-    """Read exactly ``size`` blob bytes followed by one NUL record terminator."""
-    end = offset + size
-    if output[end : end + 1] != b"\0":
-        raise ValueError("missing blob terminator")
-    return output[offset:end], end + 1
+    expected_requests: list[bytes],
+) -> list[bytes | None]:
+    """Decode exactly one strict newline-framed response per ordered request."""
+    stream = io.BytesIO(output)
+    blobs = [
+        _read_git_batch_blob(stream, request, require_object_match=False, collect=True)
+        for request in expected_requests
+    ]
+    if stream.read(1):
+        raise ValueError("unexpected batch response")
+    return blobs
 
 
 def git_command(
@@ -127,12 +216,21 @@ def git_command(
     input_data: str | bytes | None = None,
     git_dir: Path | None = None,
     work_tree: Path | None = None,
+    stdin: IO[bytes] | None = None,
+    stdout: IO[bytes] | None = None,
+    local_objects_only: bool = False,
+    object_directory: Path | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     if (git_dir is None) != (work_tree is None):
         raise ValueError("git_dir and work_tree must be provided together")
     environment = os.environ.copy()
     for name in GIT_REPOSITORY_ENVIRONMENT:
         environment.pop(name, None)
+    if object_directory is not None:
+        environment["GIT_OBJECT_DIRECTORY"] = os.fspath(object_directory)
+    if local_objects_only:
+        environment["GIT_ALLOW_PROTOCOL"] = ""
+        environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_LITERAL_PATHSPECS"] = "1"
     # Repository-local config is untrusted; fsmonitor may name an executable hook.
     command = [
@@ -151,7 +249,9 @@ def git_command(
         return subprocess.run(
             full_command,
             check=False,
-            capture_output=True,
+            stdin=stdin,
+            stdout=subprocess.PIPE if stdout is None else stdout,
+            stderr=subprocess.PIPE,
             env=environment,
             text=text,
             encoding="utf-8" if text else None,
@@ -172,10 +272,391 @@ def update_digest_field(digest: Any, label: bytes, value: bytes) -> None:
     digest.update(value)
 
 
+def update_digest_stream_field(digest: Any, label: bytes, stream: IO[bytes]) -> None:
+    """Hash a length-framed stream without loading it into memory."""
+    digest.update(len(label).to_bytes(4, "big"))
+    digest.update(label)
+    digest.update(os.fstat(stream.fileno()).st_size.to_bytes(8, "big"))
+    stream.seek(0)
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+
+
 def worktree_content_digest(target: Path) -> str:
     require_clean_submodule_worktrees(target)
     repository, pathspec = git_worktree_context(target)
     return worktree_content_digest_for_context(repository, pathspec)
+
+
+def empty_git_tree(target: Path) -> str:
+    object_format = git_output(target, "rev-parse", "--show-object-format")
+    return EMPTY_GIT_TREES.get(object_format or "", EMPTY_GIT_TREES["sha1"])
+
+
+def _replacement_refs(
+    repository: Path,
+    *,
+    object_id_length: int,
+    object_directory: Path | None = None,
+) -> bytes:
+    replacement_ref_base = os.fsencode(
+        os.environ.get("GIT_REPLACE_REF_BASE", "refs/replace/")
+    )
+    replacements = git_command(
+        repository,
+        "for-each-ref",
+        "--sort=refname",
+        "--format=%(refname)%00%(objectname)",
+        text=False,
+        local_objects_only=True,
+        object_directory=object_directory,
+    )
+    if replacements.returncode != 0:
+        raise SystemExit("Could not inspect the selected committed changes.")
+    selected = bytearray()
+    for record in replacements.stdout.splitlines():
+        fields = record.split(b"\0")
+        if len(fields) != 2:
+            raise SystemExit("Could not inspect the selected committed changes.")
+        if not fields[0].startswith(replacement_ref_base):
+            continue
+        original_object_id = fields[0][len(replacement_ref_base) :].rsplit(b"/", 1)[-1]
+        if (
+            len(original_object_id) != object_id_length
+            or any(
+                character not in b"0123456789abcdefABCDEF"
+                for character in original_object_id
+            )
+        ):
+            continue
+        selected.extend(record)
+        selected.extend(b"\n")
+    return bytes(selected)
+
+
+def _replacement_refs_enabled(
+    repository: Path,
+    *,
+    object_directory: Path | None = None,
+) -> bool:
+    if "GIT_NO_REPLACE_OBJECTS" in os.environ:
+        return False
+    configured = git_command(
+        repository,
+        "config",
+        "--bool",
+        "--get",
+        "core.useReplaceRefs",
+        text=False,
+        local_objects_only=True,
+        object_directory=object_directory,
+    )
+    value = configured.stdout.strip()
+    if configured.returncode == 1 and not value:
+        return True
+    if configured.returncode == 0 and value in {b"true", b"false"}:
+        return value == b"true"
+    raise SystemExit("Could not inspect the selected committed changes.")
+
+
+def _create_committed_diff_view(repository: Path, view: Path) -> Path:
+    object_format = git_output(
+        repository,
+        "rev-parse",
+        "--show-object-format",
+        local_objects_only=True,
+    )
+    object_directory_value = git_output(
+        repository,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+        local_objects_only=True,
+    )
+    if object_format not in {"sha1", "sha256"} or object_directory_value is None:
+        raise SystemExit("Could not snapshot the selected committed changes.")
+    object_directory = Path(object_directory_value)
+    if not object_directory.is_dir():
+        raise SystemExit("Could not snapshot the selected committed changes.")
+
+    object_id_length = 40 if object_format == "sha1" else 64
+    replacements = _replacement_refs(
+        repository,
+        object_id_length=object_id_length,
+    )
+    replacements_enabled = _replacement_refs_enabled(repository)
+    parsed_replacements: list[tuple[list[str], bytes]] = []
+    for record in replacements.splitlines():
+        fields = record.split(b"\0")
+        if (
+            len(fields) != 2
+            or len(fields[1]) != object_id_length
+            or any(character not in b"0123456789abcdef" for character in fields[1])
+        ):
+            raise SystemExit("Could not snapshot the selected committed changes.")
+        refname = os.fsdecode(fields[0])
+        parts = refname.split("/")
+        if (
+            len(parts) < 2
+            or parts[0] != "refs"
+            or "\\" in refname
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise SystemExit("Could not snapshot the selected committed changes.")
+        parsed_replacements.append((parts, fields[1]))
+
+    try:
+        view.mkdir(mode=0o700)
+        (view / "objects" / "info").mkdir(parents=True)
+        (view / "objects" / "pack").mkdir()
+        (view / "refs" / "heads").mkdir(parents=True)
+        repository_format_version = 0 if object_format == "sha1" else 1
+        config = (
+            (
+                b"[extensions]\n\tobjectformat = sha256\n"
+                if object_format == "sha256"
+                else b""
+            )
+            + b"[core]\n\trepositoryformatversion = "
+            + str(repository_format_version).encode("ascii")
+            + b"\n\tfilemode = false\n\tbare = true\n\tuseReplaceRefs = "
+            + (b"true" if replacements_enabled else b"false")
+            + b"\n"
+        )
+        (view / "config").write_bytes(config)
+        (view / "HEAD").write_bytes(b"ref: refs/heads/codex-security-snapshot\n")
+        for parts, object_id in parsed_replacements:
+            ref = view.joinpath(*parts)
+            ref.parent.mkdir(parents=True, exist_ok=True)
+            ref.write_bytes(object_id + b"\n")
+    except OSError as exc:
+        raise SystemExit("Could not snapshot the selected committed changes.") from exc
+    return object_directory
+
+
+def committed_diff_content_snapshot(
+    target: Path,
+    base: str,
+    head: str,
+) -> tuple[str, str]:
+    """Return a digest and identity from one frozen replacement view."""
+    repository, pathspec = git_worktree_context(target)
+    configured_state = os.environ.get("CODEX_SECURITY_STATE_DIR")
+    if configured_state:
+        state_directory = Path(configured_state).expanduser().resolve()
+        state_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="codex-security-committed-view-",
+            dir=state_directory,
+        ) as directory:
+            return _committed_diff_content_snapshot(
+                repository,
+                pathspec,
+                base,
+                head,
+                Path(directory),
+            )
+    with tempfile.TemporaryDirectory(prefix="codex-security-committed-diff-") as directory:
+        return _committed_diff_content_snapshot(
+            repository,
+            pathspec,
+            base,
+            head,
+            Path(directory),
+        )
+
+
+def committed_diff_content_digest(target: Path, base: str, head: str) -> str:
+    """Bind normalized committed-diff metadata to every changed blob byte."""
+    return committed_diff_content_snapshot(target, base, head)[0]
+
+
+def _committed_diff_object_identity(
+    repository: Path,
+    pathspec: str,
+    base: str,
+    head: str,
+    *,
+    object_directory: Path | None = None,
+) -> str:
+    digest = hashlib.sha256()
+    update_digest_field(digest, b"format", b"codex-security-committed-objects/v1")
+    update_digest_field(
+        digest,
+        b"pathspec",
+        pathspec.encode("utf-8", errors="surrogateescape"),
+    )
+    for label, revision in ((b"base", base), (b"head", head)):
+        if revision in EMPTY_GIT_TREES.values():
+            tree = revision
+        else:
+            tree = git_output(
+                repository,
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                f"{revision}^{{tree}}",
+                local_objects_only=True,
+                object_directory=object_directory,
+            )
+            if tree is None:
+                raise SystemExit("Could not inspect the selected committed changes.")
+        update_digest_field(digest, label, os.fsencode(revision))
+        update_digest_field(digest, label + b"-tree", os.fsencode(tree))
+
+    replacement_ref_base = os.environ.get("GIT_REPLACE_REF_BASE", "refs/replace/")
+    object_format = git_output(
+        repository,
+        "rev-parse",
+        "--show-object-format",
+        local_objects_only=True,
+        object_directory=object_directory,
+    )
+    if object_format not in {"sha1", "sha256"}:
+        raise SystemExit("Could not inspect the selected committed changes.")
+    replacements_enabled = _replacement_refs_enabled(
+        repository,
+        object_directory=object_directory,
+    )
+    replacements = _replacement_refs(
+        repository,
+        object_id_length=40 if object_format == "sha1" else 64,
+        object_directory=object_directory,
+    )
+    update_digest_field(
+        digest,
+        b"replacement-ref-base",
+        os.fsencode(replacement_ref_base),
+    )
+    update_digest_field(
+        digest,
+        b"replacement-objects-disabled",
+        os.fsencode(os.environ.get("GIT_NO_REPLACE_OBJECTS", "")),
+    )
+    update_digest_field(
+        digest,
+        b"replacement-refs-enabled",
+        b"true" if replacements_enabled else b"false",
+    )
+    update_digest_field(digest, b"replacement-refs", replacements)
+    return f"codex-security-committed-objects/v1:sha256:{digest.hexdigest()}"
+
+
+def committed_diff_object_identity(target: Path, base: str, head: str) -> str:
+    """Bind immutable commit trees to the replacement view used by Git."""
+    repository, pathspec = git_worktree_context(target)
+    return _committed_diff_object_identity(repository, pathspec, base, head)
+
+
+def _committed_diff_content_snapshot(
+    repository: Path,
+    pathspec: str,
+    base: str,
+    head: str,
+    operation_directory: Path,
+) -> tuple[str, str]:
+    view = operation_directory / "repository.git"
+    object_directory = _create_committed_diff_view(repository, view)
+    before = _committed_diff_object_identity(
+        view,
+        pathspec,
+        base,
+        head,
+        object_directory=object_directory,
+    )
+    content_digest = _committed_diff_content_digest(
+        view,
+        pathspec,
+        base,
+        head,
+        operation_directory,
+        object_directory=object_directory,
+    )
+    after = _committed_diff_object_identity(
+        view,
+        pathspec,
+        base,
+        head,
+        object_directory=object_directory,
+    )
+    if before != after:
+        raise SystemExit("Could not snapshot the selected committed changes.")
+    return content_digest, after
+
+
+def _committed_diff_content_digest(
+    repository: Path,
+    pathspec: str,
+    base: str,
+    head: str,
+    state_directory: Path,
+    *,
+    object_directory: Path | None = None,
+) -> str:
+    digest = hashlib.sha256()
+    update_digest_field(digest, b"format", b"codex-security-snapshot/v1")
+    with (
+        tempfile.TemporaryFile(dir=state_directory) as metadata,
+        tempfile.TemporaryFile(dir=state_directory) as requests,
+        tempfile.TemporaryFile(dir=state_directory) as objects,
+    ):
+        diff = git_command(
+            repository,
+            "-c",
+            f"diff.orderFile={os.devnull}",
+            "diff",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-relative",
+            "--no-renames",
+            "--ignore-submodules=none",
+            base,
+            head,
+            "--",
+            pathspec,
+            text=False,
+            stdout=metadata,
+            local_objects_only=True,
+            object_directory=object_directory,
+        )
+        if diff.returncode != 0:
+            raise SystemExit("Could not snapshot the selected committed changes.")
+        metadata.seek(0)
+        try:
+            write_committed_diff_object_requests(metadata, requests)
+        except ValueError as exc:
+            raise SystemExit("Could not snapshot the selected committed changes.") from exc
+        update_digest_stream_field(digest, b"tracked-diff", metadata)
+
+        requests.seek(0, os.SEEK_END)
+        if requests.tell():
+            requests.seek(0)
+            batch = git_command(
+                repository,
+                "cat-file",
+                "--batch",
+                "-z",
+                text=False,
+                stdin=requests,
+                stdout=objects,
+                local_objects_only=True,
+                object_directory=object_directory,
+            )
+            if batch.returncode != 0:
+                raise SystemExit("Could not snapshot the selected committed changes.")
+        requests.seek(0)
+        objects.seek(0)
+        try:
+            validate_git_batch_blob_stream(requests, objects)
+        except ValueError as exc:
+            raise SystemExit("Could not snapshot the selected committed changes.") from exc
+        update_digest_stream_field(digest, b"tracked-objects", objects)
+    return f"codex-security-snapshot/v1:sha256:{digest.hexdigest()}"
 
 
 def remediation_checkout_snapshot(
@@ -636,10 +1117,31 @@ def require_git_worktree_head(target: Path) -> str:
 
 
 def scan_target_warning(scan: sqlite3.Row) -> str | None:
-    if scan["diff_target_kind"] != "working_tree" and not scan["target_snapshot_digest"]:
+    committed_diff = scan["diff_target_kind"] in {"commit", "range"}
+    if (
+        not committed_diff
+        and scan["diff_target_kind"] != "working_tree"
+        and not scan["target_snapshot_digest"]
+    ):
+        return None
+    if committed_diff and not scan["diff_content_digest"]:
         return None
     try:
         target = require_scan_target_identity(scan)
+        if committed_diff:
+            if (
+                committed_diff_content_digest(
+                    target,
+                    scan["diff_base_revision"],
+                    scan["diff_head_revision"],
+                )
+                != scan["diff_content_digest"]
+            ):
+                return (
+                    "Committed changes changed while the scan was running; "
+                    "results were saved for the original snapshot."
+                )
+            return None
         if scan["target_revision"] == "unversioned":
             if (
                 directory_content_digest(target, excluded=(Path(scan["scan_dir"]),))
