@@ -256,20 +256,51 @@ def tree_path(
     return path.as_posix(), kind, object_id
 
 
+def replacement_refs_absent(repository: Path) -> bool:
+    environment = os.environ.copy()
+    for variable in GIT_REPOSITORY_ENVIRONMENT:
+        environment.pop(variable, None)
+    environment["GIT_ALLOW_PROTOCOL"] = ""
+    environment["GIT_LITERAL_PATHSPECS"] = "1"
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    command = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "i18n.logOutputEncoding=UTF-8",
+        "-C",
+        str(repository),
+        "--no-replace-objects",
+        "for-each-ref",
+        "--count=1",
+        "--format=",
+        "refs/replace/",
+    ]
+    try:
+        with subprocess.Popen(
+            command,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        ) as process:
+            if process.stdout is None:
+                return False
+            if process.stdout.read(1):
+                if process.poll() is None:
+                    process.kill()
+                return False
+            return process.wait() == 0
+    except (MemoryError, OSError):
+        return False
+
+
 def target_tree(target: Path, revision: str) -> tuple[Path, str] | None:
     if not isinstance(revision, str) or not OBJECT_ID.fullmatch(revision):
         return None
     repository, prefix = git_worktree_context(target)
-    if (
-        local_git_bytes(
-            repository,
-            "for-each-ref",
-            "--count=1",
-            "--format=",
-            "refs/replace/",
-        )
-        != b""
-    ):
+    if not replacement_refs_absent(repository):
         return None
     raw_tree = local_git_bytes(
         repository,

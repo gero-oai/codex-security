@@ -282,6 +282,9 @@ original_git = excerpts.local_git_bytes
 original_popen = subprocess.Popen
 blob_reads = []
 blob_read_sizes = []
+replacement_probe_commands = []
+replacement_probe_read_sizes = []
+watch_replacement_probe = False
 class WatchedBlobOutput:
     def __init__(self, output):
         self.output = output
@@ -292,11 +295,23 @@ class WatchedBlobOutput:
         return self.output.read(size)
     def __getattr__(self, name):
         return getattr(self.output, name)
+class WatchedReplacementOutput:
+    def __init__(self, output):
+        self.output = output
+    def read(self, size=-1):
+        replacement_probe_read_sizes.append(size)
+        return self.output.read(size)
+    def __getattr__(self, name):
+        return getattr(self.output, name)
 def watched_popen(arguments, *positional, **keywords):
     process = original_popen(arguments, *positional, **keywords)
     if len(arguments) >= 3 and arguments[-3:-1] == ["cat-file", "blob"]:
         blob_reads.append(arguments[-1])
         process.stdout = WatchedBlobOutput(process.stdout)
+    if watch_replacement_probe and "for-each-ref" in arguments:
+        start = arguments.index("for-each-ref")
+        replacement_probe_commands.append(arguments[start:])
+        process.stdout = WatchedReplacementOutput(process.stdout)
     return process
 subprocess.Popen = watched_popen
 allowed = excerpt("src/allowed.py")
@@ -309,25 +324,6 @@ linked_excerpt = excerpt(
     "alias/subdir/secret.py", linked_scan, ["alias/subdir"]
 )
 linked_blob_reads = blob_reads[before:]
-replacement_probe_calls = []
-def guarded_git(*arguments, **keywords):
-    command = arguments[1:]
-    if command == ("replace", "--list"):
-        replacement_probe_calls.append(list(command))
-        raise MemoryError("unbounded replacement-ref probe")
-    if command == ("for-each-ref", "--count=1", "--format=", "refs/replace/"):
-        replacement_probe_calls.append(list(command))
-    return original_git(*arguments, **keywords)
-excerpts.local_git_bytes = guarded_git
-try:
-    try:
-        excerpts.capture_source_scopes(repository, identity, ["src"])
-    except MemoryError:
-        replacement_probe_memory_error = True
-    else:
-        replacement_probe_memory_error = False
-finally:
-    excerpts.local_git_bytes = original_git
 before = len(blob_read_sizes)
 large_blob_excerpt = excerpt("src/large.py")
 large_blob_sizes = blob_read_sizes[before:]
@@ -432,6 +428,36 @@ finally:
         check=True,
     )
 replacement_blob_reads = blob_reads[before:]
+replace_directory = outer_git_dir / "refs" / "replace"
+replace_directory.mkdir(parents=True, exist_ok=True)
+broken_replacements = []
+for index in range(128):
+    broken = replace_directory / f"r{index:04d}"
+    broken.write_text("not-an-object\n")
+    broken_replacements.append(broken)
+watch_replacement_probe = True
+try:
+    malformed_replacement_paths = excerpts.capture_source_scopes(
+        repository, identity, ["src"]
+    )["paths"]
+finally:
+    watch_replacement_probe = False
+    for broken in broken_replacements:
+        broken.unlink()
+def exhausted_popen(arguments, *positional, **keywords):
+    if "for-each-ref" in arguments:
+        raise MemoryError("synthetic replacement probe exhaustion")
+    return original_popen(arguments, *positional, **keywords)
+subprocess.Popen = exhausted_popen
+try:
+    try:
+        replacement_memory_paths = excerpts.capture_source_scopes(
+            repository, identity, ["src"]
+        )["paths"]
+    except MemoryError:
+        replacement_memory_paths = "escaped"
+finally:
+    subprocess.Popen = watched_popen
 subprocess.Popen = original_popen
 legacy_scan = dict(scan)
 legacy_scan.pop("source_scopes_json")
@@ -623,6 +649,7 @@ print(json.dumps({
     "linkedAuthorityPaths": linked_authority["paths"],
     "linkedBlobReads": linked_blob_reads,
     "linkedExcerpt": linked_excerpt,
+    "malformedReplacementPaths": malformed_replacement_paths,
     "invalid": invalid,
     "legacy": legacy,
     "malformedRevision": malformed_revision,
@@ -637,8 +664,9 @@ print(json.dumps({
     "pathCollisionPaths": len(scope_collision_authority["paths"]),
     "replaced": replaced,
     "replacementBlobReads": replacement_blob_reads,
-    "replacementProbeCalls": replacement_probe_calls,
-    "replacementProbeMemoryError": replacement_probe_memory_error,
+    "replacementMemoryPaths": replacement_memory_paths,
+    "replacementProbeCommands": replacement_probe_commands,
+    "replacementProbeReadSizes": replacement_probe_read_sizes,
     "streamedWideTree": streamed_wide_tree,
 }))
 `;
@@ -704,6 +732,7 @@ describe("workbench source excerpts", () => {
       linkedAuthorityPaths: [],
       linkedBlobReads: [],
       linkedExcerpt: null,
+      malformedReplacementPaths: [],
       invalid: null,
       legacy: null,
       malformedRevision: null,
@@ -721,10 +750,11 @@ describe("workbench source excerpts", () => {
       pathCollisionPaths: 1,
       replaced: null,
       replacementBlobReads: [],
-      replacementProbeCalls: [
+      replacementMemoryPaths: [],
+      replacementProbeCommands: [
         ["for-each-ref", "--count=1", "--format=", "refs/replace/"],
       ],
-      replacementProbeMemoryError: false,
+      replacementProbeReadSizes: [1],
       streamedWideTree: true,
     });
   }, 60_000);
