@@ -450,12 +450,9 @@ def exhausted_popen(arguments, *positional, **keywords):
     return original_popen(arguments, *positional, **keywords)
 subprocess.Popen = exhausted_popen
 try:
-    try:
-        replacement_memory_paths = excerpts.capture_source_scopes(
-            repository, identity, ["src"]
-        )["paths"]
-    except MemoryError:
-        replacement_memory_paths = "escaped"
+    replacement_memory_paths = excerpts.capture_source_scopes(
+        repository, identity, ["src"]
+    )["paths"]
 finally:
     subprocess.Popen = watched_popen
 subprocess.Popen = original_popen
