@@ -293,6 +293,33 @@ def path_is_excluded(path: Path) -> bool:
     return path.name.endswith((".min.js", ".map"))
 
 
+def changed_path_parent_is_within_target(path: Path, target: Path) -> bool:
+    """Resolve the nearest existing parent without dereferencing the changed leaf."""
+    target = target.resolve(strict=True)
+    candidate = path.parent
+    while True:
+        try:
+            candidate.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            parent = candidate.parent
+            if parent == candidate:
+                return False
+            candidate = parent
+            continue
+        break
+
+    resolved = candidate.resolve(strict=True)
+    if resolved.is_relative_to(target):
+        return True
+    for ancestor in (resolved, *resolved.parents):
+        try:
+            if ancestor.samefile(target):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def windows_stream_component(path: Path) -> str | None:
     """Return the first NTFS alternate-data-stream component."""
 
@@ -708,6 +735,17 @@ def make_diff_rank_input(args: argparse.Namespace) -> None:
     rows: list[JsonRow] = []
     for path, status in changed:
         rel = path.relative_to(repo)
+        if args.mode != "revisions":
+            try:
+                within_target = changed_path_parent_is_within_target(path, repo)
+            except (OSError, RuntimeError) as error:
+                raise SystemExit(
+                    "Could not inspect a changed Git working-tree path."
+                ) from error
+            if not within_target:
+                raise SystemExit(
+                    "Changed Git working-tree paths must stay inside the selected target."
+                )
 
         if status == "D":
             preview = ""
@@ -723,14 +761,9 @@ def make_diff_rank_input(args: argparse.Namespace) -> None:
         elif path.is_symlink():
             preview = ""
         elif path.is_file():
-            try:
-                path.resolve(strict=True).relative_to(repo)
-            except (OSError, ValueError):
-                preview = ""
-            else:
-                preview, is_binary = preview_for(path, args.preview_bytes)
-                if is_binary:
-                    continue
+            preview, is_binary = preview_for(path, args.preview_bytes)
+            if is_binary:
+                continue
         else:
             preview = ""
         rows.append({"path": rel.as_posix(), "area": args.area, "preview": preview})

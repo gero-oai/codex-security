@@ -167,7 +167,11 @@ def generate_diff_in_scope_files(
 ) -> int:
     """Reuse the existing diff selection without generating previews or duplicate worklists."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from generate_rank_input import git_changed_paths, path_is_excluded
+    from generate_rank_input import (
+        changed_path_parent_is_within_target,
+        git_changed_paths,
+        path_is_excluded,
+    )
     from rank_preview import (
         DEFAULT_PREVIEW_BYTES,
         TEXT_CODE_EXTENSIONS,
@@ -206,6 +210,19 @@ def generate_diff_in_scope_files(
 
         for path, status in eligible:
             relative = path.relative_to(repository)
+            if mode != "revisions":
+                try:
+                    within_target = changed_path_parent_is_within_target(
+                        path, repository
+                    )
+                except (OSError, RuntimeError) as error:
+                    raise InventoryError(
+                        "could not inspect a changed Git working-tree path"
+                    ) from error
+                if not within_target:
+                    raise InventoryError(
+                        "changed Git working-tree paths must stay inside the selected target"
+                    )
             if status != "D":
                 if mode == "revisions":
                     contents = revision_blobs[relative]
