@@ -345,6 +345,41 @@ immutable = {
     )
     for kind in ("commit", "range")
 }
+large_paths = [str(index) for index in range(20_000)]
+large_tree = "0" * 40
+large_scan = {
+    **scan,
+    "source_scopes_json": json.dumps(
+        {"version": 1, "paths": large_paths, "targetTree": large_tree}
+    ),
+}
+large_recipe_bytes = len(
+    json.dumps(
+        {"target": {"kind": "paths", "paths": large_paths}}, separators=(",", ":")
+    ).encode()
+)
+original_target_tree = excerpts.target_tree
+original_tree_path = excerpts.tree_path
+original_source_object = excerpts.source_object_for_path
+scope_checks = 0
+def counted_source_object(*arguments, **kwargs):
+    global scope_checks
+    scope_checks += 1
+    return original_source_object(*arguments, **kwargs)
+excerpts.target_tree = lambda *_: (repository, large_tree)
+excerpts.tree_path = lambda _, __, value: (value, "file", "1" * 40)
+excerpts.source_object_for_path = counted_source_object
+try:
+    large_context = excerpts.source_excerpt_context(
+        large_scan, repository, large_paths
+    )
+    large_excerpt = excerpts.finding_source_excerpt_from_context(
+        large_context, [{"path": "unmatched/path.py", "startLine": 1}]
+    )
+finally:
+    excerpts.target_tree = original_target_tree
+    excerpts.tree_path = original_tree_path
+    excerpts.source_object_for_path = original_source_object
 print(json.dumps({
     "allowed": allowed,
     "broadened": broadened,
@@ -353,6 +388,9 @@ print(json.dumps({
     "collisions": collisions,
     "duplicatePaths": len(authority["paths"]),
     "immutable": immutable,
+    "largeExcerpt": large_excerpt,
+    "largeRecipeFits": large_recipe_bytes < 256 * 1024,
+    "largeScopeChecks": scope_checks,
     "invalid": invalid,
     "legacy": legacy,
     "malformedRevision": malformed_revision,
@@ -414,6 +452,9 @@ describe("workbench source excerpts", () => {
         commit: expect.stringContaining("allowed = True"),
         range: expect.stringContaining("allowed = True"),
       },
+      largeExcerpt: null,
+      largeRecipeFits: true,
+      largeScopeChecks: 0,
       invalid: null,
       legacy: null,
       malformedRevision: null,

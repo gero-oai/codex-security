@@ -29,7 +29,7 @@ OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 TreeEntry = tuple[str, str, str]
 SourceScope = dict[str, str]
-SourceContext = tuple[Path, tuple[SourceScope, ...]]
+SourceContext = tuple[Path, dict[str, SourceScope]]
 
 
 def normalized_path_component(value: str) -> str:
@@ -230,16 +230,14 @@ def load_source_scopes(
     repository, tree = context
     if tree != expected_tree:
         return None
-    scopes: list[SourceScope] = []
-    seen: set[str] = set()
+    scopes: dict[str, SourceScope] = {}
     for record in records:
         path = relative_path(record) if isinstance(record, str) else None
         if path is None:
             return None
         selected = path.as_posix()
-        if selected != record or selected not in expected or selected in seen:
+        if selected != record or selected not in expected or selected in scopes:
             return None
-        seen.add(selected)
         entry = tree_path(repository, tree, selected)
         if entry is None or entry[1] not in {"file", "directory"}:
             return None
@@ -248,8 +246,8 @@ def load_source_scopes(
             "kind": entry[1],
             "objectId": entry[2],
         }
-        scopes.append(scope)
-    return repository, tuple(scopes)
+        scopes[selected] = scope
+    return repository, scopes
 
 
 def source_object_for_path(
@@ -277,6 +275,22 @@ def source_object_for_path(
         PurePosixPath(*suffix).as_posix(),
     )
     return entry[2] if entry is not None and entry[1] == "file" else None
+
+
+def source_scopes_for_path(
+    scopes: dict[str, SourceScope], value: str
+) -> tuple[SourceScope, ...]:
+    path = relative_path(value)
+    if path is None:
+        return ()
+    return tuple(
+        scope
+        for length in range(len(path.parts), -1, -1)
+        if (
+            scope := scopes.get(PurePosixPath(*path.parts[:length]).as_posix())
+        )
+        is not None
+    )
 
 
 def source_excerpt_context(
@@ -322,7 +336,7 @@ def finding_source_excerpt_from_context(
         object_id = next(
             (
                 candidate
-                for scope in scopes
+                for scope in source_scopes_for_path(scopes, path)
                 if (
                     candidate := source_object_for_path(repository, path, scope)
                 )
