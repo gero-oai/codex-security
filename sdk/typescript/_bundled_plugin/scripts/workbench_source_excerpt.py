@@ -81,7 +81,6 @@ def matching_tree_entries(
     responses: IO[bytes],
     object_id: str,
     name: str,
-    name_bytes_limit: int,
 ) -> TreeEntry | None:
     encoded_object = object_id.encode("ascii")
     requests.write(encoded_object + b"\0")
@@ -112,7 +111,7 @@ def matching_tree_entries(
         buffered.extend(chunk)
         unread -= len(chunk)
 
-    def read_field(delimiter: int, maximum_bytes: int) -> bytearray:
+    def read_field(delimiter: int, maximum_bytes: int | None = None) -> bytearray:
         nonlocal cursor
         field = bytearray()
         while True:
@@ -120,7 +119,7 @@ def matching_tree_entries(
                 end = buffered.index(delimiter, cursor)
             except ValueError:
                 available = len(buffered) - cursor
-                if len(field) + available > maximum_bytes:
+                if maximum_bytes is not None and len(field) + available > maximum_bytes:
                     raise ValueError("oversized tree field") from None
                 field.extend(buffered[cursor:])
                 cursor = len(buffered)
@@ -128,7 +127,7 @@ def matching_tree_entries(
                     raise ValueError("unterminated tree entry") from None
                 read_more()
                 continue
-            if len(field) + end - cursor > maximum_bytes:
+            if maximum_bytes is not None and len(field) + end - cursor > maximum_bytes:
                 raise ValueError("oversized tree field")
             field.extend(buffered[cursor:end])
             cursor = end + 1
@@ -150,7 +149,7 @@ def matching_tree_entries(
     ambiguous = False
     while cursor < len(buffered) or unread:
         mode = bytes(read_field(ord(" "), 6))
-        decoded_name = read_field(0, name_bytes_limit).decode(
+        decoded_name = read_field(0).decode(
             sys.getfilesystemencoding(), errors="surrogateescape"
         )
         entry_object = read_object_id(object_id_bytes)
@@ -187,18 +186,6 @@ def tree_path(
     kind, object_id = "directory", tree
     if not path.parts:
         return path.as_posix(), kind, object_id
-    try:
-        # Windows components are at most 255 UTF-16 units; Git stores path bytes.
-        name_bytes_limit = (
-            255 * 4
-            if os.name == "nt"
-            else os.pathconf(repository, "PC_NAME_MAX")
-        )
-    except (AttributeError, OSError, ValueError):
-        return None
-    if name_bytes_limit < 1:
-        return None
-
     environment = os.environ.copy()
     for variable in GIT_REPOSITORY_ENVIRONMENT:
         environment.pop(variable, None)
@@ -236,7 +223,6 @@ def tree_path(
                     process.stdout,
                     object_id,
                     name,
-                    name_bytes_limit,
                 )
                 # The normalized name must be unique before an exact spelling can win.
                 if aliases is None or aliases[0] != name:

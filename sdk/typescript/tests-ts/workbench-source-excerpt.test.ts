@@ -88,6 +88,7 @@ function collisionRepository(root: string): {
     ["100644", "blob", blob("unicode_decomposed = True\n"), "é.py"],
     ["100644", "blob", blob("plain_name = True\n"), "trailing.py"],
     ["100644", "blob", blob("trailing_dot = True\n"), "trailing.py."],
+    ["100644", "blob", blob("uncheckoutable = True\n"), "z".repeat(2048)],
   ]);
   const upperScope = tree([
     ["100644", "blob", blob("selected_scope = True\n"), "selected.py"],
@@ -171,14 +172,14 @@ function ordinaryRepository(root: string): {
 }
 
 async function upgradedPlugin(root: string) {
-  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.28");
+  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.47");
   const previous = join(root, "previous-plugin");
   cpSync(PLUGIN_ROOT, previous, { recursive: true });
   const manifestPath = join(previous, ".codex-plugin", "plugin.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
     version: string;
   };
-  manifest.version = "0.1.27";
+  manifest.version = "0.1.46";
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
 
   const home = join(root, "codex-home");
@@ -214,8 +215,8 @@ async function upgradedPlugin(root: string) {
   const installedMcp = JSON.parse(
     readFileSync(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
   ) as { mcpServers: Record<string, { env_vars?: string[] }> };
-  expect(predecessor.version).toBe("0.1.27");
-  expect(upgraded.version).toBe("0.1.28");
+  expect(predecessor.version).toBe("0.1.46");
+  expect(upgraded.version).toBe("0.1.47");
   expect(upgraded.installedRoot).not.toBe(predecessor.installedRoot);
   expect(
     installedMcp.mcpServers["codex-security"]?.env_vars?.find(
@@ -399,7 +400,7 @@ outer_git_dir = Path(
     ).strip()
 )
 alternates = subtarget / ".git" / "objects" / "info" / "alternates"
-alternates.write_text(str(outer_git_dir / "objects") + "\n")
+alternates.write_bytes((str(outer_git_dir / "objects") + "\n").encode())
 subprocess.run(
     ["git", "-C", str(subtarget), "update-ref", "refs/heads/main", revision],
     check=True,
@@ -554,9 +555,8 @@ stream_responses = CappedRead(
     + wide_tree
     + b"\n"
 )
-name_limit = 255 * 4 if sys.platform == "win32" else os.pathconf(repository, "PC_NAME_MAX")
 streamed_aliases = excerpts.matching_tree_entries(
-    stream_requests, stream_responses, batch_object, "target.py", name_limit
+    stream_requests, stream_responses, batch_object, "target.py"
 )
 alias_tree = (b"100644 target.py\0" + entry_object) * 20_000
 alias_responses = CappedRead(
@@ -565,33 +565,43 @@ alias_responses = CappedRead(
     + b"\n"
 )
 ambiguous_alias = excerpts.matching_tree_entries(
-    io.BytesIO(), alias_responses, batch_object, "target.py", name_limit
+    io.BytesIO(), alias_responses, batch_object, "target.py"
 )
-oversized_name = b"x" * (name_limit + 1)
-oversized_tree = b"100644 " + oversized_name + b"\0" + entry_object
-try:
-    excerpts.matching_tree_entries(
-        io.BytesIO(),
-        io.BytesIO(
-            f"{batch_object} tree {len(oversized_tree)}\n".encode()
-            + oversized_tree
-            + b"\n"
-        ),
-        batch_object,
-        "target.py",
-        name_limit,
-    )
-except ValueError:
-    oversized_rejected = True
-else:
-    oversized_rejected = False
+oversized_name = b"x" * (64 * 1024 + 1)
+oversized_tree = (
+    b"100644 " + oversized_name + b"\0" + entry_object
+    + b"100644 target.py\0" + entry_object
+)
+oversized_responses = CappedRead(
+    f"{batch_object} tree {len(oversized_tree)}\n".encode()
+    + oversized_tree
+    + b"\n"
+)
+oversized_sibling = excerpts.matching_tree_entries(
+    io.BytesIO(), oversized_responses, batch_object, "target.py"
+)
+oversized_alias_tree = (
+    b"100644 target.py\0" + entry_object
+    + b"100644 target.py" + b"." * (64 * 1024 + 1) + b"\0" + entry_object
+)
+oversized_alias_responses = CappedRead(
+    f"{batch_object} tree {len(oversized_alias_tree)}\n".encode()
+    + oversized_alias_tree
+    + b"\n"
+)
+oversized_alias = excerpts.matching_tree_entries(
+    io.BytesIO(), oversized_alias_responses, batch_object, "target.py"
+)
 streamed_wide_tree = (
     streamed_aliases == ("target.py", "file", entry_object.hex())
     and stream_requests.getvalue() == batch_object.encode() + b"\0"
     and stream_responses.largest == 64 * 1024
     and ambiguous_alias is None
     and alias_responses.largest == 64 * 1024
-    and oversized_rejected
+    and oversized_sibling == ("target.py", "file", entry_object.hex())
+    and oversized_responses.largest == 64 * 1024
+    and oversized_alias is None
+    and oversized_alias_responses.largest == 64 * 1024
 )
 large_paths = [str(index) for index in range(20_000)]
 large_tree = "0" * 40
