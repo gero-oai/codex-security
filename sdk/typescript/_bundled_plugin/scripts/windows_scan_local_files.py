@@ -28,6 +28,7 @@ import secrets
 from collections.abc import Iterator
 from ctypes import wintypes
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 _msvcrt = importlib.import_module("msvcrt") if os.name == "nt" else None
 
@@ -71,6 +72,7 @@ _ERROR_ALREADY_EXISTS = 183
 _MISSING_ERRORS = {_ERROR_FILE_NOT_FOUND, _ERROR_PATH_NOT_FOUND}
 _COLLISION_ERRORS = {_ERROR_FILE_EXISTS, _ERROR_ALREADY_EXISTS}
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_MAX_COMPARE_CHUNK = 64 * 1024
 _MAX_WRITE_CHUNK = 1024 * 1024
 
 _INVALID_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
@@ -490,6 +492,16 @@ def open_read_fd(scan_dir: Path, relative_path: str, context: str) -> int:
         ) from exc
 
 
+def stream_matches_payload(stream: BinaryIO, payload: bytes) -> bool:
+    offset = 0
+    while offset < len(payload):
+        chunk = stream.read(min(_MAX_COMPARE_CHUNK, len(payload) - offset))
+        if not chunk or chunk != payload[offset : offset + len(chunk)]:
+            return False
+        offset += len(chunk)
+    return stream.read(1) == b""
+
+
 def _write_all(handle: int, payload: bytes) -> None:
     view = memoryview(payload)
     offset = 0
@@ -592,7 +604,9 @@ def _existing_output_matches(path: Path, payload: bytes) -> bool:
             raise
         try:
             with os.fdopen(descriptor, "rb") as stream:
-                return stream.read() == payload
+                if os.fstat(stream.fileno()).st_size != len(payload):
+                    return False
+                return stream_matches_payload(stream, payload)
         except OSError:
             return False
 

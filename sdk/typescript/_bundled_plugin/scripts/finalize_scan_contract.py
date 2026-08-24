@@ -598,13 +598,16 @@ def write_scan_local_bytes(
                         raise ContractError(
                             f"{relative_path}: changed while it was being opened"
                         )
-                    try:
-                        with os.fdopen(existing_fd, "rb") as handle:
-                            existing_fd = -1
-                            if handle.read() == payload:
-                                return
-                    except OSError:
-                        pass
+                    if opened.st_size == len(payload):
+                        try:
+                            with os.fdopen(existing_fd, "rb") as handle:
+                                existing_fd = -1
+                                if _windows_scan_local_files().stream_matches_payload(
+                                    handle, payload
+                                ):
+                                    return
+                        except OSError:
+                            pass
                 finally:
                     if existing_fd >= 0:
                         os.close(existing_fd)

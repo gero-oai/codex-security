@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   chmod,
   mkdir,
+  open,
   readFile,
   rename,
   rm,
@@ -233,6 +234,64 @@ describe("completed scan follow-up instructions", () => {
     expect(Number(after.mtimeMs)).toBe(before!.mtimeMs);
     await fixture.client.close();
   });
+
+  test.skipIf(process.platform !== "linux")(
+    "replaces a large sparse artifact within bounded comparison memory",
+    async () => {
+      const root = await temporaryDirectory();
+      const scanDir = join(root, "scan");
+      const artifactPath = join(scanDir, "artifact.bin");
+      const artifactSize = 32 * 1024 * 1024;
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      await mkdir(scanDir, { mode: 0o700 });
+      const script = [
+        "from pathlib import Path",
+        "from runpy import run_path",
+        "import os",
+        "import resource",
+        "import sys",
+        "module = run_path(sys.argv[1])",
+        "scan_dir = Path(sys.argv[2])",
+        "artifact = scan_dir / 'artifact.bin'",
+        "size = 32 * 1024 * 1024",
+        "payload = b'x' * size",
+        "with artifact.open('wb') as stream:",
+        "    stream.truncate(size)",
+        "pages = int(Path('/proc/self/statm').read_text().split()[0])",
+        "current_vms = pages * os.sysconf('SC_PAGE_SIZE')",
+        "_, hard_limit = resource.getrlimit(resource.RLIMIT_AS)",
+        "resource.setrlimit(resource.RLIMIT_AS, (current_vms + 8 * 1024 * 1024, hard_limit))",
+        "module['write_scan_local_bytes'](scan_dir, 'artifact.bin', payload)",
+      ].join("\n");
+      const execution = Bun.spawnSync([
+        python!,
+        "-I",
+        "-B",
+        "-c",
+        script,
+        join(PLUGIN_ROOT, "scripts", "finalize_scan_contract.py"),
+        scanDir,
+      ]);
+
+      expect(
+        execution.exitCode,
+        new TextDecoder().decode(execution.stderr),
+      ).toBe(0);
+      expect((await stat(artifactPath)).size).toBe(artifactSize);
+      const artifact = await open(artifactPath, "r");
+      try {
+        const first = Buffer.alloc(1);
+        const last = Buffer.alloc(1);
+        await artifact.read(first, 0, 1, 0);
+        await artifact.read(last, 0, 1, artifactSize - 1);
+        expect(first).toEqual(Buffer.from("x"));
+        expect(last).toEqual(Buffer.from("x"));
+      } finally {
+        await artifact.close();
+      }
+    },
+  );
 
   test.skipIf(process.platform === "win32")(
     "restores a changed artifact that cannot be read for comparison",
