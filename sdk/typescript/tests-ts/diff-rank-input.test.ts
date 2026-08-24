@@ -7,6 +7,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -348,7 +349,7 @@ test("diff inventory and previews stay inside the selected repository", async ()
     "changed Git working-tree paths must stay inside the selected target",
   );
 
-  rmSync(removedParent);
+  unlinkSync(removedParent);
   git(repository, "update-index", "--skip-worktree", "src/nested/linked.py");
   rmSync(nested, { recursive: true });
   symlinkSync(externalFixture, nested, "junction");
