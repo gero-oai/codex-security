@@ -64,6 +64,7 @@ import {
   planOutputArchive,
   prepareCodexSecurityCredentialHome,
   preparePersistentOutputRoot,
+  prepareScanArtifactRestorer,
   preserveCodexSecurityPluginRegistration,
   requirePrivateCredentialHome,
   requirePrivateCredentialFile,
@@ -1995,16 +1996,25 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
-  test("upgrades a plugin with the real bundled Codex executable", async () => {
+  test("upgrades the predecessor bundled cache and restores with the installed plugin", async () => {
     const root = await temporaryDirectory();
-    const previous = await plugin(join(root, "previous"), "1.2.3");
-    const next = await plugin(join(root, "next"), "1.2.4");
+    const previous = await plugin(join(root, "previous"), "0.1.23");
+    await copyFile(join(PLUGIN_ROOT, ".mcp.json"), join(previous, ".mcp.json"));
+    await copyFile(
+      join(PLUGIN_ROOT, "scripts", "workbench_target.py"),
+      join(previous, "scripts", "workbench_target.py"),
+    );
     const home = join(root, "home");
+    const unrelatedProject = join(root, "unrelated-project");
     await mkdir(home, { mode: 0o700 });
+    await mkdir(unrelatedProject);
     await writeFile(
       join(home, "config.toml"),
-      'cli_auth_credentials_store = "file"\n\n[features]\nplugins = true\n',
+      'cli_auth_credentials_store = "file"\n\n[features]\nplugins = true\n\n[projects.' +
+        JSON.stringify(unrelatedProject) +
+        ']\ntrust_level = "trusted"\n',
     );
+    await writeFile(join(home, "unrelated-state"), "preserved\n");
 
     const command = resolveCodexCommand();
     const environment = {
@@ -2023,13 +2033,35 @@ describe("plugin runtime preparation", () => {
     const credentials = await readFile(join(home, "auth.json"), "utf8");
 
     const options = { codexCommand: command, environment };
-    expect((await bootstrapPlugin(home, previous, options)).version).toBe(
-      "1.2.3",
-    );
-    const upgraded = await bootstrapPlugin(home, next, options);
+    const stale = await bootstrapPlugin(home, previous, options);
+    const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
 
-    expect(upgraded.version).toBe("1.2.4");
+    expect(stale.version).toBe("0.1.23");
+    expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
+    expect(upgraded.version).not.toBe(stale.version);
+    expect(upgraded.installedRoot).not.toBe(stale.installedRoot);
+    const installedMcp = JSON.parse(
+      await readFile(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
+    ) as {
+      mcpServers: Record<string, { env_vars?: string[] }>;
+    };
+    expect(installedMcp.mcpServers["codex-security"]?.env_vars).toContain(
+      "CODEX_SAFETY_IDENTIFIER",
+    );
+    expect(
+      await readFile(
+        join(upgraded.installedRoot, "scripts", "workbench_target.py"),
+      ),
+    ).toEqual(
+      await readFile(join(PLUGIN_ROOT, "scripts", "workbench_target.py")),
+    );
     expect(await readFile(join(home, "auth.json"), "utf8")).toBe(credentials);
+    expect(await readFile(join(home, "unrelated-state"), "utf8")).toBe(
+      "preserved\n",
+    );
+    expect(await readFile(join(home, "config.toml"), "utf8")).toContain(
+      "[projects." + JSON.stringify(unrelatedProject) + "]",
+    );
     expect(
       spawnSync(command.command, ["login", "status"], {
         env: environment,
@@ -2037,6 +2069,27 @@ describe("plugin runtime preparation", () => {
         windowsHide: true,
       }).status,
     ).toBe(0);
+
+    const scanDir = join(root, "scan");
+    const artifact = "artifacts/worker.bin";
+    const expected = Buffer.from([0, 255, 10, 1]);
+    await mkdir(join(scanDir, "artifacts"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await writeFile(join(scanDir, artifact), expected);
+    const python = await resolvePluginPython({ environment });
+    const restorer = await prepareScanArtifactRestorer(
+      {
+        python,
+        pluginRoot: upgraded.installedRoot,
+        environment,
+      },
+      scanDir,
+    );
+    await writeFile(join(scanDir, artifact), Buffer.from([9, 0, 8]));
+    await restorer.restore(artifact, expected);
+    expect(await readFile(join(scanDir, artifact))).toEqual(expected);
   });
 
   test("resolves the exact npm Codex executable", () => {
