@@ -7,6 +7,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -97,6 +98,10 @@ function collisionRepository(root: string): {
   const mismatchTree = tree([
     ["100644", "blob", blob("unscanned = True\n"), "secret.py"],
   ]);
+  const linkedSubtree = tree([
+    ["100644", "blob", blob("linked_secret = True\n"), "secret.py"],
+  ]);
+  const linkedTree = tree([["040000", "tree", linkedSubtree, "subdir"]]);
   const deepComponents = Array.from({ length: 128 }, (_, index) => `d${index}`);
   let deepTree = tree([["100644", "blob", blob("deep = True\n"), "source.py"]]);
   for (const component of deepComponents.toReversed()) {
@@ -105,6 +110,7 @@ function collisionRepository(root: string): {
   const deepPath = ["deep", ...deepComponents, "source.py"].join("/");
   const rootTree = tree([
     ["040000", "tree", upperScope, "Scope"],
+    ["040000", "tree", linkedTree, "alias"],
     ["040000", "tree", deepTree, "deep"],
     ["040000", "tree", mismatchTree, "mismatch"],
     ["040000", "tree", lowerScope, "scope"],
@@ -131,6 +137,12 @@ function collisionRepository(root: string): {
   mkdirSync(join(repository, "src"));
   mkdirSync(join(repository, "Scope"));
   mkdirSync(join(repository, "deep"));
+  mkdirSync(join(repository, "real", "subdir"), { recursive: true });
+  symlinkSync(join(repository, "real"), join(repository, "alias"), "junction");
+  writeFileSync(
+    join(repository, "real", "subdir", "allowed.py"),
+    "linked_allowed = True\n",
+  );
   writeFileSync(join(repository, "src", "allowed.py"), "allowed = True\n");
   writeFileSync(join(repository, "src", "LOWER.py"), "case_upper = True\n");
   writeFileSync(join(repository, "src", "é.py"), "unicode_composed = True\n");
@@ -288,6 +300,34 @@ def watched_popen(arguments, *positional, **keywords):
     return process
 subprocess.Popen = watched_popen
 allowed = excerpt("src/allowed.py")
+linked_authority = excerpts.capture_source_scopes(
+    repository, identity, ["alias/subdir"]
+)
+linked_scan = {**scan, "source_scopes_json": json.dumps(linked_authority)}
+before = len(blob_reads)
+linked_excerpt = excerpt(
+    "alias/subdir/secret.py", linked_scan, ["alias/subdir"]
+)
+linked_blob_reads = blob_reads[before:]
+replacement_probe_calls = []
+def guarded_git(*arguments, **keywords):
+    command = arguments[1:]
+    if command == ("replace", "--list"):
+        replacement_probe_calls.append(list(command))
+        raise MemoryError("unbounded replacement-ref probe")
+    if command == ("for-each-ref", "--count=1", "--format=", "refs/replace/"):
+        replacement_probe_calls.append(list(command))
+    return original_git(*arguments, **keywords)
+excerpts.local_git_bytes = guarded_git
+try:
+    try:
+        excerpts.capture_source_scopes(repository, identity, ["src"])
+    except MemoryError:
+        replacement_probe_memory_error = True
+    else:
+        replacement_probe_memory_error = False
+finally:
+    excerpts.local_git_bytes = original_git
 before = len(blob_read_sizes)
 large_blob_excerpt = excerpt("src/large.py")
 large_blob_sizes = blob_read_sizes[before:]
@@ -580,6 +620,9 @@ print(json.dumps({
     "blobMemoryError": blob_memory_error,
     "largeRecipeFits": large_recipe_bytes < 256 * 1024,
     "largeTreePathChecks": tree_path_checks,
+    "linkedAuthorityPaths": linked_authority["paths"],
+    "linkedBlobReads": linked_blob_reads,
+    "linkedExcerpt": linked_excerpt,
     "invalid": invalid,
     "legacy": legacy,
     "malformedRevision": malformed_revision,
@@ -594,6 +637,8 @@ print(json.dumps({
     "pathCollisionPaths": len(scope_collision_authority["paths"]),
     "replaced": replaced,
     "replacementBlobReads": replacement_blob_reads,
+    "replacementProbeCalls": replacement_probe_calls,
+    "replacementProbeMemoryError": replacement_probe_memory_error,
     "streamedWideTree": streamed_wide_tree,
 }))
 `;
@@ -656,6 +701,9 @@ describe("workbench source excerpts", () => {
       blobMemoryError: null,
       largeRecipeFits: true,
       largeTreePathChecks: 0,
+      linkedAuthorityPaths: [],
+      linkedBlobReads: [],
+      linkedExcerpt: null,
       invalid: null,
       legacy: null,
       malformedRevision: null,
@@ -673,6 +721,10 @@ describe("workbench source excerpts", () => {
       pathCollisionPaths: 1,
       replaced: null,
       replacementBlobReads: [],
+      replacementProbeCalls: [
+        ["for-each-ref", "--count=1", "--format=", "refs/replace/"],
+      ],
+      replacementProbeMemoryError: false,
       streamedWideTree: true,
     });
   }, 60_000);

@@ -260,7 +260,16 @@ def target_tree(target: Path, revision: str) -> tuple[Path, str] | None:
     if not isinstance(revision, str) or not OBJECT_ID.fullmatch(revision):
         return None
     repository, prefix = git_worktree_context(target)
-    if local_git_bytes(repository, "replace", "--list") != b"":
+    if (
+        local_git_bytes(
+            repository,
+            "for-each-ref",
+            "--count=1",
+            "--format=",
+            "refs/replace/",
+        )
+        != b""
+    ):
         return None
     raw_tree = local_git_bytes(
         repository,
@@ -307,13 +316,29 @@ def capture_source_scopes(
         captured: set[str] = set()
         for requested in paths:
             parsed = relative_path(requested)
-            selected_path = safe_source_path(target, requested)
-            if parsed is None or selected_path is None:
+            if parsed is None or safe_source_path(target, requested) is None:
                 continue
-            raw_selected = target / parsed.as_posix()
             try:
-                metadata = raw_selected.lstat()
+                raw_selected = target
+                components = parsed.parts
+                if not components:
+                    metadata = raw_selected.lstat()
+                for index, component in enumerate(components):
+                    raw_selected /= component
+                    metadata = raw_selected.lstat()
+                    if (
+                        stat.S_ISLNK(metadata.st_mode)
+                        or getattr(metadata, "st_reparse_tag", 0) & 0x20000000
+                        or (
+                            index < len(components) - 1
+                            and not stat.S_ISDIR(metadata.st_mode)
+                        )
+                    ):
+                        metadata = None
+                        break
             except OSError:
+                continue
+            if metadata is None:
                 continue
             kind = (
                 "directory"
