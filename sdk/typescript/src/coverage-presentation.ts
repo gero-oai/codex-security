@@ -20,7 +20,7 @@ export function formatScopePath(path: string): string {
   return JSON.stringify(path).replace(
     normalizationSensitive
       ? /[^\u0020-\u007e]/gu
-      : /[\u007f-\u009f\u2028\u2029\p{Cf}\p{Default_Ignorable_Code_Point}]/gu,
+      : /[\u007f-\u009f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\p{Cf}\p{Default_Ignorable_Code_Point}]/gu,
     (character) =>
       character
         .split("")

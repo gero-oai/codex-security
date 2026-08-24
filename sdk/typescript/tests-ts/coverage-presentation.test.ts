@@ -97,6 +97,18 @@ describe("coverage scope presentation", () => {
     }
   });
 
+  test("escapes non-ASCII spaces while preserving ordinary spaces", () => {
+    for (const [path, encoded] of [
+      ["src/a b.ts", '"src/a b.ts"'],
+      ["src/a\u00a0b.ts", '"src/a\\u00a0b.ts"'],
+      ["src/a\u2007b.ts", '"src/a\\u2007b.ts"'],
+      ["src/a\u202fb.ts", '"src/a\\u202fb.ts"'],
+    ] as const) {
+      expect(formatScopePath(path)).toBe(encoded);
+      expect(JSON.parse(encoded)).toBe(path);
+    }
+  });
+
   test("escapes invisible Unicode controls independently of Python's Unicode database", () => {
     // Unicode 17 DerivedGeneralCategory.txt, General_Category=Format.
     const formatControls = (
@@ -158,7 +170,11 @@ describe("coverage scope presentation", () => {
 
   test("preserves exact paths in Markdown scope and deferred work", () => {
     const included = [
+      ["src/a b.ts", '`"src/a b.ts"`'],
       ["src/a  b.ts", '`"src/a  b.ts"`'],
+      ["src/a\u00a0b.ts", '`"src/a\\u00a0b.ts"`'],
+      ["src/a\u2007b.ts", '`"src/a\\u2007b.ts"`'],
+      ["src/a\u202fb.ts", '`"src/a\\u202fb.ts"`'],
       ["src/trailing ", '`"src/trailing "`'],
       ["src,tests", '`"src,tests"`'],
       ["src/line\nfeed", '`"src/line\\nfeed"`'],
@@ -197,7 +213,7 @@ describe("coverage scope presentation", () => {
       'Excluded ``"generated/\\u2066[omitted]*`"``: Synthetic exclusion.',
     );
     expect(report).not.toMatch(
-      /[\u007f-\u009f\u2028\u2029\p{Cf}\p{Default_Ignorable_Code_Point}]/u,
+      /[\u007f-\u009f\u00a0\u2007\u2028\u2029\u202f\p{Cf}\p{Default_Ignorable_Code_Point}]/u,
     );
   });
 });

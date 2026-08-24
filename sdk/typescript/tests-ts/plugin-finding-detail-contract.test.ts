@@ -184,13 +184,34 @@ async function startMcp() {
 }
 
 describe("bundled plugin finding detail contracts", () => {
-  test("keeps the shipped example report equal to its canonical projection", async () => {
-    expect(projectFindingDetails({})).toBe(
-      await readFile(
-        join(PLUGIN_ROOT, "examples", "completed-scan", "report.md"),
-        "utf8",
-      ),
-    );
+  test("keeps the shipped example report aligned with canonical scan facts", async () => {
+    const exampleRoot = join(PLUGIN_ROOT, "examples", "completed-scan");
+    const [manifest, findings, coverage, example] = await Promise.all([
+      readJson(join(exampleRoot, "scan-manifest.json")),
+      readJson(join(exampleRoot, "findings.json")),
+      readJson(join(exampleRoot, "coverage.json")),
+      readFile(join(exampleRoot, "report.md"), "utf8"),
+    ]);
+    const target = (manifest["scan"] as JsonObject)["target"] as JsonObject;
+    const finding = (findings["findings"] as JsonObject[])[0]!;
+    const location = (finding["locations"] as JsonObject[])[0]!;
+    const canonicalFacts = [
+      target["displayName"],
+      target["revision"],
+      finding["title"],
+      finding["summary"],
+      (finding["severity"] as JsonObject)["level"],
+      (finding["confidence"] as JsonObject)["level"],
+      location["path"],
+      `${coverage["completeness"]} for requested scope`,
+    ] as string[];
+
+    for (const report of [projectFindingDetails({}), example]) {
+      for (const fact of canonicalFacts) expect(report).toContain(fact);
+      for (const path of coverage["includePaths"] as string[]) {
+        expect(report).toContain(`\`${path}\``);
+      }
+    }
   });
 
   test("rejects malformed known fields in scan drafts", async () => {

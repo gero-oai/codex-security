@@ -25,9 +25,10 @@ WRITEUP_REPORT_PATH_RE = re.compile(r"^findings/([a-z0-9][a-z0-9._-]*)/\1\.md$")
 SCOPE_PATH_QUOTING_RE = re.compile(r"""[\s,;'"\\\x00-\x1f]""")
 SCOPE_PATH_NON_ASCII_RE = re.compile(r"[^\x20-\x7e]")
 # Unicode 17 General_Category=Format, Default_Ignorable_Code_Point, C1 controls,
-# and line separators.
+# non-ASCII whitespace, and line separators.
 SCOPE_PATH_CONTROLS_RE = re.compile(
-    r"[\x7f-\x9f\u2028\u2029\u00ad\u034f\u0600-\u0605\u061c\u06dd\u070f"
+    r"[\x7f-\x9f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"
+    r"\u00ad\u034f\u0600-\u0605\u061c\u06dd\u070f"
     r"\u0890-\u0891\u08e2\u115f-\u1160\u17b4-\u17b5"
     r"\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f"
     r"\ufeff\uffa0\ufff0-\ufffb\U000110bd\U000110cd\U00013430-\U0001343f"
