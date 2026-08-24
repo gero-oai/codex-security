@@ -861,8 +861,8 @@ const PATCH_REVIEW_POLICY = [
   "Shared patching policy, in priority order:",
   "1. Fully fix the reported security finding.",
   "2. Preserve existing observable behavior unless changing it is required to close the finding.",
-  "3. Make the smallest complete, reviewable change; do not redesign protocols, serialization formats, public interfaces, or architecture.",
-  "4. Reuse applicable existing helpers, tests, build targets, and CI infrastructure; treat broader hardening as separate follow-up work.",
+  "3. Make the smallest complete, concise, easy-to-review change; do not redesign protocols, serialization formats, public interfaces, or architecture when a narrower fix closes the finding.",
+  "4. Reuse applicable existing helpers, tests, build targets, and CI infrastructure. Record broader hardening or redesign suggestions in a PR comment, or the patch summary when no PR exists; do not implement them in the patch.",
   "5. Follow the nearest applicable project guidance without expanding the patch for an optional stylistic preference.",
   "Request a structural change only when an applicable mandatory rule requires it, the current patch introduces a concrete problem, and no smaller compliant correction exists.",
 ].join("\n");

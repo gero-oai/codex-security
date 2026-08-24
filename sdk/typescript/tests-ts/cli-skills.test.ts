@@ -283,9 +283,12 @@ describe("CLI skill commands", () => {
       expect(prompt).toContain("Shared patching policy, in priority order:");
       expect(prompt).toContain("Preserve existing observable behavior");
       expect(prompt).toContain("do not redesign protocols");
+      expect(prompt).toContain("when a narrower fix closes the finding");
       expect(prompt).toContain(
         "existing helpers, tests, build targets, and CI",
       );
+      expect(prompt).toContain("redesign suggestions in a PR comment");
+      expect(prompt).toContain("do not implement them in the patch");
       expect(prompt).toContain("an applicable mandatory rule");
       expect(prompt).toContain("introduces a concrete problem");
     }

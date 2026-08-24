@@ -20,6 +20,8 @@ Judge the result in this order:
 
 Never trade an earlier property for a later one. Minimal means the smallest repository-native change that satisfies all earlier properties, not the fewest lines.
 
+Keep the patch small, concise, focused on the demonstrated vulnerability, and easy to review. Do not redesign working code, protocols, data representations, or architecture when a narrower behavior-preserving fix closes the finding. Record worthwhile broader improvements in a PR comment, or in the patch summary when no PR exists; do not implement them in the patch.
+
 ## Patch Contract
 
 Before editing, establish from repository evidence:
@@ -66,7 +68,7 @@ The investigation requires repository-relative evidence and a clear separation b
    - Determine whether a narrow tactical change can close the boundary while preserving the patch contract.
    - Consider broader remediation only when the narrow option cannot close the boundary without breaking supported behavior. Remove or disable functionality only when repository or product evidence supports that mitigation.
    - If the only complete fix requires an unresolved decision about product policy, public-API compatibility, or cross-subsystem ownership, return `blocked` with the options, security tradeoff, and likely owner or codeowner when available.
-   - Use nearby variants to test the chosen boundary. Report unrelated sibling findings or longer-term architectural work separately instead of expanding this patch.
+   - Use nearby variants to test the chosen boundary. Report unrelated sibling findings or longer-term architectural work in a PR comment, or in the patch summary when no PR exists, instead of expanding this patch.
 4. Implement the fix and its proof.
    - Make the smallest repository-native change that fully enforces the invariant.
    - Prefer existing helpers and abstractions. Preserve APIs, legitimate inputs, and error semantics unless changing them is required by the security contract.
