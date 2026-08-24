@@ -231,12 +231,15 @@ test("diff inventory and previews stay inside the selected repository", async ()
   const installedPluginRoot = await upgradeBundledPlugin(root);
   const repository = join(root, "repository");
   const nested = join(repository, "src", "nested");
+  const removedParent = join(repository, "removed");
   mkdirSync(nested, { recursive: true });
+  mkdirSync(removedParent);
   git(repository, "init", "-q");
   writeFileSync(join(repository, "src", "handler.py"), "value = 1\n");
   writeFileSync(join(repository, "src", "deleted.py"), "removed = True\n");
   writeFileSync(join(repository, "src", "entry.py"), "handler.py");
   writeFileSync(join(nested, "linked.py"), "value = 1\n");
+  writeFileSync(join(removedParent, "deleted.py"), "removed = True\n");
   git(repository, "add", ".");
   const originalLink = git(repository, "hash-object", "src/entry.py");
   git(
@@ -252,6 +255,7 @@ test("diff inventory and previews stay inside the selected repository", async ()
   writeFileSync(join(repository, "src", "entry.py"), "nested/linked.py");
   writeFileSync(join(nested, "linked.py"), "value = 2\n");
   rmSync(join(repository, "src", "deleted.py"));
+  rmSync(removedParent, { recursive: true });
   git(repository, "add", ".");
   const updatedLink = git(repository, "hash-object", "src/entry.py");
   git(
@@ -281,14 +285,39 @@ test("diff inventory and previews stay inside the selected repository", async ()
     "--out",
     output,
   ];
+  const inventoryOutput = join(root, "in-scope-files.txt");
+  const inventoryArgs = [
+    "-B",
+    join(installedPluginRoot, "scripts", "generate_in_scope_files.py"),
+    "--repo",
+    repository,
+    "--scope",
+    ".",
+    "--out",
+    inventoryOutput,
+    "--diff-base",
+    base,
+    "--diff-head",
+    head,
+    "--diff-mode",
+    "local-patch",
+  ];
   const result = spawnSync(python!, args, { encoding: "utf8" });
+  const safeInventory = spawnSync(python!, inventoryArgs, {
+    encoding: "utf8",
+  });
 
   expect(result.status, result.stderr).toBe(0);
+  expect(safeInventory.status, safeInventory.stderr).toBe(0);
+  expect(readFileSync(inventoryOutput, "utf8")).toContain(
+    "removed/deleted.py\n",
+  );
   const rows = readFileSync(output, "utf8")
     .trim()
     .split("\n")
     .map((row) => JSON.parse(row) as { path: string; preview: string });
   expect(rows.map((row) => row.path)).toEqual([
+    "removed/deleted.py",
     "src/deleted.py",
     "src/entry.py",
     "src/handler.py",
@@ -303,31 +332,29 @@ test("diff inventory and previews stay inside the selected repository", async ()
 
   const externalFixture = join(root, "synthetic-fixture");
   mkdirSync(externalFixture);
+  writeFileSync(join(externalFixture, "deleted.py"), "external = True\n");
   writeFileSync(join(externalFixture, "linked.py"), "synthetic = True\n");
+  symlinkSync(externalFixture, removedParent, "junction");
+
+  const escapedDeletion = spawnSync(python!, args, { encoding: "utf8" });
+  const deletionInventory = spawnSync(python!, inventoryArgs, {
+    encoding: "utf8",
+  });
+  expect([escapedDeletion.status, deletionInventory.status]).toEqual([1, 2]);
+  expect(escapedDeletion.stderr).toContain(
+    "Changed Git working-tree paths must stay inside the selected target.",
+  );
+  expect(deletionInventory.stderr).toContain(
+    "changed Git working-tree paths must stay inside the selected target",
+  );
+
+  rmSync(removedParent);
+  git(repository, "update-index", "--skip-worktree", "src/nested/linked.py");
   rmSync(nested, { recursive: true });
   symlinkSync(externalFixture, nested, "junction");
 
   const escaped = spawnSync(python!, args, { encoding: "utf8" });
-  const inventory = spawnSync(
-    python!,
-    [
-      "-B",
-      join(installedPluginRoot, "scripts", "generate_in_scope_files.py"),
-      "--repo",
-      repository,
-      "--scope",
-      ".",
-      "--out",
-      join(root, "in-scope-files.txt"),
-      "--diff-base",
-      base,
-      "--diff-head",
-      head,
-      "--diff-mode",
-      "local-patch",
-    ],
-    { encoding: "utf8" },
-  );
+  const inventory = spawnSync(python!, inventoryArgs, { encoding: "utf8" });
   expect([escaped.status, inventory.status]).toEqual([1, 2]);
   expect(escaped.stderr).toContain(
     "Changed Git working-tree paths must stay inside the selected target.",
