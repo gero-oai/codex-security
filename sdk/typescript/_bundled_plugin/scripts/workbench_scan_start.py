@@ -11,6 +11,7 @@ import tempfile
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 # Some plugin hosts launch Python with safe-path isolation enabled.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -166,7 +167,7 @@ def insert_running_scan(
     model: str | None = None,
     reasoning_effort: str | None = None,
     scan_dir: Path | None = None,
-    source_paths: list[str] | None = None,
+    source_scopes: dict[str, Any] | None = None,
 ) -> str:
     revision = target_identity[0]
     native_scan = scan_dir is None
@@ -178,12 +179,13 @@ def insert_running_scan(
                 dir=target_root,
             )
         ).resolve()
-    source_scopes = capture_source_scopes(
-        target,
-        target_identity,
-        source_paths or [scope],
-        diff_target_kind=diff_target["kind"] if diff_target is not None else None,
-    )
+    if source_scopes is None:
+        source_scopes = capture_source_scopes(
+            target,
+            target_identity,
+            [scope],
+            diff_target_kind=diff_target["kind"] if diff_target is not None else None,
+        )
     connection.execute(
         """
         INSERT INTO scans (

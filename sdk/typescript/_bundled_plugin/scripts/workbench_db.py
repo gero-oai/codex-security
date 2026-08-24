@@ -101,7 +101,13 @@ from workbench_schema import (
 from workbench_schema import (
     sql_statements as sql_statements,
 )
-from workbench_source_excerpt import finding_source_excerpt, safe_source_path
+from workbench_source_excerpt import (
+    SourceContext,
+    capture_source_scopes,
+    finding_source_excerpt_from_context,
+    safe_source_path,
+    source_excerpt_context,
+)
 from workbench_target import (
     clean_worktree_content_digest,
     committed_diff_content_snapshot,
@@ -2280,6 +2286,12 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
             ) = committed_diff_content_snapshot(repository, base, head)
     mode = "diff" if diff_target is not None else recipe["mode"]
     target_identity = scan_target_identity(repository, diff_target)
+    source_scopes = capture_source_scopes(
+        repository,
+        target_identity,
+        paths or ["."],
+        diff_target_kind=diff_target["kind"] if diff_target is not None else None,
+    )
     scope_file_count = (
         directory_snapshot_regular_file_count(repository)
         if not paths
@@ -2394,7 +2406,7 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
             timestamp=timestamp,
             handoff_status="delivered",
             scan_dir=scan_dir,
-            source_paths=paths or ["."],
+            source_scopes=source_scopes,
         )
         connection.execute(
             "UPDATE scans SET recipe_json = ?, parent_scan_id = ?, user_context = ? WHERE id = ?",
@@ -3860,7 +3872,7 @@ def list_findings(connection: sqlite3.Connection, args: argparse.Namespace) -> d
     next_offset = args.offset + len(rows)
     return {
         "findingsPage": {
-            "findings": [finding_result(connection, scan, row) for row in rows],
+            "findings": finding_results(connection, scan, rows),
             "limit": limit,
             "nextOffset": next_offset if next_offset < total else None,
             "offset": args.offset,
@@ -3959,7 +3971,7 @@ def scan_result(
         "contract": scan_contract(scan),
         "continuationThreadId": scan["continuation_thread_id"],
         "failureMessage": scan["failure_message"],
-        "findings": [finding_result(connection, scan, row) for row in occurrence_rows],
+        "findings": finding_results(connection, scan, occurrence_rows),
         "findingCount": finding_count,
         "findingsTruncated": finding_count > len(occurrence_rows),
         "severityCounts": severity_counts,
@@ -4102,10 +4114,51 @@ def legacy_finding_matches(row: sqlite3.Row, finding: Any) -> bool:
     )
 
 
+def scan_source_excerpt_context(
+    scan: sqlite3.Row,
+) -> tuple[Path | None, SourceContext | None]:
+    try:
+        target = require_scan_target_identity(scan)
+    except SystemExit:
+        return None, None
+    try:
+        selected_paths = requested_scan_paths(scan)
+    except (IndexError, KeyError, TypeError, ValueError):
+        selected_paths = []
+    if not isinstance(selected_paths, list) or not all(
+        isinstance(path, str) for path in selected_paths
+    ):
+        selected_paths = []
+    return target, source_excerpt_context(scan, target, selected_paths)
+
+
+def finding_results(
+    connection: sqlite3.Connection,
+    scan: sqlite3.Row,
+    occurrences: list[sqlite3.Row],
+) -> list[dict[str, Any]]:
+    if not occurrences:
+        return []
+    target, source_context = scan_source_excerpt_context(scan)
+    return [
+        finding_result(
+            connection,
+            scan,
+            occurrence,
+            target=target,
+            source_context=source_context,
+        )
+        for occurrence in occurrences
+    ]
+
+
 def finding_result(
     connection: sqlite3.Connection,
     scan: sqlite3.Row,
     occurrence: sqlite3.Row,
+    *,
+    target: Path | None,
+    source_context: SourceContext | None,
 ) -> dict[str, Any]:
     details = bounded_finding_details(read_finding_details(occurrence["details_json"]))
     confidence = details.get("confidence")
@@ -4114,10 +4167,6 @@ def finding_result(
     severity = severity if isinstance(severity, dict) else {}
     excerpt_locations = []
     locations = []
-    try:
-        target = require_scan_target_identity(scan)
-    except SystemExit:
-        target = None
     for row in connection.execute(
         """
         SELECT relative_path, start_line, end_line, role
@@ -4180,16 +4229,8 @@ def finding_result(
         result["knownSince"] = known_since
         result["knownScanIds"] = known_scan_ids
     result.pop("artifactPaths", None)
-    try:
-        selected_paths = requested_scan_paths(scan)
-    except (IndexError, KeyError, TypeError, ValueError):
-        selected_paths = []
-    if not isinstance(selected_paths, list) or not all(
-        isinstance(path, str) for path in selected_paths
-    ):
-        selected_paths = []
-    source_excerpt = finding_source_excerpt(
-        scan, target, excerpt_locations, selected_paths
+    source_excerpt = finding_source_excerpt_from_context(
+        source_context, excerpt_locations
     )
     if source_excerpt:
         result["sourceExcerpt"] = source_excerpt

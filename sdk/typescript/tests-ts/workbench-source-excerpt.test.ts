@@ -454,20 +454,60 @@ describe("workbench source excerpts", () => {
     ]);
     const cliScanDirectory = join(root, "cli-scan");
     mkdirSync(cliScanDirectory, { mode: 0o700 });
-    const cli = await workbench(root, [
-      "register-cli-scan",
-      "--repository",
+    const recipe = JSON.stringify({
+      config: {},
+      mode: "standard",
       repository,
-      "--scan-dir",
-      cliScanDirectory,
-      "--recipe-json",
-      JSON.stringify({
-        config: {},
-        mode: "standard",
+      target: { kind: "paths", paths: ["src/allowed.py", "other"] },
+    });
+    const cliProgram = String.raw`
+import argparse, json, os, sys
+os.environ["CODEX_SECURITY_STATE_DIR"] = sys.argv[2]
+sys.path.insert(0, sys.argv[1])
+import workbench_db
+
+connection = workbench_db.connect()
+original_capture = workbench_db.capture_source_scopes
+transaction_states = []
+def capture(*arguments, **keywords):
+    transaction_states.append(connection.in_transaction)
+    return original_capture(*arguments, **keywords)
+workbench_db.capture_source_scopes = capture
+try:
+    result = workbench_db.register_cli_scan(connection, argparse.Namespace(
+        archive_existing=False,
+        archived_scan_dir=None,
+        parent_scan_id=None,
+        recipe_json=sys.argv[5],
+        recipe_json_stdin=False,
+        registration_json_stdin=False,
+        repository=sys.argv[3],
+        scan_dir=sys.argv[4],
+    ))
+finally:
+    workbench_db.capture_source_scopes = original_capture
+    connection.close()
+result["capturedOutsideTransaction"] = transaction_states == [False]
+print(json.dumps(result))
+`;
+    const cliResult = spawnSync(
+      python(),
+      [
+        "-I",
+        "-B",
+        "-c",
+        cliProgram,
+        join(PLUGIN_ROOT, "scripts"),
+        join(root, "state"),
         repository,
-        target: { kind: "paths", paths: ["src/allowed.py", "other"] },
-      }),
-    ]);
+        cliScanDirectory,
+        recipe,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(cliResult.status, cliResult.stderr).toBe(0);
+    const cli = JSON.parse(cliResult.stdout) as Record<string, unknown>;
+    expect(cli["capturedOutsideTransaction"]).toBe(true);
     const deep = await workbench(root, [
       "begin-deep-scan",
       "--thread-id",
@@ -591,25 +631,26 @@ workbench_db.finding_triage_result = lambda database, occurrence_id: None
 workbench_db.scan_history.finding_matches = lambda *arguments: ([], None, [])
 seen = []
 selected_paths_seen = []
-def source_excerpt(scan, selected, locations, selected_paths):
-    seen.append([location["path"] for location in locations])
+authority_context = (target, ())
+def prepare_context(scan, selected, selected_paths):
     selected_paths_seen.append(selected_paths)
-    if selected_paths and locations[0]["path"] == raw_path:
+    return authority_context if selected_paths else None
+def source_excerpt(context, locations):
+    seen.append([location["path"] for location in locations])
+    if context is authority_context and locations[0]["path"] == raw_path:
         return "1  raw_path_authorized = True"
     return None
-workbench_db.finding_source_excerpt = source_excerpt
+workbench_db.source_excerpt_context = prepare_context
+workbench_db.finding_source_excerpt_from_context = source_excerpt
 scan = {"id": "scan", "started_at": "now", "scan_dir": str(target), "scope": "."}
 occurrence = {"id": "occurrence", "details_json": "{}", "confidence": "high", "severity": "high", "created_at": "now", "finding_id": "finding", "remediation": "fix", "summary": "summary", "title": "title"}
-finding = workbench_db.finding_result(
-    connection,
-    scan,
-    occurrence,
-)
-malformed = workbench_db.finding_result(
+findings = workbench_db.finding_results(connection, scan, [occurrence, occurrence])
+finding = findings[0]
+malformed = workbench_db.finding_results(
     connection,
     {**scan, "recipe_json": json.dumps({"target": {"kind": "paths", "paths": 42}})},
-    occurrence,
-)
+    [occurrence],
+)[0]
 display_path = finding["locations"][0]["path"]
 print(json.dumps({
     "displayBytes": len(display_path.encode()),
@@ -617,7 +658,8 @@ print(json.dumps({
     "excerpt": finding.get("sourceExcerpt"),
     "malformedExcerpt": malformed.get("sourceExcerpt"),
     "malformedTitle": malformed.get("title"),
-    "sawRawPath": seen == [[raw_path], [raw_path]],
+    "reusedExcerpt": findings[1].get("sourceExcerpt"),
+    "sawRawPath": seen == [[raw_path], [raw_path], [raw_path]],
     "sawSelectedPaths": selected_paths_seen == [["."], []],
 }))
 `;
@@ -633,6 +675,7 @@ print(json.dumps({
       excerpt: "1  raw_path_authorized = True",
       malformedExcerpt: null,
       malformedTitle: "title",
+      reusedExcerpt: "1  raw_path_authorized = True",
       sawRawPath: true,
       sawSelectedPaths: true,
     });

@@ -29,6 +29,7 @@ OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 TreeEntry = tuple[str, str, str]
 SourceScope = dict[str, str]
+SourceContext = tuple[Path, tuple[SourceScope, ...]]
 
 
 def normalized_path_component(value: str) -> str:
@@ -196,7 +197,7 @@ def capture_source_scopes(
 
 def load_source_scopes(
     scan: sqlite3.Row, target: Path, selected_paths: list[str]
-) -> tuple[Path, tuple[SourceScope, ...]] | None:
+) -> SourceContext | None:
     try:
         saved = scan["source_scopes_json"]
     except (IndexError, KeyError):
@@ -272,15 +273,14 @@ def source_object_for_path(
     return entry[2] if entry is not None and entry[1] == "file" else None
 
 
-def finding_source_excerpt(
+def source_excerpt_context(
     scan: sqlite3.Row,
     target: Path | None,
-    locations: list[dict[str, Any]],
     selected_paths: list[str],
-) -> str | None:
+) -> SourceContext | None:
     if scan["mode"] == "diff" and scan["diff_target_kind"] not in {"commit", "range"}:
         return None
-    if target is None or not locations or scan["target_revision"] == "unversioned":
+    if target is None or scan["target_revision"] == "unversioned":
         return None
     snapshot = scan["target_snapshot_digest"]
     if snapshot is not None and snapshot != clean_worktree_content_digest():
@@ -289,7 +289,14 @@ def finding_source_excerpt(
         context = load_source_scopes(scan, target, selected_paths)
     except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
         return None
-    if context is None:
+    return context
+
+
+def finding_source_excerpt_from_context(
+    context: SourceContext | None,
+    locations: list[dict[str, Any]],
+) -> str | None:
+    if context is None or not locations:
         return None
     repository, scopes = context
 
@@ -341,6 +348,18 @@ def finding_source_excerpt(
         for line_number in range(excerpt_start, excerpt_end + 1)
     )
     return excerpt.encode("utf-8")[:MAX_BYTES].decode("utf-8", errors="ignore")
+
+
+def finding_source_excerpt(
+    scan: sqlite3.Row,
+    target: Path | None,
+    locations: list[dict[str, Any]],
+    selected_paths: list[str],
+) -> str | None:
+    return finding_source_excerpt_from_context(
+        source_excerpt_context(scan, target, selected_paths),
+        locations,
+    )
 
 
 def scanned_source_text(repository: Path, object_id: str) -> str | None:
