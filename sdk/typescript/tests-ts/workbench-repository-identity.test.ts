@@ -493,8 +493,7 @@ elif scenario == "recreated-directory":
         "SELECT target_device, target_inode FROM scans WHERE id = 'before-recreation'"
     ).fetchone()
 
-    shutil.rmtree(target)
-    (root / "retired-directory-inode").mkdir()
+    target.rename(root / "retired-directory-inode")
     target.mkdir()
     (target / "service.py").write_text("value = 2\n")
     recreated_metadata = target.stat()
@@ -517,8 +516,7 @@ elif scenario == "recreated-directory":
     plain = root / "recreated-nongit"
     plain.mkdir()
     add_scan("plain-before-recreation", plain)
-    shutil.rmtree(plain)
-    (root / "retired-nongit-inode").mkdir()
+    plain.rename(root / "retired-nongit-inode")
     plain.mkdir()
     try:
         ensure_security_target(connection, str(plain))
@@ -532,8 +530,7 @@ elif scenario == "recreated-directory":
     root_identity = repository_identity(worktree)
     root_metadata = worktree.stat()
     git_pointer = (worktree / ".git").read_text()
-    shutil.rmtree(worktree)
-    (root / "retired-worktree-root-inode").mkdir()
+    worktree.rename(root / "retired-worktree-root-inode")
     worktree.mkdir()
     (worktree / ".git").write_text(git_pointer)
     try:
