@@ -20,8 +20,8 @@ type ReducerFinding = {
   identity: { anchor: string };
   locations: Array<{ path: string; startLine: number }>;
   summary: string;
-  severity?: { level: string };
-  confidence?: { level: string; rationale?: string };
+  severity?: { level: string; [field: string]: unknown };
+  confidence?: { level: string; rationale?: string; [field: string]: unknown };
   rootCause?: { summary: string; evidenceRefs?: string[] };
   codeEvidence?: Array<{ id: string; code: string }>;
   validation?: { summary: string };
@@ -283,8 +283,18 @@ test("rejects reduced severity or confidence for accepted source findings", asyn
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
   const accepted: ReducerFinding = {
     ...reducerFinding("accepted"),
-    severity: { level: "high" },
-    confidence: { level: "high", rationale: "Confirmed accepted evidence." },
+    severity: {
+      level: "high",
+      score: 8.2,
+      vector: "synthetic-accepted-vector",
+      rationale: "Accepted severity evidence.",
+      conditions: { review: "Accepted conditions." },
+    },
+    confidence: {
+      level: "high",
+      rationale: "Confirmed accepted evidence.",
+      conditions: { validation: "Accepted source trace." },
+    },
   };
   const reduced = {
     ...accepted,
@@ -300,6 +310,61 @@ test("rejects reduced severity or confidence for accepted source findings", asyn
       },
       error: "confidence",
     },
+    {
+      finding: {
+        ...reduced,
+        confidence: {
+          ...accepted.confidence!,
+          rationale: "Dynamic exploitation succeeded.",
+        },
+      },
+      error: "confidence",
+    },
+    {
+      finding: { ...reduced, confidence: { level: "high" } },
+      error: "confidence",
+    },
+    {
+      finding: {
+        ...reduced,
+        confidence: {
+          ...accepted.confidence!,
+          conditions: { validation: "Invented validation." },
+        },
+      },
+      error: "confidence",
+    },
+    {
+      finding: {
+        ...reduced,
+        severity: { ...accepted.severity!, score: 10 },
+      },
+      error: "severity",
+    },
+    {
+      finding: {
+        ...reduced,
+        severity: {
+          ...accepted.severity!,
+          vector: "synthetic-invented-vector",
+        },
+      },
+      error: "severity",
+    },
+    {
+      finding: { ...reduced, severity: { level: "high" } },
+      error: "severity",
+    },
+    {
+      finding: {
+        ...reduced,
+        severity: {
+          ...accepted.severity!,
+          conditions: { review: "Invented conditions." },
+        },
+      },
+      error: "severity",
+    },
   ]) {
     expect(() =>
       reconcileDeepReduction(
@@ -309,6 +374,44 @@ test("rejects reduced severity or confidence for accepted source findings", asyn
       ),
     ).toThrow(error);
   }
+});
+
+test("retains complete source-backed ratings at their strongest accepted levels", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const lower: ReducerFinding = {
+    ...reducerFinding("shared", "First independently accepted observation."),
+    severity: { level: "low", score: 2.1, rationale: "Limited exposure." },
+    confidence: { level: "high", rationale: "First accepted trace." },
+  };
+  const stronger: ReducerFinding = {
+    ...reducerFinding("shared", "Second independently accepted observation."),
+    severity: {
+      level: "high",
+      score: 8.2,
+      vector: "synthetic-accepted-vector",
+      conditions: { validation: "Second accepted trace." },
+    },
+    confidence: { level: "high", rationale: "Second accepted trace." },
+  };
+  const reduced = reconcileDeepReduction(
+    reducerDraft([
+      {
+        ...stronger,
+        provenance: {
+          ...stronger.provenance,
+          sourceFindingIds: ["first:0", "second:0"],
+        },
+      },
+    ]),
+    [
+      { workerId: "first", result: reducerDraft([lower]) },
+      { workerId: "second", result: reducerDraft([stronger]) },
+    ],
+    null,
+  );
+
+  expect(reduced.findings[0]?.severity).toEqual(stronger.severity);
+  expect(reduced.findings[0]?.confidence).toEqual(stronger.confidence);
 });
 
 test("keeps accepted source evidence visible on the reduced finding", async () => {
@@ -470,10 +573,15 @@ test("renames colliding accepted code-evidence IDs and preserves every reference
 
 test("accepts threat-model synthesis grounded in accepted scope and finding evidence", async () => {
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
-  const threatModelSource = reducerDraft([], {
+  const shared = reducerFinding("shared", "Accepted shared request path.");
+  const independent = reducerFinding(
+    "independent",
+    "Accepted independent request path.",
+  );
+  const threatModelSource = reducerDraft([shared], {
     threatModel: { summary: "Requests may reach shared code." },
   });
-  const scopeSource = reducerDraft([], {
+  const scopeSource = reducerDraft([independent], {
     scope: { summary: "Shared and independent request handling." },
   });
   const discoveries = [
@@ -482,7 +590,7 @@ test("accepts threat-model synthesis grounded in accepted scope and finding evid
   ];
 
   const reduced = reconcileDeepReduction(
-    reducerDraft([], {
+    reducerDraft([shared, independent], {
       scope: scopeSource.scope,
       threatModel: { summary: "Requests reach shared and independent code." },
     }),
@@ -495,13 +603,37 @@ test("accepts threat-model synthesis grounded in accepted scope and finding evid
 
   expect(() =>
     reconcileDeepReduction(
-      reducerDraft([], {
+      reducerDraft([shared, independent], {
         scope: scopeSource.scope,
         threatModel: {
           summary: "Unauthenticated remote attackers exploit the service.",
         },
       }),
       discoveries,
+      null,
+    ),
+  ).toThrow("threatModel.summary");
+
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([], {
+        scope: scopeSource.scope,
+        threatModel: {
+          summary: "Requests reach shared and independent code.",
+        },
+      }),
+      [
+        {
+          workerId: "threat-model",
+          result: reducerDraft([], {
+            threatModel: threatModelSource.threatModel,
+          }),
+        },
+        {
+          workerId: "scope",
+          result: reducerDraft([], { scope: scopeSource.scope }),
+        },
+      ],
       null,
     ),
   ).toThrow("threatModel.summary");
@@ -527,6 +659,33 @@ test("accepts threat-model synthesis grounded in accepted scope and finding evid
   expect(independentlyGrounded.threatModel?.["summary"]).toBe(
     `${firstClaim} ${secondClaim}`,
   );
+
+  const overlappingFirst = "Remote attackers are not trusted.";
+  const overlappingSecond = "Remote attackers are not privileged.";
+  expect(
+    reconcileDeepReduction(
+      reducerDraft([], {
+        threatModel: {
+          summary: `${overlappingFirst} ${overlappingSecond}`,
+        },
+      }),
+      [
+        {
+          workerId: "trust-boundary",
+          result: reducerDraft([], {
+            threatModel: { summary: overlappingFirst },
+          }),
+        },
+        {
+          workerId: "privilege-boundary",
+          result: reducerDraft([], {
+            threatModel: { summary: overlappingSecond },
+          }),
+        },
+      ],
+      null,
+    ).threatModel?.["summary"],
+  ).toBe(`${overlappingFirst} ${overlappingSecond}`);
 });
 
 test("rejects threat-model synthesis that drops or reverses accepted claims", async () => {
@@ -574,6 +733,18 @@ test("rejects threat-model synthesis that drops or reverses accepted claims", as
       synthesized: "Trusted attackers are not remote.",
     },
     {
+      accepted: "No authentication is required.",
+      synthesized: "No, authentication is required.",
+    },
+    {
+      accepted: "No remote attacker is trusted.",
+      synthesized: "No, remote attacker is trusted.",
+    },
+    {
+      accepted: "Remote attackers are trusted.",
+      synthesized: "Remote attackers are trusted?",
+    },
+    {
       accepted: "Remote attackers are trusted.",
       synthesized: "Remote attackers are not trusted.",
       scope: "Not all request handlers were assessed.",
@@ -614,6 +785,51 @@ test("rejects threat-model synthesis that drops or reverses accepted claims", as
       synthesized:
         "Remote attackers cannot reach admin endpoints except when authenticated.",
       scope: "Except when authenticated.",
+    },
+    {
+      accepted: "Remote attackers can reach admin endpoints.",
+      synthesized:
+        "Remote attackers can reach admin endpoints only after authentication.",
+      scope: "Only after authentication.",
+    },
+    {
+      accepted: "Remote attackers can reach admin endpoints.",
+      synthesized: "Remote attackers can only reach admin endpoints.",
+      scope: "Only after authentication.",
+    },
+    {
+      accepted: "Remote attackers can reach admin endpoints.",
+      synthesized:
+        "Remote attackers can reach admin endpoints if authenticated.",
+      scope: "If authenticated.",
+    },
+    {
+      accepted: "Remote attackers can reach admin endpoints.",
+      synthesized:
+        "Remote attackers can reach admin endpoints when authenticated.",
+      scope: "When authenticated.",
+    },
+    {
+      accepted: "Remote attackers can reach admin endpoints.",
+      synthesized:
+        "Remote attackers can reach admin endpoints provided authentication succeeds.",
+      scope: "Provided authentication succeeds.",
+    },
+    {
+      accepted: "Remote attackers can reach admin endpoints.",
+      synthesized:
+        "Remote attackers can reach admin endpoints following successful authentication.",
+      scope: "Following successful authentication.",
+    },
+    {
+      accepted: "Remote requests are accepted unconditionally.",
+      synthesized: "Remote requests are accepted and not unconditionally.",
+      scope: "Accepted and not audited requests were assessed.",
+    },
+    {
+      accepted: "Authentication is required always.",
+      synthesized: "Authentication is required and not always.",
+      scope: "Required and not audited controls were assessed.",
     },
   ];
 
