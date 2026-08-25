@@ -1117,6 +1117,7 @@ export async function applySecurityPolicy(
     (await readSecurityPolicy(target.targetPath)) === draft.content;
   let written = alreadyApplied && draft.previousContent !== draft.content;
   let recoveryPath: string | null = null;
+  let verificationRecoveryPath: string | null = null;
   let pluginWorkspace: string | undefined;
   try {
     await readDraftContent(target, draft, options.signal);
@@ -1133,7 +1134,7 @@ export async function applySecurityPolicy(
     );
     const protectedRoot = protectedRoots[0]!;
     const recoveryDirectory =
-      alreadyApplied || draft.previousContent === null
+      draft.previousContent === null
         ? null
         : dirname(
             await requireScanFile(
@@ -1145,6 +1146,32 @@ export async function applySecurityPolicy(
           );
     if (recoveryDirectory !== null)
       requireOutputOutsideRepositories(protectedRoots, recoveryDirectory);
+    if (alreadyApplied && recoveryDirectory !== null) {
+      const candidates: string[] = [];
+      for (const entry of await readdir(recoveryDirectory, {
+        withFileTypes: true,
+      })) {
+        if (
+          !entry.isFile() ||
+          !/^recovery-SECURITY-[0-9a-f-]{36}\.md$/u.test(entry.name)
+        )
+          continue;
+        const candidate = await requireScanFile(
+          recoveryDirectory,
+          entry.name,
+          "security policy recovery",
+          options.signal,
+        );
+        if ((await readSecurityPolicy(candidate)) === draft.previousContent)
+          candidates.push(candidate);
+      }
+      if (candidates.length !== 1) {
+        throw new CodexSecurityError(
+          "The installed SECURITY.md cannot be verified without its original recovery file.",
+        );
+      }
+      verificationRecoveryPath = candidates[0]!;
+    }
     const pluginPath = options.pluginPath ?? draft.pluginPath;
     if (draft.customPlugin && pluginPath === undefined) {
       throw new CodexSecurityError(
@@ -1203,6 +1230,13 @@ export async function applySecurityPolicy(
               temporary,
               options.signal,
             );
+          } else if (draft.previousContent !== null) {
+            await execFileAsync(
+              "/bin/cp",
+              ["-p", target.targetPath, temporary],
+              { encoding: "utf8", signal: options.signal },
+            );
+            await temporaryHandle.truncate(0);
           }
           await temporaryHandle.writeFile(draft.content, {
             encoding: "utf8",
@@ -1210,6 +1244,15 @@ export async function applySecurityPolicy(
           });
         } finally {
           await temporaryHandle.close();
+        }
+        if (draft.previousContent !== null && process.platform !== "win32") {
+          await chmod(temporary, (await stat(target.targetPath)).mode & 0o7777);
+          await verifyUnixSecurityMetadata(
+            target.targetPath,
+            temporary,
+            python,
+            options.signal,
+          );
         }
         if (
           (await realpath(dirname(target.targetPath))) !==
@@ -1249,6 +1292,7 @@ export async function applySecurityPolicy(
             target.targetPath,
             draft.previousContent,
             recoveryDirectory!,
+            python,
             options.signal,
           );
         written = true;
@@ -1289,22 +1333,30 @@ export async function applySecurityPolicy(
       previousContent: draft.content,
       inheritedPolicySha256: draft.inheritedPolicySha256,
     });
-    if (recoveryPath !== null) {
-      if (
-        ((await stat(recoveryPath)).mode & 0o777) !==
-        ((await stat(target.targetPath)).mode & 0o777)
-      ) {
-        throw new CodexSecurityError(
-          "SECURITY.md permissions changed while the replacement was being installed.",
-        );
-      }
-      if (process.platform === "win32")
+    const permissionsReference = recoveryPath ?? verificationRecoveryPath;
+    if (permissionsReference !== null) {
+      if (process.platform === "win32") {
+        if (
+          ((await stat(permissionsReference)).mode & 0o777) !==
+          ((await stat(target.targetPath)).mode & 0o777)
+        ) {
+          throw new CodexSecurityError(
+            "SECURITY.md permissions changed while the replacement was being installed.",
+          );
+        }
         await copyWindowsSecurityDescriptor(
-          recoveryPath,
+          permissionsReference,
           target.targetPath,
           undefined,
           true,
         );
+      } else {
+        await verifyUnixSecurityMetadata(
+          permissionsReference,
+          target.targetPath,
+          python,
+        );
+      }
     }
     return {
       status: alreadyApplied ? "unchanged" : "written",
@@ -1312,11 +1364,15 @@ export async function applySecurityPolicy(
       recoveryPath,
     };
   } catch (error) {
-    if (written)
+    if (written) {
+      const retainedRecovery = recoveryPath ?? verificationRecoveryPath;
       throw new SecurityPolicyVerificationError(target.targetPath, {
         cause: error,
-        ...(recoveryPath === null ? {} : { recoveryPath }),
+        ...(retainedRecovery === null
+          ? {}
+          : { recoveryPath: retainedRecovery }),
       });
+    }
     throw error;
   } finally {
     if (pluginWorkspace !== undefined)
@@ -1495,12 +1551,31 @@ async function copyWindowsSecurityDescriptor(
             "}",
           ].join(" "),
           "$sourceAuditRules = & $auditRules $acl",
-          `Microsoft.PowerShell.Utility\\Add-Type -Name PolicyIntegrity -Namespace CodexSecurity -MemberDefinition '${integrityMethods}'`,
-          "$descriptor = [System.IntPtr]::Zero",
-          `$status = [CodexSecurity.PolicyIntegrity]::GetNamedSecurityInfo($env:${sourceVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$descriptor)`,
-          "if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) }",
-          "$destinationLabelDescriptor = [System.IntPtr]::Zero",
           [
+            "$auditControlMask =",
+            "[System.Security.AccessControl.ControlFlags]::SystemAclPresent",
+            "-bor [System.Security.AccessControl.ControlFlags]::SystemAclDefaulted",
+            "-bor [System.Security.AccessControl.ControlFlags]::SystemAclAutoInheritRequired",
+            "-bor [System.Security.AccessControl.ControlFlags]::SystemAclAutoInherited",
+            "-bor [System.Security.AccessControl.ControlFlags]::SystemAclProtected",
+          ].join(" "),
+          "$auditControl = { param($descriptor) [System.Security.AccessControl.RawSecurityDescriptor]::new($descriptor.GetSecurityDescriptorBinaryForm(), 0).ControlFlags -band $auditControlMask }",
+          "$sourceAuditControl = & $auditControl $acl",
+          [
+            "$describe = { param([string]$path)",
+            "$lines = @(& ([System.IO.Path]::Combine($env:SystemRoot, 'System32', 'icacls.exe')) $path);",
+            "if ($LASTEXITCODE -ne 0 -or $lines.Count -eq 0 -or -not $lines[0].StartsWith($path, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Could not inspect the complete Windows security descriptor.' };",
+            "$lines[0] = $lines[0].Substring($path.Length);",
+            "$lines | Microsoft.PowerShell.Core\\ForEach-Object { $_.Trim() }",
+            "}",
+          ].join(" "),
+          `Microsoft.PowerShell.Utility\\Add-Type -Name PolicyIntegrity -Namespace CodexSecurity -MemberDefinition '${integrityMethods}'`,
+          [
+            "$alignLabels = {",
+            "$descriptor = [System.IntPtr]::Zero;",
+            `$status = [CodexSecurity.PolicyIntegrity]::GetNamedSecurityInfo($env:${sourceVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$descriptor);`,
+            "if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) };",
+            "$destinationLabelDescriptor = [System.IntPtr]::Zero;",
             "try {",
             "$present = 0; $label = [System.IntPtr]::Zero; $defaulted = 0;",
             "if (-not [CodexSecurity.PolicyIntegrity]::GetSecurityDescriptorSacl($descriptor, [ref]$present, [ref]$label, [ref]$defaulted)) { throw [System.ComponentModel.Win32Exception]::new() };",
@@ -1512,35 +1587,37 @@ async function copyWindowsSecurityDescriptor(
               ? "if ($sourceHasLabel -ne $destinationHasLabel -or ($sourceHasLabel -and -not [CodexSecurity.PolicyIntegrity]::SameAcl($label, $destinationLabel))) { throw 'The Windows integrity label changed during policy replacement.' }"
               : `if ($sourceHasLabel) { if (-not [CodexSecurity.PolicyIntegrity]::SameAcl($label, $destinationLabel)) { $status = [CodexSecurity.PolicyIntegrity]::SetNamedSecurityInfo($env:${destinationVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, $label); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) } } } elseif ($destinationHasLabel) { $status = [CodexSecurity.PolicyIntegrity]::ClearLabel($env:${destinationVariable}); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) } }`,
             "} finally { if ($destinationLabelDescriptor -ne [System.IntPtr]::Zero) { [void][CodexSecurity.PolicyIntegrity]::LocalFree($destinationLabelDescriptor) }; if ($descriptor -ne [System.IntPtr]::Zero) { [void][CodexSecurity.PolicyIntegrity]::LocalFree($descriptor) } }",
+            "}",
           ].join(" "),
+          "& $alignLabels",
           ...(verifyOnly
             ? []
             : [
                 `$staged = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
                 [
-                  "if ($acl.AreAuditRulesProtected -eq $staged.AreAuditRulesProtected -and $sourceAuditRules -eq (& $auditRules $staged)) {",
+                  "if ($sourceAuditControl -eq (& $auditControl $staged) -and $acl.AreAuditRulesProtected -eq $staged.AreAuditRulesProtected -and $sourceAuditRules -eq (& $auditRules $staged)) {",
+                  "$differentOwner = $acl.GetOwner($identityType).Value -ne $staged.GetOwner($identityType).Value;",
+                  "$differentGroup = $acl.GetGroup($identityType).Value -ne $staged.GetGroup($identityType).Value;",
+                  `$sourceDescription = [string]::Join([System.Environment]::NewLine, (& $describe $env:${sourceVariable}));`,
+                  `$stagedDescription = [string]::Join([System.Environment]::NewLine, (& $describe $env:${destinationVariable}));`,
+                  "if ($differentOwner -or $differentGroup -or $sourceDescription -ne $stagedDescription) {",
                   "$sections = [System.Security.AccessControl.AccessControlSections]::Access;",
-                  "if ($acl.GetOwner($identityType).Value -ne $staged.GetOwner($identityType).Value) { $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Owner };",
-                  "if ($acl.GetGroup($identityType).Value -ne $staged.GetGroup($identityType).Value) { $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Group };",
+                  "if ($differentOwner) { $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Owner };",
+                  "if ($differentGroup) { $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Group };",
                   "$access = [System.Security.AccessControl.FileSecurity]::new();",
                   "$access.SetSecurityDescriptorBinaryForm($acl.GetSecurityDescriptorBinaryForm(), $sections);",
                   `[System.IO.FileInfo]::new($env:${destinationVariable}).SetAccessControl($access)`,
+                  "}",
                   `} else { Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl }`,
                 ].join(" "),
+                "& $alignLabels",
               ]),
           `$copied = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
           "if ($acl.GetOwner($identityType).Value -ne $copied.GetOwner($identityType).Value -or $acl.GetGroup($identityType).Value -ne $copied.GetGroup($identityType).Value) { throw 'The copied Windows security descriptor owner or group differs.' }",
           "if ($acl.AreAuditRulesProtected -ne $copied.AreAuditRulesProtected) { throw 'The copied Windows audit inheritance settings differ.' }",
+          "if ($sourceAuditControl -ne (& $auditControl $copied)) { throw 'The copied Windows audit control settings differ.' }",
           "$destinationAuditRules = & $auditRules $copied",
           "if ($sourceAuditRules -ne $destinationAuditRules) { throw 'The copied Windows audit rules differ.' }",
-          [
-            "$describe = { param([string]$path)",
-            "$lines = @(& ([System.IO.Path]::Combine($env:SystemRoot, 'System32', 'icacls.exe')) $path);",
-            "if ($LASTEXITCODE -ne 0 -or $lines.Count -eq 0 -or -not $lines[0].StartsWith($path, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Could not inspect the complete Windows security descriptor.' };",
-            "$lines[0] = $lines[0].Substring($path.Length);",
-            "$lines | Microsoft.PowerShell.Core\\ForEach-Object { $_.Trim() }",
-            "}",
-          ].join(" "),
           `$sourceDescriptor = [string]::Join([System.Environment]::NewLine, (& $describe $env:${sourceVariable}))`,
           `$destinationDescriptor = [string]::Join([System.Environment]::NewLine, (& $describe $env:${destinationVariable}))`,
           "if ($sourceDescriptor -ne $destinationDescriptor) { throw 'The copied Windows security descriptor or integrity label differs.' }",
@@ -1572,11 +1649,69 @@ async function copyWindowsSecurityDescriptor(
   }
 }
 
+async function unixSecurityAccess(
+  path: string,
+  python: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (process.platform === "darwin") {
+    const { stdout } = await execFileAsync("/bin/ls", ["-ledn", path], {
+      encoding: "utf8",
+      signal,
+    });
+    return stdout.split(/\r?\n/u).slice(1).join("\n");
+  }
+  if (process.platform === "linux") {
+    const script = [
+      "import base64, errno, os, sys",
+      "try:",
+      "    value = os.getxattr(sys.argv[1], 'system.posix_acl_access', follow_symlinks=False)",
+      "except OSError as error:",
+      "    if error.errno not in {errno.ENODATA, errno.ENOTSUP, getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP)}:",
+      "        raise",
+      "    value = b''",
+      "sys.stdout.write(base64.b64encode(value).decode('ascii'))",
+    ].join("\n");
+    const { stdout } = await execFileAsync(python, ["-I", "-c", script, path], {
+      encoding: "utf8",
+      signal,
+    });
+    return stdout;
+  }
+  return "";
+}
+
+async function verifyUnixSecurityMetadata(
+  source: string,
+  destination: string,
+  python: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const [sourceMetadata, destinationMetadata, sourceAccess, destinationAccess] =
+    await Promise.all([
+      stat(source),
+      stat(destination),
+      unixSecurityAccess(source, python, signal),
+      unixSecurityAccess(destination, python, signal),
+    ]);
+  if (
+    sourceMetadata.uid !== destinationMetadata.uid ||
+    sourceMetadata.gid !== destinationMetadata.gid ||
+    (sourceMetadata.mode & 0o7777) !== (destinationMetadata.mode & 0o7777) ||
+    sourceAccess !== destinationAccess
+  ) {
+    throw new CodexSecurityError(
+      "SECURITY.md ownership, permissions, or access-control entries changed while the replacement was being installed.",
+    );
+  }
+}
+
 async function replaceExistingPolicy(
   temporary: string,
   targetPath: string,
   previousContent: string,
   recoveryDirectory: string,
+  python: string,
   signal?: AbortSignal,
 ): Promise<string> {
   const recoveryPath = `${temporary}.previous`;
@@ -1596,7 +1731,8 @@ async function replaceExistingPolicy(
       );
     }
     const mode = (await stat(recoveryPath)).mode & 0o777;
-    if (process.platform !== "win32") await chmod(temporary, mode);
+    if (process.platform !== "win32")
+      await verifyUnixSecurityMetadata(recoveryPath, temporary, python, signal);
     else if (((await stat(temporary)).mode & 0o777) !== mode) {
       throw new CodexSecurityError(
         "SECURITY.md permissions changed while the replacement was being installed.",

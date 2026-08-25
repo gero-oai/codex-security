@@ -1559,6 +1559,97 @@ describe("security policy review and application", () => {
   );
 
   test.skipIf(process.platform !== "win32")(
+    "preserves an ordinary Windows policy without rewriting its audit settings",
+    async () => {
+      const name =
+        "preserves an ordinary Windows policy without rewriting its audit settings";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      await writeFile(target, "# Existing policy\n");
+      const systemDirectory = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+      );
+      const powershell = join(
+        systemDirectory,
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+      const environment = {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([key]) => key.toUpperCase() !== "PSMODULEPATH",
+          ),
+        ),
+        CODEX_SECURITY_TEST_ACL_PATH: target,
+        PSModulePath: join(
+          systemDirectory,
+          "WindowsPowerShell",
+          "v1.0",
+          "Modules",
+        ),
+      };
+      const descriptor = () =>
+        JSON.parse(
+          execFileSync(
+            powershell,
+            [
+              "-NoLogo",
+              "-NoProfile",
+              "-NonInteractive",
+              "-Command",
+              [
+                "$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -Audit",
+                "[pscustomobject]@{ Protected = $acl.AreAuditRulesProtected; Rules = $acl.GetAuditRules($true, $true, [System.Security.Principal.SecurityIdentifier]).Count; Sddl = $acl.Sddl } | Microsoft.PowerShell.Utility\\ConvertTo-Json -Compress",
+              ].join("; "),
+            ],
+            { encoding: "utf8", env: environment, windowsHide: true },
+          ),
+        ) as { Protected: boolean; Rules: number; Sddl: string };
+      const before = descriptor();
+      expect(before.Rules).toBe(0);
+      const draft = await f.generate();
+      await applySecurityPolicy(draft);
+      expect(await readFile(target, "utf8")).toBe(POLICY);
+      expect(descriptor()).toEqual(before);
+    },
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "preserves Unix ownership, special permissions, and access-control entries",
+    async () => {
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      await writeFile(target, "# Existing policy\n");
+      const identity = await stat(target);
+      const secondaryGroup = (process.getgroups?.() ?? []).find(
+        (group) => group !== identity.gid,
+      );
+      if (secondaryGroup !== undefined)
+        await fsPromises.chown(target, identity.uid, secondaryGroup);
+      await chmod(target, 0o2750);
+      execFileSync("/bin/chmod", ["+a", "everyone allow read", target]);
+      const accessControl = (path: string) =>
+        execFileSync("/bin/ls", ["-ledn", path], { encoding: "utf8" })
+          .split(/\r?\n/u)
+          .slice(1)
+          .join("\n");
+      const previous = await stat(target);
+      const previousAccess = accessControl(target);
+      expect(previousAccess).toContain("allow read");
+      const draft = await f.generate();
+      await applySecurityPolicy(draft);
+      const installed = await stat(target);
+      expect(installed.uid).toBe(previous.uid);
+      expect(installed.gid).toBe(previous.gid);
+      expect(installed.mode & 0o7777).toBe(previous.mode & 0o7777);
+      expect(accessControl(target)).toBe(previousAccess);
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
     "preserves an existing Windows security descriptor",
     async () => {
       const name = "preserves an existing Windows security descriptor";
@@ -1991,6 +2082,13 @@ describe("security policy review and application", () => {
         expect((await stat(target)).mode & 0o777).toBe(0o644);
         expect((await stat(recovery!)).mode & 0o777).toBe(0o600);
         expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
+        const retry = await applySecurityPolicy(draft).catch(
+          (value: unknown) => value,
+        );
+        expect(retry).toBeInstanceOf(SecurityPolicyVerificationError);
+        expect((retry as SecurityPolicyVerificationError).recoveryPath).toBe(
+          recovery,
+        );
       } finally {
         await writer.close();
         mock.module("node:fs/promises", () => ({
