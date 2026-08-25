@@ -2453,6 +2453,8 @@ describe("live scan cost tracking", () => {
       "def task_event(turn_id):",
       "    return {'type': 'event_msg', 'timestamp': stamp, 'payload': {'type': 'task_started', 'turn_id': turn_id, 'started_at': fork['startedAt']}}",
       "metadata = {'id': thread, 'parent_thread_id': parent}",
+      "if case.get('forkOnly'):",
+      "    del metadata['parent_thread_id']",
       "if inherited is not None and not case.get('copiedHistory'):",
       "    metadata['forked_from_id'] = parent",
       "events = [{'type': 'session_meta', 'payload': metadata}]",
@@ -2484,6 +2486,7 @@ describe("live scan cost tracking", () => {
       expected: Usage;
       inherited?: Usage;
       copiedHistory?: boolean;
+      forkOnly?: boolean;
       limit?: number;
     }> = [
       {
@@ -2641,6 +2644,7 @@ describe("live scan cost tracking", () => {
         expected: { input_tokens: 2_500, output_tokens: 1_100 },
       },
       inheritedReset,
+      { ...inheritedReset, forkOnly: true },
       { ...inheritedReset, copiedHistory: true },
       {
         samples: [
@@ -2655,6 +2659,7 @@ describe("live scan cost tracking", () => {
       samples,
       inherited,
       copiedHistory,
+      forkOnly,
       expected: counters,
       limit,
     } of cases) {
@@ -2677,6 +2682,7 @@ describe("live scan cost tracking", () => {
             samples,
             inherited,
             copiedHistory,
+            forkOnly,
             fork: accountingFork,
           }),
         ],
@@ -2736,7 +2742,7 @@ describe("live scan cost tracking", () => {
               [accountingFork.threadId]: accountingSession(
                 accountingFork.threadId,
                 events,
-                "scan-thread",
+                forkOnly ? undefined : "scan-thread",
                 {
                   ...metadata,
                   ...(copiedHistory ? {} : { forked_from_id: "scan-thread" }),
@@ -2766,6 +2772,108 @@ describe("live scan cost tracking", () => {
       );
     }
   });
+
+  test.each([
+    ["fork-only delegated worker", { forked_from_id: "scan-thread" }, true],
+    [
+      "nested spawn parent precedence",
+      {
+        source: {
+          subagent: { thread_spawn: { parent_thread_id: "scan-thread" } },
+        },
+        parent_thread_id: "unrelated-thread",
+        forked_from_id: "another-thread",
+      },
+      true,
+    ],
+    [
+      "direct parent fallback",
+      {
+        source: { subagent: { thread_spawn: { parent_thread_id: "" } } },
+        parent_thread_id: "scan-thread",
+        forked_from_id: "unrelated-thread",
+      },
+      true,
+    ],
+    [
+      "fork parent fallback after invalid candidates",
+      {
+        source: { subagent: { thread_spawn: { parent_thread_id: 7 } } },
+        parent_thread_id: "",
+        forked_from_id: "scan-thread",
+      },
+      true,
+    ],
+    [
+      "fork parent fallback after non-string direct parent",
+      { parent_thread_id: 7, forked_from_id: "scan-thread" },
+      true,
+    ],
+    ["unrelated fork parent", { forked_from_id: "unrelated-thread" }, false],
+    ["empty fork parent", { forked_from_id: "" }, false],
+    ["non-string fork parent", { forked_from_id: 7 }, false],
+  ] as const)(
+    "tracks the proactive standard-scan budget for a %s",
+    async (_description, parentMetadata, included) => {
+      const home = await codexHome();
+      const repository = join(home, "repository");
+      const rootUsage = { input_tokens: 100, output_tokens: 10 };
+      const inherited = { input_tokens: 1_000, output_tokens: 100 };
+      const owned = { input_tokens: 1_300, output_tokens: 130 };
+      await writeSession(home, "scan-thread", rootUsage);
+      const worker = await writeSession(home, accountingFork.threadId, null);
+      await writeFile(
+        worker,
+        `${[
+          {
+            type: "session_meta",
+            payload: {
+              id: accountingFork.threadId,
+              timestamp: accountingFork.timestamp,
+              cwd: repository,
+              ...parentMetadata,
+            },
+          },
+          accountingTaskStart(
+            accountingFork.inheritedTurnId,
+            accountingFork.startedAt,
+          ),
+          accountingEvent(inherited),
+          accountingTaskStart(
+            accountingFork.ownedTurnId,
+            accountingFork.startedAt,
+          ),
+          accountingEvent(owned),
+        ]
+          .map((event) => JSON.stringify(event))
+          .join("\n")}\n`,
+      );
+      const maxCostUsd = 0.001;
+      const exceeded = new AbortController();
+      const costs: number[] = [];
+      const tracker = new ScanCostTracker({
+        codexHome: home,
+        model: "gpt-5.6-terra",
+        repository,
+        scanDirectory: join(home, "scan"),
+        maxCostUsd,
+        onCost: (cost) => {
+          costs.push(cost.estimatedUsd);
+          if (cost.estimatedUsd > maxCostUsd) exceeded.abort();
+        },
+      });
+      tracker.start("scan-thread");
+
+      expect((await tracker.refresh()).cost).toMatchObject(
+        included
+          ? { inputTokens: 400, outputTokens: 40, estimatedUsd: 0.00128 }
+          : { inputTokens: 100, outputTokens: 10, estimatedUsd: 0.00032 },
+      );
+      expect(exceeded.signal.aborted).toBe(included);
+      expect(costs.at(-1)).toBe(included ? 0.00128 : 0.00032);
+      await tracker.stop();
+    },
+  );
 
   test("keeps same-millisecond inherited UUID7 turns below an explicit worker budget", async () => {
     if (

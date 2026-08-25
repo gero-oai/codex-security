@@ -844,10 +844,16 @@ function readSessionEvent(
     const source = payload["source"];
     const subagent = isRecord(source) ? source["subagent"] : undefined;
     const spawn = isRecord(subagent) ? subagent["thread_spawn"] : undefined;
-    const parent =
-      payload["parent_thread_id"] ??
-      (isRecord(spawn) ? spawn["parent_thread_id"] : undefined);
-    if (typeof parent === "string") session.parentThreadId = parent;
+    for (const parent of [
+      isRecord(spawn) ? spawn["parent_thread_id"] : undefined,
+      payload["parent_thread_id"],
+      payload["forked_from_id"],
+    ]) {
+      if (typeof parent === "string" && parent.length > 0) {
+        session.parentThreadId = parent;
+        break;
+      }
+    }
     const forkedFrom = payload["forked_from_id"];
     session.replaying = typeof forkedFrom === "string" && forkedFrom.length > 0;
     session.events?.push(event);
