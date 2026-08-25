@@ -1035,6 +1035,87 @@ describe("security policy review and application", () => {
     }
   });
 
+  test("rechecks retained recovery contents when retrying an installed policy", async () => {
+    const name =
+      "rechecks retained recovery contents when retrying an installed policy";
+    if (runTestInSubprocess(import.meta.path, name)) return;
+    const f = await fixture();
+    await writeFile(join(f.repository, "SECURITY.md"), "# Existing policy\n");
+    const draft = await f.generate();
+    const applied = await applySecurityPolicy(draft);
+    const recovery = applied.recoveryPath!;
+    const originalStat = fsPromises.stat;
+    let changedRecovery = false;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      stat: async (...args: Parameters<typeof originalStat>) => {
+        const result = await originalStat(...args);
+        if (!changedRecovery && args[0] === recovery) {
+          changedRecovery = true;
+          await writeFile(recovery, "# Concurrent recovery edit\n");
+        }
+        return result;
+      },
+    }));
+    try {
+      const error = await applySecurityPolicy(draft).catch(
+        (value: unknown) => value,
+      );
+      expect(changedRecovery).toBe(true);
+      expect(error).toBeInstanceOf(SecurityPolicyVerificationError);
+      expect((error as SecurityPolicyVerificationError).recoveryPath).toBe(
+        recovery,
+      );
+      expect(await readFile(recovery, "utf8")).toBe(
+        "# Concurrent recovery edit\n",
+      );
+    } finally {
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        stat: originalStat,
+      }));
+    }
+  });
+
+  test("chooses whether to write from the validated policy snapshot", async () => {
+    const name = "chooses whether to write from the validated policy snapshot";
+    if (runTestInSubprocess(import.meta.path, name)) return;
+    const f = await fixture();
+    const target = join(f.repository, "SECURITY.md");
+    const previous = "# Existing policy\n";
+    await writeFile(target, previous);
+    const draft = await f.generate();
+    await writeFile(target, draft.content);
+    const originalOpen = fsPromises.open;
+    let restoredOriginal = false;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      open: async (...args: Parameters<typeof originalOpen>) => {
+        if (
+          !restoredOriginal &&
+          args[0] === target &&
+          new Error().stack?.includes("readDraftContent")
+        ) {
+          restoredOriginal = true;
+          await writeFile(target, previous);
+        }
+        return originalOpen(...args);
+      },
+    }));
+    try {
+      const applied = await applySecurityPolicy(draft);
+      expect(restoredOriginal).toBe(true);
+      expect(applied.status).toBe("written");
+      expect(await readFile(target, "utf8")).toBe(draft.content);
+      expect(await readFile(applied.recoveryPath!, "utf8")).toBe(previous);
+    } finally {
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        open: originalOpen,
+      }));
+    }
+  });
+
   test("handles unavailable hard links without clobbering policy files", async () => {
     const name =
       "handles unavailable hard links without clobbering policy files";
@@ -1271,6 +1352,11 @@ describe("security policy review and application", () => {
     try {
       const applied = await applySecurityPolicy(draft);
       expect(dirname(applied.recoveryPath!)).toBe(f.repository);
+      expect(await applySecurityPolicy(draft)).toEqual({
+        status: "unchanged",
+        targetPath: draft.targetPath,
+        recoveryPath: null,
+      });
       await writer.truncate(0);
       await writer.writeFile("# Late save\n");
       expect(await readFile(applied.recoveryPath!, "utf8")).toBe(
@@ -1302,6 +1388,37 @@ describe("security policy review and application", () => {
     const writer = await open(draft.targetPath, "r+");
     let windowsDescriptor: (() => string) | undefined;
     let windowsIntegrity: (() => string) | undefined;
+    let unixDescriptor:
+      | (() => Promise<{ uid: number; gid: number; mode: number; acl: string }>)
+      | undefined;
+    if (process.platform === "darwin") {
+      const initial = await stat(draft.targetPath);
+      const secondaryGroup = (process.getgroups?.() ?? []).find(
+        (group) => group !== initial.gid,
+      );
+      if (secondaryGroup !== undefined)
+        await fsPromises.chown(draft.targetPath, initial.uid, secondaryGroup);
+      await chmod(draft.targetPath, 0o2750);
+      execFileSync("/bin/chmod", [
+        "+a",
+        "everyone allow read",
+        draft.targetPath,
+      ]);
+      unixDescriptor = async () => {
+        const metadata = await stat(draft.targetPath);
+        return {
+          uid: metadata.uid,
+          gid: metadata.gid,
+          mode: metadata.mode & 0o7777,
+          acl: execFileSync("/bin/ls", ["-ledn", draft.targetPath], {
+            encoding: "utf8",
+          })
+            .split(/\r?\n/u)
+            .slice(1)
+            .join("\n"),
+        };
+      };
+    }
     if (process.platform === "win32") {
       const systemDirectory = join(
         process.env["SystemRoot"] ?? "C:\\Windows",
@@ -1370,6 +1487,7 @@ describe("security policy review and application", () => {
     }
     const previousWindowsDescriptor = windowsDescriptor?.();
     const previousWindowsIntegrity = windowsIntegrity?.();
+    const previousUnixDescriptor = await unixDescriptor?.();
     if (process.platform === "win32") {
       expect(previousWindowsDescriptor).toContain("S:P");
       expect(previousWindowsDescriptor).toContain("(AU;SA;");
@@ -1397,6 +1515,8 @@ describe("security policy review and application", () => {
       }).catch((value: unknown) => value);
       expect(error).toBeInstanceOf(SecurityPolicyRecoveryError);
       const recovery = error as SecurityPolicyRecoveryError;
+      if (process.platform === "darwin")
+        expect(await unixDescriptor!()).toEqual(previousUnixDescriptor!);
       await writer.truncate(0);
       await writer.writeFile("# Late rollback save\n");
       expect(await readFile(recovery.recoveryPath, "utf8")).toBe(
@@ -1645,6 +1765,29 @@ describe("security policy review and application", () => {
       expect(installed.uid).toBe(previous.uid);
       expect(installed.gid).toBe(previous.gid);
       expect(installed.mode & 0o7777).toBe(previous.mode & 0o7777);
+      expect(accessControl(target)).toBe(previousAccess);
+    },
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "preserves access-control entries when replacing a read-only Unix policy",
+    async () => {
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      await writeFile(target, "# Existing policy\n");
+      await chmod(target, 0o440);
+      execFileSync("/bin/chmod", ["+a", "everyone allow read", target]);
+      const accessControl = (path: string) =>
+        execFileSync("/bin/ls", ["-ledn", path], { encoding: "utf8" })
+          .split(/\r?\n/u)
+          .slice(1)
+          .join("\n");
+      const previousAccess = accessControl(target);
+      expect(previousAccess).toContain("allow read");
+      const draft = await f.generate();
+      await applySecurityPolicy(draft);
+      expect(await readFile(target, "utf8")).toBe(POLICY);
+      expect((await stat(target)).mode & 0o777).toBe(0o440);
       expect(accessControl(target)).toBe(previousAccess);
     },
   );
@@ -1969,7 +2112,10 @@ describe("security policy review and application", () => {
         ...fsPromises,
         open: async (...args: Parameters<typeof originalOpen>) => {
           const handle = await originalOpen(...args);
-          if (String(args[0]).startsWith(join(f.repository, ".SECURITY.md."))) {
+          if (
+            String(args[0]).startsWith(join(f.repository, ".SECURITY.md.")) &&
+            String(args[0]).endsWith(".tmp")
+          ) {
             expect(integrity(String(args[0]))).toContain("(NW)");
             inheritedLabel = true;
           }
@@ -2155,6 +2301,62 @@ describe("security policy review and application", () => {
         expect(descriptor(recovery!)).toBe(changedDescriptor!);
         expect(descriptor(target)).not.toBe(changedDescriptor!);
         expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
+      } finally {
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          link: originalLink,
+        }));
+      }
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "never replaces a concurrent Unix policy when native installation is required",
+    async () => {
+      const name =
+        "never replaces a concurrent Unix policy when native installation is required";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      const previous = "# Existing policy\n";
+      const concurrent = "# Concurrent policy\n";
+      await writeFile(target, previous);
+      const draft = await f.generate();
+      const originalLink = fsPromises.link;
+      let attemptedNativeMove = false;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        link: async (...args: Parameters<typeof originalLink>) => {
+          if (args[1] === target && String(args[0]).endsWith(".tmp")) {
+            await writeFile(target, concurrent, { flag: "wx" });
+            attemptedNativeMove = true;
+            throw Object.assign(new Error("hard links are unsupported"), {
+              code: "ENOTSUP",
+            });
+          }
+          return originalLink(...args);
+        },
+      }));
+      try {
+        const error = await applySecurityPolicy(draft).catch(
+          (value: unknown) => value,
+        );
+        expect(error).toBeInstanceOf(SecurityPolicyRecoveryError);
+        expect(attemptedNativeMove).toBe(true);
+        expect((error as SecurityPolicyRecoveryError).cause).toBeInstanceOf(
+          AggregateError,
+        );
+        expect(
+          ((error as SecurityPolicyRecoveryError).cause as AggregateError)
+            .errors[0],
+        ).toMatchObject({ code: "EEXIST" });
+        expect(await readFile(target, "utf8")).toBe(concurrent);
+        expect(
+          await readFile(
+            (error as SecurityPolicyRecoveryError).recoveryPath,
+            "utf8",
+          ),
+        ).toBe(previous);
       } finally {
         mock.module("node:fs/promises", () => ({
           ...fsPromises,

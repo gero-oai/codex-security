@@ -14,6 +14,7 @@ import {
   rename,
   rm,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1113,14 +1114,15 @@ export async function applySecurityPolicy(
   draft = { ...draft };
   validatePolicyContent(draft.content);
   const target = await resolveDraftTarget(draft, options.signal);
-  const alreadyApplied =
-    (await readSecurityPolicy(target.targetPath)) === draft.content;
-  let written = alreadyApplied && draft.previousContent !== draft.content;
+  let alreadyApplied = false;
+  let written = false;
   let recoveryPath: string | null = null;
   let verificationRecoveryPath: string | null = null;
   let pluginWorkspace: string | undefined;
   try {
-    await readDraftContent(target, draft, options.signal);
+    alreadyApplied =
+      (await readDraftContent(target, draft, options.signal)) === draft.content;
+    written = alreadyApplied && draft.previousContent !== draft.content;
     await validatePolicyLinks(target, options.signal);
     if (draft.previousContent === draft.content)
       return {
@@ -1162,6 +1164,27 @@ export async function applySecurityPolicy(
           "security policy recovery",
           options.signal,
         );
+        if ((await readSecurityPolicy(candidate)) === draft.previousContent)
+          candidates.push(candidate);
+      }
+      const targetDirectory = dirname(target.targetPath);
+      const canonicalTargetDirectory = await realpath(targetDirectory);
+      for (const entry of await readdir(targetDirectory, {
+        withFileTypes: true,
+      })) {
+        if (
+          !entry.isFile() ||
+          !/^\.SECURITY\.md\.[0-9a-f-]{36}\.tmp\.previous$/u.test(entry.name)
+        )
+          continue;
+        const candidate = join(targetDirectory, entry.name);
+        const metadata = await lstat(candidate);
+        if (
+          !metadata.isFile() ||
+          metadata.isSymbolicLink() ||
+          dirname(await realpath(candidate)) !== canonicalTargetDirectory
+        )
+          continue;
         if ((await readSecurityPolicy(candidate)) === draft.previousContent)
           candidates.push(candidate);
       }
@@ -1313,9 +1336,10 @@ export async function applySecurityPolicy(
         "The written policy contents do not match the reviewed draft.",
       );
     }
+    const permissionsReference = recoveryPath ?? verificationRecoveryPath;
     if (
-      recoveryPath !== null &&
-      (await readSecurityPolicy(recoveryPath)) !== draft.previousContent
+      permissionsReference !== null &&
+      (await readSecurityPolicy(permissionsReference)) !== draft.previousContent
     ) {
       throw new CodexSecurityError(
         "The previous SECURITY.md changed while the replacement was being installed.",
@@ -1333,7 +1357,6 @@ export async function applySecurityPolicy(
       previousContent: draft.content,
       inheritedPolicySha256: draft.inheritedPolicySha256,
     });
-    const permissionsReference = recoveryPath ?? verificationRecoveryPath;
     if (permissionsReference !== null) {
       if (process.platform === "win32") {
         if (
@@ -1355,6 +1378,14 @@ export async function applySecurityPolicy(
           permissionsReference,
           target.targetPath,
           python,
+        );
+      }
+      if (
+        (await readSecurityPolicy(permissionsReference)) !==
+        draft.previousContent
+      ) {
+        throw new CodexSecurityError(
+          "The previous SECURITY.md changed while the replacement was being installed.",
         );
       }
     }
@@ -1383,9 +1414,31 @@ export async function applySecurityPolicy(
 async function installPolicyFile(
   temporary: string,
   targetPath: string,
-  preserveWindowsDescriptor = false,
+  preserveExistingSecurity = false,
+  python?: string,
 ): Promise<void> {
-  if (preserveWindowsDescriptor && process.platform === "win32") {
+  if (preserveExistingSecurity && process.platform !== "win32") {
+    try {
+      await link(temporary, targetPath);
+    } catch (error) {
+      if (
+        ![
+          "EPERM",
+          "ENOTSUP",
+          "EOPNOTSUPP",
+          "EXDEV",
+          "EMLINK",
+          "EISDIR",
+        ].includes((error as NodeJS.ErrnoException).code ?? "")
+      )
+        throw error;
+      await moveUnixPolicyFileNoClobber(temporary, targetPath, python!);
+      return;
+    }
+    await unlink(temporary);
+    return;
+  }
+  if (preserveExistingSecurity && process.platform === "win32") {
     if (((await stat(temporary)).mode & 0o200) !== 0) {
       try {
         await link(temporary, targetPath);
@@ -1413,6 +1466,42 @@ async function installPolicyFile(
   if (((await stat(temporary)).mode & 0o200) === 0)
     await copyFile(temporary, targetPath, constants.COPYFILE_EXCL);
   else await installFileNoClobber(temporary, targetPath);
+}
+
+async function moveUnixPolicyFileNoClobber(
+  source: string,
+  destination: string,
+  python: string,
+): Promise<void> {
+  const script = [
+    "import ctypes, errno, os, sys",
+    "library = ctypes.CDLL(None, use_errno=True)",
+    "if sys.platform == 'darwin':",
+    "    operation, descriptor, flags = library.renameatx_np, -2, 4",
+    "elif sys.platform.startswith('linux'):",
+    "    operation, descriptor, flags = library.renameat2, -100, 1",
+    "else:",
+    "    raise OSError(errno.ENOTSUP, 'exclusive policy replacement is unsupported')",
+    "operation.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]",
+    "operation.restype = ctypes.c_int",
+    "if operation(descriptor, os.fsencode(sys.argv[1]), descriptor, os.fsencode(sys.argv[2]), flags) != 0:",
+    "    code = ctypes.get_errno()",
+    "    if code == errno.EEXIST:",
+    "        raise SystemExit(17)",
+    "    raise OSError(code, os.strerror(code))",
+  ].join("\n");
+  try {
+    await execFileAsync(python, ["-I", "-c", script, source, destination], {
+      encoding: "utf8",
+    });
+  } catch (error) {
+    if ((error as { code?: number }).code === 17) {
+      throw Object.assign(new Error("The policy destination already exists."), {
+        code: "EEXIST",
+      });
+    }
+    throw error;
+  }
 }
 
 async function moveWindowsPolicyFileNoClobber(
@@ -1747,7 +1836,7 @@ async function replaceExistingPolicy(
         true,
       );
     signal?.throwIfAborted();
-    await installPolicyFile(temporary, targetPath, true);
+    await installPolicyFile(temporary, targetPath, true, python);
   } catch (error) {
     let cause = error;
     try {
@@ -1758,7 +1847,45 @@ async function replaceExistingPolicy(
         );
       }
       if (process.platform !== "win32") {
-        await installFileNoClobber(recoveryPath, targetPath);
+        try {
+          await link(recoveryPath, targetPath);
+        } catch (restoreError) {
+          if (
+            ![
+              "EPERM",
+              "ENOTSUP",
+              "EOPNOTSUPP",
+              "EXDEV",
+              "EMLINK",
+              "EISDIR",
+            ].includes((restoreError as NodeJS.ErrnoException).code ?? "")
+          )
+            throw restoreError;
+          const restoreTemporary = `${recoveryPath}.restore`;
+          try {
+            await writeFile(restoreTemporary, "", {
+              flag: "wx",
+              mode: 0o600,
+            });
+            await execFileAsync(
+              "/bin/cp",
+              ["-p", recoveryPath, restoreTemporary],
+              { encoding: "utf8" },
+            );
+            await verifyUnixSecurityMetadata(
+              recoveryPath,
+              restoreTemporary,
+              python,
+            );
+            await moveUnixPolicyFileNoClobber(
+              restoreTemporary,
+              targetPath,
+              python,
+            );
+          } finally {
+            await rm(restoreTemporary, { force: true }).catch(() => undefined);
+          }
+        }
       } else {
         try {
           await link(recoveryPath, targetPath);
