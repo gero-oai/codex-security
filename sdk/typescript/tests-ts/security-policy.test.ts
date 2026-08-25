@@ -1077,6 +1077,53 @@ describe("security policy review and application", () => {
     }
   });
 
+  test("rechecks installed policy contents after final permission verification", async () => {
+    const name =
+      "rechecks installed policy contents after final permission verification";
+    if (runTestInSubprocess(import.meta.path, name)) return;
+    const f = await fixture();
+    const original = "# Existing policy\n";
+    await writeFile(join(f.repository, "SECURITY.md"), original);
+    const draft = await f.generate();
+    const applied = await applySecurityPolicy(draft);
+    const recovery = applied.recoveryPath!;
+    const writer = await open(draft.targetPath, "r+");
+    const originalStat = fsPromises.stat;
+    let changedTarget = false;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      stat: async (...args: Parameters<typeof originalStat>) => {
+        const metadata = await originalStat(...args);
+        if (!changedTarget && args[0] === recovery) {
+          changedTarget = true;
+          await writer.truncate(0);
+          await writer.writeFile("# Concurrent installed edit\n");
+        }
+        return metadata;
+      },
+    }));
+    try {
+      const error = await applySecurityPolicy(draft).catch(
+        (value: unknown) => value,
+      );
+      expect(changedTarget).toBe(true);
+      expect(error).toBeInstanceOf(SecurityPolicyVerificationError);
+      expect((error as SecurityPolicyVerificationError).recoveryPath).toBe(
+        recovery,
+      );
+      expect(await readFile(draft.targetPath, "utf8")).toBe(
+        "# Concurrent installed edit\n",
+      );
+      expect(await readFile(recovery, "utf8")).toBe(original);
+    } finally {
+      await writer.close();
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        stat: originalStat,
+      }));
+    }
+  });
+
   test("chooses whether to write from the validated policy snapshot", async () => {
     const name = "chooses whether to write from the validated policy snapshot";
     if (runTestInSubprocess(import.meta.path, name)) return;
@@ -1905,6 +1952,87 @@ describe("security policy review and application", () => {
       expect(installed.gid).toBe(previous.gid);
       expect(installed.mode & 0o7777).toBe(previous.mode & 0o7777);
       expect(accessControl(target)).toBe(previousAccess);
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "preserves protected Windows discretionary access-control settings",
+    async () => {
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      await writeFile(target, "# Existing policy\n");
+      const systemDirectory = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+      );
+      const powershell = join(
+        systemDirectory,
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+      const environment = {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([key]) => key.toUpperCase() !== "PSMODULEPATH",
+          ),
+        ),
+        CODEX_SECURITY_TEST_ACL_PATH: target,
+        PSModulePath: join(
+          systemDirectory,
+          "WindowsPowerShell",
+          "v1.0",
+          "Modules",
+        ),
+      };
+      execFileSync(
+        powershell,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          [
+            "$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH",
+            "$acl.SetAccessRuleProtection($true, $true)",
+            "[System.IO.FileInfo]::new($env:CODEX_SECURITY_TEST_ACL_PATH).SetAccessControl($acl)",
+          ].join("; "),
+        ],
+        { env: environment, windowsHide: true },
+      );
+      const descriptor = () =>
+        JSON.parse(
+          execFileSync(
+            powershell,
+            [
+              "-NoLogo",
+              "-NoProfile",
+              "-NonInteractive",
+              "-Command",
+              [
+                "$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -Audit",
+                "$raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)",
+                "$mask = [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent -bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclDefaulted -bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInheritRequired -bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited -bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected",
+                "$bytes = [byte[]]::new($raw.DiscretionaryAcl.BinaryLength); $raw.DiscretionaryAcl.GetBinaryForm($bytes, 0)",
+                "[pscustomobject]@{ Protected = $acl.AreAccessRulesProtected; Flags = [int]($raw.ControlFlags -band $mask); Rules = [System.Convert]::ToBase64String($bytes); AuditProtected = $acl.AreAuditRulesProtected; AuditCount = $acl.GetAuditRules($true, $true, [System.Security.Principal.SecurityIdentifier]).Count } | Microsoft.PowerShell.Utility\\ConvertTo-Json -Compress",
+              ].join("; "),
+            ],
+            { encoding: "utf8", env: environment, windowsHide: true },
+          ),
+        ) as {
+          Protected: boolean;
+          Flags: number;
+          Rules: string;
+          AuditProtected: boolean;
+          AuditCount: number;
+        };
+      const before = descriptor();
+      expect(before.Protected).toBe(true);
+      expect(before.AuditCount).toBe(0);
+      const draft = await f.generate();
+      await applySecurityPolicy(draft);
+      expect(await readFile(target, "utf8")).toBe(POLICY);
+      expect(descriptor()).toEqual(before);
     },
   );
 

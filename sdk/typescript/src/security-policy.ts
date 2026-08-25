@@ -1390,6 +1390,11 @@ export async function applySecurityPolicy(
         );
       }
     }
+    if ((await readSecurityPolicy(target.targetPath)) !== draft.content) {
+      throw new CodexSecurityError(
+        "The written policy contents changed during final permission verification.",
+      );
+    }
     return {
       status: alreadyApplied ? "unchanged" : "written",
       targetPath: target.targetPath,
@@ -1672,6 +1677,14 @@ async function copyWindowsSecurityDescriptor(
           ].join(" "),
           "$sourceSystemRules = & $systemRules $acl",
           [
+            "$accessRules = { param($descriptor)",
+            "$access = [System.Security.AccessControl.RawSecurityDescriptor]::new($descriptor.GetSecurityDescriptorBinaryForm(), 0).DiscretionaryAcl;",
+            "if ($null -eq $access) { return 'none' };",
+            "$bytes = [byte[]]::new($access.BinaryLength); $access.GetBinaryForm($bytes, 0); [System.Convert]::ToBase64String($bytes)",
+            "}",
+          ].join(" "),
+          "$sourceAccessRules = & $accessRules $acl",
+          [
             "$auditControlMask =",
             "[System.Security.AccessControl.ControlFlags]::SystemAclPresent",
             "-bor [System.Security.AccessControl.ControlFlags]::SystemAclDefaulted",
@@ -1681,6 +1694,16 @@ async function copyWindowsSecurityDescriptor(
           ].join(" "),
           "$auditControl = { param($descriptor) [System.Security.AccessControl.RawSecurityDescriptor]::new($descriptor.GetSecurityDescriptorBinaryForm(), 0).ControlFlags -band $auditControlMask }",
           "$sourceAuditControl = & $auditControl $acl",
+          [
+            "$accessControlMask =",
+            "[System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent",
+            "-bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclDefaulted",
+            "-bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInheritRequired",
+            "-bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited",
+            "-bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected",
+          ].join(" "),
+          "$accessControl = { param($descriptor) [System.Security.AccessControl.RawSecurityDescriptor]::new($descriptor.GetSecurityDescriptorBinaryForm(), 0).ControlFlags -band $accessControlMask }",
+          "$sourceAccessControl = & $accessControl $acl",
           [
             "$describe = { param([string]$path)",
             "$lines = @(& ([System.IO.Path]::Combine($env:SystemRoot, 'System32', 'icacls.exe')) $path);",
@@ -1725,9 +1748,10 @@ async function copyWindowsSecurityDescriptor(
                   `if ($sourceAuditControl -eq (& $auditControl $staged) -and $acl.AreAuditRulesProtected -eq $staged.AreAuditRulesProtected -and $sourceAuditRules -eq (& $auditRules $staged) -and $sourceSystemRules -eq (& $systemRules $staged) -and $sourceNativeSystemRules -eq (& $nativeSystemRules $env:${destinationVariable})) {`,
                   "$differentOwner = $acl.GetOwner($identityType).Value -ne $staged.GetOwner($identityType).Value;",
                   "$differentGroup = $acl.GetGroup($identityType).Value -ne $staged.GetGroup($identityType).Value;",
+                  "$differentAccess = $sourceAccessRules -ne (& $accessRules $staged) -or $sourceAccessControl -ne (& $accessControl $staged) -or $acl.AreAccessRulesProtected -ne $staged.AreAccessRulesProtected;",
                   `$sourceDescription = [string]::Join([System.Environment]::NewLine, (& $describe $env:${sourceVariable}));`,
                   `$stagedDescription = [string]::Join([System.Environment]::NewLine, (& $describe $env:${destinationVariable}));`,
-                  "if ($differentOwner -or $differentGroup -or $sourceDescription -ne $stagedDescription) {",
+                  "if ($differentOwner -or $differentGroup -or $differentAccess -or $sourceDescription -ne $stagedDescription) {",
                   "$sections = [System.Security.AccessControl.AccessControlSections]::Access;",
                   "if ($differentOwner) { $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Owner };",
                   "if ($differentGroup) { $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Group };",
@@ -1741,6 +1765,8 @@ async function copyWindowsSecurityDescriptor(
               ]),
           `$copied = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
           "if ($acl.GetOwner($identityType).Value -ne $copied.GetOwner($identityType).Value -or $acl.GetGroup($identityType).Value -ne $copied.GetGroup($identityType).Value) { throw 'The copied Windows security descriptor owner or group differs.' }",
+          "if ($acl.AreAccessRulesProtected -ne $copied.AreAccessRulesProtected -or $sourceAccessControl -ne (& $accessControl $copied)) { throw 'The copied Windows discretionary access-control settings differ.' }",
+          "if ($sourceAccessRules -ne (& $accessRules $copied)) { throw 'The copied Windows discretionary access-control entries differ.' }",
           "if ($acl.AreAuditRulesProtected -ne $copied.AreAuditRulesProtected) { throw 'The copied Windows audit inheritance settings differ.' }",
           "if ($sourceAuditControl -ne (& $auditControl $copied)) { throw 'The copied Windows audit control settings differ.' }",
           "$destinationAuditRules = & $auditRules $copied",
@@ -1992,6 +2018,12 @@ async function replaceExistingPolicy(
             );
             await chmod(restoreTemporary, recoveryMode);
             await copyWindowsSecurityDescriptor(recoveryPath, restoreTemporary);
+            await copyWindowsSecurityDescriptor(
+              recoveryPath,
+              restoreTemporary,
+              undefined,
+              true,
+            );
             if (
               recoveryContent === null ||
               ((await stat(recoveryPath)).mode & 0o777) !== recoveryMode ||
@@ -2004,12 +2036,6 @@ async function replaceExistingPolicy(
                 "SECURITY.md changed while its recovery snapshot was being copied.",
               );
             }
-            await copyWindowsSecurityDescriptor(
-              recoveryPath,
-              restoreTemporary,
-              undefined,
-              true,
-            );
             await moveWindowsPolicyFileNoClobber(restoreTemporary, targetPath);
           } finally {
             await rm(restoreTemporary, { force: true }).catch(() => undefined);
