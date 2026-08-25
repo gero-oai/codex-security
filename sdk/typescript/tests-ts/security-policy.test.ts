@@ -1124,6 +1124,57 @@ describe("security policy review and application", () => {
     }
   });
 
+  test("rechecks policy links after final permission verification", async () => {
+    const name = "rechecks policy links after final permission verification";
+    if (runTestInSubprocess(import.meta.path, name)) return;
+    const f = await fixture();
+    const component = join(f.repository, "component");
+    const sibling = join(f.repository, "sibling");
+    await mkdir(component);
+    await mkdir(sibling);
+    const original = "# Existing component policy\n";
+    const target = join(component, "SECURITY.md");
+    const alias = join(sibling, "SECURITY.md");
+    await writeFile(target, original);
+    const draft = await f.generate({ path: "component" });
+    const applied = await applySecurityPolicy(draft);
+    const recovery = applied.recoveryPath!;
+    const originalStat = fsPromises.stat;
+    let createdAlias = false;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      stat: async (...args: Parameters<typeof originalStat>) => {
+        const metadata = await originalStat(...args);
+        if (!createdAlias && args[0] === recovery) {
+          createdAlias = true;
+          await symlink(target, alias, "file");
+        }
+        return metadata;
+      },
+    }));
+    try {
+      const error = await applySecurityPolicy(draft).catch(
+        (value: unknown) => value,
+      );
+      expect(createdAlias).toBe(true);
+      expect(error).toBeInstanceOf(SecurityPolicyVerificationError);
+      expect((error as SecurityPolicyVerificationError).recoveryPath).toBe(
+        recovery,
+      );
+      expect(String((error as Error).cause)).toContain(
+        "outside the selected component",
+      );
+      expect(await readFile(target, "utf8")).toBe(draft.content);
+      expect(await readFile(recovery, "utf8")).toBe(original);
+      expect((await lstat(alias)).isSymbolicLink()).toBe(true);
+    } finally {
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        stat: originalStat,
+      }));
+    }
+  });
+
   test("chooses whether to write from the validated policy snapshot", async () => {
     const name = "chooses whether to write from the validated policy snapshot";
     if (runTestInSubprocess(import.meta.path, name)) return;

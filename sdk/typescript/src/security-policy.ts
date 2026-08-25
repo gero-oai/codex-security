@@ -1390,6 +1390,7 @@ export async function applySecurityPolicy(
         );
       }
     }
+    await validatePolicyLinks(target);
     if ((await readSecurityPolicy(target.targetPath)) !== draft.content) {
       throw new CodexSecurityError(
         "The written policy contents changed during final permission verification.",
