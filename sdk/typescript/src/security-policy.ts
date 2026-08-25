@@ -1983,16 +1983,33 @@ async function replaceExistingPolicy(
           }
           const restoreTemporary = `${recoveryPath}.restore`;
           try {
+            const recoveryContent = await readSecurityPolicy(recoveryPath);
+            const recoveryMode = (await stat(recoveryPath)).mode & 0o777;
             await copyFile(
               recoveryPath,
               restoreTemporary,
               constants.COPYFILE_EXCL,
             );
-            await chmod(
-              restoreTemporary,
-              (await stat(recoveryPath)).mode & 0o777,
-            );
+            await chmod(restoreTemporary, recoveryMode);
             await copyWindowsSecurityDescriptor(recoveryPath, restoreTemporary);
+            if (
+              recoveryContent === null ||
+              ((await stat(recoveryPath)).mode & 0o777) !== recoveryMode ||
+              ((await stat(restoreTemporary)).mode & 0o777) !== recoveryMode ||
+              (await readSecurityPolicy(restoreTemporary)) !==
+                recoveryContent ||
+              (await readSecurityPolicy(recoveryPath)) !== recoveryContent
+            ) {
+              throw new CodexSecurityError(
+                "SECURITY.md changed while its recovery snapshot was being copied.",
+              );
+            }
+            await copyWindowsSecurityDescriptor(
+              recoveryPath,
+              restoreTemporary,
+              undefined,
+              true,
+            );
             await moveWindowsPolicyFileNoClobber(restoreTemporary, targetPath);
           } finally {
             await rm(restoreTemporary, { force: true }).catch(() => undefined);

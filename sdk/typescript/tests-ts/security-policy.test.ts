@@ -1605,6 +1605,77 @@ describe("security policy review and application", () => {
     },
   );
 
+  test.skipIf(process.platform !== "win32")(
+    "rejects a Windows recovery snapshot changed while rollback copies it",
+    async () => {
+      const name =
+        "rejects a Windows recovery snapshot changed while rollback copies it";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const original = "# Original policy\n";
+      await writeFile(join(f.repository, "SECURITY.md"), original);
+      const draft = await f.generate();
+      const writer = await open(draft.targetPath, "r+");
+      const controller = new AbortController();
+      const originalRename = fsPromises.rename;
+      const originalLink = fsPromises.link;
+      const originalCopy = fsPromises.copyFile;
+      let changed = false;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        rename: async (source: string, destination: string) => {
+          await originalRename(source, destination);
+          if (source === draft.targetPath)
+            controller.abort("cancel before install");
+        },
+        link: async () => {
+          throw Object.assign(new Error("hard links are unsupported"), {
+            code: "ENOTSUP",
+          });
+        },
+        copyFile: async (
+          source: string,
+          destination: string,
+          mode?: number,
+        ) => {
+          await originalCopy(source, destination, mode);
+          if (!changed && destination.endsWith(".previous.restore")) {
+            changed = true;
+            await writer.truncate(0);
+            await writer.writeFile("# Complete concurrent save\n");
+          }
+        },
+      }));
+      try {
+        const error = await applySecurityPolicy(draft, {
+          signal: controller.signal,
+        }).catch((value: unknown) => value);
+        expect(error).toBeInstanceOf(SecurityPolicyRecoveryError);
+        expect(changed).toBe(true);
+        expect(await readSecurityPolicy(draft.targetPath)).toBeNull();
+        expect(
+          await readFile(
+            (error as SecurityPolicyRecoveryError).recoveryPath,
+            "utf8",
+          ),
+        ).toBe("# Complete concurrent save\n");
+        expect(
+          (await readdir(f.repository)).some((path) =>
+            path.endsWith(".restore"),
+          ),
+        ).toBe(false);
+      } finally {
+        await writer.close();
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          rename: originalRename,
+          link: originalLink,
+          copyFile: originalCopy,
+        }));
+      }
+    },
+  );
+
   test("keeps recovery files outside checkouts and Git metadata", async () => {
     for (const kind of ["root", "submodule", "external_git"]) {
       const f = await fixture();
