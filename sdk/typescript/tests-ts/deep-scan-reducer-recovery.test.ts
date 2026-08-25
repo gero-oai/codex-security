@@ -22,9 +22,14 @@ type ReducerFinding = {
   summary: string;
   severity?: { level: string; [field: string]: unknown };
   confidence?: { level: string; rationale?: string; [field: string]: unknown };
-  rootCause?: { summary: string; evidenceRefs?: string[] };
+  rootCause?: {
+    summary: string;
+    evidenceRefs?: string[];
+    [field: string]: unknown;
+  };
   codeEvidence?: Array<{ id: string; code: string }>;
-  validation?: { summary: string };
+  validation?: { summary?: string; [field: string]: unknown };
+  attackPath?: Record<string, unknown>;
   writeup?: { reportPath: string };
   provenance: {
     source: string;
@@ -455,6 +460,133 @@ test("keeps accepted source evidence visible on the reduced finding", async () =
   });
 });
 
+test("rejects changed accepted validation outcomes and unsupported evidence", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const accepted: ReducerFinding = {
+    ...reducerFinding("accepted"),
+    rootCause: {
+      summary: "Accepted root-cause evidence.",
+      classification: "input_validation",
+    },
+    validation: {
+      status: "not_exploited",
+      summary: "Accepted static trace.",
+      evidence: { outcome: "not_reachable" },
+    },
+    attackPath: { reachability: { outcome: "not_reachable" } },
+  };
+  const reduced = {
+    ...accepted,
+    provenance: { ...accepted.provenance, sourceFindingIds: ["worker:0"] },
+  };
+
+  for (const { finding, error } of [
+    {
+      finding: {
+        ...reduced,
+        validation: { ...accepted.validation!, status: "exploited" },
+      },
+      error: "validation.status",
+    },
+    {
+      finding: {
+        ...reduced,
+        validation: {
+          ...accepted.validation!,
+          evidence: { outcome: "reachable" },
+        },
+      },
+      error: "validation.evidence.outcome",
+    },
+    {
+      finding: {
+        ...reduced,
+        validation: {
+          ...accepted.validation!,
+          dynamicResult: "Exploited during runtime validation.",
+        },
+      },
+      error: "validation.dynamicResult",
+    },
+    {
+      finding: {
+        ...reduced,
+        rootCause: {
+          ...accepted.rootCause!,
+          classification: "remote_code_execution",
+        },
+      },
+      error: "rootCause.classification",
+    },
+    {
+      finding: {
+        ...reduced,
+        attackPath: { reachability: { outcome: "reachable" } },
+      },
+      error: "attackPath.reachability.outcome",
+    },
+  ]) {
+    expect(() =>
+      reconcileDeepReduction(
+        reducerDraft([finding]),
+        [{ workerId: "worker", result: reducerDraft([accepted]) }],
+        null,
+      ),
+    ).toThrow(error);
+  }
+
+  const plain = reducerFinding("unsupported-evidence");
+  for (const { evidence, error } of [
+    {
+      evidence: {
+        validation: {
+          status: "exploited",
+          result: "Dynamic exploitation succeeded.",
+        },
+      },
+      error: "validation",
+    },
+    {
+      evidence: {
+        rootCause: {
+          summary: "Invented remote execution.",
+          classification: "remote_code_execution",
+        },
+      },
+      error: "rootCause",
+    },
+    {
+      evidence: {
+        attackPath: { reachability: { outcome: "reachable" } },
+      },
+      error: "attackPath",
+    },
+    {
+      evidence: {
+        codeEvidence: [{ id: "invented", code: "inventedDynamicExploit()" }],
+      },
+      error: "codeEvidence",
+    },
+  ]) {
+    expect(() =>
+      reconcileDeepReduction(
+        reducerDraft([
+          {
+            ...plain,
+            ...evidence,
+            provenance: {
+              ...plain.provenance,
+              sourceFindingIds: ["worker:0"],
+            },
+          },
+        ]),
+        [{ workerId: "worker", result: reducerDraft([plain]) }],
+        null,
+      ),
+    ).toThrow(error);
+  }
+});
+
 test("preserves every accepted finding location and rejects fabricated locations", async () => {
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
   const first: ReducerFinding = {
@@ -592,13 +724,15 @@ test("accepts threat-model synthesis grounded in accepted scope and finding evid
   const reduced = reconcileDeepReduction(
     reducerDraft([shared, independent], {
       scope: scopeSource.scope,
-      threatModel: { summary: "Requests reach shared and independent code." },
+      threatModel: {
+        summary: "Requests may reach shared and independent code.",
+      },
     }),
     discoveries,
     null,
   );
   expect(reduced.threatModel?.["summary"]).toBe(
-    "Requests reach shared and independent code.",
+    "Requests may reach shared and independent code.",
   );
 
   expect(() =>
@@ -619,7 +753,7 @@ test("accepts threat-model synthesis grounded in accepted scope and finding evid
       reducerDraft([], {
         scope: scopeSource.scope,
         threatModel: {
-          summary: "Requests reach shared and independent code.",
+          summary: "Requests may reach shared and independent code.",
         },
       }),
       [
@@ -701,6 +835,14 @@ test("rejects threat-model synthesis that drops or reverses accepted claims", as
     {
       accepted: "Unauthenticated attackers cannot reach admin endpoints.",
       synthesized: "Attackers reach admin endpoints.",
+    },
+    {
+      accepted: "Requests may reach shared code.",
+      synthesized: "Requests reach shared code.",
+    },
+    {
+      accepted: "Authentication may block attackers.",
+      synthesized: "Authentication blocks attackers.",
     },
     {
       accepted: "Remote attackers are not trusted.",
