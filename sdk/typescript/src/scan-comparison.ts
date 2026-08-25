@@ -197,6 +197,7 @@ export async function runReadOnlyCodex(
       } as NonNullable<CodexOptions["config"]>,
     });
   const thread = codex.startThread({
+    threadSource: `codex_security_${runtimeOptions.surface}`,
     ...(model === undefined ? {} : { model }),
     modelReasoningEffort: reasoningEffort,
     sandboxMode: "read-only",

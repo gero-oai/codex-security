@@ -1297,6 +1297,8 @@ describe("connected Linear publication", () => {
     ).toBe(true);
     expect(args).toEqual([
       "exec",
+      "--thread-source",
+      "codex_security_publish",
       "--model",
       "gpt-5.6-luna",
       "-c",

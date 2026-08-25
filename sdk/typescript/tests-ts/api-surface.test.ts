@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { CodexOptions } from "@openai/codex-sdk";
+import type { CodexOptions, ThreadOptions } from "@openai/codex-sdk";
 import { afterEach, describe, expect, test } from "bun:test";
 import { CodexSecurity } from "../src/index.js";
 import { mockWorkbench } from "./support/api-client.js";
@@ -29,7 +29,7 @@ async function scanResponseSurface(runtimeOptions?: {
   await mkdir(repository);
   await mkdir(codexHome);
   await mkdir(scanDir, { mode: 0o700 });
-  let codexOptions: CodexOptions | null = null;
+  let surface: string | undefined;
 
   const client = new InternalCodexSecurity(
     {},
@@ -45,11 +45,18 @@ async function scanResponseSurface(runtimeOptions?: {
         input?: string,
       ) => mockWorkbench(args, input),
       createCodex: (options: CodexOptions) => {
-        codexOptions = options;
+        surface = (
+          options.config?.["responses_api_metadata"] as
+            | Record<string, string>
+            | undefined
+        )?.["codex_security_surface"];
         return {
-          startThread: () => ({
+          startThread: (threadOptions: ThreadOptions) => ({
             id: null,
             async runStreamed() {
+              expect(threadOptions.threadSource).toBe(
+                `codex_security_${runtimeOptions?.surface ?? "sdk"}`,
+              );
               await fixtures.copyCompletedScan(root);
               return { events: completedEvents() };
             },
@@ -62,21 +69,15 @@ async function scanResponseSurface(runtimeOptions?: {
 
   await client.run(repository);
   await client.close();
-  return (
-    (codexOptions as CodexOptions | null)?.config?.[
-      "responses_api_metadata"
-    ] as Record<string, string> | undefined
-  )?.["codex_security_surface"];
+  return surface;
 }
 
-describe("CodexSecurity Responses metadata", () => {
-  test("SDK runtime scans use sdk metadata", async () => {
+describe("CodexSecurity request attribution", () => {
+  test("SDK runtime scans use SDK attribution", async () => {
     expect(await scanResponseSurface()).toBe("sdk");
   });
 
-  test("CLI runtime scans use cli metadata instead of sdk metadata", async () => {
-    const surface = await scanResponseSurface({ surface: "cli" });
-    expect(surface).toBe("cli");
-    expect(surface).not.toBe("sdk");
+  test("CLI runtime scans use CLI attribution", async () => {
+    expect(await scanResponseSurface({ surface: "cli" })).toBe("cli");
   });
 });

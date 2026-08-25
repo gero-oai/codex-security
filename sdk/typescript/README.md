@@ -630,6 +630,9 @@ The CLI and SDK recognize the following user-configurable environment:
 | `CI`                                                                        | Disable interactive update notices in automated environments.                                 |
 | `NO_COLOR`, `TERM`                                                          | Disable colored scan-history output when `NO_COLOR` is defined or `TERM=dumb`.                |
 
+Custom Codex executables must support `exec --thread-source` (Codex 0.149.1
+or later).
+
 On Windows, `CODEX_CLI_PATH` must name a native `.exe` or `.com`. Command
 shims such as `codex.cmd` automatically use the bundled Codex executable
 instead.

@@ -21,6 +21,7 @@ import {
   comparisonEnvironment,
   matchCompletedScan,
   matchScanFindings,
+  matchScanFindingsInternal,
   type ScanComparisonInput,
   type ScanComparisonOptions,
   type ScanComparisonResult,
@@ -67,6 +68,16 @@ function fakeCodex(response: unknown) {
 }
 
 describe("semantic scan comparison", () => {
+  test("uses CLI attribution for CLI comparison turns", async () => {
+    const { codex, calls } = fakeCodex({ matches: [], uncertain: [] });
+    await matchScanFindingsInternal(
+      { before: [], after: [] },
+      { codex },
+      { surface: "cli" },
+    );
+    expect(calls.threadOptions?.threadSource).toBe("codex_security_cli");
+  });
+
   test("disables explicit and inherited MCP servers for read-only helper turns", async () => {
     const home = await mkdtemp(join(tmpdir(), "codex-security-comparison-"));
     temporaryDirectories.push(home);
@@ -409,6 +420,7 @@ describe("semantic scan comparison", () => {
       }),
     ).toEqual(result);
     expect(calls.threadOptions).toEqual({
+      threadSource: "codex_security_sdk",
       model: "comparison-model",
       modelReasoningEffort: "high",
       sandboxMode: "read-only",

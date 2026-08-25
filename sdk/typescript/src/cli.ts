@@ -5072,7 +5072,14 @@ async function runSkill(
   const appServer = patch || verify;
   return dependencies.runCodex(
     [
-      ...(appServer ? ["app-server"] : ["exec", "--ignore-user-config"]),
+      ...(appServer
+        ? ["app-server"]
+        : [
+            "exec",
+            "--ignore-user-config",
+            "--thread-source",
+            "codex_security_cli",
+          ]),
       "--disable",
       "plugins",
       ...(appServer ? [] : ["--ephemeral", "--color", "never", "--json"]),
@@ -5164,6 +5171,7 @@ export async function readSkillCommandOutput(
       // An explicit cwd makes Codex persist trust for a new project.
       // Inherit the child process cwd and preserve the user's decision.
       params: {
+        threadSource: "codex_security_cli",
         approvalPolicy:
           appServer?.sandbox === "read-only" ? "on-request" : "never",
         sandbox: appServer?.sandbox ?? "workspace-write",

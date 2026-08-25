@@ -242,6 +242,7 @@ async function smokeNestedDeepScanWorker(installedRoot, consumer) {
     });
     const { events } = await codex
       .startThread({
+        threadSource: "codex_security_sdk",
         workingDirectory: workerHome,
         skipGitRepoCheck: true,
         sandboxMode: "read-only",

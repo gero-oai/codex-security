@@ -399,6 +399,7 @@ describe("custom validation", () => {
             });
             return {
               startThread: (threadOptions) => {
+                expect(threadOptions.threadSource).toBe("codex_security_sdk");
                 workingDirectories.push(threadOptions.workingDirectory);
                 return {
                   id: "thread-1",
