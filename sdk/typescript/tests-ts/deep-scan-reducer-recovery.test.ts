@@ -22,12 +22,22 @@ type ReducerFinding = {
   summary: string;
   severity?: { level: string; [field: string]: unknown };
   confidence?: { level: string; rationale?: string; [field: string]: unknown };
-  rootCause?: {
-    summary: string;
-    evidenceRefs?: string[];
-    [field: string]: unknown;
-  } | null;
-  codeEvidence?: Array<{ id: string; code: string }> | null;
+  rootCause?:
+    | {
+        summary: string;
+        evidenceRefs?: string[];
+        [field: string]: unknown;
+      }
+    | string;
+  root_cause?:
+    | {
+        summary?: string;
+        evidenceRefs?: string[];
+        evidence_refs?: string[];
+        [field: string]: unknown;
+      }
+    | string;
+  codeEvidence?: Array<{ id: string; code: string }>;
   validation?: { summary?: string; [field: string]: unknown } | null;
   attackPath?: Record<string, unknown> | null;
   writeup?: { reportPath: string };
@@ -305,7 +315,6 @@ test("rejects reduced severity or confidence for accepted source findings", asyn
     ...accepted,
     provenance: { ...accepted.provenance, sourceFindingIds: ["worker:0"] },
   };
-
   for (const { finding, error } of [
     { finding: { ...reduced, severity: { level: "low" } }, error: "severity" },
     {
@@ -471,7 +480,7 @@ test("rejects changed accepted validation outcomes and unsupported evidence", as
     validation: {
       status: "not_exploited",
       summary: "Accepted static trace.",
-      evidence: { outcome: "not_reachable" },
+      details: { outcome: "not_reachable" },
     },
     attackPath: { reachability: { outcome: "not_reachable" } },
   };
@@ -479,6 +488,10 @@ test("rejects changed accepted validation outcomes and unsupported evidence", as
     ...accepted,
     provenance: { ...accepted.provenance, sourceFindingIds: ["worker:0"] },
   };
+  const acceptedRootCause = accepted.rootCause;
+  if (!acceptedRootCause || typeof acceptedRootCause === "string") {
+    throw new Error("Expected a structured accepted root cause.");
+  }
 
   for (const { finding, error } of [
     {
@@ -493,10 +506,10 @@ test("rejects changed accepted validation outcomes and unsupported evidence", as
         ...reduced,
         validation: {
           ...accepted.validation!,
-          evidence: { outcome: "reachable" },
+          details: { outcome: "reachable" },
         },
       },
-      error: "validation.evidence.outcome",
+      error: "validation.details.outcome",
     },
     {
       finding: {
@@ -512,7 +525,7 @@ test("rejects changed accepted validation outcomes and unsupported evidence", as
       finding: {
         ...reduced,
         rootCause: {
-          ...accepted.rootCause!,
+          ...acceptedRootCause,
           classification: "remote_code_execution",
         },
       },
@@ -584,6 +597,140 @@ test("rejects changed accepted validation outcomes and unsupported evidence", as
         null,
       ),
     ).toThrow(error);
+  }
+});
+
+test("reconciles schema-valid alternate encodings without inventing evidence", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const rootSummary = "Accepted root-cause explanation.";
+  const pathSummary = "Accepted request reaches the sensitive sink.";
+  const cases: Array<{
+    field: string;
+    first: unknown;
+    second: unknown;
+    expected: unknown;
+    fabricated: unknown;
+    error: string;
+  }> = [
+    ...["rootCause", "root_cause"].map((field) => ({
+      field,
+      first: rootSummary,
+      second: { summary: rootSummary, code: "acceptedSourceTrace()" },
+      expected: { summary: rootSummary, code: "acceptedSourceTrace()" },
+      fabricated: {
+        summary: "Invented remote exploitation.",
+        code: "acceptedSourceTrace()",
+      },
+      error: `${field}.summary`,
+    })),
+    ...["dataFlow", "data_flow", "dataflow", "reachability"].map((field) => ({
+      field: "attackPath",
+      first: { [field]: pathSummary },
+      second: {
+        [field]: { summary: pathSummary, outcome: "not_reachable" },
+      },
+      expected: {
+        [field]: { summary: pathSummary, outcome: "not_reachable" },
+      },
+      fabricated: {
+        [field]: { summary: pathSummary, outcome: "exploited" },
+      },
+      error: `attackPath.${field}.outcome`,
+    })),
+    ...["impact", "likelihood"].map((field) => ({
+      field: "attackPath",
+      first: { [field]: "high" },
+      second: {
+        [field]: { level: "high", rationale: "Accepted assessment." },
+      },
+      expected: {
+        [field]: { level: "high", rationale: "Accepted assessment." },
+      },
+      fabricated: {
+        [field]: { level: "critical", rationale: "Accepted assessment." },
+      },
+      error: `attackPath.${field}.level`,
+    })),
+    ...["impact", "likelihood"].map((field) => ({
+      field: "attackPath",
+      first: { [field]: null },
+      second: {
+        [field]: { level: "high", rationale: "Accepted assessment." },
+      },
+      expected: {
+        [field]: { level: "high", rationale: "Accepted assessment." },
+      },
+      fabricated: {
+        [field]: { level: "critical", rationale: "Accepted assessment." },
+      },
+      error: `attackPath.${field}.level`,
+    })),
+    {
+      field: "validation",
+      first: { evidence: "Accepted source trace." },
+      second: {
+        evidence: ["Accepted source trace.", "Accepted independent trace."],
+      },
+      expected: {
+        evidence: ["Accepted source trace.", "Accepted independent trace."],
+      },
+      fabricated: {
+        evidence: [
+          "Accepted source trace.",
+          "Accepted independent trace.",
+          "Invented dynamic exploitation.",
+        ],
+      },
+      error: "validation.evidence",
+    },
+  ];
+
+  for (const { field, first, second, expected, fabricated, error } of cases) {
+    for (const values of [
+      [first, second],
+      [second, first],
+    ]) {
+      const original = reducerFinding("alternate-evidence");
+      const originals = values.map((value) => ({
+        ...original,
+        [field]: value,
+      }));
+      const discoveries = originals.map((finding, index) => ({
+        workerId: `worker-${index}`,
+        result: reducerDraft([finding]),
+      }));
+      const draft = (value: unknown) =>
+        reducerDraft([
+          {
+            ...original,
+            [field]: value,
+            provenance: {
+              ...original.provenance,
+              sourceFindingIds: ["worker-0:0", "worker-1:0"],
+            },
+          },
+        ]);
+
+      for (const supplied of [first, second]) {
+        const reduced = reconcileDeepReduction(
+          draft(supplied),
+          discoveries,
+          null,
+        );
+        expect(reduced.findings[0]).toMatchObject({ [field]: expected });
+        expect(reduced.findings[0]!.provenance.sourceFindings).toEqual([
+          { id: "worker-0:0", finding: originals[0]! },
+          { id: "worker-1:0", finding: originals[1]! },
+        ]);
+        expect(
+          reconcileDeepReduction(structuredClone(reduced), discoveries, null),
+        ).toEqual(reduced);
+      }
+
+      expect(() =>
+        reconcileDeepReduction(draft(fabricated), discoveries, null),
+      ).toThrow(error);
+    }
   }
 });
 
@@ -734,16 +881,8 @@ test("reconciles absent and populated worker evidence in either source order", a
   for (const { field, accepted } of [
     { field: "validation", accepted: { status: "not_exploited" } },
     {
-      field: "rootCause",
-      accepted: { summary: "Accepted source explanation." },
-    },
-    {
       field: "attackPath",
       accepted: { reachability: { outcome: "not_reachable" } },
-    },
-    {
-      field: "codeEvidence",
-      accepted: [{ id: "source", code: "acceptedSourceTrace()" }],
     },
   ]) {
     for (const values of [
@@ -911,12 +1050,49 @@ test("renames colliding accepted code-evidence IDs and preserves every reference
     { id: "evidence-1", code: "firstProof()" },
     { id: "evidence-1-2", code: "secondProof()" },
   ]);
-  expect(reduced.rootCause?.evidenceRefs).toEqual([
+  if (!reduced.rootCause || typeof reduced.rootCause === "string") {
+    throw new Error("Expected structured merged root-cause evidence.");
+  }
+  expect(reduced.rootCause.evidenceRefs).toEqual([
     "evidence-1",
     "evidence-1-2",
   ]);
-  expect(reduced.rootCause?.summary).toContain(first.rootCause!.summary);
-  expect(reduced.rootCause?.summary).toContain(second.rootCause!.summary);
+  expect(reduced.rootCause.summary).toContain(
+    "First independently accepted root cause.",
+  );
+  expect(reduced.rootCause.summary).toContain(
+    "Second independently accepted root cause.",
+  );
+});
+
+test("rejects transferring accepted threat predicates to unrelated subjects", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const administrator = reducerFinding("administrator");
+  const attacker = reducerFinding("attacker");
+  const source = reducerDraft([administrator], {
+    threatModel: { summary: "Administrator cannot bypass authentication." },
+  });
+  const unrelated = reducerDraft([attacker], {
+    scope: {
+      summary: "Administrator and attacker routes use distinct controls.",
+    },
+  });
+
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([administrator, attacker], {
+        scope: unrelated.scope,
+        threatModel: {
+          summary: "Administrator and attacker cannot bypass authentication.",
+        },
+      }),
+      [
+        { workerId: "administrator", result: source },
+        { workerId: "attacker", result: unrelated },
+      ],
+      null,
+    ),
+  ).toThrow("threatModel.summary");
 });
 
 test("accepts threat-model synthesis grounded in accepted scope and finding evidence", async () => {
@@ -931,6 +1107,7 @@ test("accepts threat-model synthesis grounded in accepted scope and finding evid
   });
   const scopeSource = reducerDraft([independent], {
     scope: { summary: "Shared and independent request handling." },
+    threatModel: { summary: "Requests may reach independent code." },
   });
   const discoveries = [
     { workerId: "threat-model", result: threatModelSource },
