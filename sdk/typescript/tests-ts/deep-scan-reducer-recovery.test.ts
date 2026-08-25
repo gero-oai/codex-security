@@ -18,8 +18,11 @@ function bundledFunction(runtime: string, name: string): string {
 type ReducerFinding = {
   ruleId: string;
   identity: { anchor: string };
+  title: string;
   locations: Array<{ path: string; startLine: number }>;
   summary: string;
+  taxonomy: { category: string; cwe: string[]; [field: string]: unknown };
+  remediation: string;
   severity?: { level: string; [field: string]: unknown };
   confidence?: { level: string; rationale?: string; [field: string]: unknown };
   rootCause?:
@@ -67,8 +70,11 @@ function reducerFinding(anchor: string, summary = "Accepted worker evidence.") {
   return {
     ruleId: "synthetic.shared-control",
     identity: { anchor },
+    title: `Accepted finding ${anchor}.`,
     locations: [{ path: "src/shared.ts", startLine: 10 }],
     summary,
+    taxonomy: { category: "injection", cwe: ["CWE-89"] },
+    remediation: "Apply the accepted input control.",
     provenance: { source: "local_plugin" },
   } satisfies ReducerFinding;
 }
@@ -164,7 +170,7 @@ test("retains every accepted observation when workers report the same identity",
   const result = reducerDraft([
     {
       ...first,
-      summary: "The reducer grouped both independently accepted observations.",
+      summary: `${first.summary}\n\n${second.summary}`,
       provenance: {
         ...first.provenance,
         sourceFindingIds: ["worker-first:0", "worker-second:0"],
@@ -412,6 +418,183 @@ test("preserves inherited property names in structured finding evidence", async 
       null,
     ),
   ).toThrow("__proto__");
+});
+
+test("preserves complete source-backed finding classifications and details", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const original = reducerFinding("source-backed-finding");
+  const first = {
+    ...original,
+    title: "Accepted SQL injection.",
+    summary: "An accepted SQL query is injectable.",
+    remediation: "Parameterize the accepted SQL query.",
+    taxonomy: {
+      category: "injection",
+      cwe: ["CWE-89", "CWE-20"],
+      details: { control: "query parameterization" },
+    },
+    extensions: { candidateId: "candidate-sql", reportId: "report-sql" },
+    remediationTests: ["Reject the accepted SQL payload."],
+    preventiveControls: ["Bind accepted SQL parameters."],
+    status: "accepted-injection",
+  };
+  const second = {
+    ...original,
+    title: "Accepted authentication failure.",
+    summary: "An accepted authentication control is missing.",
+    remediation: "Require the accepted authentication control.",
+    taxonomy: {
+      category: "authentication",
+      cwe: ["CWE-287"],
+      details: { control: "authentication" },
+    },
+    extensions: { candidateId: "candidate-auth", reportId: "report-auth" },
+    remediationTests: ["Reject the accepted anonymous request."],
+    preventiveControls: ["Require accepted authentication."],
+    status: "accepted-authentication",
+  };
+  const discoveries = [
+    { workerId: "first", result: reducerDraft([first]) },
+    { workerId: "second", result: reducerDraft([second]) },
+  ];
+  const reduce = (
+    source: typeof first,
+    overrides: Record<string, unknown> = {},
+  ) =>
+    reconcileDeepReduction(
+      reducerDraft([
+        {
+          ...source,
+          ...overrides,
+          provenance: {
+            ...source.provenance,
+            sourceFindingIds: ["first:0", "second:0"],
+          },
+        },
+      ]),
+      discoveries,
+      null,
+    ).findings[0]!;
+
+  for (const source of [first, second]) {
+    const reduced = reduce(source);
+    expect(reduced.title).toBe(source.title);
+    expect(reduced.taxonomy).toEqual(source.taxonomy);
+    expect(reduced["extensions" as keyof ReducerFinding]).toEqual(
+      source.extensions,
+    );
+    expect(reduced["status" as keyof ReducerFinding]).toBe(source.status);
+    for (const other of [first, second]) {
+      expect(reduced.summary.split(/\n\s*\n/u)).toContain(other.summary);
+      expect(reduced.remediation.split(/\n\s*\n/u)).toContain(
+        other.remediation,
+      );
+      expect(reduced["remediationTests" as keyof ReducerFinding]).toContain(
+        other.remediationTests[0],
+      );
+      expect(reduced["preventiveControls" as keyof ReducerFinding]).toContain(
+        other.preventiveControls[0],
+      );
+    }
+  }
+
+  const fabricated: Array<[string, unknown]> = [
+    ["title", "No accepted finding exists."],
+    ["summary", "The reducer fabricated dynamic exploitation."],
+    ["remediation", "Disable all access controls."],
+    ["taxonomy", { category: "authentication", cwe: ["CWE-89"] }],
+    ["taxonomy", { ...first.taxonomy, cwe: ["CWE-999"] }],
+    ["taxonomy", { ...first.taxonomy, cwe: ["CWE-89", "CWE-89"] }],
+    ["extensions", { ...first.extensions, candidateId: "fabricated" }],
+    ["remediationTests", ["Disable the accepted control."]],
+    ["preventiveControls", ["Trust all request parameters."]],
+    ["status", "dismissed"],
+    ["type", "not_vulnerable"],
+  ];
+  for (const [field, value] of fabricated) {
+    expect(() => reduce(first, { [field]: value })).toThrow(`finding.${field}`);
+  }
+
+  expect(() => reduce(first, { taxonomy: second.taxonomy })).toThrow(
+    "finding evidence tuple",
+  );
+  expect(
+    reduce(first, {
+      taxonomy: { ...first.taxonomy, cwe: ["CWE-20", "CWE-89"] },
+    }).taxonomy,
+  ).toEqual(first.taxonomy);
+
+  for (const field of ["summary", "remediation"]) {
+    const broad = "The accepted exploit succeeds";
+    const qualified = `${broad} only in tests.`;
+    const sources = [
+      { ...original, [field]: broad },
+      { ...original, [field]: qualified },
+    ];
+    const combined = reconcileDeepReduction(
+      reducerDraft([
+        {
+          ...sources[1]!,
+          provenance: {
+            ...original.provenance,
+            sourceFindingIds: ["broad:0", "qualified:0"],
+          },
+        },
+      ]),
+      [
+        { workerId: "broad", result: reducerDraft([sources[0]!]) },
+        { workerId: "qualified", result: reducerDraft([sources[1]!]) },
+      ],
+      null,
+    ).findings[0]!;
+    const claims = (
+      combined[field as "summary" | "remediation"] as string
+    ).split(/\n\s*\n/u);
+    expect(claims).toContain(broad);
+    expect(claims).toContain(qualified);
+
+    expect(() =>
+      reconcileDeepReduction(
+        reducerDraft([
+          {
+            ...sources[0]!,
+            [field]: `${broad}? No.`,
+            provenance: {
+              ...original.provenance,
+              sourceFindingIds: ["broad:0"],
+            },
+          },
+        ]),
+        [{ workerId: "broad", result: reducerDraft([sources[0]!]) }],
+        null,
+      ),
+    ).toThrow(`finding.${field}`);
+  }
+
+  const inherited = JSON.parse(
+    '{"__proto__":{"outcome":"accepted"},"constructor":{"outcome":"accepted constructor"},"prototype":{"outcome":"accepted prototype"}}',
+  ) as Record<string, unknown>;
+  const accepted = { ...original, ...inherited };
+  const restored = reconcileDeepReduction(
+    reducerDraft([
+      {
+        ...original,
+        provenance: {
+          ...original.provenance,
+          sourceFindingIds: ["worker:0"],
+        },
+      },
+    ]),
+    [{ workerId: "worker", result: reducerDraft([accepted]) }],
+    null,
+  ).findings[0]!;
+  expect(Object.getPrototypeOf(restored)).toBe(Object.prototype);
+  for (const key of ["__proto__", "constructor", "prototype"]) {
+    expect(Object.hasOwn(restored, key)).toBe(true);
+    expect((restored as unknown as Record<string, unknown>)[key]).toEqual(
+      inherited[key],
+    );
+  }
 });
 
 test("rejects a fabricated identity claiming an accepted source finding", async () => {
@@ -1536,6 +1719,109 @@ test("preserves the complete accepted order of attack-path steps", async () => {
   ).toThrow("attackPath.steps");
 });
 
+test("preserves the accepted source-to-sink transformation sequence", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const original = reducerFinding("ordered-transformations");
+  const decode = "Decode the attacker-controlled request.";
+  const validate = "Validate the decoded request.";
+  const audit = "Audit the accepted request.";
+
+  for (const field of ["dataFlow", "data_flow", "dataflow"]) {
+    const finding = (transformations: string[]) => ({
+      ...original,
+      attackPath: {
+        [field]: {
+          summary: "Accepted source-to-sink data flow.",
+          transformations,
+        },
+      },
+    });
+    const reduced = (transformations: string[], workers: number) => ({
+      ...finding(transformations),
+      provenance: {
+        ...original.provenance,
+        sourceFindingIds: Array.from(
+          { length: workers },
+          (_, index) => `worker-${index}:0`,
+        ),
+      },
+    });
+
+    expect(() =>
+      reconcileDeepReduction(
+        reducerDraft([reduced([validate, decode], 1)]),
+        [
+          {
+            workerId: "worker-0",
+            result: reducerDraft([finding([decode, validate])]),
+          },
+        ],
+        null,
+      ),
+    ).toThrow(`attackPath.${field}.transformations`);
+
+    const accepted = [
+      finding([decode, validate]),
+      finding([decode, audit, validate]),
+    ];
+    const retained = reconcileDeepReduction(
+      reducerDraft([reduced([decode, validate], 2)]),
+      accepted.map((source, index) => ({
+        workerId: `worker-${index}`,
+        result: reducerDraft([source]),
+      })),
+      null,
+    ).findings[0]?.attackPath?.[field] as {
+      transformations: string[];
+    };
+    expect(retained.transformations).toEqual([decode, audit, validate]);
+
+    const repeated = [
+      finding([decode, decode]),
+      finding([validate, decode, validate, validate]),
+      finding([validate, validate, decode, validate]),
+    ];
+    const merged = reconcileDeepReduction(
+      reducerDraft([reduced([decode, decode], 3)]),
+      repeated.map((source, index) => ({
+        workerId: `worker-${index}`,
+        result: reducerDraft([source]),
+      })),
+      null,
+    ).findings[0]?.attackPath?.[field] as {
+      transformations: string[];
+    };
+    expect(merged.transformations).toEqual([
+      validate,
+      decode,
+      validate,
+      decode,
+      validate,
+    ]);
+  }
+
+  const controls = {
+    ...original,
+    attackPath: { controls: [decode, validate] },
+  };
+  expect(
+    reconcileDeepReduction(
+      reducerDraft([
+        {
+          ...original,
+          attackPath: { controls: [validate, decode] },
+          provenance: {
+            ...original.provenance,
+            sourceFindingIds: ["worker:0"],
+          },
+        },
+      ]),
+      [{ workerId: "worker", result: reducerDraft([controls]) }],
+      null,
+    ).findings[0]?.attackPath?.["controls"],
+  ).toEqual([validate, decode]);
+});
+
 test("retains overlapping accepted narratives without duplicating source evidence", async () => {
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
   const shorter = "Input reaches the sink.";
@@ -1808,7 +2094,7 @@ test("renames colliding accepted code-evidence IDs and preserves every reference
   const reduced = reconcileDeepReduction(
     reducerDraft([
       {
-        ...reducerFinding("shared", "Both accepted observations."),
+        ...reducerFinding("shared", `${first.summary}\n\n${second.summary}`),
         provenance: {
           source: "local_plugin",
           sourceFindingIds: ["first:0", "second:0"],
