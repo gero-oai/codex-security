@@ -1294,6 +1294,80 @@ test("preserves the complete accepted order of attack-path steps", async () => {
     ).findings[0]?.attackPath,
   ).toEqual({ steps: [input, bypass, input, audit, sink] });
 
+  const repeatedGlobally = [
+    { ...original, attackPath: { steps: [input, input] } },
+    { ...original, attackPath: { steps: [input, bypass, input] } },
+    { ...original, attackPath: { steps: [input, bypass, bypass, bypass] } },
+  ];
+  for (const order of [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+  ]) {
+    const discoveries = order.map((index, position) => ({
+      workerId: `repeat-${position}`,
+      result: reducerDraft([repeatedGlobally[index]!]),
+    }));
+    for (const source of repeatedGlobally) {
+      const reconciled = reconcileDeepReduction(
+        reducerDraft([
+          reducedFinding(source.attackPath.steps, [
+            "repeat-0:0",
+            "repeat-1:0",
+            "repeat-2:0",
+          ]),
+        ]),
+        discoveries,
+        null,
+      ).findings[0]?.attackPath?.["steps"] as string[];
+
+      expect(reconciled).toHaveLength(5);
+      expect(reconciled.filter((step) => step === input)).toHaveLength(2);
+      expect(reconciled.filter((step) => step === bypass)).toHaveLength(3);
+      for (const { attackPath } of repeatedGlobally) {
+        let index = 0;
+        for (const step of reconciled) {
+          if (attackPath.steps[index] === step) index += 1;
+        }
+        expect(index).toBe(attackPath.steps.length);
+      }
+    }
+  }
+
+  const repeatedAtScale = repeatedGlobally.map(({ attackPath }) => ({
+    ...original,
+    attackPath: {
+      steps: Array.from({ length: 12 }, () => attackPath.steps).flat(),
+    },
+  }));
+  const scaled = reconcileDeepReduction(
+    reducerDraft([
+      reducedFinding(repeatedAtScale[0]!.attackPath.steps, [
+        "scaled-0:0",
+        "scaled-1:0",
+        "scaled-2:0",
+      ]),
+    ]),
+    repeatedAtScale.map((finding, index) => ({
+      workerId: `scaled-${index}`,
+      result: reducerDraft([finding]),
+    })),
+    null,
+  ).findings[0]?.attackPath?.["steps"] as string[];
+  expect(scaled).toHaveLength(60);
+  expect(scaled.filter((step) => step === input)).toHaveLength(24);
+  expect(scaled.filter((step) => step === bypass)).toHaveLength(36);
+  for (const { attackPath } of repeatedAtScale) {
+    let index = 0;
+    for (const step of scaled) {
+      if (attackPath.steps[index] === step) index += 1;
+    }
+    expect(index).toBe(attackPath.steps.length);
+  }
+
   const leftSteps = [
     input,
     ...Array.from({ length: 32 }, (_, index) => `Accepted left step ${index}.`),
@@ -1403,6 +1477,11 @@ test("preserves contradictory and qualified source narratives as complete claims
       ["safe", "unsafe"],
       ["exploited", "not_exploited"],
       ["Exploit succeeds", "Exploit succeeds only in tests"],
+      ["Exploit succeeds", "Exploit succeeds? No."],
+      ["Exploit succeeds", "Exploit succeeds! Never."],
+      ["Exploit succeeds", "Exploit succeeds. Never."],
+      ["Exploit succeeds", "Exploit succeeds？ No."],
+      ["Exploit succeeds", "Exploit succeeds！ Never."],
       ["Accès autorisé", "Accès autorisé uniquement en test"],
     ] as Array<[string, string]>) {
       for (const values of [
@@ -1732,6 +1811,56 @@ test("preserves ordered evidence-reference chains across all supported sections"
       null,
     ).findings[0],
   ).toMatchObject({ rootCause: { evidenceRefs: ordered } });
+
+  for (const { section, key } of [
+    { section: "rootCause", key: "evidenceRefs" },
+    { section: "root_cause", key: "evidence_refs" },
+    { section: "validation", key: "evidence_refs" },
+    { section: "attackPath", key: "evidenceRefs" },
+  ]) {
+    const sequences = [
+      ["input", "input"],
+      ["input", "transition", "input"],
+      ["input", "transition", "transition", "transition"],
+    ];
+    const detail = (references: string[]) => ({
+      ...(section === "rootCause" || section === "root_cause"
+        ? { summary: "Accepted root cause." }
+        : {}),
+      [key]: references,
+    });
+    const references = reconcileDeepReduction(
+      reducerDraft([
+        {
+          ...original,
+          codeEvidence,
+          [section]: detail(sequences[0]!),
+          provenance: {
+            ...original.provenance,
+            sourceFindingIds: ["refs-0:0", "refs-1:0", "refs-2:0"],
+          },
+        },
+      ]),
+      sequences.map((source, index) => ({
+        workerId: `refs-${index}`,
+        result: reducerDraft([
+          { ...original, codeEvidence, [section]: detail(source) },
+        ]),
+      })),
+      null,
+    ).findings[0]![
+      section as "rootCause" | "root_cause" | "validation" | "attackPath"
+    ] as Record<string, unknown> | undefined;
+
+    expect(references?.[key]).toHaveLength(5);
+    for (const sequence of sequences) {
+      let index = 0;
+      for (const reference of references?.[key] as string[]) {
+        if (sequence[index] === reference) index += 1;
+      }
+      expect(index).toBe(sequence.length);
+    }
+  }
 });
 
 test("rejects transferring accepted threat predicates to unrelated subjects", async () => {
@@ -2018,6 +2147,22 @@ test("preserves each complete accepted threat claim when claims overlap", async 
     {
       broad: "Les attaquants atteignent la sécurité",
       qualified: "Les attaquants atteignent la sécurité uniquement en test.",
+    },
+    {
+      broad: "Exploit succeeds",
+      qualified: "Exploit succeeds? No.",
+    },
+    {
+      broad: "Exploit succeeds",
+      qualified: "Exploit succeeds! Never.",
+    },
+    {
+      broad: "Exploit succeeds",
+      qualified: "Exploit succeeds？ No.",
+    },
+    {
+      broad: "Exploit succeeds",
+      qualified: "Exploit succeeds！ Never.",
     },
   ]) {
     for (const summaries of [
