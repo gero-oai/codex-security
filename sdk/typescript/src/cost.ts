@@ -484,6 +484,14 @@ export class ScanCostTracker {
       unfinishedWorkers: false,
     };
     for (const [path, session] of this.#sessions) {
+      if (
+        this.#options.maxCostUsd !== undefined &&
+        session.threadId === null &&
+        session.pendingLineBytes > 0 &&
+        presentSessions.has(path)
+      ) {
+        observed.unverified = true;
+      }
       if (session.threadId !== null && included.has(session.threadId)) {
         await this.#reportSessionEvents(path, session);
         if (

@@ -4491,6 +4491,117 @@ describe("live scan cost tracking", () => {
     },
   );
 
+  test("rejects budget finalization while discovered worker metadata is incomplete", async () => {
+    const home = await codexHome();
+    const rootUsage = { input_tokens: 100, output_tokens: 10 };
+    await writeSession(home, "scan-thread", rootUsage);
+    const worker = join(
+      home,
+      "sessions",
+      "2026",
+      "07",
+      "26",
+      "rollout-pending-worker.jsonl",
+    );
+    const metadata = JSON.stringify({
+      type: "session_meta",
+      payload: { id: "worker-thread", parent_thread_id: "scan-thread" },
+    });
+    await writeFile(worker, metadata.slice(0, -1));
+    const reportedCosts: number[] = [];
+    const tracker = new ScanCostTracker({
+      codexHome: home,
+      model: "gpt-5.6-terra",
+      maxCostUsd: 0.001,
+      onCost: (cost) => reportedCosts.push(cost.estimatedUsd),
+    });
+    tracker.start("scan-thread");
+
+    await expect(tracker.stop(rootUsage)).rejects.toThrow(
+      "The scan cost limit could not be verified",
+    );
+    expect(reportedCosts).toEqual([0.00032]);
+
+    await appendFile(
+      worker,
+      `${metadata.slice(-1)}\n${JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: 10_000,
+              output_tokens: 1_000,
+            },
+          },
+        },
+      })}\n${taskEvent("task_complete")}\n`,
+    );
+
+    await expect(tracker.stop(rootUsage)).resolves.toMatchObject({
+      cost: {
+        inputTokens: 10_100,
+        outputTokens: 1_010,
+        estimatedUsd: 0.03232,
+      },
+    });
+    expect(reportedCosts).toEqual([0.00032, 0.03232]);
+  });
+
+  test.each([
+    ["optional incomplete metadata", undefined, "partial"],
+    ["empty discovered rollout", 0.001, "empty"],
+    ["completed unrelated rollout", 0.001, "unrelated"],
+    ["removed incomplete rollout", 0.001, "removed"],
+  ] as const)(
+    "preserves accounting compatibility for %s",
+    async (_description, maxCostUsd, scenario) => {
+      const home = await codexHome();
+      const rootUsage = { input_tokens: 100, output_tokens: 10 };
+      await writeSession(home, "scan-thread", rootUsage);
+      const path = join(
+        home,
+        "sessions",
+        "2026",
+        "07",
+        "26",
+        "rollout-unidentified.jsonl",
+      );
+      if (scenario === "unrelated") {
+        await writeSession(home, "unrelated-thread", {
+          input_tokens: 10_000,
+          output_tokens: 1_000,
+        });
+      } else {
+        await writeFile(
+          path,
+          scenario === "empty"
+            ? ""
+            : '{"type":"session_meta","payload":{"id":"pending-worker"',
+        );
+      }
+      const tracker = new ScanCostTracker({
+        codexHome: home,
+        model: "gpt-5.6-terra",
+        maxCostUsd,
+      });
+      tracker.start("scan-thread");
+
+      if (scenario === "removed") {
+        await tracker.refresh();
+        await rm(path);
+      }
+
+      await expect(tracker.stop(rootUsage)).resolves.toMatchObject({
+        cost: {
+          inputTokens: 100,
+          outputTokens: 10,
+          estimatedUsd: 0.00032,
+        },
+      });
+    },
+  );
+
   test("rejects an incomplete final root event without delegated workers", async () => {
     const home = await codexHome();
     const root = await writeSession(home, "scan-thread", {
