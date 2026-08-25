@@ -346,7 +346,7 @@ def _open_windows_changed_path_descriptor(target: Path, relative_path: Path) -> 
             raise FileNotFoundError(
                 error.errno, error.strerror, error.filename
             ) from error
-        if error.errno in {errno.EACCES, 5}:
+        if error.errno in {errno.EACCES, 5, 32, 33}:
             raise PermissionError(error.errno, error.strerror, error.filename) from error
         raise
 
