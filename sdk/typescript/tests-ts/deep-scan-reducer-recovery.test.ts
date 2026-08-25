@@ -79,6 +79,8 @@ function bundledReducer(
   options: {
     files?: Map<string, ReducerDraft>;
     inspected?: Array<{ path: string; root: string }>;
+    checkpoints?: ReducerDraft[];
+    writes?: Array<{ path: string; result: ReducerDraft }>;
   } = {},
 ) {
   const start = runtime.indexOf("// src/deep-scan/artifact-validation.ts\n");
@@ -118,8 +120,14 @@ function bundledReducer(
       if (!result) throw new Error(`Missing synthetic artifact: ${path}`);
       return structuredClone(result);
     },
-    async () => {},
-    async () => {},
+    async (_context: unknown, result: ReducerDraft) => {
+      options.checkpoints?.push(structuredClone(result));
+    },
+    async (path: string, result: ReducerDraft) => {
+      const saved = structuredClone(result);
+      options.writes?.push({ path, result: saved });
+      options.files?.set(path, saved);
+    },
   ) as {
     reconcileDeepReduction: (
       result: ReducerDraft,
@@ -344,6 +352,50 @@ test("keeps accepted source evidence visible on the reduced finding", async () =
   });
 });
 
+test("preserves every accepted finding location and rejects fabricated locations", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const first: ReducerFinding = {
+    ...reducerFinding("shared"),
+    locations: [{ path: "src/first.ts", startLine: 10 }],
+  };
+  const second: ReducerFinding = {
+    ...reducerFinding("shared", "A second accepted request path."),
+    locations: [{ path: "src/second.ts", startLine: 20 }],
+  };
+  const discoveries = [
+    { workerId: "first", result: reducerDraft([first]) },
+    { workerId: "second", result: reducerDraft([second]) },
+  ];
+  const reducedFinding = (locations: ReducerFinding["locations"]) => ({
+    ...first,
+    locations,
+    provenance: {
+      ...first.provenance,
+      sourceFindingIds: ["first:0", "second:0"],
+    },
+  });
+
+  for (const locations of [[], first.locations]) {
+    expect(
+      reconcileDeepReduction(
+        reducerDraft([reducedFinding(locations)]),
+        discoveries,
+        null,
+      ).findings[0]?.locations,
+    ).toEqual([...first.locations, ...second.locations]);
+  }
+
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([
+        reducedFinding([{ path: "src/fabricated.ts", startLine: 999 }]),
+      ]),
+      discoveries,
+      null,
+    ),
+  ).toThrow("location");
+});
+
 test("rejects an omitted writeup instead of inventing an unbacked artifact path", async () => {
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
   const accepted: ReducerFinding = {
@@ -453,6 +505,189 @@ test("accepts threat-model synthesis grounded in accepted scope and finding evid
       null,
     ),
   ).toThrow("threatModel.summary");
+
+  const firstClaim = "Administrators are not trusted.";
+  const secondClaim = "Workers are not privileged.";
+  const independentlyGrounded = reconcileDeepReduction(
+    reducerDraft([], {
+      threatModel: { summary: `${firstClaim} ${secondClaim}` },
+    }),
+    [
+      {
+        workerId: "administrator-boundary",
+        result: reducerDraft([], { threatModel: { summary: firstClaim } }),
+      },
+      {
+        workerId: "worker-boundary",
+        result: reducerDraft([], { threatModel: { summary: secondClaim } }),
+      },
+    ],
+    null,
+  );
+  expect(independentlyGrounded.threatModel?.["summary"]).toBe(
+    `${firstClaim} ${secondClaim}`,
+  );
+});
+
+test("rejects threat-model synthesis that drops or reverses accepted claims", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+
+  const unsupported: Array<{
+    accepted: string;
+    synthesized: string;
+    scope?: string;
+    duplicate?: boolean;
+    anotherAccepted?: string;
+  }> = [
+    {
+      accepted: "Unauthenticated attackers cannot reach admin endpoints.",
+      synthesized: "Attackers reach admin endpoints.",
+    },
+    {
+      accepted: "Remote attackers are not trusted.",
+      synthesized: "Remote attackers are trusted.",
+    },
+    {
+      accepted: "Remote attackers are not trusted.",
+      synthesized: "Remote attackers are not not trusted.",
+    },
+    {
+      accepted: "Remote attackers are not trusted.",
+      synthesized: "Remote attackers are not not trusted.",
+      duplicate: true,
+    },
+    {
+      accepted: "Remote attackers are not trusted.",
+      anotherAccepted: "Remote attackers are not trusted. Always.",
+      synthesized: "Remote attackers are not not trusted. Always.",
+    },
+    {
+      accepted: "Remote attackers are not trusted.",
+      synthesized: "Remote attackers are trusted not trusted.",
+    },
+    {
+      accepted: "Remote attackers are not trusted.",
+      synthesized: "!!!",
+    },
+    {
+      accepted: "Remote attackers are not trusted.",
+      synthesized: "Trusted attackers are not remote.",
+    },
+    {
+      accepted: "Remote attackers are trusted.",
+      synthesized: "Remote attackers are not trusted.",
+      scope: "Not all request handlers were assessed.",
+    },
+    {
+      accepted: "Remote attackers are trusted.",
+      synthesized: "No remote attackers are trusted.",
+      scope: "No request handler was assessed.",
+    },
+    {
+      accepted: "Remote attackers are trusted.",
+      synthesized: "Remote attackers are never trusted.",
+      scope: "Never assessed the request handler.",
+    },
+    {
+      accepted: "Remote attackers are trusted.",
+      synthesized: "Remote attackers are trusted without review.",
+      scope: "Without review.",
+    },
+    {
+      accepted: "Remote attackers reach admin endpoints.",
+      synthesized: "Remote attackers cannot reach admin endpoints.",
+      scope: "Some users cannot authenticate.",
+    },
+    {
+      accepted: "Remote attackers can reach admin endpoints.",
+      synthesized: "Remote attackers can't reach admin endpoints.",
+      scope: "We can't inspect every request handler.",
+    },
+    {
+      accepted: "Remote attackers cannot reach admin endpoints.",
+      synthesized:
+        "Remote attackers cannot reach admin endpoints unless authenticated.",
+      scope: "Review the endpoint unless authenticated.",
+    },
+    {
+      accepted: "Remote attackers cannot reach admin endpoints.",
+      synthesized:
+        "Remote attackers cannot reach admin endpoints except when authenticated.",
+      scope: "Except when authenticated.",
+    },
+  ];
+
+  for (const {
+    accepted,
+    synthesized,
+    scope,
+    duplicate,
+    anotherAccepted,
+  } of unsupported) {
+    const acceptedScope =
+      scope === undefined ? {} : { scope: { summary: scope } };
+    const acceptedDraft = reducerDraft([], {
+      ...acceptedScope,
+      threatModel: { summary: accepted },
+    });
+    expect(() =>
+      reconcileDeepReduction(
+        reducerDraft([], {
+          ...acceptedScope,
+          threatModel: { summary: synthesized },
+        }),
+        [
+          { workerId: "worker", result: acceptedDraft },
+          ...(duplicate || anotherAccepted !== undefined
+            ? [
+                {
+                  workerId: "another-worker",
+                  result:
+                    anotherAccepted === undefined
+                      ? acceptedDraft
+                      : reducerDraft([], {
+                          ...acceptedScope,
+                          threatModel: { summary: anotherAccepted },
+                        }),
+                },
+              ]
+            : []),
+        ],
+        null,
+      ),
+    ).toThrow("threatModel.summary");
+  }
+});
+
+test("reconciles unknown coverage with deferred and follow-up work", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+
+  for (const pending of [
+    { deferred: [{ reason: "The accepted surface needs follow-up." }] },
+    {
+      surfaces: [
+        {
+          label: "Accepted request handler",
+          disposition: "needs_follow_up",
+        },
+      ],
+    },
+  ]) {
+    const coverage: ReducerDraft["coverage"] = {
+      completeness: "unknown",
+      surfaces: [],
+      explicitExclusions: [],
+      deferred: [],
+      ...pending,
+    };
+    const reduced = reconcileDeepReduction(
+      reducerDraft([], { coverage: structuredClone(coverage) }),
+      [{ workerId: "worker", result: reducerDraft([], { coverage }) }],
+      null,
+    );
+
+    expect(reduced.coverage).toEqual({ ...coverage, completeness: "partial" });
+  }
 });
 
 test("rejects reducer-only scope, coverage, and threat-model evidence", async () => {
@@ -583,17 +818,23 @@ test("rejects reducer-only scope, coverage, and threat-model evidence", async ()
 });
 
 test("revalidates original workers when recovering a Deep reduction", async () => {
-  const first = reducerFinding("first");
+  const first: ReducerFinding = {
+    ...reducerFinding("first"),
+    rootCause: { summary: "Accepted worker evidence reaches the response." },
+  };
   const worker = reducerDraft([first]);
-  const result = reducerDraft([first]);
+  const { rootCause: _rootCause, ...withoutRootCause } = first;
+  const result = reducerDraft([withoutRootCause]);
   const files = new Map([
     ["worker.json", worker],
     ["result.json", result],
   ]);
   const inspected: Array<{ path: string; root: string }> = [];
+  const checkpoints: ReducerDraft[] = [];
+  const writes: Array<{ path: string; result: ReducerDraft }> = [];
   const { validateReducerArtifacts } = bundledReducer(
     await loadBundledRuntime(),
-    { files, inspected },
+    { files, inspected, checkpoints, writes },
   );
   const input = {
     artifacts: { workersRoot: "workers", dedupRoot: "reducers" },
@@ -607,6 +848,12 @@ test("revalidates original workers when recovering a Deep reduction", async () =
     newFindings: 1,
   });
   expect(inspected).toContainEqual({ path: "worker.json", root: "workers" });
+  expect(files.get("result.json")?.findings[0]?.rootCause).toEqual(
+    first.rootCause,
+  );
+  expect(writes).toHaveLength(1);
+  expect(writes[0]?.path).toBe("result.json");
+  expect(checkpoints).toHaveLength(1);
 
   files.set("result.json", {
     ...result,
