@@ -123,6 +123,7 @@ import {
   type CodexCommand,
 } from "./runtime.js";
 import {
+  comparisonFindingGroups,
   matchScanFindingsInternal,
   type matchScanFindings,
   type ScanComparisonInput,
@@ -4389,26 +4390,26 @@ async function matchAllScans(
 
   let matchedPairs = 0;
   let findingMatches = 0;
+  const newlyMatchedGroups: string[][] = [];
   for (const {
     afterScanId,
     afterFindings,
     beforeScans,
-    knownFindingGroups,
+    knownFindingGroups = [],
   } of batches) {
     const before = beforeScans.flatMap(({ findings }) => findings);
+    const knownGroups = [...knownFindingGroups, ...newlyMatchedGroups];
+    const input: ScanComparisonInput = {
+      before,
+      after: afterFindings,
+      ...(knownGroups.length === 0 ? {} : { knownFindingGroups: knownGroups }),
+    };
     const matching: ScanComparisonResult =
       before.length === 0 || afterFindings.length === 0
         ? { matches: [], uncertain: [] }
-        : await dependencies.matchFindings(
-            {
-              before,
-              after: afterFindings,
-              ...(knownFindingGroups === undefined
-                ? {}
-                : { knownFindingGroups }),
-            },
-            { allowHistoricalUncertainty: true },
-          );
+        : await dependencies.matchFindings(input, {
+            allowHistoricalUncertainty: true,
+          });
     const comparisons = beforeScans.map(({ scanId, findings }) => {
       const beforeIds = new Set(
         findings.map(({ occurrenceId }) => occurrenceId),
@@ -4469,6 +4470,7 @@ async function matchAllScans(
         0,
       );
     }
+    newlyMatchedGroups.push(...comparisonFindingGroups(input, matching));
   }
   return {
     repository,

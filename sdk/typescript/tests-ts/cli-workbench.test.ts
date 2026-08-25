@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import type { CodexSecurityConfig, JsonObject } from "../src/index.js";
 import { DiffTarget } from "../src/index.js";
 import { main } from "../src/cli.js";
+import type { ScanComparisonInput } from "../src/scan-comparison.js";
 import {
   capture,
   dependencies,
@@ -695,6 +696,72 @@ describe("CLI workbench", () => {
       uncertain: [],
       related: [related],
     });
+  });
+
+  test("carries newly confirmed finding identities into later matching batches", async () => {
+    const first = { occurrenceId: "first", findingId: "identity-first" };
+    const second = { occurrenceId: "second", findingId: "identity-second" };
+    const third = { occurrenceId: "third", findingId: "identity-third" };
+    const existingGroups = [["existing-first", "existing-second"]];
+    const matchedInputs: ScanComparisonInput[] = [];
+
+    expect(
+      await main(
+        ["scans", "match", "--all", "--json"],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          onWorkbench: (args): JsonObject =>
+            args[0] === "list-unmatched-scan-pairs"
+              ? {
+                  repository: "/current/repository",
+                  scanCount: 3,
+                  unavailableScans: 0,
+                  skippedPairs: 0,
+                  batches: [
+                    {
+                      afterScanId: "second-scan",
+                      afterFindings: [second],
+                      beforeScans: [
+                        { scanId: "first-scan", findings: [first] },
+                      ],
+                    },
+                    {
+                      afterScanId: "third-scan",
+                      afterFindings: [third],
+                      beforeScans: [
+                        { scanId: "first-scan", findings: [first] },
+                        { scanId: "second-scan", findings: [second] },
+                      ],
+                      knownFindingGroups: existingGroups,
+                    },
+                  ],
+                }
+              : {},
+          onMatch: async (input) => {
+            matchedInputs.push(input);
+            return matchedInputs.length === 1
+              ? {
+                  matches: [
+                    {
+                      beforeOccurrenceIds: [first.occurrenceId],
+                      afterOccurrenceIds: [second.occurrenceId],
+                      confidence: "high",
+                      reason: "The same root cause appears in both scans.",
+                    },
+                  ],
+                  uncertain: [],
+                }
+              : { matches: [], uncertain: [] };
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(matchedInputs).toHaveLength(2);
+    expect(matchedInputs[1]!.knownFindingGroups).toEqual([
+      ...existingGroups,
+      [first.findingId, second.findingId],
+    ]);
   });
 
   test("saves empty comparisons without starting Codex", async () => {

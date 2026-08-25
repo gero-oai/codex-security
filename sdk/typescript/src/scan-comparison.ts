@@ -382,6 +382,32 @@ export async function matchCompletedScan(
   }
 }
 
+export function comparisonFindingGroups(
+  input: ScanComparisonInput,
+  comparison: ScanComparisonResult,
+): string[][] {
+  const findingIds = new Map(
+    [...input.before, ...input.after].flatMap((finding) =>
+      typeof finding["findingId"] === "string"
+        ? [[finding.occurrenceId, finding["findingId"]] as const]
+        : [],
+    ),
+  );
+  return comparison.matches.flatMap((match) => {
+    const ids = [
+      ...new Set(
+        [...match.beforeOccurrenceIds, ...match.afterOccurrenceIds].flatMap(
+          (id) => {
+            const findingId = findingIds.get(id);
+            return findingId === undefined ? [] : [findingId];
+          },
+        ),
+      ),
+    ];
+    return ids.length > 1 ? [ids] : [];
+  });
+}
+
 function comparisonPrompt(input: ScanComparisonInput): string {
   return [
     "Compare every finding from one or more earlier scans against a later scan of the same repository.",
