@@ -1892,6 +1892,99 @@ describe("security policy review and application", () => {
   );
 
   test.skipIf(process.platform !== "win32")(
+    "never drops an existing Windows resource-attribute access-control entry",
+    async () => {
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      const original = "# Existing policy\n";
+      await writeFile(target, original);
+      const draft = await f.generate();
+      const systemDirectory = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+      );
+      const powershell = join(
+        systemDirectory,
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+      const methods = [
+        '[System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint="ConvertStringSecurityDescriptorToSecurityDescriptorW", CharSet=System.Runtime.InteropServices.CharSet.Unicode, SetLastError=true)]',
+        "public static extern bool Convert(string sddl, uint revision, out System.IntPtr descriptor, out uint size);",
+        '[System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint="GetSecurityDescriptorSacl", SetLastError=true)]',
+        "public static extern bool Sacl(System.IntPtr descriptor, out int present, out System.IntPtr acl, out int defaulted);",
+        '[System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint="GetNamedSecurityInfoW", CharSet=System.Runtime.InteropServices.CharSet.Unicode)]',
+        "public static extern uint Read(string path, uint type, uint information, System.IntPtr owner, System.IntPtr group, System.IntPtr dacl, System.IntPtr sacl, out System.IntPtr descriptor);",
+        '[System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint="SetNamedSecurityInfoW", CharSet=System.Runtime.InteropServices.CharSet.Unicode)]',
+        "public static extern uint Write(string path, uint type, uint information, System.IntPtr owner, System.IntPtr group, System.IntPtr dacl, System.IntPtr sacl);",
+        '[System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint="LocalFree")]',
+        "public static extern System.IntPtr Free(System.IntPtr memory);",
+      ].join(" ");
+      const helper = `Microsoft.PowerShell.Utility\\Add-Type -Name PolicyResource -Namespace CodexSecurityTest -MemberDefinition '${methods}'`;
+      const environment = {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([key]) => key.toUpperCase() !== "PSMODULEPATH",
+          ),
+        ),
+        CODEX_SECURITY_TEST_ACL_PATH: target,
+        PSModulePath: join(
+          systemDirectory,
+          "WindowsPowerShell",
+          "v1.0",
+          "Modules",
+        ),
+      };
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        helper,
+        "$descriptor = [System.IntPtr]::Zero; [uint32]$size = 0",
+        'if (-not [CodexSecurityTest.PolicyResource]::Convert(\'S:(RA;;;;;WD;("CodexSynthetic",TS,0,"protected"))\', 1, [ref]$descriptor, [ref]$size)) { throw [System.ComponentModel.Win32Exception]::new() }',
+        "try { $present = 0; $acl = [System.IntPtr]::Zero; $defaulted = 0; if (-not [CodexSecurityTest.PolicyResource]::Sacl($descriptor, [ref]$present, [ref]$acl, [ref]$defaulted)) { throw [System.ComponentModel.Win32Exception]::new() }; $status = [CodexSecurityTest.PolicyResource]::Write($env:CODEX_SECURITY_TEST_ACL_PATH, 1, 32, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, $acl); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) } } finally { [void][CodexSecurityTest.PolicyResource]::Free($descriptor) }",
+      ].join("; ");
+      execFileSync(
+        powershell,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        { env: environment, windowsHide: true },
+      );
+      const resource = () =>
+        execFileSync(
+          powershell,
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            [
+              "$ErrorActionPreference = 'Stop'",
+              helper,
+              "$descriptor = [System.IntPtr]::Zero",
+              "$status = [CodexSecurityTest.PolicyResource]::Read($env:CODEX_SECURITY_TEST_ACL_PATH, 1, 32, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$descriptor); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) }",
+              "try { $present = 0; $acl = [System.IntPtr]::Zero; $defaulted = 0; if (-not [CodexSecurityTest.PolicyResource]::Sacl($descriptor, [ref]$present, [ref]$acl, [ref]$defaulted)) { throw [System.ComponentModel.Win32Exception]::new() }; if ($present -eq 0 -or $acl -eq [System.IntPtr]::Zero) { throw 'The synthetic resource attribute was not retained.' }; $bytes = [byte[]]::new([uint16][System.Runtime.InteropServices.Marshal]::ReadInt16($acl, 2)); [System.Runtime.InteropServices.Marshal]::Copy($acl, $bytes, 0, $bytes.Length); [System.Convert]::ToBase64String($bytes) } finally { [void][CodexSecurityTest.PolicyResource]::Free($descriptor) }",
+            ].join("; "),
+          ],
+          { encoding: "utf8", env: environment, windowsHide: true },
+        ).trim();
+      const previous = resource();
+      expect(previous).not.toBe("");
+      const applied = await applySecurityPolicy(draft).catch(
+        (error: unknown) => error,
+      );
+      if (applied instanceof Error) {
+        expect(applied.message).toContain(
+          "Cannot preserve the existing SECURITY.md security descriptor",
+        );
+        expect(await readFile(target, "utf8")).toBe(original);
+      } else {
+        expect(await readFile(target, "utf8")).toBe(POLICY);
+      }
+      expect(resource()).toBe(previous);
+      expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
     "preserves an existing Windows security descriptor",
     async () => {
       const name = "preserves an existing Windows security descriptor";

@@ -1620,6 +1620,21 @@ async function copyWindowsSecurityDescriptor(
       "}",
     ].join(" "),
     [
+      "public static string ReadSecuritySection(string path, uint information, bool optional) {",
+      "System.IntPtr descriptor = System.IntPtr.Zero;",
+      "uint status = GetNamedSecurityInfo(path, 1, information, System.IntPtr.Zero, System.IntPtr.Zero, System.IntPtr.Zero, System.IntPtr.Zero, out descriptor);",
+      'if (status != 0) { if (optional && (status == 50 || status == 87)) return "unsupported:" + status; throw new System.ComponentModel.Win32Exception((int)status); }',
+      "try {",
+      "int present; int defaulted; System.IntPtr acl;",
+      "if (!GetSecurityDescriptorSacl(descriptor, out present, out acl, out defaulted)) throw new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error());",
+      'if (present == 0 || acl == System.IntPtr.Zero) return "none";',
+      "int size = (ushort)System.Runtime.InteropServices.Marshal.ReadInt16(acl, 2);",
+      "byte[] bytes = new byte[size]; System.Runtime.InteropServices.Marshal.Copy(acl, bytes, 0, size);",
+      "return System.Convert.ToBase64String(bytes);",
+      "} finally { if (descriptor != System.IntPtr.Zero) LocalFree(descriptor); }",
+      "}",
+    ].join(" "),
+    [
       "public static uint ClearLabel(string path) {",
       "System.IntPtr empty = System.Runtime.InteropServices.Marshal.AllocHGlobal(8);",
       "try {",
@@ -1649,6 +1664,14 @@ async function copyWindowsSecurityDescriptor(
           ].join(" "),
           "$sourceAuditRules = & $auditRules $acl",
           [
+            "$systemRules = { param($descriptor)",
+            "$system = [System.Security.AccessControl.RawSecurityDescriptor]::new($descriptor.GetSecurityDescriptorBinaryForm(), 0).SystemAcl;",
+            "if ($null -eq $system) { return 'none' };",
+            "$bytes = [byte[]]::new($system.BinaryLength); $system.GetBinaryForm($bytes, 0); [System.Convert]::ToBase64String($bytes)",
+            "}",
+          ].join(" "),
+          "$sourceSystemRules = & $systemRules $acl",
+          [
             "$auditControlMask =",
             "[System.Security.AccessControl.ControlFlags]::SystemAclPresent",
             "-bor [System.Security.AccessControl.ControlFlags]::SystemAclDefaulted",
@@ -1667,6 +1690,13 @@ async function copyWindowsSecurityDescriptor(
             "}",
           ].join(" "),
           `Microsoft.PowerShell.Utility\\Add-Type -Name PolicyIntegrity -Namespace CodexSecurity -MemberDefinition '${integrityMethods}'`,
+          [
+            "$nativeSystemRules = { param([string]$path)",
+            "$sections = @(32, 64, 128, 256 | Microsoft.PowerShell.Core\\ForEach-Object { '{0}:{1}' -f $_, [CodexSecurity.PolicyIntegrity]::ReadSecuritySection($path, [uint32]$_, ($_ -eq 128 -or $_ -eq 256)) });",
+            "[string]::Join([System.Environment]::NewLine, [string[]]$sections)",
+            "}",
+          ].join(" "),
+          `$sourceNativeSystemRules = & $nativeSystemRules $env:${sourceVariable}`,
           [
             "$alignLabels = {",
             "$descriptor = [System.IntPtr]::Zero;",
@@ -1692,7 +1722,7 @@ async function copyWindowsSecurityDescriptor(
             : [
                 `$staged = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
                 [
-                  "if ($sourceAuditControl -eq (& $auditControl $staged) -and $acl.AreAuditRulesProtected -eq $staged.AreAuditRulesProtected -and $sourceAuditRules -eq (& $auditRules $staged)) {",
+                  `if ($sourceAuditControl -eq (& $auditControl $staged) -and $acl.AreAuditRulesProtected -eq $staged.AreAuditRulesProtected -and $sourceAuditRules -eq (& $auditRules $staged) -and $sourceSystemRules -eq (& $systemRules $staged) -and $sourceNativeSystemRules -eq (& $nativeSystemRules $env:${destinationVariable})) {`,
                   "$differentOwner = $acl.GetOwner($identityType).Value -ne $staged.GetOwner($identityType).Value;",
                   "$differentGroup = $acl.GetGroup($identityType).Value -ne $staged.GetGroup($identityType).Value;",
                   `$sourceDescription = [string]::Join([System.Environment]::NewLine, (& $describe $env:${sourceVariable}));`,
@@ -1715,6 +1745,8 @@ async function copyWindowsSecurityDescriptor(
           "if ($sourceAuditControl -ne (& $auditControl $copied)) { throw 'The copied Windows audit control settings differ.' }",
           "$destinationAuditRules = & $auditRules $copied",
           "if ($sourceAuditRules -ne $destinationAuditRules) { throw 'The copied Windows audit rules differ.' }",
+          "if ($sourceSystemRules -ne (& $systemRules $copied)) { throw 'The copied Windows system access-control entries differ.' }",
+          `if ($sourceNativeSystemRules -ne (& $nativeSystemRules $env:${destinationVariable})) { throw 'The copied Windows system access-control categories differ.' }`,
           `$sourceDescriptor = [string]::Join([System.Environment]::NewLine, (& $describe $env:${sourceVariable}))`,
           `$destinationDescriptor = [string]::Join([System.Environment]::NewLine, (& $describe $env:${destinationVariable}))`,
           "if ($sourceDescriptor -ne $destinationDescriptor) { throw 'The copied Windows security descriptor or integrity label differs.' }",
