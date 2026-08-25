@@ -200,6 +200,11 @@ test("preserves the accepted finding producer in canonical provenance", async ()
       candidateId: "candidate-first",
       workerId: "worker-first",
       provider: "accepted-first-provider",
+      details: {
+        outcome: "accepted-first-outcome",
+        nested: { worker: "accepted-first-worker" },
+      },
+      labels: ["first", "accepted"],
     },
   };
   const second = {
@@ -210,6 +215,11 @@ test("preserves the accepted finding producer in canonical provenance", async ()
       candidateId: "candidate-second",
       workerId: "worker-second",
       provider: "accepted-second-provider",
+      details: {
+        outcome: "accepted-second-outcome",
+        nested: { worker: "accepted-second-worker" },
+      },
+      labels: ["second", "accepted"],
     },
   };
   const discoveries = [
@@ -243,15 +253,28 @@ test("preserves the accepted finding producer in canonical provenance", async ()
     reconcileDeepReduction(result("fabricated_import"), discoveries, null),
   ).toThrow("provenance.source");
 
-  for (const [field, value] of [
+  const fabricated: Array<[string, unknown]> = [
     ["candidateId", "fabricated-candidate"],
     ["workerId", "fabricated-worker"],
     ["provider", "fabricated-provider"],
     ["invented", "reducer-only-metadata"],
-  ]) {
+    ["details", { outcome: "fabricated" }],
+    [
+      "details",
+      {
+        outcome: "accepted-first-outcome",
+        nested: { worker: "fabricated-worker" },
+      },
+    ],
+    ["labels", ["fabricated"]],
+    ["labels", ["accepted", "first"]],
+    ["inventedObject", { outcome: "fabricated" }],
+    ["inventedArray", ["fabricated"]],
+  ];
+  for (const [field, value] of fabricated) {
     expect(() =>
       reconcileDeepReduction(
-        result("local_plugin", { [field!]: value }),
+        result("local_plugin", { [field]: value }),
         discoveries,
         null,
       ),
@@ -269,6 +292,16 @@ test("preserves the accepted finding producer in canonical provenance", async ()
     ),
   ).toThrow("provenance");
 
+  expect(() =>
+    reconcileDeepReduction(
+      result("local_plugin", {
+        details: second.provenance.details,
+      }),
+      discoveries,
+      null,
+    ),
+  ).toThrow("provenance");
+
   expect(
     reconcileDeepReduction(
       result("local_plugin", { previousFindings: "legacy-host-history" }),
@@ -276,6 +309,29 @@ test("preserves the accepted finding producer in canonical provenance", async ()
       null,
     ).findings[0]?.provenance["previousFindings"],
   ).toBe("legacy-host-history");
+
+  const inheritedNames = JSON.parse(
+    '{"source":"local_plugin","__proto__":{"outcome":"accepted"},"constructor":{"outcome":"accepted constructor"},"prototype":{"outcome":"accepted prototype"}}',
+  ) as ReducerFinding["provenance"];
+  const inheritedFinding = { ...original, provenance: inheritedNames };
+  const restored = reconcileDeepReduction(
+    reducerDraft([
+      {
+        ...original,
+        provenance: {
+          source: "local_plugin",
+          sourceFindingIds: ["inherited:0"],
+        },
+      },
+    ]),
+    [{ workerId: "inherited", result: reducerDraft([inheritedFinding]) }],
+    null,
+  ).findings[0]!.provenance;
+  expect(Object.getPrototypeOf(restored)).toBe(Object.prototype);
+  for (const key of ["__proto__", "constructor", "prototype"]) {
+    expect(Object.hasOwn(restored, key)).toBe(true);
+    expect(restored[key]).toEqual(inheritedNames[key]);
+  }
 });
 
 test("rejects a fabricated identity claiming an accepted source finding", async () => {
@@ -1708,6 +1764,249 @@ test("rejects transferring accepted threat predicates to unrelated subjects", as
   ).toThrow("threatModel.summary");
 });
 
+test("keeps Boolean and qualified threat claims independently attributable", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const administrator = reducerFinding("administrator");
+  const attacker = reducerFinding("attacker");
+  const scope = {
+    summary: "Administrator and attacker request paths were reviewed.",
+  };
+
+  for (const { first, second, synthesized } of [
+    {
+      first: "The administrator, or the service, can bypass authentication.",
+      second: "The attacker, or the service, can bypass authentication.",
+      synthesized:
+        "The administrator and attacker, or the service, can bypass authentication.",
+    },
+    {
+      first: "The administrator or service can bypass authentication.",
+      second: "The attacker or service can bypass authentication.",
+      synthesized:
+        "The administrator and attacker or service can bypass authentication.",
+    },
+    {
+      first: "The administrator (or service) can bypass authentication.",
+      second: "The attacker (or service) can bypass authentication.",
+      synthesized:
+        "The administrator and attacker (or service) can bypass authentication.",
+    },
+    {
+      first: "The administrator cannot bypass authentication.",
+      second: "The attacker cannot bypass authentication.",
+      synthesized:
+        "The administrator and attacker cannot bypass authentication.",
+    },
+    {
+      first: "The administrator can bypass authentication only in testing.",
+      second: "The attacker can bypass authentication only in testing.",
+      synthesized:
+        "The administrator and attacker can bypass authentication only in testing.",
+    },
+    {
+      first:
+        "The administrator can bypass authentication if the service is offline.",
+      second:
+        "The attacker can bypass authentication if the service is offline.",
+      synthesized:
+        "The administrator and attacker can bypass authentication if the service is offline.",
+    },
+  ]) {
+    for (const discoveries of [
+      [
+        {
+          workerId: "administrator",
+          result: reducerDraft([administrator], {
+            threatModel: { summary: first },
+          }),
+        },
+        {
+          workerId: "attacker",
+          result: reducerDraft([attacker], {
+            scope,
+            threatModel: { summary: second },
+          }),
+        },
+      ],
+      [
+        {
+          workerId: "attacker",
+          result: reducerDraft([attacker], {
+            scope,
+            threatModel: { summary: second },
+          }),
+        },
+        {
+          workerId: "administrator",
+          result: reducerDraft([administrator], {
+            threatModel: { summary: first },
+          }),
+        },
+      ],
+    ]) {
+      expect(() =>
+        reconcileDeepReduction(
+          reducerDraft([administrator, attacker], {
+            scope,
+            threatModel: { summary: synthesized },
+          }),
+          discoveries,
+          null,
+        ),
+      ).toThrow("threatModel.summary");
+
+      const preserved = `${first}\n\n${second}`;
+      expect(
+        reconcileDeepReduction(
+          reducerDraft([administrator, attacker], {
+            scope,
+            threatModel: { summary: preserved },
+          }),
+          discoveries,
+          null,
+        ).threatModel?.["summary"],
+      ).toBe(preserved);
+    }
+  }
+
+  const shared = reducerFinding("shared");
+  const independent = reducerFinding("independent");
+  const modifierScope = {
+    summary: "Shared and independent request paths were reviewed.",
+  };
+  for (const prefix of [
+    "Requests or automated tools may reach",
+    "Requests and automated tools may reach",
+    "Neither requests nor automated tools may reach",
+    "Requests cannot reach",
+    "Requests do not reach",
+    "Only authenticated requests reach",
+    "Requests reach unless excluded from",
+  ]) {
+    const first = `${prefix} shared code.`;
+    const second = `${prefix} independent code.`;
+    const discoveries = [
+      {
+        workerId: "shared",
+        result: reducerDraft([shared], { threatModel: { summary: first } }),
+      },
+      {
+        workerId: "independent",
+        result: reducerDraft([independent], {
+          scope: modifierScope,
+          threatModel: { summary: second },
+        }),
+      },
+    ];
+    expect(() =>
+      reconcileDeepReduction(
+        reducerDraft([shared, independent], {
+          scope: modifierScope,
+          threatModel: { summary: `${prefix} shared and independent code.` },
+        }),
+        discoveries,
+        null,
+      ),
+    ).toThrow("threatModel.summary");
+    expect(
+      reconcileDeepReduction(
+        reducerDraft([shared, independent], {
+          scope: modifierScope,
+          threatModel: { summary: `${first}\n\n${second}` },
+        }),
+        discoveries,
+        null,
+      ).threatModel?.["summary"],
+    ).toBe(`${first}\n\n${second}`);
+  }
+
+  const unicodeFirst = "Requests may reach shared sécurité。";
+  const unicodeSecond = "Requests may reach independent sécurité。";
+  const unicodeDiscoveries = [
+    {
+      workerId: "shared",
+      result: reducerDraft([shared], {
+        threatModel: { summary: unicodeFirst },
+      }),
+    },
+    {
+      workerId: "independent",
+      result: reducerDraft([independent], {
+        scope: modifierScope,
+        threatModel: { summary: unicodeSecond },
+      }),
+    },
+  ];
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([shared, independent], {
+        scope: modifierScope,
+        threatModel: {
+          summary: "Requests may reach shared and independent sécurité。",
+        },
+      }),
+      unicodeDiscoveries,
+      null,
+    ),
+  ).toThrow("threatModel.summary");
+  expect(
+    reconcileDeepReduction(
+      reducerDraft([shared, independent], {
+        scope: modifierScope,
+        threatModel: {
+          summary: `${unicodeFirst}\n\n${unicodeSecond}`,
+        },
+      }),
+      unicodeDiscoveries,
+      null,
+    ).threatModel?.["summary"],
+  ).toBe(`${unicodeFirst}\n\n${unicodeSecond}`);
+
+  for (const { first, second, combined } of [
+    {
+      first: "Remote attackers reach administrator endpoints",
+      second: "only in tests.",
+      combined: "Remote attackers reach administrator endpoints only in tests.",
+    },
+    {
+      first: "Remote attackers are trusted",
+      second: "not.",
+      combined: "Remote attackers are trustednot.",
+    },
+    {
+      first: "Authentication may block attackers",
+      second: "Remote execution succeeds",
+      combined: "Authentication may block attackers Remote execution succeeds",
+    },
+  ]) {
+    const discoveries = [
+      {
+        workerId: "first-claim",
+        result: reducerDraft([], { threatModel: { summary: first } }),
+      },
+      {
+        workerId: "second-claim",
+        result: reducerDraft([], { threatModel: { summary: second } }),
+      },
+    ];
+    expect(() =>
+      reconcileDeepReduction(
+        reducerDraft([], { threatModel: { summary: combined } }),
+        discoveries,
+        null,
+      ),
+    ).toThrow("threatModel.summary");
+    const separate = `${first}\n\n${second}`;
+    expect(
+      reconcileDeepReduction(
+        reducerDraft([], { threatModel: { summary: separate } }),
+        discoveries,
+        null,
+      ).threatModel?.["summary"],
+    ).toBe(separate);
+  }
+});
+
 test("preserves each complete accepted threat claim when claims overlap", async () => {
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
   for (const { broad, qualified } of [
@@ -1750,7 +2049,7 @@ test("preserves each complete accepted threat claim when claims overlap", async 
   }
 });
 
-test("accepts threat-model synthesis grounded in accepted scope and finding evidence", async () => {
+test("preserves every distinct accepted threat-model claim without synthesis", async () => {
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
   const shared = reducerFinding("shared", "Accepted shared request path.");
   const independent = reducerFinding(
@@ -1773,15 +2072,29 @@ test("accepts threat-model synthesis grounded in accepted scope and finding evid
     reducerDraft([shared, independent], {
       scope: scopeSource.scope,
       threatModel: {
-        summary: "Requests may reach shared and independent code.",
+        summary:
+          "Requests may reach shared code.\n\nRequests may reach independent code.",
       },
     }),
     discoveries,
     null,
   );
   expect(reduced.threatModel?.["summary"]).toBe(
-    "Requests may reach shared and independent code.",
+    "Requests may reach shared code.\n\nRequests may reach independent code.",
   );
+
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([shared, independent], {
+        scope: scopeSource.scope,
+        threatModel: {
+          summary: "Requests may reach shared and independent code.",
+        },
+      }),
+      discoveries,
+      null,
+    ),
+  ).toThrow("threatModel.summary");
 
   expect(() =>
     reconcileDeepReduction(
