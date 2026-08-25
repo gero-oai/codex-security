@@ -1300,6 +1300,81 @@ describe("security policy review and application", () => {
     await writeFile(join(f.repository, "SECURITY.md"), original);
     const draft = await f.generate();
     const writer = await open(draft.targetPath, "r+");
+    let windowsDescriptor: (() => string) | undefined;
+    let windowsIntegrity: (() => string) | undefined;
+    if (process.platform === "win32") {
+      const systemDirectory = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+      );
+      const powershell = join(
+        systemDirectory,
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+      const environment = {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([name]) => name.toUpperCase() !== "PSMODULEPATH",
+          ),
+        ),
+        CODEX_SECURITY_TEST_ACL_PATH: draft.targetPath,
+        PSModulePath: join(
+          systemDirectory,
+          "WindowsPowerShell",
+          "v1.0",
+          "Modules",
+        ),
+      };
+      execFileSync(join(systemDirectory, "icacls.exe"), [
+        draft.targetPath,
+        "/setintegritylevel",
+        "L",
+      ]);
+      execFileSync(
+        powershell,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          [
+            "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()",
+            "$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -Audit",
+            "$acl.SetAuditRuleProtection($true, $false)",
+            "$audit = [System.Security.AccessControl.FileSystemAuditRule]::new($identity.User, 'Read', 'Success')",
+            "$acl.AddAuditRule($audit)",
+            "Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -AclObject $acl",
+          ].join("; "),
+        ],
+        { env: environment, windowsHide: true },
+      );
+      windowsDescriptor = () =>
+        execFileSync(
+          powershell,
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -Audit | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+          ],
+          { encoding: "utf8", env: environment, windowsHide: true },
+        ).trim();
+      windowsIntegrity = () =>
+        execFileSync(join(systemDirectory, "icacls.exe"), [draft.targetPath], {
+          encoding: "utf8",
+          windowsHide: true,
+        });
+    }
+    const previousWindowsDescriptor = windowsDescriptor?.();
+    const previousWindowsIntegrity = windowsIntegrity?.();
+    if (process.platform === "win32") {
+      expect(previousWindowsDescriptor).toContain("S:P");
+      expect(previousWindowsDescriptor).toContain("(AU;SA;");
+      expect(previousWindowsIntegrity).toContain("(NW)");
+    }
     const controller = new AbortController();
     const originalRename = fsPromises.rename;
     const originalLink = fsPromises.link;
@@ -1328,6 +1403,10 @@ describe("security policy review and application", () => {
         "# Late rollback save\n",
       );
       expect(await readFile(draft.targetPath, "utf8")).toBe(original);
+      if (process.platform === "win32") {
+        expect(windowsDescriptor!()).toBe(previousWindowsDescriptor!);
+        expect(windowsIntegrity!()).toBe(previousWindowsIntegrity!);
+      }
     } finally {
       await writer.close();
       mock.module("node:fs/promises", () => ({
@@ -1634,6 +1713,221 @@ describe("security policy review and application", () => {
           ...fsPromises,
           link: originalLink,
           rename: originalRename,
+        }));
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "removes an inherited Windows integrity label when the existing policy has none",
+    async () => {
+      const name =
+        "removes an inherited Windows integrity label when the existing policy has none";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      await writeFile(target, "# Existing policy\n");
+      const systemDirectory = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+      );
+      const powershell = join(
+        systemDirectory,
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+      const powershellEnvironment = {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([name]) => name.toUpperCase() !== "PSMODULEPATH",
+          ),
+        ),
+        CODEX_SECURITY_TEST_ACL_PATH: target,
+        PSModulePath: join(
+          systemDirectory,
+          "WindowsPowerShell",
+          "v1.0",
+          "Modules",
+        ),
+      };
+      execFileSync(
+        powershell,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          [
+            "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()",
+            "$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -Audit",
+            "$acl.SetAuditRuleProtection($true, $false)",
+            "$audit = [System.Security.AccessControl.FileSystemAuditRule]::new($identity.User, 'Read', 'Success')",
+            "$acl.AddAuditRule($audit)",
+            "Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -AclObject $acl",
+          ].join("; "),
+        ],
+        { env: powershellEnvironment, windowsHide: true },
+      );
+      execFileSync(join(systemDirectory, "icacls.exe"), [
+        f.repository,
+        "/setintegritylevel",
+        "(OI)(CI)L",
+      ]);
+      const integrity = (path: string) =>
+        execFileSync(join(systemDirectory, "icacls.exe"), [path], {
+          encoding: "utf8",
+          windowsHide: true,
+        });
+      expect(integrity(target)).not.toContain("(NW)");
+      const descriptor = () =>
+        execFileSync(
+          powershell,
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -Audit | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+          ],
+          { encoding: "utf8", env: powershellEnvironment, windowsHide: true },
+        ).trim();
+      const before = descriptor();
+      expect(before).toContain("S:P");
+      expect(before).toContain("(AU;SA;");
+      const draft = await f.generate();
+      const originalOpen = fsPromises.open;
+      let inheritedLabel = false;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        open: async (...args: Parameters<typeof originalOpen>) => {
+          const handle = await originalOpen(...args);
+          if (String(args[0]).startsWith(join(f.repository, ".SECURITY.md."))) {
+            expect(integrity(String(args[0]))).toContain("(NW)");
+            inheritedLabel = true;
+          }
+          return handle;
+        },
+      }));
+      try {
+        await applySecurityPolicy(draft);
+        expect(inheritedLabel).toBe(true);
+        expect(await readFile(target, "utf8")).toBe(POLICY);
+        expect(integrity(target)).not.toContain("(NW)");
+        expect(descriptor()).toBe(before);
+      } finally {
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          open: originalOpen,
+        }));
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "restores a Windows policy when its security descriptor changes during replacement",
+    async () => {
+      const name =
+        "restores a Windows policy when its security descriptor changes during replacement";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      const previous = "# Existing policy\n";
+      await writeFile(target, previous);
+      const draft = await f.generate();
+      const icacls = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+        "icacls.exe",
+      );
+      const descriptor = () =>
+        execFileSync(icacls, [target], {
+          encoding: "utf8",
+          windowsHide: true,
+        });
+      const originalRename = fsPromises.rename;
+      let changedDescriptor: string | undefined;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        rename: async (...args: Parameters<typeof originalRename>) => {
+          if (args[0] === target) {
+            execFileSync(icacls, [target, "/grant", "*S-1-1-0:R"], {
+              windowsHide: true,
+            });
+            changedDescriptor = descriptor();
+          }
+          return originalRename(...args);
+        },
+      }));
+      try {
+        await expect(applySecurityPolicy(draft)).rejects.toBeInstanceOf(
+          SecurityPolicyRecoveryError,
+        );
+        expect(changedDescriptor).toBeDefined();
+        expect(await readFile(target, "utf8")).toBe(previous);
+        expect(descriptor()).toBe(changedDescriptor!);
+        expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
+      } finally {
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          rename: originalRename,
+        }));
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "never replaces a concurrent Windows policy when native installation is required",
+    async () => {
+      const name =
+        "never replaces a concurrent Windows policy when native installation is required";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      const previous = "# Existing policy\n";
+      const concurrent = "# Concurrent policy\n";
+      await writeFile(target, previous);
+      const draft = await f.generate();
+      const originalLink = fsPromises.link;
+      let attemptedNativeMove = false;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        link: async (...args: Parameters<typeof originalLink>) => {
+          if (args[1] === target && String(args[0]).endsWith(".tmp")) {
+            await writeFile(target, concurrent, { flag: "wx" });
+            attemptedNativeMove = true;
+            throw Object.assign(new Error("hard links are unsupported"), {
+              code: "ENOTSUP",
+            });
+          }
+          return originalLink(...args);
+        },
+      }));
+      try {
+        const error = await applySecurityPolicy(draft).catch(
+          (value: unknown) => value,
+        );
+        expect(error).toBeInstanceOf(SecurityPolicyRecoveryError);
+        expect(attemptedNativeMove).toBe(true);
+        expect((error as SecurityPolicyRecoveryError).cause).toBeInstanceOf(
+          AggregateError,
+        );
+        expect(
+          ((error as SecurityPolicyRecoveryError).cause as AggregateError)
+            .errors[0],
+        ).toMatchObject({ code: "EEXIST" });
+        expect(await readFile(target, "utf8")).toBe(concurrent);
+        expect(
+          await readFile(
+            (error as SecurityPolicyRecoveryError).recoveryPath,
+            "utf8",
+          ),
+        ).toBe(previous);
+        expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
+      } finally {
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          link: originalLink,
         }));
       }
     },

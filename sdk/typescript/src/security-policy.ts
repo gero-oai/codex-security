@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import {
   chmod,
   copyFile,
+  link,
   lstat,
   open,
   readFile,
@@ -1309,7 +1310,31 @@ export async function applySecurityPolicy(
 async function installPolicyFile(
   temporary: string,
   targetPath: string,
+  preserveWindowsDescriptor = false,
 ): Promise<void> {
+  if (preserveWindowsDescriptor && process.platform === "win32") {
+    if (((await stat(temporary)).mode & 0o200) !== 0) {
+      try {
+        await link(temporary, targetPath);
+        return;
+      } catch (error) {
+        if (
+          ![
+            "EPERM",
+            "ENOTSUP",
+            "EOPNOTSUPP",
+            "EXDEV",
+            "EMLINK",
+            "EISDIR",
+          ].includes((error as NodeJS.ErrnoException).code ?? "")
+        ) {
+          throw error;
+        }
+      }
+    }
+    await moveWindowsPolicyFileNoClobber(temporary, targetPath);
+    return;
+  }
   // Windows may make a read-only file writable before removing it. Keep the
   // temporary inode separate so cleanup cannot change the installed mode.
   if (((await stat(temporary)).mode & 0o200) === 0)
@@ -1317,10 +1342,72 @@ async function installPolicyFile(
   else await installFileNoClobber(temporary, targetPath);
 }
 
+async function moveWindowsPolicyFileNoClobber(
+  source: string,
+  destination: string,
+): Promise<void> {
+  const sourceVariable = "CODEX_SECURITY_POLICY_MOVE_SOURCE";
+  const destinationVariable = "CODEX_SECURITY_POLICY_MOVE_DESTINATION";
+  const systemDirectory = join(
+    process.env["SystemRoot"] ?? "C:\\Windows",
+    "System32",
+  );
+  const moveFile = [
+    '[System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "MoveFileExW", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]',
+    "public static extern bool MoveFile(string source, string destination, uint flags);",
+  ].join(" ");
+  try {
+    await execFileAsync(
+      join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"),
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        [
+          "$ErrorActionPreference = 'Stop'",
+          `Microsoft.PowerShell.Utility\\Add-Type -Name PolicyMove -Namespace CodexSecurity -MemberDefinition '${moveFile}'`,
+          `if (-not [CodexSecurity.PolicyMove]::MoveFile($env:${sourceVariable}, $env:${destinationVariable}, 0)) { $code = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error(); if ($code -eq 80 -or $code -eq 183) { exit 17 }; throw [System.ComponentModel.Win32Exception]::new($code) }`,
+        ].join("; "),
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(
+              ([name]) =>
+                !["PSMODULEPATH", sourceVariable, destinationVariable].includes(
+                  name.toUpperCase(),
+                ),
+            ),
+          ),
+          [sourceVariable]: source,
+          [destinationVariable]: destination,
+          PSModulePath: join(
+            systemDirectory,
+            "WindowsPowerShell",
+            "v1.0",
+            "Modules",
+          ),
+        },
+        windowsHide: true,
+      },
+    );
+  } catch (error) {
+    if ((error as { code?: number }).code === 17) {
+      throw Object.assign(new Error("The policy destination already exists."), {
+        code: "EEXIST",
+      });
+    }
+    throw error;
+  }
+}
+
 async function copyWindowsSecurityDescriptor(
   source: string,
   destination: string,
   signal?: AbortSignal,
+  verifyOnly = false,
 ): Promise<void> {
   const sourceVariable = "CODEX_SECURITY_POLICY_ACL_SOURCE";
   const destinationVariable = "CODEX_SECURITY_POLICY_ACL_DESTINATION";
@@ -1343,8 +1430,15 @@ async function copyWindowsSecurityDescriptor(
     "public static extern bool GetSecurityDescriptorSacl(System.IntPtr descriptor, out int present, out System.IntPtr sacl, out int defaulted);",
     '[System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint = "SetNamedSecurityInfoW", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]',
     "public static extern uint SetNamedSecurityInfo(string path, uint type, uint information, System.IntPtr owner, System.IntPtr group, System.IntPtr dacl, System.IntPtr sacl);",
+    '[System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint = "InitializeAcl", SetLastError = true)]',
+    "public static extern bool InitializeAcl(System.IntPtr acl, uint length, uint revision);",
     '[System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "LocalFree")]',
     "public static extern System.IntPtr LocalFree(System.IntPtr memory);",
+    [
+      "public static bool HasEntries(System.IntPtr acl) {",
+      "return acl != System.IntPtr.Zero && System.Runtime.InteropServices.Marshal.ReadInt16(acl, 4) != 0;",
+      "}",
+    ].join(" "),
     [
       "public static bool SameAcl(System.IntPtr left, System.IntPtr right) {",
       "if (left == right) return true;",
@@ -1353,6 +1447,15 @@ async function copyWindowsSecurityDescriptor(
       "if (size != (ushort)System.Runtime.InteropServices.Marshal.ReadInt16(right, 2)) return false;",
       "for (int index = 0; index < size; index++) if (System.Runtime.InteropServices.Marshal.ReadByte(left, index) != System.Runtime.InteropServices.Marshal.ReadByte(right, index)) return false;",
       "return true;",
+      "}",
+    ].join(" "),
+    [
+      "public static uint ClearLabel(string path) {",
+      "System.IntPtr empty = System.Runtime.InteropServices.Marshal.AllocHGlobal(8);",
+      "try {",
+      "if (!InitializeAcl(empty, 8, 2)) throw new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error());",
+      "return SetNamedSecurityInfo(path, 1, 16, System.IntPtr.Zero, System.IntPtr.Zero, System.IntPtr.Zero, empty);",
+      "} finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(empty); }",
       "}",
     ].join(" "),
   ].join(" ");
@@ -1379,10 +1482,18 @@ async function copyWindowsSecurityDescriptor(
             `$status = [CodexSecurity.PolicyIntegrity]::GetNamedSecurityInfo($env:${destinationVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$destinationLabelDescriptor); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) };`,
             "$destinationPresent = 0; $destinationLabel = [System.IntPtr]::Zero; $destinationDefaulted = 0;",
             "if (-not [CodexSecurity.PolicyIntegrity]::GetSecurityDescriptorSacl($destinationLabelDescriptor, [ref]$destinationPresent, [ref]$destinationLabel, [ref]$destinationDefaulted)) { throw [System.ComponentModel.Win32Exception]::new() };",
-            `if ($present -ne 0 -and $label -ne [System.IntPtr]::Zero -and -not [CodexSecurity.PolicyIntegrity]::SameAcl($label, $destinationLabel)) { $status = [CodexSecurity.PolicyIntegrity]::SetNamedSecurityInfo($env:${destinationVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, $label); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) } }`,
+            "$sourceHasLabel = $present -ne 0 -and [CodexSecurity.PolicyIntegrity]::HasEntries($label); $destinationHasLabel = $destinationPresent -ne 0 -and [CodexSecurity.PolicyIntegrity]::HasEntries($destinationLabel);",
+            verifyOnly
+              ? "if ($sourceHasLabel -ne $destinationHasLabel -or ($sourceHasLabel -and -not [CodexSecurity.PolicyIntegrity]::SameAcl($label, $destinationLabel))) { throw 'The Windows integrity label changed during policy replacement.' }"
+              : `if ($sourceHasLabel) { if (-not [CodexSecurity.PolicyIntegrity]::SameAcl($label, $destinationLabel)) { $status = [CodexSecurity.PolicyIntegrity]::SetNamedSecurityInfo($env:${destinationVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, $label); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) } } } elseif ($destinationHasLabel) { $status = [CodexSecurity.PolicyIntegrity]::ClearLabel($env:${destinationVariable}); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) } }`,
             "} finally { if ($destinationLabelDescriptor -ne [System.IntPtr]::Zero) { [void][CodexSecurity.PolicyIntegrity]::LocalFree($destinationLabelDescriptor) }; if ($descriptor -ne [System.IntPtr]::Zero) { [void][CodexSecurity.PolicyIntegrity]::LocalFree($descriptor) } }",
           ].join(" "),
-          `Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl`,
+          ...(verifyOnly
+            ? []
+            : [
+                "$acl.SetAuditRuleProtection($acl.AreAuditRulesProtected, $true)",
+                `Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl`,
+              ]),
           `$copied = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
           "$identityType = [System.Security.Principal.SecurityIdentifier]",
           "if ($acl.GetOwner($identityType).Value -ne $copied.GetOwner($identityType).Value -or $acl.GetGroup($identityType).Value -ne $copied.GetGroup($identityType).Value) { throw 'The copied Windows security descriptor owner or group differs.' }",
@@ -1392,7 +1503,10 @@ async function copyWindowsSecurityDescriptor(
             "[string]::Join([System.Environment]::NewLine, [string[]]$rules)",
             "}",
           ].join(" "),
-          "if ($acl.AreAuditRulesProtected -ne $copied.AreAuditRulesProtected -or (& $auditRules $acl) -ne (& $auditRules $copied)) { throw 'The copied Windows audit security descriptor differs.' }",
+          "if ($acl.AreAuditRulesProtected -ne $copied.AreAuditRulesProtected) { throw 'The copied Windows audit inheritance settings differ.' }",
+          "$sourceAuditRules = & $auditRules $acl",
+          "$destinationAuditRules = & $auditRules $copied",
+          "if ($sourceAuditRules -ne $destinationAuditRules) { throw 'The copied Windows audit rules differ.' }",
           [
             "$describe = { param([string]$path)",
             "$lines = @(& ([System.IO.Path]::Combine($env:SystemRoot, 'System32', 'icacls.exe')) $path);",
@@ -1464,9 +1578,14 @@ async function replaceExistingPolicy(
     }
     signal?.throwIfAborted();
     if (process.platform === "win32")
-      await copyWindowsSecurityDescriptor(recoveryPath, temporary, signal);
+      await copyWindowsSecurityDescriptor(
+        recoveryPath,
+        temporary,
+        signal,
+        true,
+      );
     signal?.throwIfAborted();
-    await installPolicyFile(temporary, targetPath);
+    await installPolicyFile(temporary, targetPath, true);
   } catch (error) {
     let cause = error;
     try {
@@ -1476,7 +1595,42 @@ async function replaceExistingPolicy(
           "The recovery path is not a regular file.",
         );
       }
-      await installFileNoClobber(recoveryPath, targetPath);
+      if (process.platform !== "win32") {
+        await installFileNoClobber(recoveryPath, targetPath);
+      } else {
+        try {
+          await link(recoveryPath, targetPath);
+        } catch (restoreError) {
+          if (
+            ![
+              "EPERM",
+              "ENOTSUP",
+              "EOPNOTSUPP",
+              "EXDEV",
+              "EMLINK",
+              "EISDIR",
+            ].includes((restoreError as NodeJS.ErrnoException).code ?? "")
+          ) {
+            throw restoreError;
+          }
+          const restoreTemporary = `${recoveryPath}.restore`;
+          try {
+            await copyFile(
+              recoveryPath,
+              restoreTemporary,
+              constants.COPYFILE_EXCL,
+            );
+            await chmod(
+              restoreTemporary,
+              (await stat(recoveryPath)).mode & 0o777,
+            );
+            await copyWindowsSecurityDescriptor(recoveryPath, restoreTemporary);
+            await moveWindowsPolicyFileNoClobber(restoreTemporary, targetPath);
+          } finally {
+            await rm(restoreTemporary, { force: true }).catch(() => undefined);
+          }
+        }
+      }
     } catch (restoreError) {
       cause = new AggregateError([error, restoreError]);
     }
