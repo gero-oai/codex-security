@@ -4241,14 +4241,22 @@ describe("runtime directories and plugin Python boundary", () => {
     expect(result["details"]).toHaveLength(5 * 1024 * 1024);
   });
 
-  test.each(["legacy", "current"])(
+  test.each([
+    ["legacy", "0.1.22", false, false],
+    ["previous", "0.1.37", true, false],
+    ["current", BUNDLED_PLUGIN_VERSION, true, true],
+  ] as const)(
     "saves comparisons with a %s custom plugin",
-    async (version) => {
-      const supportsStdin = version === "current";
+    async (_kind, version, supportsStdin, supportsRelated) => {
       const root = await temporaryDirectory();
       const pluginRoot = join(root, "custom plugin");
       const scripts = join(pluginRoot, "scripts");
       await mkdir(scripts, { recursive: true });
+      await mkdir(join(pluginRoot, ".codex-plugin"));
+      await writeFile(
+        join(pluginRoot, ".codex-plugin", "plugin.json"),
+        JSON.stringify({ name: "codex-security", version }),
+      );
       await writeFile(
         join(scripts, "workbench_db.py"),
         [
@@ -4271,6 +4279,11 @@ describe("runtime directories and plugin Python boundary", () => {
           "args = parser.parse_args()",
           "uses_stdin = getattr(args, 'matches_json_stdin', False)",
           "payload = json.loads(sys.stdin.buffer.read().decode('utf-8') if uses_stdin else args.matches_json)",
+          ...(supportsRelated
+            ? []
+            : [
+                "if 'related' in payload: sys.exit('Unsupported comparison fields')",
+              ]),
           "print(json.dumps({'payload': payload, 'usesStdin': uses_stdin}))",
         ].join("\n"),
       );
@@ -4331,7 +4344,7 @@ describe("runtime directories and plugin Python boundary", () => {
       ).rejects.toThrow("Synthetic help failure");
       const expected = {
         usesStdin: supportsStdin,
-        payload: supportsStdin
+        payload: supportsRelated
           ? original
           : { matches: original.matches, uncertain: original.uncertain },
       };

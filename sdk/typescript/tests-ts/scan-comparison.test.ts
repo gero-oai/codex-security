@@ -1053,6 +1053,56 @@ describe("semantic scan comparison", () => {
     expect(calls.prompt).toBeUndefined();
   });
 
+  test("never accepts uncertainty between occurrences of the same stable finding", async () => {
+    const input = {
+      before: [{ occurrenceId: "before", findingId: "shared-identity" }],
+      after: [{ occurrenceId: "after", findingId: "shared-identity" }],
+    };
+    const response = {
+      matches: [],
+      uncertain: [
+        {
+          beforeOccurrenceId: "before",
+          afterOccurrenceId: "after",
+          reason: "Incorrectly treats the same stable identity as uncertain.",
+        },
+      ],
+    };
+
+    const deterministic = fakeCodex(response);
+    expect(
+      await matchScanFindings(input, { codex: deterministic.codex }),
+    ).toEqual({
+      matches: [
+        {
+          beforeOccurrenceIds: ["before"],
+          afterOccurrenceIds: ["after"],
+          confidence: "high",
+          reason:
+            "The findings share a stable identity or a previously confirmed link.",
+        },
+      ],
+      uncertain: [],
+    });
+    expect(deterministic.calls.prompt).toBeUndefined();
+
+    const requiringModel = {
+      before: [
+        ...input.before,
+        { occurrenceId: "other-before", findingId: "other-before" },
+      ],
+      after: [
+        ...input.after,
+        { occurrenceId: "other-after", findingId: "other-after" },
+      ],
+    };
+    const contradictory = fakeCodex(response);
+    await expect(
+      matchScanFindings(requiringModel, { codex: contradictory.codex }),
+    ).rejects.toThrow("invalid uncertain pair");
+    expect(contradictory.calls.prompt).toBeDefined();
+  });
+
   test("never lets a model split a confirmed historical group", async () => {
     const input = {
       before: [

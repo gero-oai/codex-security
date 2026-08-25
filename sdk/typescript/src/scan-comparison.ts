@@ -1051,6 +1051,13 @@ function validateComparison(
     input.before.map(({ occurrenceId }) => occurrenceId),
   );
   const afterIds = new Set(input.after.map(({ occurrenceId }) => occurrenceId));
+  const findingIds = new Map(
+    [...input.before, ...input.after].flatMap((finding) =>
+      typeof finding["findingId"] === "string"
+        ? [[finding.occurrenceId, finding["findingId"]] as const]
+        : [],
+    ),
+  );
   const matchedBefore = new Map<string, number>();
   const matchedAfter = new Map<string, number>();
   const uncertainPairs = new Set<string>();
@@ -1077,10 +1084,13 @@ function validateComparison(
   }
 
   for (const candidate of response.uncertain) {
+    const beforeFindingId = findingIds.get(candidate.beforeOccurrenceId);
+    const afterFindingId = findingIds.get(candidate.afterOccurrenceId);
     if (
       !beforeIds.has(candidate.beforeOccurrenceId) ||
       matchedBefore.has(candidate.beforeOccurrenceId) ||
       !afterIds.has(candidate.afterOccurrenceId) ||
+      (beforeFindingId !== undefined && beforeFindingId === afterFindingId) ||
       (!allowHistoricalUncertainty &&
         matchedAfter.has(candidate.afterOccurrenceId))
     ) {
