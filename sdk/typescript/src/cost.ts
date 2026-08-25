@@ -1,4 +1,4 @@
-import { open, readdir } from "node:fs/promises";
+import { open, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 import {
   scanActivityFromSessionEvent,
@@ -87,6 +87,9 @@ interface ScanCostTrackerOptions {
   onProgress?: (progress: ScanProgress) => void;
   onSessionEvent?: (event: ScanSessionEvent) => void;
   onError?: (error: unknown) => void;
+  resolveOwnedSessionPaths?: (
+    rootThreadId: string,
+  ) => Promise<ReadonlySet<string>>;
 }
 
 interface ScanCostSnapshot {
@@ -101,6 +104,7 @@ interface ObservedSessionUsage {
   rootCompleted: boolean;
   unverified: boolean;
   unfinishedWorkers: boolean;
+  unidentifiedSessions: Set<string>;
 }
 
 const MODEL_PRICING_NANODOLLARS: Readonly<Record<string, ModelPricing>> = {
@@ -159,6 +163,7 @@ export class ScanCostTracker {
     rootCompleted: false,
     unverified: false,
     unfinishedWorkers: false,
+    unidentifiedSessions: new Set(),
   };
   #lastCost: number | null = null;
   #rootOnlyReadError = false;
@@ -285,11 +290,30 @@ export class ScanCostTracker {
         this.#options.onError?.(refreshFailure.error);
       }
     }
+    let unidentifiedOwnedSession = false;
+    if (
+      this.#options.maxCostUsd !== undefined &&
+      observed.unidentifiedSessions.size > 0
+    ) {
+      const resolveOwnedSessionPaths = this.#options.resolveOwnedSessionPaths;
+      if (resolveOwnedSessionPaths === undefined || this.#threadId === null) {
+        unidentifiedOwnedSession = true;
+      } else {
+        const ownedPaths = await resolveOwnedSessionPaths(this.#threadId);
+        for (const path of observed.unidentifiedSessions) {
+          if (ownedPaths.has(await realpath(path))) {
+            unidentifiedOwnedSession = true;
+            break;
+          }
+        }
+      }
+    }
     if (
       this.#options.maxCostUsd !== undefined &&
       (rootUsage === null ||
         cost === null ||
         observed.unverified ||
+        unidentifiedOwnedSession ||
         (finalizing &&
           ((completedRoot === null && !observed.rootCompleted) ||
             observed.unfinishedWorkers)))
@@ -482,6 +506,7 @@ export class ScanCostTracker {
       rootCompleted: false,
       unverified: hasUnverifiedWorkerAttribution,
       unfinishedWorkers: false,
+      unidentifiedSessions: new Set(),
     };
     for (const [path, session] of this.#sessions) {
       if (
@@ -490,7 +515,7 @@ export class ScanCostTracker {
         session.pendingLineBytes > 0 &&
         presentSessions.has(path)
       ) {
-        observed.unverified = true;
+        observed.unidentifiedSessions.add(path);
       }
       if (session.threadId !== null && included.has(session.threadId)) {
         await this.#reportSessionEvents(path, session);

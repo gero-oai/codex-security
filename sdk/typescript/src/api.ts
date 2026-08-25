@@ -112,6 +112,7 @@ import {
   resolveCodexCommand,
   resolvePluginPath,
   resolvePluginPython,
+  resolveScanSessionPaths,
   runWorkbench,
   setCodexSecurityCredentialLogout,
   type CodexCommand,
@@ -676,6 +677,22 @@ export class CodexSecurity {
         repository: repo,
         scanDirectory: scanDir,
         maxCostUsd: options.maxCostUsd,
+        resolveOwnedSessionPaths:
+          options.maxCostUsd === undefined
+            ? undefined
+            : async (threadId) => {
+                const scan = activeScan;
+                if (scan === null) {
+                  throw new CodexSecurityError(
+                    "The scan session ownership could not be verified.",
+                  );
+                }
+                return await resolveScanSessionPaths(
+                  scan.options,
+                  scan.id,
+                  threadId,
+                );
+              },
         onActivity:
           options.onActivity === undefined
             ? undefined

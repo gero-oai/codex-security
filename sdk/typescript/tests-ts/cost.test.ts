@@ -4548,6 +4548,218 @@ describe("live scan cost tracking", () => {
     expect(reportedCosts).toEqual([0.00032, 0.03232]);
   });
 
+  test("ignores unrelated incomplete rollouts confirmed by trusted session ownership", async () => {
+    const home = await codexHome();
+    const rootUsage = { input_tokens: 100, output_tokens: 10 };
+    const root = await writeSession(home, "scan-thread", rootUsage);
+    await writeFile(
+      join(
+        home,
+        "sessions",
+        "2026",
+        "07",
+        "26",
+        "rollout-unrelated-incomplete.jsonl",
+      ),
+      '{"type":"session_meta","payload":{"id":"unrelated-thread"',
+    );
+    let ownershipChecks = 0;
+    const tracker = new ScanCostTracker({
+      codexHome: home,
+      model: "gpt-5.6-terra",
+      maxCostUsd: 0.001,
+      resolveOwnedSessionPaths: async () => {
+        ownershipChecks += 1;
+        return new Set([root]);
+      },
+    });
+    tracker.start("scan-thread");
+
+    await tracker.refresh();
+    await tracker.refresh();
+    expect(ownershipChecks).toBe(0);
+    await expect(tracker.stop(rootUsage)).resolves.toMatchObject({
+      cost: {
+        inputTokens: 100,
+        outputTokens: 10,
+        estimatedUsd: 0.00032,
+      },
+    });
+    expect(ownershipChecks).toBe(1);
+  });
+
+  test.each([
+    ["delegated worker", "delegated", true],
+    ["independent Deep Scan worker", "independent", true],
+    ["unrelated session", "unrelated", false],
+    ["incomplete ownership graph", "missing-worker", true],
+    ["missing scan root", "missing-root", true],
+    ["missing Codex state database", "missing-database", true],
+    ["missing workbench scan", "missing-scan", true],
+  ] as const)(
+    "checks incomplete metadata against trusted SQLite ownership for a %s",
+    async (_description, relationship, shouldReject) => {
+      const home = await codexHome();
+      const stateDirectory = join(home, "workbench");
+      await mkdir(stateDirectory);
+      const rootUsage = { input_tokens: 100, output_tokens: 10 };
+      const root = await writeSession(home, "scan-thread", rootUsage);
+      const incomplete = join(
+        home,
+        "sessions",
+        "2026",
+        "07",
+        "26",
+        "rollout-unrelated-incomplete.jsonl",
+      );
+      await writeFile(
+        incomplete,
+        '{"type":"session_meta","payload":{"id":"unrelated-thread"',
+      );
+      const { resolvePluginPython, resolveScanSessionPaths } = await import(
+        "../src/runtime.js"
+      );
+      const python = await resolvePluginPython({ environment: process.env });
+      const fixture = spawnSync(
+        python,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import json, sqlite3, sys",
+            "from pathlib import Path",
+            "home, root, incomplete, relationship = json.loads(sys.argv[1])",
+            "workbench = sqlite3.connect(Path(home) / 'workbench' / 'workbench.sqlite3')",
+            "workbench.execute('PRAGMA journal_mode = WAL')",
+            "workbench.execute('CREATE TABLE scans (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, mode TEXT NOT NULL)')",
+            "workbench.execute('CREATE TABLE workspaces (id TEXT PRIMARY KEY, thread_id TEXT)')",
+            "workbench.execute('CREATE TABLE deep_scan_workers (scan_id TEXT NOT NULL, sdk_thread_id TEXT)')",
+            "workbench.execute('INSERT INTO scans VALUES (?, ?, ?)', ('fixture-scan', 'fixture-workspace', 'deep'))",
+            "workbench.execute('INSERT INTO workspaces VALUES (?, ?)', ('fixture-workspace', 'scan-thread'))",
+            "if relationship == 'independent':",
+            "    workbench.execute('INSERT INTO deep_scan_workers VALUES (?, ?)', ('fixture-scan', 'pending-thread'))",
+            "workbench.commit()",
+            "workbench.close()",
+            "state = sqlite3.connect(Path(home) / 'state_7.sqlite')",
+            "state.execute('PRAGMA journal_mode = WAL')",
+            "state.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)')",
+            "state.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL)')",
+            "if relationship != 'missing-root':",
+            "    state.execute('INSERT INTO threads VALUES (?, ?)', ('scan-thread', root))",
+            "if relationship != 'missing-worker':",
+            "    state.execute('INSERT INTO threads VALUES (?, ?)', ('pending-thread', incomplete))",
+            "if relationship in ('delegated', 'missing-worker'):",
+            "    state.execute('INSERT INTO thread_spawn_edges VALUES (?, ?)', ('scan-thread', 'pending-thread'))",
+            "state.commit()",
+            "state.close()",
+          ].join("\n"),
+          JSON.stringify([home, root, incomplete, relationship]),
+        ],
+        { encoding: "utf8" },
+      );
+      expect(fixture.status, fixture.stderr).toBe(0);
+      if (relationship === "missing-database") {
+        await rm(join(home, "state_7.sqlite"));
+      }
+      const { PLUGIN_ROOT } = await import("./plugin-root.js");
+      let pluginRoot = PLUGIN_ROOT;
+      if (relationship === "unrelated") {
+        pluginRoot = join(home, "ownership-plugin");
+        await mkdir(join(pluginRoot, "scripts"), { recursive: true });
+        const helper = join(PLUGIN_ROOT, "scripts", "workbench_scan_usage.py");
+        await writeFile(
+          join(pluginRoot, "scripts", "workbench_scan_usage.py"),
+          [
+            "import os, sys",
+            "assert sys.flags.isolated and sys.dont_write_bytecode",
+            "assert not any(os.environ.get(key) for key in ('OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENROUTER_API_KEY', 'FIREWORKS_API_KEY'))",
+            `exec(compile(open(${JSON.stringify(helper)}).read(), ${JSON.stringify(helper)}, 'exec'), globals())`,
+          ].join("\n"),
+        );
+      }
+      let ownershipChecks = 0;
+      const tracker = new ScanCostTracker({
+        codexHome: home,
+        model: "gpt-5.6-terra",
+        maxCostUsd: 0.001,
+        resolveOwnedSessionPaths: async (threadId) => {
+          ownershipChecks += 1;
+          return await resolveScanSessionPaths(
+            {
+              python,
+              pluginRoot,
+              environment: {
+                PATH: process.env["PATH"],
+                SystemRoot:
+                  process.env["SystemRoot"] ?? process.env["SYSTEMROOT"],
+                CODEX_HOME: home,
+                CODEX_SECURITY_STATE_DIR: stateDirectory,
+                OPENAI_API_KEY: "synthetic-never-forwarded",
+                CODEX_API_KEY: "synthetic-never-forwarded",
+                OPENROUTER_API_KEY: "synthetic-never-forwarded",
+                FIREWORKS_API_KEY: "synthetic-never-forwarded",
+              },
+            },
+            relationship === "missing-scan" ? "missing-scan" : "fixture-scan",
+            threadId,
+          );
+        },
+      });
+      tracker.start("scan-thread");
+      await tracker.refresh();
+      expect(ownershipChecks).toBe(0);
+
+      const result = tracker.stop(rootUsage);
+      if (shouldReject) {
+        await expect(result).rejects.toThrow(/could not be verified/u);
+      } else {
+        await expect(result).resolves.toMatchObject({
+          cost: { inputTokens: 100, outputTokens: 10, estimatedUsd: 0.00032 },
+        });
+      }
+      expect(ownershipChecks).toBe(1);
+    },
+  );
+
+  test("does not let an unrelated partial session hide incomplete owned usage", async () => {
+    const home = await codexHome();
+    const rootUsage = { input_tokens: 100, output_tokens: 10 };
+    const root = await writeSession(home, "scan-thread", rootUsage);
+    const worker = await writeSession(
+      home,
+      "worker-thread",
+      { input_tokens: 10, output_tokens: 1 },
+      "scan-thread",
+      undefined,
+      undefined,
+      true,
+    );
+    await appendIncompleteTokenUsage(worker);
+    await writeFile(
+      join(
+        home,
+        "sessions",
+        "2026",
+        "07",
+        "26",
+        "rollout-unrelated-incomplete.jsonl",
+      ),
+      '{"type":"session_meta","payload":{"id":"unrelated-thread"',
+    );
+    const tracker = new ScanCostTracker({
+      codexHome: home,
+      model: "gpt-5.6-terra",
+      maxCostUsd: 0.001,
+      resolveOwnedSessionPaths: async () => new Set([root, worker]),
+    });
+    tracker.start("scan-thread");
+
+    await expect(tracker.stop(rootUsage)).rejects.toThrow(
+      "The scan cost limit could not be verified",
+    );
+  });
+
   test.each([
     ["optional incomplete metadata", undefined, "partial"],
     ["empty discovered rollout", 0.001, "empty"],
