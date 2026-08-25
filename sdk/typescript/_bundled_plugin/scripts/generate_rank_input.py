@@ -333,7 +333,10 @@ def preview_for_changed_path(
 ) -> tuple[str, bool]:
     """Bind working-tree reads to the checked repository and parent identities."""
 
-    relative_parent = path.parent.resolve(strict=True).relative_to(target)
+    try:
+        relative_parent = path.parent.resolve(strict=True).relative_to(target)
+    except (FileNotFoundError, PermissionError) as error:
+        raise ValueError("changed Git working-tree parent became unavailable") from error
     descriptor: int | None = None
     try:
         if os.name == "nt":
@@ -344,9 +347,14 @@ def preview_for_changed_path(
         elif _descriptor_relative_reads_available():
             root_descriptor = _open_verified_scan_directory(target)
             try:
-                parent_descriptor = _open_scan_local_directory(
-                    root_descriptor, relative_parent.parts, create=False
-                )
+                try:
+                    parent_descriptor = _open_scan_local_directory(
+                        root_descriptor, relative_parent.parts, create=False
+                    )
+                except (FileNotFoundError, PermissionError) as error:
+                    raise ValueError(
+                        "changed Git working-tree parent became unavailable"
+                    ) from error
                 try:
                     descriptor = os.open(
                         path.name,
@@ -820,6 +828,8 @@ def make_diff_rank_input(args: argparse.Namespace) -> None:
                 preview, is_binary = preview_for_changed_path(
                     path, repo, args.preview_bytes
                 )
+            except (FileNotFoundError, PermissionError):
+                continue
             except (OSError, RuntimeError, ValueError) as error:
                 raise SystemExit(
                     "Changed Git working-tree paths must stay inside the selected target."
