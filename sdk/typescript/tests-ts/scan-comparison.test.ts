@@ -711,8 +711,40 @@ describe("semantic scan comparison", () => {
 
     await expect(
       matchScanFindings(input, { codex: fakeCodex(response).codex }),
-    ).rejects.toThrow("invalid uncertain pair");
+    ).rejects.toThrow("confirmed finding groups");
   });
+
+  test.each(["omitted", "split"] as const)(
+    "rejects %s confirmed matches for the same stable finding identity",
+    async (scenario) => {
+      const input = {
+        before: [
+          { occurrenceId: "before-a", findingId: "shared-identity" },
+          { occurrenceId: "before-b", findingId: "shared-identity" },
+        ],
+        after: [
+          { occurrenceId: "after-a", findingId: "shared-identity" },
+          { occurrenceId: "after-b", findingId: "shared-identity" },
+        ],
+      };
+      const response = {
+        matches:
+          scenario === "omitted"
+            ? []
+            : input.before.map(({ occurrenceId }, index) => ({
+                beforeOccurrenceIds: [occurrenceId],
+                afterOccurrenceIds: [input.after[index]!.occurrenceId],
+                confidence: "high" as const,
+                reason: "Incorrectly splits one stable finding identity.",
+              })),
+        uncertain: [],
+      };
+
+      await expect(
+        matchScanFindings(input, { codex: fakeCodex(response).codex }),
+      ).rejects.toThrow("confirmed finding groups");
+    },
+  );
 
   test("rejects a match that splits a confirmed historical group", async () => {
     const input = {

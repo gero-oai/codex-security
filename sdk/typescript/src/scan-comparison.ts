@@ -541,7 +541,11 @@ function validateComparison(
     }
   }
 
-  for (const knownGroup of input.knownFindingGroups ?? []) {
+  const confirmedGroups = [
+    ...(input.knownFindingGroups ?? []),
+    ...[...new Set(findingIds.values())].map((findingId) => [findingId]),
+  ];
+  for (const knownGroup of confirmedGroups) {
     const knownFindingIds = new Set(knownGroup);
     const knownBefore = input.before.filter(({ occurrenceId }) =>
       knownFindingIds.has(findingIds.get(occurrenceId) ?? ""),

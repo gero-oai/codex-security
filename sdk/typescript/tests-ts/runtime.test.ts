@@ -4244,6 +4244,7 @@ describe("runtime directories and plugin Python boundary", () => {
   test.each([
     ["legacy", "0.1.22", false, false],
     ["previous", "0.1.37", true, false],
+    ["development", "dev", true, false],
     ["current", BUNDLED_PLUGIN_VERSION, true, true],
   ] as const)(
     "saves comparisons with a %s custom plugin",
