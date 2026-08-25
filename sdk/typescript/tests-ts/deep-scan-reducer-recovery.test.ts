@@ -41,6 +41,7 @@ type ReducerFinding = {
       }
     | string;
   codeEvidence?: Array<{ id: string; code: string }>;
+  code_evidence?: Array<{ id: string; code: string }>;
   validation?: { summary?: string; [field: string]: unknown } | null;
   attackPath?: Record<string, unknown> | null;
   writeup?: { reportPath: string };
@@ -312,13 +313,51 @@ test("preserves the accepted finding producer in canonical provenance", async ()
     ),
   ).toThrow("provenance");
 
-  expect(
-    reconcileDeepReduction(
-      result("local_plugin", { previousFindings: "legacy-host-history" }),
-      discoveries,
-      null,
-    ).findings[0]?.provenance["previousFindings"],
-  ).toBe("legacy-host-history");
+  for (const field of ["previousFindings", "originalCandidates"]) {
+    for (const value of [
+      "fabricated-host-history",
+      { candidateId: "fabricated-candidate", outcome: "validated" },
+      [{ candidateId: "fabricated-candidate", outcome: "validated" }],
+      [first],
+    ]) {
+      expect(() =>
+        reconcileDeepReduction(
+          result("local_plugin", { [field]: value }),
+          discoveries,
+          null,
+        ),
+      ).toThrow(`provenance.${field}`);
+    }
+  }
+
+  for (const [field, value] of [
+    ["previousFindings", "accepted-legacy-host-history"],
+    ["previousFindings", [{ summary: "Accepted earlier observation." }]],
+    ["originalCandidates", [{ candidateId: "accepted-candidate" }]],
+  ] as const) {
+    const source = {
+      ...first,
+      provenance: { ...first.provenance, [field]: value },
+    };
+    const accepted = [{ workerId: "worker", result: reducerDraft([source]) }];
+    for (const supplied of [true, false]) {
+      const reduced = reconcileDeepReduction(
+        reducerDraft([
+          {
+            ...original,
+            provenance: {
+              ...first.provenance,
+              ...(supplied ? { [field]: value } : {}),
+              sourceFindingIds: ["worker:0"],
+            },
+          },
+        ]),
+        accepted,
+        null,
+      );
+      expect(reduced.findings[0]?.provenance[field]).toEqual(value);
+    }
+  }
 
   const inheritedNames = JSON.parse(
     '{"source":"local_plugin","__proto__":{"outcome":"accepted"},"constructor":{"outcome":"accepted constructor"},"prototype":{"outcome":"accepted prototype"}}',
@@ -2115,6 +2154,54 @@ test("preserves the complete accepted order of attack-path steps", async () => {
     }
   }
 
+  const repeatedBeyondSingleSwitches = [
+    { ...original, attackPath: { steps: [input, input, input, input] } },
+    {
+      ...original,
+      attackPath: { steps: [bypass, input, bypass, bypass, input] },
+    },
+    {
+      ...original,
+      attackPath: { steps: [input, bypass, bypass, input, bypass] },
+    },
+  ];
+  for (const order of [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+  ]) {
+    const discoveries = order.map((index, position) => ({
+      workerId: `cursor-${position}`,
+      result: reducerDraft([repeatedBeyondSingleSwitches[index]!]),
+    }));
+    for (const source of repeatedBeyondSingleSwitches) {
+      const reconciled = reconcileDeepReduction(
+        reducerDraft([
+          reducedFinding(source.attackPath.steps, [
+            "cursor-0:0",
+            "cursor-1:0",
+            "cursor-2:0",
+          ]),
+        ]),
+        discoveries,
+        null,
+      ).findings[0]?.attackPath?.["steps"] as string[];
+      expect(reconciled).toHaveLength(7);
+      expect(reconciled.filter((step) => step === input)).toHaveLength(4);
+      expect(reconciled.filter((step) => step === bypass)).toHaveLength(3);
+      for (const { attackPath } of repeatedBeyondSingleSwitches) {
+        let index = 0;
+        for (const step of reconciled) {
+          if (attackPath.steps[index] === step) index += 1;
+        }
+        expect(index).toBe(attackPath.steps.length);
+      }
+    }
+  }
+
   const repeatedAtScale = repeatedGlobally.map(({ attackPath }) => ({
     ...original,
     attackPath: {
@@ -2543,6 +2630,84 @@ test("rejects an omitted writeup instead of inventing an unbacked artifact path"
       null,
     ),
   ).toThrow("writeup");
+});
+
+test("retains accepted evidence independently in both evidence catalogs", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const original = reducerFinding("independent-evidence-catalogs");
+  const firstEvidence = { id: "shared-evidence", code: "firstProof()" };
+  const secondEvidence = { id: "shared-evidence", code: "secondProof()" };
+
+  for (const [firstCatalog, secondCatalog] of [
+    ["codeEvidence", "code_evidence"],
+    ["code_evidence", "codeEvidence"],
+  ] as const) {
+    const first: ReducerFinding = {
+      ...original,
+      [firstCatalog]: [firstEvidence],
+      [secondCatalog]: [firstEvidence],
+      rootCause: {
+        summary: "Accepted first evidence.",
+        evidenceRefs: [firstEvidence.id],
+      },
+    };
+    const one = reconcileDeepReduction(
+      reducerDraft([
+        {
+          ...original,
+          provenance: {
+            ...original.provenance,
+            sourceFindingIds: ["first:0"],
+          },
+        },
+      ]),
+      [{ workerId: "first", result: reducerDraft([first]) }],
+      null,
+    ).findings[0]!;
+    expect(one.codeEvidence).toEqual([firstEvidence]);
+    expect(one.code_evidence).toEqual([firstEvidence]);
+
+    const second: ReducerFinding = {
+      ...original,
+      [firstCatalog]: [secondEvidence],
+      [secondCatalog]: [secondEvidence],
+      rootCause: {
+        summary: "Accepted second evidence.",
+        evidenceRefs: [secondEvidence.id],
+      },
+    };
+    const result = reducerDraft([
+      {
+        ...original,
+        provenance: {
+          ...original.provenance,
+          sourceFindingIds: ["first:0", "second:0"],
+        },
+      },
+    ]);
+    const discoveries = [
+      { workerId: "first", result: reducerDraft([first]) },
+      { workerId: "second", result: reducerDraft([second]) },
+    ];
+    const merged = reconcileDeepReduction(result, discoveries, null);
+    const expected = [
+      firstEvidence,
+      { ...secondEvidence, id: "shared-evidence-2" },
+    ];
+    expect(merged.findings[0]?.codeEvidence).toEqual(expected);
+    expect(merged.findings[0]?.code_evidence).toEqual(expected);
+    expect(merged.findings[0]?.rootCause).toMatchObject({
+      evidenceRefs: ["shared-evidence", "shared-evidence-2"],
+    });
+    expect(
+      reconcileDeepReduction(structuredClone(merged), discoveries, null)
+        .findings[0]?.codeEvidence,
+    ).toEqual(expected);
+    expect(
+      reconcileDeepReduction(structuredClone(merged), discoveries, null)
+        .findings[0]?.code_evidence,
+    ).toEqual(expected);
+  }
 });
 
 test("renames colliding accepted code-evidence IDs and preserves every reference", async () => {
