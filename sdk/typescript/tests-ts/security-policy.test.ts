@@ -1774,6 +1774,82 @@ describe("security policy review and application", () => {
     },
   );
 
+  test("rejects recovery metadata changed after snapshot verification", async () => {
+    const name =
+      "rejects recovery metadata changed after snapshot verification";
+    if (runTestInSubprocess(import.meta.path, name)) return;
+    const f = await fixture();
+    const original = "# Original policy\n";
+    await writeFile(join(f.repository, "SECURITY.md"), original);
+    if (process.platform !== "win32")
+      await chmod(join(f.repository, "SECURITY.md"), 0o644);
+    const draft = await f.generate();
+    const writer = await open(draft.targetPath, "r+");
+    const controller = new AbortController();
+    const originalRename = fsPromises.rename;
+    const originalLink = fsPromises.link;
+    const originalOpen = fsPromises.open;
+    let changed = false;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      rename: async (source: string, destination: string) => {
+        await originalRename(source, destination);
+        if (source === draft.targetPath)
+          controller.abort("cancel before install");
+      },
+      link: async () => {
+        throw Object.assign(new Error("hard links are unsupported"), {
+          code: "ENOTSUP",
+        });
+      },
+      open: async (...args: Parameters<typeof originalOpen>) => {
+        const handle = await originalOpen(...args);
+        if (!changed && String(args[0]).endsWith(".previous.restore")) {
+          changed = true;
+          const recovery = String(args[0]).slice(0, -".restore".length);
+          const before = (await stat(recovery, { bigint: true })).ctimeNs;
+          if (process.platform === "win32") {
+            const icacls = join(
+              process.env["SystemRoot"] ?? "C:\\Windows",
+              "System32",
+              "icacls.exe",
+            );
+            execFileSync(icacls, [recovery, "/grant", "*S-1-1-0:R"], {
+              windowsHide: true,
+            });
+          } else await writer.chmod(0o600);
+          expect((await stat(recovery, { bigint: true })).ctimeNs).not.toBe(
+            before,
+          );
+        }
+        return handle;
+      },
+    }));
+    try {
+      const error = await applySecurityPolicy(draft, {
+        signal: controller.signal,
+      }).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(SecurityPolicyRecoveryError);
+      expect(changed).toBe(true);
+      expect(await readSecurityPolicy(draft.targetPath)).toBeNull();
+      const recovery = (error as SecurityPolicyRecoveryError).recoveryPath;
+      expect(await readFile(recovery, "utf8")).toBe(original);
+      if (process.platform !== "win32")
+        expect((await stat(recovery)).mode & 0o777).toBe(0o600);
+      expect(
+        (await readdir(f.repository)).some((path) => path.endsWith(".restore")),
+      ).toBe(false);
+    } finally {
+      await writer.close();
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        rename: originalRename,
+        link: originalLink,
+        open: originalOpen,
+      }));
+    }
+  });
+
   test("keeps recovery files outside checkouts and Git metadata", async () => {
     for (const kind of ["root", "submodule", "external_git"]) {
       const f = await fixture();

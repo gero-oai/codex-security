@@ -1894,6 +1894,20 @@ async function verifyUnixSecurityMetadata(
   }
 }
 
+async function securityPolicyRecoveryGeneration(path: string): Promise<string> {
+  const metadata = await stat(path, { bigint: true });
+  return [
+    metadata.dev,
+    metadata.ino,
+    metadata.ctimeNs,
+    metadata.mtimeNs,
+    metadata.size,
+    metadata.mode,
+    metadata.uid,
+    metadata.gid,
+  ].join(":");
+}
+
 async function replaceExistingPolicy(
   temporary: string,
   targetPath: string,
@@ -1968,6 +1982,10 @@ async function replaceExistingPolicy(
             });
             const recoveryContent = await readSecurityPolicy(recoveryPath);
             await copyUnixPolicyFile(recoveryPath, restoreTemporary, python);
+            const recoveryGeneration =
+              await securityPolicyRecoveryGeneration(recoveryPath);
+            const restoreGeneration =
+              await securityPolicyRecoveryGeneration(restoreTemporary);
             await verifyUnixSecurityMetadata(
               recoveryPath,
               restoreTemporary,
@@ -1977,7 +1995,11 @@ async function replaceExistingPolicy(
               recoveryContent === null ||
               (await readSecurityPolicy(restoreTemporary)) !==
                 recoveryContent ||
-              (await readSecurityPolicy(recoveryPath)) !== recoveryContent
+              (await readSecurityPolicy(recoveryPath)) !== recoveryContent ||
+              (await securityPolicyRecoveryGeneration(restoreTemporary)) !==
+                restoreGeneration ||
+              (await securityPolicyRecoveryGeneration(recoveryPath)) !==
+                recoveryGeneration
             ) {
               throw new CodexSecurityError(
                 "SECURITY.md changed while its recovery snapshot was being copied.",
@@ -2019,6 +2041,10 @@ async function replaceExistingPolicy(
             );
             await chmod(restoreTemporary, recoveryMode);
             await copyWindowsSecurityDescriptor(recoveryPath, restoreTemporary);
+            const recoveryGeneration =
+              await securityPolicyRecoveryGeneration(recoveryPath);
+            const restoreGeneration =
+              await securityPolicyRecoveryGeneration(restoreTemporary);
             await copyWindowsSecurityDescriptor(
               recoveryPath,
               restoreTemporary,
@@ -2031,7 +2057,11 @@ async function replaceExistingPolicy(
               ((await stat(restoreTemporary)).mode & 0o777) !== recoveryMode ||
               (await readSecurityPolicy(restoreTemporary)) !==
                 recoveryContent ||
-              (await readSecurityPolicy(recoveryPath)) !== recoveryContent
+              (await readSecurityPolicy(recoveryPath)) !== recoveryContent ||
+              (await securityPolicyRecoveryGeneration(restoreTemporary)) !==
+                restoreGeneration ||
+              (await securityPolicyRecoveryGeneration(recoveryPath)) !==
+                recoveryGeneration
             ) {
               throw new CodexSecurityError(
                 "SECURITY.md changed while its recovery snapshot was being copied.",
