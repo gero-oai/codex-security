@@ -4,6 +4,9 @@
 
 **See the [Codex Security documentation](https://learn.chatgpt.com/docs/security/cli)** for more details.
 
+See [GitHub Releases](https://github.com/openai/codex-security/releases) for
+the canonical changelog and upgrade notes.
+
 Some cybersecurity requests and protected findings require approval through
 Trusted Access for Cyber. To apply or check your access, visit
 [chatgpt.com/cyber](https://chatgpt.com/cyber).
@@ -22,10 +25,16 @@ npx @openai/codex-security scan . --patch --patch-severity high --json
 npx @openai/codex-security scan . --patch --patch-severity high --create-pr
 npx @openai/codex-security scan . --model gpt-5.6-terra --effort high
 npx @openai/codex-security scan . --scan-prompt-file scan.md --post-scan-prompt-file follow-up.md
+npx @openai/codex-security scan . --validation-prompt-file validation.md
 npx @openai/codex-security scan . --mode deep --workers 2 --subagents 0 --stop-after-no-new 3 --max-discovery-runs 10 --max-time-hours 1.5
 ```
 
 For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY` instead of signing in.
+
+Use `--validation-prompt-file` to replace final validation with your own setup,
+testing, and cleanup instructions. This works for standard and diff scans;
+Deep scans do not support it. See [custom validation](sdk/typescript/README.md#custom-validation).
+For a runnable local example, see the [custom validation demo](examples/custom-validation/README.md).
 Environment API keys are passed directly to the current scan and are never
 stored in Codex's credential home or system keyring.
 
@@ -35,12 +44,25 @@ threshold, select individual findings, and add patch instructions for each one.
 Each selected finding runs in its own saved Codex desktop task.
 Use `--patch --patch-severity high` to fix high and critical findings. Add
 `--create-pr`, or enable the pull request option during review, to commit the
-verified files and open a GitHub pull request. Ordinary scans do not change
-repository files.
+verified files and open a draft GitHub pull request. Ordinary scans do not
+change repository files.
 
 Deep-scan discovery stops after 96 hours by default. Set `--max-time-hours` to
 any positive number of hours, including fractional hours, up to 96. Completed
 findings are preserved and returned when the limit is reached.
+
+For a monorepo, run separate standard scans and combine their results by root
+cause:
+
+```bash
+npx @openai/codex-security scan-components . \
+  --component apps/api --component apps/web \
+  --output-dir /path/outside/repository/results
+```
+
+Use `--auto` to let Codex choose the components, or `--auto --plan-only` to
+review the split first. See [component scans](sdk/typescript/README.md#scan-project-components)
+for reusable plans, combined reports, and coverage details.
 
 To use another inference provider, set its API key and select a model:
 
@@ -83,13 +105,17 @@ Scan history is stored in the Codex Security workbench state directory. If that
 directory cannot be written, set `CODEX_SECURITY_STATE_DIR` to a writable
 directory outside the repository.
 
+Applications can attribute API-key scans to an end user with
+`scan --safety-identifier ID` or the SDK's per-run `safetyIdentifier` option.
+See [Safety ID setup and runtime requirements](sdk/typescript/README.md#attribute-scans-to-end-users).
+
 `findings list [repository]` shows open findings across a repository's scans
 and identifies findings not confirmed in its latest scan.
 
 Use `patch OCCURRENCE_ID` to fix one saved finding, or
 `patch --scan SCAN_ID --severity high` to fix selected findings from a saved
-scan. Add `--json` for structured results or `--create-pr` to open a GitHub pull
-request after verification. If publication fails, use the printed
+scan. Add `--json` for structured results or `--create-pr` to open a draft
+GitHub pull request after verification. If publication fails, use the printed
 `patch --resume-pr BRANCH` command to retry without running Codex again.
 
 Use `patch --linear-issue SEC-123` to import and fix a Linear issue, or
@@ -107,15 +133,18 @@ incomplete or their original location was not reviewed.
 Publish every finding from a completed scan to a Linear team:
 
 ```bash
-npx @openai/codex-security publish scan /path/to/scan \
+npx @openai/codex-security publish scan --scan SCAN_ID \
   --to linear \
   --linear-team TEAM_ID
 ```
 
 Add `--linear-project PROJECT_ID` to place the issues in a Linear project, or
 omit it to create issues directly in the team. The existing `--project` flag
-remains an alias. Omit the scan directory to select a
-completed scan interactively. You can also set `CODEX_SECURITY_LINEAR_TEAM` and
+remains an alias. Omit `--scan` to select a completed scan interactively. Use
+`scans list --json` to find saved scan IDs, or pass `--scan latest` for the
+current repository's latest completed scan. External scan artifacts can still
+be supplied with `--scan-dir PATH` or a positional directory.
+You can also set `CODEX_SECURITY_LINEAR_TEAM` and
 the optional `CODEX_SECURITY_LINEAR_PROJECT` instead of passing the destination
 flags. Add `--dry-run` to preview the issues or `--json` to return
 machine-readable results.

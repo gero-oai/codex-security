@@ -225,6 +225,29 @@ describe("scan and patch workflow", () => {
       join(STATE_DIRECTORY, "codex-home"),
     );
 
+    const attributed = await runWorkflow(
+      [
+        "scan",
+        "--patch",
+        "--auth",
+        "api-key",
+        "--safety-identifier",
+        "synthetic-user",
+        "--json",
+      ],
+      {
+        result,
+        environment: { OPENAI_API_KEY: "synthetic-key" },
+        onCodex: (args, output) => {
+          invocation = args;
+          completePatches(args, output);
+          return 0;
+        },
+      },
+    );
+    expect(attributed.exitCode).toBe(0);
+    expect(invocation).toContain('safety_identifier="synthetic-user"');
+
     const provider = await runWorkflow(
       [
         "scan",
@@ -322,6 +345,7 @@ describe("scan and patch workflow", () => {
       expect(pullRequestArguments).toEqual([
         "pr",
         "create",
+        "--draft",
         "--head",
         "codex-security/patch-scan",
         "--title",
@@ -839,7 +863,7 @@ describe("scan and patch workflow", () => {
     expect(patched[0]).not.toHaveProperty("instructions");
   });
 
-  test("creates a pull request when selected in the interactive review", async () => {
+  test("creates a draft pull request when selected in the interactive review", async () => {
     let published = false;
     const url = "https://github.example.test/example/repository/pull/13";
     const outcome = await runWorkflow(
@@ -896,7 +920,7 @@ describe("scan and patch workflow", () => {
     });
   });
 
-  test("creates a pull request for verified saved-finding patches", async () => {
+  test("creates a draft pull request for verified saved-finding patches", async () => {
     const result = resultWithFindings(["high"]);
     const url = "https://github.example.test/example/repository/pull/14";
     let repository = "";

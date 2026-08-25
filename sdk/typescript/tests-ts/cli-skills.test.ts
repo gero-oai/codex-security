@@ -15,12 +15,25 @@ import type { LinearClientFactory } from "../src/linear.js";
 import { capture, dependencies } from "./cli-fixtures.js";
 import { runTestInSubprocess } from "./support/test-subprocess.js";
 
-function linearIssue(identifier: string) {
+function linearIssue(identifier: string, comments: string[] = []) {
+  const nodes = comments.map((body, index) => ({
+    body,
+    url: `https://linear.app/example/issue/${identifier}#comment-${index}`,
+  }));
   return {
     identifier,
     title: `Fix ${identifier}`,
     description: `Synthetic evidence for ${identifier}`,
     url: `https://linear.app/example/issue/${identifier}`,
+    comments: async () => ({
+      nodes: nodes.slice(0, 1),
+      pageInfo: { hasNextPage: nodes.length > 1 },
+      async fetchNext() {
+        this.nodes.push(...nodes.slice(1));
+        this.pageInfo.hasNextPage = false;
+        return this;
+      },
+    }),
   };
 }
 
@@ -51,9 +64,10 @@ describe("CLI skill commands", () => {
             stderr.stream,
             dependencies({
               currentDirectory: directory,
-              onCodex: (args, output) => {
+              onCodex: (args, output, _environment, input) => {
                 invocation = args;
-                prompt = output?.appServer?.prompt ?? args.at(-1)!;
+                prompt = output?.appServer?.prompt ?? input ?? "";
+                expect(input).toBe(command === "patch" ? undefined : prompt);
                 return status;
               },
             }),
@@ -84,7 +98,7 @@ describe("CLI skill commands", () => {
                 "--skip-git-repo-check",
                 "--cd",
                 directory,
-                prompt,
+                "-",
               ]),
         ]);
         expect(prompt).toContain(
@@ -127,6 +141,10 @@ describe("CLI skill commands", () => {
 
   test("imports selected Linear issues without exposing its credential to Codex", async () => {
     const requests: string[] = [];
+    const description =
+      "# Report\n\n## Reproduction\n\n```ts\nreadRecord(id);\n```";
+    const laterComment =
+      "# Report\n\n## Extra evidence\n\n```ts\ncheckOwner(id);\n```\n\nCheck **both** paths.";
     let inputs: string[] = [];
     let environment: NodeJS.ProcessEnv | undefined;
 
@@ -156,7 +174,13 @@ describe("CLI skill commands", () => {
             return {
               issue: async (id: string) => {
                 requests.push(id);
-                return linearIssue(id);
+                return {
+                  ...linearIssue(id, [
+                    `Additional evidence for ${id}`,
+                    laterComment,
+                  ]),
+                  description,
+                };
               },
             } as ReturnType<LinearClientFactory>;
           },
@@ -172,7 +196,15 @@ describe("CLI skill commands", () => {
     expect(requests).toEqual(["SEC-123", "SEC-124"]);
     expect(inputs).toHaveLength(2);
     expect(inputs[0]).toContain("Issue: SEC-123");
-    expect(inputs[1]).toContain("Synthetic evidence for SEC-124");
+    expect(inputs[1]).toContain(
+      `<description>\n${description}\n</description>`,
+    );
+    expect(inputs[0]).toContain("Additional evidence for SEC-123");
+    expect(inputs[1]).toContain("Additional evidence for SEC-124");
+    expect(inputs[1]).toContain(laterComment);
+    expect(inputs[0]).toContain(
+      `<comment>\nURL: https://linear.app/example/issue/SEC-123#comment-1\n\n${laterComment}\n</comment>`,
+    );
     expect(environment).toEqual({
       OPENAI_API_KEY: "sk-proj-SYNTHETIC_MODEL_KEY",
     });
@@ -201,7 +233,7 @@ describe("CLI skill commands", () => {
             `..${paths.sep}`.repeat(32) +
             paths.relative(paths.parse(target).root, target),
         };
-        const expected = `Source: linear\nIssue: SEC-123\nURL: ${issue.url}\n\nTitle: ${issue.title}\n\n${issue.description}`;
+        const expected = `Source: linear\nIssue: SEC-123\nURL: ${issue.url}\n\nTitle: ${issue.title}\n\n<description>\n${issue.description}\n</description>`;
         const forbiddenPath = resolve(repository, expected);
         const originalLstat = filesystem.lstat;
         let probed = false;
@@ -268,11 +300,13 @@ describe("CLI skill commands", () => {
           linearClient: ({ accessToken }) => {
             expect(accessToken).toBe("SYNTHETIC_OAUTH_TOKEN");
             const page = {
-              nodes: [linearIssue("SEC-123")],
+              nodes: [linearIssue("SEC-123", ["First issue comment"])],
               pageInfo: { hasNextPage: true },
               async fetchNext() {
                 nextPages++;
-                this.nodes.push(linearIssue("SEC-124"));
+                this.nodes.push(
+                  linearIssue("SEC-124", ["Second issue comment"]),
+                );
                 this.pageInfo.hasNextPage = false;
                 return this;
               },
@@ -317,6 +351,8 @@ describe("CLI skill commands", () => {
     expect(inputs).toHaveLength(2);
     expect(inputs[0]).toContain("Issue: SEC-123");
     expect(inputs[1]).toContain("Issue: SEC-124");
+    expect(inputs[0]).toContain("First issue comment");
+    expect(inputs[1]).toContain("Second issue comment");
   });
 
   test("rejects invalid Linear selections before starting Codex", async () => {
@@ -422,9 +458,9 @@ describe("CLI skill commands", () => {
               stderr.stream,
               dependencies({
                 currentDirectory: repository,
-                onCodex: (args, output) => {
+                onCodex: (args, output, _environment, input) => {
                   invocation = args;
-                  prompt = output?.appServer?.prompt ?? args.at(-1);
+                  prompt = output?.appServer?.prompt ?? input;
                   return 0;
                 },
               }),
@@ -446,9 +482,9 @@ describe("CLI skill commands", () => {
               capture().stream,
               dependencies({
                 currentDirectory: repository,
-                onCodex: (args, output) => {
+                onCodex: (args, output, _environment, input) => {
                   invocation = args;
-                  prompt = output?.appServer?.prompt ?? args.at(-1);
+                  prompt = output?.appServer?.prompt ?? input;
                   return 0;
                 },
               }),
@@ -678,7 +714,7 @@ describe("CLI skill commands", () => {
         }
       }
 
-      let invocation: readonly string[] = [];
+      let prompt = "";
       const stdout = capture();
       const stderr = capture();
       expect(
@@ -694,14 +730,14 @@ describe("CLI skill commands", () => {
           stderr.stream,
           dependencies({
             currentDirectory: directory,
-            onCodex: (args) => {
-              invocation = args;
+            onCodex: (_args, _output, _environment, input) => {
+              prompt = input ?? "";
               return 0;
             },
           }),
         ),
       ).toBe(0);
-      expect(JSON.parse(invocation.at(-1)!.split("\n").at(-1)!)).toEqual([
+      expect(JSON.parse(prompt.split("\n").at(-1)!)).toEqual([
         "local finding contents\n",
         ...localDrivePaths.map(
           (_, index) => `local drive ${index + 1} contents\n`,
@@ -749,7 +785,7 @@ describe("CLI skill commands", () => {
       "This candidate finding has enough context to exceed a filesystem name. ".repeat(
         8,
       );
-    let literalInvocation: readonly string[] = [];
+    let literalPrompt = "";
     expect(
       await main(
         ["validate", longLiteral],
@@ -757,14 +793,14 @@ describe("CLI skill commands", () => {
         capture().stream,
         dependencies({
           currentDirectory: process.cwd(),
-          onCodex: (args) => {
-            literalInvocation = args;
+          onCodex: (_args, _output, _environment, input) => {
+            literalPrompt = input ?? "";
             return 0;
           },
         }),
       ),
     ).toBe(0);
-    expect(JSON.parse(literalInvocation.at(-1)!.split("\n").at(-1)!)).toEqual([
+    expect(JSON.parse(literalPrompt.split("\n").at(-1)!)).toEqual([
       longLiteral,
     ]);
 
@@ -912,8 +948,9 @@ describe("CLI skill commands", () => {
             capture().stream,
             dependencies({
               currentDirectory: directory,
-              onCodex: (args) => {
-                received = JSON.parse(args.at(-1)!.split("\n").at(-1)!);
+              onCodex: (args, _output, _environment, input) => {
+                expect(args.at(-1)).toBe("-");
+                received = JSON.parse(input!.split("\n").at(-1)!);
                 return 0;
               },
             }),
@@ -926,6 +963,30 @@ describe("CLI skill commands", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  test("streams oversized skill prompts to a real child process", async () => {
+    const input = "é日本語".repeat(256 * 1024 + 1);
+    const stdout = capture();
+    const stderr = capture();
+    const source = [
+      "let input = ''",
+      "process.stdin.setEncoding('utf8')",
+      "process.stdin.on('data', (chunk) => { input += chunk })",
+      "process.stdin.on('end', () => process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:input}}) + '\\n'))",
+    ].join(";");
+
+    await expect(
+      runCodexSkillCommand(
+        ["-e", source],
+        { command: "validate", stdout: stdout.stream, stderr: stderr.stream },
+        { command: process.execPath },
+        process.env,
+        input,
+      ),
+    ).resolves.toBe(0);
+    expect(stdout.text()).toBe(`${input}\n`);
+    expect(stderr.text()).toBe("");
   });
 
   test("extracts the final skill response without exposing intermediate events", async () => {
@@ -1159,6 +1220,88 @@ lines.on("line", (line) => {
     ).resolves.toBe(0);
     expect(stdout.text()).toBe("Patched finding\n");
     expect(stderr.text()).toBe("");
+  });
+
+  test("starts verification app-server threads with a read-only sandbox", async () => {
+    const source = `
+const assert = require("node:assert/strict");
+const lines = require("node:readline").createInterface({ input: process.stdin });
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+lines.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: 1, result: {} });
+  if (request.method === "config/read") {
+    assert.deepEqual(request.params, {
+      cwd: ${JSON.stringify(process.cwd())},
+      includeLayers: true,
+    });
+    send({ id: 4, result: { layers: [
+      { name: { type: "project" }, config: { mcp_servers: { repository: { command: "untrusted" } } } },
+      { name: { type: "user" }, config: { mcp_servers: { trusted: { command: "trusted" } } } },
+    ] } });
+  }
+  if (request.method === "thread/start") {
+    assert.deepEqual(request.params, {
+      approvalPolicy: "on-request",
+      sandbox: "read-only",
+      config: { mcp_servers: { repository: { enabled: false } } },
+    });
+    send({ id: 2, result: { thread: { id: "verification" } } });
+  }
+  if (request.method === "turn/start") {
+    send({ id: 3, result: { turn: { id: "verification-turn" } } });
+    send({ method: "item/started", params: {
+      threadId: "another-thread", turnId: "verification-turn",
+      item: { id: "hidden-command", type: "commandExecution", command: "private command" },
+    } });
+    send({ method: "item/started", params: {
+      threadId: "verification", turnId: "verification-turn",
+      item: { id: "verification-command", type: "commandExecution", command: "rg authorization src/guard.ts" },
+    } });
+    send({ method: "item/reasoning/summaryTextDelta", params: {
+      threadId: "verification", turnId: "verification-turn",
+      itemId: "verification-reasoning", delta: "Tracing the original control.",
+    } });
+    send({ method: "item/completed", params: {
+      threadId: "verification", turnId: "verification-turn",
+      item: { type: "agentMessage", text: "Verified without modifying source" },
+    } });
+    send({ method: "turn/completed", params: {
+      threadId: "verification", turn: { id: "verification-turn", status: "completed" },
+    } });
+  }
+});
+`;
+    const stdout = capture();
+    const stderr = capture();
+    const activity: Readonly<Record<string, unknown>>[] = [];
+
+    await expect(
+      runCodexSkillCommand(
+        ["-e", source],
+        {
+          command: "verify-fix",
+          stdout: stdout.stream,
+          stderr: stderr.stream,
+          appServer: {
+            directory: process.cwd(),
+            prompt:
+              "Verify the synthetic finding without editing the repository",
+            sandbox: "read-only",
+            onEvent: (event) => activity.push(event),
+          },
+        },
+        { command: process.execPath },
+      ),
+    ).resolves.toBe(0);
+    expect(stdout.text()).toBe("Verified without modifying source\n");
+    expect(stderr.text()).toBe("");
+    expect(activity.map((event) => event["method"])).toEqual([
+      "item/started",
+      "item/reasoning/summaryTextDelta",
+      "item/completed",
+    ]);
+    expect(JSON.stringify(activity)).not.toContain("private command");
   });
 
   test.each([

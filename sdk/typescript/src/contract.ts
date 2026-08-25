@@ -20,6 +20,7 @@ import {
   requireSecureOutputAncestry,
 } from "./runtime.js";
 import type { NormalizedTarget, ScanMode } from "./targets.js";
+import { isWindowsUnsafePathComponent } from "./windows-path.js";
 
 const DOCUMENTS = {
   "scan-manifest.json": "scan-manifest.schema.json",
@@ -63,15 +64,25 @@ export interface LoadedContract {
   coverage: CoverageDocument;
 }
 
+type LoadContractOptions = {
+  pluginRoot: string;
+  expectedScanId?: string;
+  expectation?: ScanExpectation;
+  workbenchValidated?: boolean;
+  signal?: AbortSignal;
+};
+
 export async function loadContract(
   scanDirectory: string,
-  options: {
-    pluginRoot: string;
-    expectation?: ScanExpectation;
-    workbenchValidated?: boolean;
-    signal?: AbortSignal;
-  },
+  options: LoadContractOptions,
 ): Promise<LoadedContract> {
+  return (await loadContractWithScanDirectory(scanDirectory, options)).contract;
+}
+
+export async function loadContractWithScanDirectory(
+  scanDirectory: string,
+  options: LoadContractOptions,
+): Promise<{ contract: LoadedContract; scanDirectory: string }> {
   const scanRoot = await requireScanRoot(scanDirectory, options.signal);
   const scanDir = scanRoot.path;
   const documentDigests = new Map<string, string>();
@@ -145,6 +156,14 @@ export async function loadContract(
   const findings = findingsPayload as FindingsDocument;
   const coverage = payloads["coverage.json"] as unknown as CoverageDocument;
   if (
+    options.expectedScanId !== undefined &&
+    manifest.scan.id !== options.expectedScanId
+  ) {
+    throw new ContractValidationError(
+      `Scan artifacts do not match selected scan ${options.expectedScanId}.`,
+    );
+  }
+  if (
     findings.scanId !== manifest.scan.id ||
     coverage.scanId !== manifest.scan.id
   ) {
@@ -183,7 +202,17 @@ export async function loadContract(
     );
   }
   await verifyScanRoot(scanRoot, options.signal);
-  return { manifest, findings, coverage };
+  return {
+    contract: { manifest, findings, coverage },
+    scanDirectory: scanRoot.path,
+  };
+}
+
+export async function requireCanonicalScanDirectory(
+  scanDirectory: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  return (await requireScanRoot(scanDirectory, signal)).path;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -518,7 +547,7 @@ async function requireCheckedScanFile(
   const checkedRoot = await requireScanRoot(scanDirectory, signal);
   const scanDir = checkedRoot.path;
   throwIfAborted(signal);
-  const safePath = safeRelativePath(relativePath, context);
+  const safePath = portableRelativePath(relativePath, context);
   const parts = safePath.split("/");
   let current = scanDir;
   try {
@@ -593,16 +622,19 @@ async function validateSeal(
   }
 
   const artifactPaths = new Set<string>();
+  const artifactCollisionKeys = new Set<string>();
   for (const [index, artifact] of scan.artifacts.entries()) {
     throwIfAborted(signal);
     const context = `manifest.scan.artifacts[${index}]`;
-    const normalized = safeRelativePath(artifact.path, `${context}.path`);
-    if (artifactPaths.has(normalized)) {
+    const normalized = portableRelativePath(artifact.path, `${context}.path`);
+    const collisionKey = normalized.toLowerCase();
+    if (artifactCollisionKeys.has(collisionKey)) {
       throw new ContractValidationError(
         `${context}.path: duplicate artifact path.`,
       );
     }
     artifactPaths.add(normalized);
+    artifactCollisionKeys.add(collisionKey);
     const digest =
       documentDigests.get(normalized) ??
       (await sha256ScanFile(
@@ -622,7 +654,7 @@ async function validateSeal(
   for (const surface of coverage.surfaces) {
     for (const receipt of surface.receiptRefs) {
       throwIfAborted(signal);
-      const normalized = safeRelativePath(receipt, "coverage receipt");
+      const normalized = portableRelativePath(receipt, "coverage receipt");
       if (!normalized.startsWith("artifacts/")) {
         throw new ContractValidationError(
           `Coverage receipt must be under artifacts/: ${receipt}`,
@@ -826,15 +858,14 @@ async function verifyScanRoot(
 function safeRelativePath(value: string, context: string): string {
   const parts = value.split("/");
   if (
-    value.length === 0 ||
+    value.trim().length === 0 ||
     !isWellFormedUnicode(value) ||
     value === "." ||
     value.startsWith("/") ||
     /^[A-Za-z]:/.test(value) ||
     parts.includes("..") ||
     value.includes("\\") ||
-    value.includes("\0") ||
-    parts.some((part) => part.includes(":"))
+    /[\u0000-\u001f]/u.test(value)
   ) {
     throw new ContractValidationError(
       `${context}: expected a safe scan-relative POSIX path.`,
@@ -846,6 +877,16 @@ function safeRelativePath(value: string, context: string): string {
     normalized.startsWith("../") ||
     isAbsolute(normalized)
   ) {
+    throw new ContractValidationError(
+      `${context}: expected a safe scan-relative POSIX path.`,
+    );
+  }
+  return normalized;
+}
+
+function portableRelativePath(value: string, context: string): string {
+  const normalized = safeRelativePath(value, context);
+  if (value.split("/").some(isWindowsUnsafePathComponent)) {
     throw new ContractValidationError(
       `${context}: expected a safe scan-relative POSIX path.`,
     );

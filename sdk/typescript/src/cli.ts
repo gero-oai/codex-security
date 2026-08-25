@@ -46,6 +46,7 @@ import {
   CodexSecurity,
   createSecurityInternal,
   listRepositoryFindings,
+  SCAN_AUTH_MODES,
   scanAuthentication,
   type DeepScanOptions,
   type ScanAuthMode,
@@ -54,6 +55,10 @@ import {
   type ScanPreflight,
 } from "./api.js";
 import { accountStatus } from "./auth.js";
+import {
+  publishScanToCloud,
+  type CloudPublicationResult,
+} from "./cloud-publish.js";
 import {
   createBulkScanDiscoveryDependencies,
   runBulkScanWizard,
@@ -93,6 +98,8 @@ import {
 } from "./linear.js";
 import type { Finding, SeverityLevel } from "./models.js";
 import { runMultiscan } from "./multiscan.js";
+import { componentPlanSchema, planComponents } from "./component-plan.js";
+import { runComponentScans } from "./component-scan.js";
 import {
   publishScan,
   type PublishScanProgress,
@@ -101,10 +108,12 @@ import {
 import type { ScanResult } from "./result.js";
 import {
   bundledPluginRoot,
+  canonicalizeModelSafePath,
   codexSecurityCredentialHome,
   codexSecurityStateDirectory,
   expandHome,
   prepareCodexSecurityCredentialHome,
+  pythonUtf8Environment,
   resolveCodexCommand,
   resolvePluginPython,
   runWorkbench,
@@ -124,11 +133,10 @@ import {
 } from "./scan-history-renderer.js";
 import { ScanDashboard } from "./scan-dashboard.js";
 import type { PatchSelection } from "./patch-tui.js";
-import type {
-  ScanPhase,
-  ScanProgress,
-  ScanWorkerPhase,
-  ScanWorkerStatus,
+import {
+  scanPhaseLabel as scanPhase,
+  type ScanProgress,
+  type ScanWorkerStatus,
 } from "./worker-progress.js";
 import {
   abortable,
@@ -207,9 +215,13 @@ const EXPORT_DEFAULT_OUTPUTS = {
 } as const;
 const VALUE_OPTIONS = new Set([
   "--auth",
+  "--safety-identifier",
   "--path",
+  "--component",
+  "--components-file",
   "--knowledge-base",
   "--scan-prompt-file",
+  "--validation-prompt-file",
   "--post-scan-prompt-file",
   "--diff",
   "--head",
@@ -229,6 +241,7 @@ const VALUE_OPTIONS = new Set([
   "--patch-severity",
   "--resume-pr",
   "--scan",
+  "--scan-dir",
   "--severity",
   "--max-cost",
   "--workers",
@@ -259,7 +272,7 @@ const PROVIDER_OPTION = z
 const CREATE_PR_OPTION = z
   .boolean()
   .default(false)
-  .describe("Create a GitHub pull request after verified patches.");
+  .describe("Create a draft GitHub pull request after verified patches.");
 
 function optionValue(flag: string) {
   return z.string().min(1, `${flag} must not be empty.`);
@@ -548,6 +561,160 @@ class PublicationProgressPresenter {
   }
 }
 
+class VerificationProgressPresenter {
+  readonly #stream: Writable;
+  readonly #dependencies: CliDependencies;
+  readonly #repository: string;
+  readonly #total: number;
+  readonly #seenActivities = new Set<string>();
+  readonly #reasoning = new Map<string, string>();
+  #dashboard: ScanDashboard | null = null;
+
+  public constructor(
+    stream: Writable,
+    dependencies: CliDependencies,
+    repository: string,
+    total: number,
+  ) {
+    this.#stream = stream;
+    this.#dependencies = dependencies;
+    this.#repository = repository;
+    this.#total = total;
+  }
+
+  public start(): void {
+    if (
+      this.#stream.isTTY === true &&
+      this.#dependencies.environment["CI"] === undefined &&
+      this.#dependencies.environment["TERM"] !== "dumb"
+    ) {
+      const dashboard = new ScanDashboard(this.#stream, {
+        repository: this.#repository,
+        presentation: "verification",
+        clock: this.#dependencies,
+        color: this.#dependencies.environment["NO_COLOR"] === undefined,
+        sanitize: safeErrorMessage,
+      });
+      dashboard.setPublicationProgress(0, this.#total);
+      dashboard.setStage(`Verifying findings · 0/${this.#total}`);
+      try {
+        dashboard.start();
+        this.#dashboard = dashboard;
+        return;
+      } catch {
+        try {
+          dashboard.stop();
+        } catch {}
+      }
+    }
+
+    this.#write(
+      `Verifying ${this.#total} finding${this.#total === 1 ? "" : "s"} against the current checkout.`,
+    );
+  }
+
+  public observe(event: Readonly<Record<string, unknown>>): void {
+    const method = event["method"];
+    const params = event["params"];
+    if (
+      typeof params !== "object" ||
+      params === null ||
+      Array.isArray(params)
+    ) {
+      return;
+    }
+    const values = params as Record<string, unknown>;
+    let normalized: Record<string, unknown>;
+
+    if (method === "item/reasoning/summaryTextDelta") {
+      const id = values["itemId"];
+      const delta = values["delta"];
+      if (typeof id !== "string" || typeof delta !== "string") return;
+      const text = `${this.#reasoning.get(id) ?? ""}${delta}`;
+      this.#reasoning.set(id, text);
+      normalized = {
+        type: "item.updated",
+        item: { id, type: "reasoning", text },
+      };
+    } else if (method === "item/started" || method === "item/completed") {
+      const item = values["item"];
+      if (typeof item !== "object" || item === null || Array.isArray(item)) {
+        return;
+      }
+      const current = item as Record<string, unknown>;
+      const type = current["type"];
+      let converted: Record<string, unknown>;
+      if (type === "commandExecution") {
+        converted = { ...current, type: "command_execution" };
+      } else if (type === "mcpToolCall") {
+        converted = { ...current, type: "mcp_tool_call" };
+      } else if (type === "agentMessage") {
+        if (current["phase"] !== "commentary") return;
+        converted = { ...current, type: "agent_message" };
+      } else if (type === "reasoning") {
+        const summary = current["summary"];
+        const text = Array.isArray(summary)
+          ? summary
+              .filter((entry): entry is string => typeof entry === "string")
+              .join("\n")
+          : current["text"];
+        if (typeof text !== "string") return;
+        converted = { ...current, text };
+      } else {
+        return;
+      }
+      normalized = {
+        type: method === "item/started" ? "item.started" : "item.completed",
+        item: converted,
+      };
+    } else {
+      return;
+    }
+
+    for (const activity of scanActivitiesFromEvent(
+      normalized,
+      this.#repository,
+    )) {
+      if (this.#dashboard !== null) {
+        this.#dashboard.record(activity);
+        continue;
+      }
+      const key = `${activity.id}\0${activity.description}`;
+      if (this.#seenActivities.has(key)) continue;
+      this.#seenActivities.add(key);
+      const label =
+        activity.kind === "reasoning" || activity.kind === "message"
+          ? "Codex"
+          : "Tool";
+      this.#write(`${label}: ${activity.description}`);
+    }
+  }
+
+  public complete(results: readonly FindingVerification[]): void {
+    if (this.#dashboard === null) return;
+    this.#dashboard.setPublicationProgress(results.length, this.#total);
+    this.#dashboard.setStage(
+      `Verification complete · ${results.length}/${this.#total}`,
+    );
+    for (const result of results) {
+      this.#dashboard.note(`${result.status.toUpperCase()} ${result.id}`);
+    }
+  }
+
+  public stop(): void {
+    try {
+      this.#dashboard?.stop();
+    } catch {}
+    this.#dashboard = null;
+  }
+
+  #write(message: string): void {
+    try {
+      this.#stream.write(`${safePatchText(message)}\n`);
+    } catch {}
+  }
+}
+
 function effortOption() {
   return z
     .enum(MODEL_REASONING_EFFORTS, {
@@ -597,8 +764,11 @@ async function readPromptFiles(
   scanPromptFile?: string,
   postScanPromptFile?: string,
   repository = directory,
-): Promise<Pick<ScanOptions, "scanPrompt" | "postScanPrompt">> {
-  const [scanPrompt, postScanPrompt] = await Promise.all([
+  validationPromptFile?: string,
+): Promise<
+  Pick<ScanOptions, "scanPrompt" | "validationPrompt" | "postScanPrompt">
+> {
+  const [scanPrompt, postScanPrompt, validationPrompt] = await Promise.all([
     scanPromptFile === undefined
       ? undefined
       : readRegularInputFile(
@@ -611,9 +781,19 @@ async function readPromptFiles(
           resolveCliPath(directory, postScanPromptFile),
           repository,
         ),
+    validationPromptFile === undefined
+      ? undefined
+      : readRegularInputFile(
+          resolveCliPath(directory, validationPromptFile),
+          repository,
+        ),
   ]);
+  if (validationPrompt !== undefined && !validationPrompt.trim()) {
+    throw new CodexSecurityError("The validation prompt must not be empty.");
+  }
   return {
     ...(scanPrompt?.trim() ? { scanPrompt } : {}),
+    ...(validationPrompt === undefined ? {} : { validationPrompt }),
     ...(postScanPrompt?.trim() ? { postScanPrompt } : {}),
   };
 }
@@ -670,11 +850,13 @@ export function resolveCliPath(directory: string, value: string): string {
 
 interface ScanArguments extends DeepScanOptions {
   auth?: ScanAuthMode;
+  safetyIdentifier?: string;
   verbose?: boolean;
   repository?: string;
   paths: string[];
   knowledgeBasePaths: string[];
   scanPromptFile?: string;
+  validationPromptFile?: string;
   postScanPromptFile?: string;
   diff?: string;
   workingTree: boolean;
@@ -730,10 +912,15 @@ type MatchingPlan = JsonObject & {
 };
 
 interface SkillCommandOutput {
-  readonly command: "validate" | "patch";
+  readonly command: "validate" | "patch" | "verify-fix";
   readonly stdout: Writable;
   readonly stderr: Writable;
-  readonly appServer?: { readonly directory: string; readonly prompt: string };
+  readonly appServer?: {
+    readonly directory: string;
+    readonly prompt: string;
+    readonly sandbox?: "read-only" | "workspace-write";
+    readonly onEvent?: (event: Readonly<Record<string, unknown>>) => void;
+  };
 }
 
 const findingPatchSchema = z.object({
@@ -746,10 +933,21 @@ const findingPatchSchema = z.object({
 
 type FindingPatch = z.infer<typeof findingPatchSchema>;
 
+const findingVerificationSchema = z.object({
+  id: z.string(),
+  status: z.enum(["fixed", "still_vulnerable", "inconclusive"]),
+  evidence: z.string().trim().min(1),
+});
+
+type FindingVerification = z.infer<typeof findingVerificationSchema>;
+
 interface SkillRunOptions {
+  safetyIdentifier?: string;
   directory?: string;
   findings?: readonly Finding[];
   findingInstructions?: Readonly<Record<string, string>>;
+  verificationIds?: readonly string[];
+  onEvent?: (event: Readonly<Record<string, unknown>>) => void;
   provider?: string;
   providerConfiguration?: JsonObject;
   environment?: NodeJS.ProcessEnv;
@@ -773,6 +971,7 @@ interface CliDependencies {
   scanAuthenticationPrompt?: Pick<BulkScanPrompt, "isInteractive" | "select">;
   publishPrompt?: Pick<BulkScanPrompt, "isInteractive" | "select">;
   publishScan?: typeof publishScan;
+  publishScanToCloud?: typeof publishScanToCloud;
   confirmPatchReview?: (question: string) => Promise<boolean>;
   patchEditor?: (
     repository: string,
@@ -794,6 +993,7 @@ interface CliDependencies {
     args: readonly string[],
     output?: SkillCommandOutput,
     environment?: NodeJS.ProcessEnv,
+    input?: string,
   ): Promise<number>;
   runRepositoryCommand(
     command: "git" | "gh",
@@ -801,8 +1001,9 @@ interface CliDependencies {
     repository: string,
   ): Promise<string>;
   bulkScan?: BulkScanDiscoveryDependencies;
+  planComponents?: typeof planComponents;
   linearClient?: LinearClientFactory;
-  runWorkbench(args: readonly string[]): Promise<JsonObject>;
+  runWorkbench(args: readonly string[], input?: string): Promise<JsonObject>;
   matchFindings: typeof matchScanFindings;
   checkForUpdate(signal: AbortSignal): Promise<UpdateNotice | undefined>;
 }
@@ -860,12 +1061,13 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
     writeSync(stream.fd, value);
   },
   forceExit: (signal) => process.kill(process.pid, signal),
-  runCodex: (args, output, environment) =>
+  runCodex: (args, output, environment, input) =>
     runCodexSkillCommand(
       args,
       output,
       resolveCodexCommand(environment),
       environment,
+      input,
     ),
   runRepositoryCommand: async (command, args, repository) => {
     const executable = await resolveTrustedExecutable(
@@ -896,6 +1098,8 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
       python,
       [
         "-I",
+        "-X",
+        "utf8",
         join(plugin, "scripts", "finalize_scan_contract.py"),
         "--scan-dir",
         arguments_.scanDir,
@@ -947,7 +1151,7 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
     }
     return undefined;
   },
-  runWorkbench: async (args) => {
+  runWorkbench: async (args, input) => {
     const environment = {
       ...exportEnvironment(),
       CODEX_SECURITY_STATE_DIR: codexSecurityStateDirectory(),
@@ -961,6 +1165,7 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
         failureMessage: "Could not read Codex Security scan history",
       },
       args,
+      input,
     );
   },
   matchFindings: (input, options) =>
@@ -972,6 +1177,7 @@ export async function runCodexSkillCommand(
   output?: SkillCommandOutput,
   command: CodexCommand = resolveCodexCommand(),
   processEnvironment: NodeJS.ProcessEnv = process.env,
+  input?: string,
 ): Promise<number> {
   const configuredHome = processEnvironment["CODEX_HOME"];
   const environment = { ...processEnvironment };
@@ -988,10 +1194,22 @@ export async function runCodexSkillCommand(
     cwd: output?.appServer?.directory ?? parse(process.execPath).root,
     stdio:
       output === undefined
-        ? "inherit"
-        : [output.appServer === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+        ? input === undefined
+          ? "inherit"
+          : ["pipe", "inherit", "inherit"]
+        : [
+            output.appServer !== undefined || input !== undefined
+              ? "pipe"
+              : "ignore",
+            "pipe",
+            "pipe",
+          ],
     windowsHide: true,
   });
+  if (input !== undefined) {
+    invocation.stdin?.on("error", () => {});
+    invocation.stdin?.end(input);
+  }
   let requestedSignal: SignalName | null = null;
   let forcedTermination: ReturnType<typeof setTimeout> | undefined;
   let forceStatusCompletion: (() => void) | null = null;
@@ -1034,8 +1252,11 @@ export async function runCodexSkillCommand(
               output.appServer === undefined
                 ? undefined
                 : {
+                    directory: output.appServer.directory,
                     prompt: output.appServer.prompt,
                     input: invocation.stdin!,
+                    sandbox: output.appServer.sandbox,
+                    onEvent: output.appServer.onEvent,
                   },
             ),
             new Promise<undefined>((resolve) => {
@@ -1152,24 +1373,26 @@ async function writeCliOutput(
 export function exportEnvironment(
   environment: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  return Object.fromEntries(
-    [
-      "PATH",
-      "Path",
-      "PATHEXT",
-      "SystemRoot",
-      "SYSTEMROOT",
-      "WINDIR",
-      "TMP",
-      "TEMP",
-      "TMPDIR",
-      "PYTHON",
-      "LANG",
-      "LC_ALL",
-      "LC_CTYPE",
-    ]
-      .filter((key) => environment[key] !== undefined)
-      .map((key) => [key, environment[key]]),
+  return pythonUtf8Environment(
+    Object.fromEntries(
+      [
+        "PATH",
+        "Path",
+        "PATHEXT",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+        "PYTHON",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+      ]
+        .filter((key) => environment[key] !== undefined)
+        .map((key) => [key, environment[key]]),
+    ),
   );
 }
 
@@ -1216,13 +1439,13 @@ export async function main(
     args: readonly string[],
     select: (value: JsonObject) => JsonObject | Promise<JsonObject> = (value) =>
       value,
-  ): Promise<JsonObject | undefined> => {
+  ): Promise<JsonObject> => {
     try {
       return await select(await dependencies.runWorkbench(args));
     } catch (error) {
       errorOutput.write(`codex-security: ${errorMessage(error)}\n`);
       exitCode = 2;
-      return undefined;
+      throw error;
     }
   };
   const latestScans = async (
@@ -1268,19 +1491,21 @@ export async function main(
       ],
       async ({ matchingCached, matchingInputs, ...comparison }) => {
         if (matchingCached && !force) return comparison;
-        return await dependencies.runWorkbench([
-          "save-scan-comparison",
-          "--before-scan-id",
-          beforeId,
-          "--after-scan-id",
-          afterId,
-          "--matches-json",
+        return await dependencies.runWorkbench(
+          [
+            "save-scan-comparison",
+            "--before-scan-id",
+            beforeId,
+            "--after-scan-id",
+            afterId,
+            "--matches-json-stdin",
+          ],
           JSON.stringify(
             await dependencies.matchFindings(
               matchingInputs as JsonObject & ScanComparisonInput,
             ),
           ),
-        ]);
+        );
       },
     );
   const presentHistory = (
@@ -1413,7 +1638,11 @@ export async function main(
         const scanRoot =
           options.scanRoot === undefined
             ? undefined
-            : resolveCliPath(directory, options.scanRoot);
+            : process.platform === "win32"
+              ? await canonicalizeModelSafePath(
+                  resolveCliPath(directory, options.scanRoot),
+                )
+              : resolveCliPath(directory, options.scanRoot);
         const repository =
           scanRoot !== undefined && args.repository === undefined
             ? undefined
@@ -1529,6 +1758,11 @@ export async function main(
           .describe("Saved scan identifier (default: latest completed scan)."),
       }),
       options: z.object({
+        validationPromptFile: optionValue("--validation-prompt-file")
+          .optional()
+          .describe(
+            "Use FILE for custom validation; required when rerunning a custom-validation scan.",
+          ),
         verbose: z
           .boolean()
           .default(false)
@@ -1545,7 +1779,11 @@ export async function main(
             "--scan-id",
             scanId,
           ]);
-          scanArguments = scanArgumentsFromRecipe(recipe, scanId);
+          scanArguments = scanArgumentsFromRecipe(
+            recipe,
+            scanId,
+            options.validationPromptFile,
+          );
           scanArguments.verbose = options.verbose;
         } catch (error) {
           const message = errorMessage(error);
@@ -1613,7 +1851,7 @@ export async function main(
         } catch (error) {
           errorOutput.write(`codex-security: ${errorMessage(error)}\n`);
           exitCode = 2;
-          return undefined;
+          throw error;
         }
       },
     })
@@ -1665,7 +1903,25 @@ export async function main(
         .describe("Completed scan directory; omit to select a saved scan."),
     }),
     options: z.object({
-      to: z.literal("linear").describe("Publication destination."),
+      scan: z
+        .array(optionValue("--scan"))
+        .default([])
+        .describe(
+          "Saved scan ID, unique prefix, or latest; repeat for multiple scans (Linear accepts one).",
+        ),
+      scanDir: z
+        .array(optionValue("--scan-dir"))
+        .default([])
+        .describe(
+          "External completed scan directory; repeat for multiple scans (Linear accepts one).",
+        ),
+      // Cloud remains an internal destination, omitted from public discovery.
+      to: z
+        .string()
+        .refine((value) => value === "linear" || value === "cloud", {
+          message: "Unsupported publication destination. Use --to linear.",
+        })
+        .describe("Publication destination (linear)."),
       linearTeam: optionValue("--linear-team")
         .optional()
         .describe("Linear team ID; defaults to CODEX_SECURITY_LINEAR_TEAM."),
@@ -1693,18 +1949,81 @@ export async function main(
     async run({ args, format, formatExplicit, options }) {
       const controller = new AbortController();
       let presentation: PublicationProgressPresenter | undefined;
+      let cloudBatch:
+        | {
+            results: (CloudPublicationResult & { scanDir: string })[];
+            failed: { scanDir: string; scanId?: string; error: string }[];
+            notAttempted: string[];
+          }
+        | undefined;
       const cancel = (signal: SignalName): void => {
         presentation?.stop();
         controller.abort(signal);
+      };
+      const finishCancellation = (error?: unknown): boolean => {
+        const signal = controller.signal.reason;
+        if (signal !== "SIGINT" && signal !== "SIGTERM") return false;
+        const reason =
+          signal === "SIGINT"
+            ? "Publication canceled by Ctrl-C."
+            : "Publication terminated by SIGTERM.";
+        const recovery =
+          error === undefined || error === signal
+            ? ""
+            : ` ${diagnosticValue(safeErrorMessage(error))}`;
+        errorOutput.write(`codex-security: ${reason}${recovery}\n`);
+        exitCode = signal === "SIGINT" ? 130 : 143;
+        return true;
       };
       const onInterrupt = (): void => cancel("SIGINT");
       const onTerminate = (): void => cancel("SIGTERM");
       let observingSignals = false;
       try {
-        const linearApiKey = resolveLinearApiKey(
-          dependencies.environment,
-          options.linearApiKey,
-        );
+        const currentDirectory = dependencies.currentDirectory();
+        const directories = [
+          ...new Set(
+            [
+              ...(args.scanDir === undefined ? [] : [args.scanDir]),
+              ...options.scanDir,
+            ].map((directory) => resolveCliPath(currentDirectory, directory)),
+          ),
+        ];
+        if (directories.length > 1 && options.to !== "cloud") {
+          throw new CodexSecurityError(
+            "Multiple scan directories are only supported with --to cloud.",
+          );
+        }
+        if (options.scan.length > 0 && directories.length > 0) {
+          throw new CodexSecurityError(
+            "Use --scan or scan directory inputs, not both.",
+          );
+        }
+        if (new Set(options.scan).size > 1 && options.to !== "cloud") {
+          throw new CodexSecurityError(
+            "Multiple scans are only supported with --to cloud.",
+          );
+        }
+        if (
+          options.to === "cloud" &&
+          [
+            options.linearTeam,
+            options.linearApiKey,
+            options.linearProject,
+            options.project,
+            options.linearAssignee,
+          ].some((value) => value !== undefined)
+        ) {
+          throw new CodexSecurityError(
+            "Cloud publication cannot be combined with Linear options.",
+          );
+        }
+        const linearApiKey =
+          options.to === "linear"
+            ? resolveLinearApiKey(
+                dependencies.environment,
+                options.linearApiKey,
+              )
+            : undefined;
         const assigneeId = options.linearAssignee?.trim();
         if (options.linearAssignee !== undefined && !assigneeId) {
           throw new CodexSecurityError("--linear-assignee must not be empty.");
@@ -1716,8 +2035,9 @@ export async function main(
         }
         const teamId =
           options.linearTeam?.trim() ||
-          dependencies.environment["CODEX_SECURITY_LINEAR_TEAM"]?.trim();
-        if (!teamId) {
+          dependencies.environment["CODEX_SECURITY_LINEAR_TEAM"]?.trim() ||
+          "";
+        if (options.to === "linear" && !teamId) {
           throw new CodexSecurityError(
             "--linear-team or CODEX_SECURITY_LINEAR_TEAM is required.",
           );
@@ -1743,7 +2063,21 @@ export async function main(
           dependencies.environment["CODEX_SECURITY_LINEAR_PROJECT"]?.trim() ||
           undefined;
 
-        let scanDir = args.scanDir;
+        if (options.to === "cloud") {
+          dependencies.addSignalListener("SIGINT", onInterrupt);
+          dependencies.addSignalListener("SIGTERM", onTerminate);
+          observingSignals = true;
+        }
+        const selectedScans: { scanDir: string; scanId?: string }[] =
+          directories.map((scanDir) => ({ scanDir }));
+        for (const requestedId of new Set(options.scan)) {
+          controller.signal.throwIfAborted();
+          const scan = await resolvePublicationScan(requestedId, dependencies);
+          if (!selectedScans.some(({ scanId }) => scanId === scan.scanId)) {
+            selectedScans.push(scan);
+          }
+        }
+        let scanDir = selectedScans[0]?.scanDir;
         let publicationRepository =
           scanDir === undefined ? "scan" : basename(scanDir);
         if (scanDir === undefined) {
@@ -1756,7 +2090,7 @@ export async function main(
             }).prompt;
           if (!prompt.isInteractive()) {
             throw new CodexSecurityError(
-              "Interactive scan selection requires a terminal. Provide a completed scan directory: codex-security publish scan /path/to/sealed-scan --to linear --linear-team TEAM_ID.",
+              `Interactive scan selection requires a terminal. Select a saved scan: codex-security publish scan --scan SCAN_ID --to ${options.to}${options.to === "linear" ? " --linear-team TEAM_ID" : ""}.`,
             );
           }
           const saved = await dependencies.runWorkbench([
@@ -1779,7 +2113,7 @@ export async function main(
                   return undefined;
                 }
                 const metadata = await lstat(
-                  resolve(dependencies.currentDirectory(), directory),
+                  resolveCliPath(currentDirectory, directory),
                 ).catch(() => undefined);
                 return metadata?.isDirectory() === true &&
                   !metadata.isSymbolicLink()
@@ -1794,6 +2128,10 @@ export async function main(
             dependencies.environment["NO_COLOR"] === undefined &&
             dependencies.environment["TERM"] !== "dumb";
           const repositories = new Map<string, string>();
+          const scansById = new Map<
+            string,
+            { scanId: string; scanDir: string }
+          >();
           const rows = scans.flatMap((scan) => {
             if (!isJsonObject(scan)) return [];
             const progress = scan["progress"];
@@ -1843,13 +2181,17 @@ export async function main(
               .replace(/\s+/gu, " ")
               .slice(-6)}`;
             repositories.set(directory, repository);
+            scansById.set(scanId, {
+              scanId,
+              scanDir: resolveCliPath(currentDirectory, directory),
+            });
             return [
               {
                 repository,
                 findings,
                 age: publicationScanAge(timestamp, now),
                 scanId: shortScanId,
-                value: directory,
+                value: options.to === "cloud" ? scanId : directory,
               },
             ];
           });
@@ -1894,13 +2236,116 @@ export async function main(
               value: row.value,
             };
           });
-          scanDir = await prompt.select(
-            "Which completed scan would you like to publish?",
-            choices,
-            { header },
-          );
+          if (options.to === "cloud") {
+            let remaining = choices;
+            while (true) {
+              controller.signal.throwIfAborted();
+              const selected = await prompt.select(
+                "Which completed scans would you like to publish?",
+                selectedScans.length === 0
+                  ? remaining
+                  : [
+                      {
+                        label: `Done (${selectedScans.length} selected)`,
+                        value: "",
+                      },
+                      ...remaining,
+                    ],
+                { header },
+                controller.signal,
+              );
+              controller.signal.throwIfAborted();
+              if (selected === "") break;
+              selectedScans.push(scansById.get(selected)!);
+              remaining = remaining.filter(({ value }) => value !== selected);
+            }
+            scanDir = selectedScans[0]!.scanDir;
+          } else {
+            scanDir = await prompt.select(
+              "Which completed scan would you like to publish?",
+              choices,
+              { header },
+            );
+            selectedScans.push({ scanDir });
+          }
           publicationRepository =
             repositories.get(scanDir) ?? basename(scanDir);
+        }
+
+        if (options.to === "cloud") {
+          const seenDirectories = new Set<string>();
+          for (let index = 0; index < selectedScans.length; ) {
+            const selected = selectedScans[index]!;
+            const canonical = await realpath(selected.scanDir).catch(
+              () => selected.scanDir,
+            );
+            const identity =
+              process.platform === "win32"
+                ? canonical.toLowerCase()
+                : canonical;
+            if (seenDirectories.has(identity)) {
+              selectedScans.splice(index, 1);
+              continue;
+            }
+            seenDirectories.add(identity);
+            selected.scanDir = canonical;
+            index++;
+          }
+          scanDir = selectedScans[0]!.scanDir;
+          controller.signal.throwIfAborted();
+          if (selectedScans.length > 1) {
+            cloudBatch = {
+              results: [],
+              failed: [],
+              notAttempted: selectedScans.map(
+                ({ scanId, scanDir }) => scanId ?? scanDir,
+              ),
+            };
+            // Keep each scan's provenance and acceptance receipt separate. Never
+            // retry a failed POST: a lost response may still have been accepted.
+            for (const { scanDir: directory, scanId } of selectedScans) {
+              if (controller.signal.aborted) {
+                finishCancellation();
+                break;
+              }
+              cloudBatch.notAttempted.shift();
+              try {
+                const result = await (
+                  dependencies.publishScanToCloud ?? publishScanToCloud
+                )(directory, {
+                  environment: dependencies.environment,
+                  dryRun: options.dryRun,
+                  signal: controller.signal,
+                  ...(scanId === undefined ? {} : { expectedScanId: scanId }),
+                });
+                cloudBatch.results.push({ scanDir: directory, ...result });
+              } catch (error) {
+                const message = safeErrorMessage(error);
+                cloudBatch.failed.push({
+                  scanDir: directory,
+                  ...(scanId === undefined ? {} : { scanId }),
+                  error: message,
+                });
+                if (controller.signal.aborted) throw error;
+                exitCode = 2;
+                errorOutput.write(
+                  `codex-security: ${diagnosticValue(safeErrorMessage(scanId ?? directory))}: ${diagnosticValue(message)}\n`,
+                );
+              }
+            }
+            return cloudBatch;
+          }
+          const result = await (
+            dependencies.publishScanToCloud ?? publishScanToCloud
+          )(resolveCliPath(currentDirectory, scanDir), {
+            environment: dependencies.environment,
+            dryRun: options.dryRun,
+            signal: controller.signal,
+            ...(selectedScans[0]?.scanId === undefined
+              ? {}
+              : { expectedScanId: selectedScans[0].scanId }),
+          });
+          return { ...result };
         }
 
         const progress = new PublicationProgressPresenter(
@@ -1918,9 +2363,12 @@ export async function main(
         let result;
         try {
           result = await (dependencies.publishScan ?? publishScan)(
-            resolve(dependencies.currentDirectory(), scanDir),
+            resolveCliPath(currentDirectory, scanDir),
             {
-              destination: options.to,
+              destination: "linear",
+              ...(selectedScans[0]?.scanId === undefined
+                ? {}
+                : { expectedScanId: selectedScans[0].scanId }),
               teamId,
               ...(projectId === undefined ? {} : { projectId }),
               dryRun: options.dryRun,
@@ -1963,23 +2411,13 @@ export async function main(
         }
         return { ...result };
       } catch (error) {
-        const signal = controller.signal.reason;
-        if (signal === "SIGINT" || signal === "SIGTERM") {
-          const reason =
-            signal === "SIGINT"
-              ? "Publication canceled by Ctrl-C."
-              : "Publication terminated by SIGTERM.";
-          const recovery =
-            error === signal
-              ? ""
-              : ` ${diagnosticValue(safeErrorMessage(error))}`;
-          errorOutput.write(`codex-security: ${reason}${recovery}\n`);
-          exitCode = signal === "SIGINT" ? 130 : 143;
-        } else {
-          errorOutput.write(`codex-security: ${errorMessage(error)}\n`);
+        if (!finishCancellation(error)) {
+          errorOutput.write(
+            `codex-security: ${options.to === "cloud" ? safeErrorMessage(error) : errorMessage(error)}\n`,
+          );
           exitCode = 2;
         }
-        return undefined;
+        return cloudBatch;
       } finally {
         if (observingSignals) {
           dependencies.removeSignalListener("SIGINT", onInterrupt);
@@ -1990,7 +2428,7 @@ export async function main(
   });
   const cli = Cli.create("codex-security", {
     description:
-      "Run, validate, patch, export, and publish Codex Security findings.",
+      "Run, validate, patch, verify fixes, export, and publish Codex Security findings.",
     version: VERSION,
     mcp: {
       command: "npx --yes @openai/codex-security --mcp",
@@ -2011,7 +2449,7 @@ export async function main(
       options: z
         .object({
           auth: z
-            .enum(["auto", "chatgpt", "api-key"])
+            .enum(SCAN_AUTH_MODES)
             .default("auto")
             .describe(
               "Select ChatGPT, OPENAI_API_KEY/CODEX_API_KEY, or automatic authentication.",
@@ -2020,6 +2458,11 @@ export async function main(
             .boolean()
             .default(false)
             .describe("Print scan diagnostics to stderr."),
+          safetyIdentifier: optionValue("--safety-identifier")
+            .optional()
+            .describe(
+              "Stable hashed end-user ID for this scan's model requests (1–64 characters).",
+            ),
           path: z
             .array(optionValue("--path"))
             .default([])
@@ -2035,6 +2478,11 @@ export async function main(
           scanPromptFile: optionValue("--scan-prompt-file")
             .optional()
             .describe("Append scan instructions from FILE."),
+          validationPromptFile: optionValue("--validation-prompt-file")
+            .optional()
+            .describe(
+              "Replace final validation with the workflow in FILE (not Deep).",
+            ),
           postScanPromptFile: optionValue("--post-scan-prompt-file")
             .optional()
             .describe("Run FILE after each scan, including failures."),
@@ -2189,11 +2637,13 @@ export async function main(
         const outcome = await runScan(
           {
             auth: options.auth,
+            safetyIdentifier: options.safetyIdentifier,
             verbose: options.verbose,
             repository: args.repository,
             paths: options.path,
             knowledgeBasePaths: options.knowledgeBase,
             scanPromptFile: options.scanPromptFile,
+            validationPromptFile: options.validationPromptFile,
             postScanPromptFile: options.postScanPromptFile,
             diff: options.diff,
             workingTree: options.workingTree,
@@ -2318,6 +2768,253 @@ export async function main(
     .command(scanHistory)
     .command(findingFeedback)
     .command(publication)
+    .command("scan-components", {
+      description:
+        "Run standard scans for project components and combine the results.",
+      destructive: true,
+      mcp: false,
+      args: z.object({
+        repository: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Project directory (default: current directory)."),
+      }),
+      options: z
+        .object({
+          auth: z
+            .enum(SCAN_AUTH_MODES)
+            .default("auto")
+            .describe(
+              "Select ChatGPT, OPENAI_API_KEY/CODEX_API_KEY, or automatic authentication.",
+            ),
+          component: z
+            .array(optionValue("--component"))
+            .default([])
+            .describe(
+              "Scan this repository-relative path as a component; repeat for more.",
+            ),
+          componentsFile: optionValue("--components-file")
+            .optional()
+            .describe("Read a component plan from JSON."),
+          auto: z
+            .boolean()
+            .default(false)
+            .describe("Ask Codex to divide the project into components."),
+          planOnly: z
+            .boolean()
+            .default(false)
+            .describe("Save components.json without starting scans."),
+          headless: z
+            .boolean()
+            .default(false)
+            .describe(
+              "Print status lines instead of the interactive dashboard.",
+            ),
+          outputDir: optionValue("--output-dir").describe(
+            "Empty results directory outside the repository.",
+          ),
+          workers: z
+            .number()
+            .int()
+            .positive()
+            .default(4)
+            .describe("Concurrent standard component scans."),
+          knowledgeBase: z
+            .array(optionValue("--knowledge-base"))
+            .default([])
+            .describe("Read shared security docs for every component."),
+          scanPromptFile: optionValue("--scan-prompt-file")
+            .optional()
+            .describe("Append instructions from FILE to every scan."),
+          postScanPromptFile: optionValue("--post-scan-prompt-file")
+            .optional()
+            .describe("Run FILE after each scan, including failures."),
+          model: optionValue("--model")
+            .optional()
+            .describe("Model for planning and component scans."),
+          effort: effortOption(),
+          provider: PROVIDER_OPTION,
+          maxCost: z
+            .number()
+            .positive()
+            .optional()
+            .describe(
+              "Stop each component scan if estimated USD cost exceeds AMOUNT.",
+            ),
+          pluginPath: optionValue("--plugin-path")
+            .optional()
+            .describe(PLUGIN_PATH_DESCRIPTION),
+          python: optionValue("--python")
+            .optional()
+            .describe(PYTHON_PATH_DESCRIPTION),
+          codex: z
+            .array(optionValue("--codex"))
+            .default([])
+            .describe(CODEX_OVERRIDE_DESCRIPTION),
+        })
+        .refine(
+          (options) =>
+            Number(options.component.length > 0) +
+              Number(options.componentsFile !== undefined) +
+              Number(options.auto) ===
+            1,
+          {
+            message:
+              "Choose exactly one of --component, --components-file, or --auto.",
+          },
+        ),
+      output: z.record(z.string(), z.unknown()).optional(),
+      async run({ args, options }) {
+        const controller = new AbortController();
+        let dashboard: ScanDashboard | null = null;
+        const stopDashboard = (): void => {
+          try {
+            dashboard?.stop();
+          } catch {}
+        };
+        const onInterrupt = (): void => controller.abort("SIGINT");
+        const onTerminate = (): void => controller.abort("SIGTERM");
+        const interruptedExitCode = (): number | undefined =>
+          controller.signal.reason === "SIGINT"
+            ? 130
+            : controller.signal.reason === "SIGTERM"
+              ? 143
+              : undefined;
+        dependencies.addSignalListener("SIGINT", onInterrupt);
+        dependencies.addSignalListener("SIGTERM", onTerminate);
+        try {
+          const directory = dependencies.currentDirectory();
+          const repository = resolveCliPath(directory, args.repository ?? ".");
+          const config: CodexSecurityConfig = {
+            pluginPath: options.pluginPath,
+            pythonPath: options.python,
+            codexOverrides: parseCodexOverrides(
+              options.codex,
+              options.model,
+              options.effort,
+              options.provider,
+            ),
+          };
+          const components =
+            options.componentsFile === undefined
+              ? options.component.map((path) => ({ name: path, paths: [path] }))
+              : componentPlanSchema.parse(
+                  JSON.parse(
+                    await readRegularInputFile(
+                      resolveCliPath(directory, options.componentsFile),
+                      repository,
+                    ),
+                  ),
+                ).components;
+          if (
+            !options.headless &&
+            !options.planOnly &&
+            errorOutput.isTTY === true &&
+            dependencies.environment["CI"] === undefined &&
+            dependencies.environment["TERM"] !== "dumb"
+          ) {
+            const candidate = new ScanDashboard(errorOutput, {
+              repository,
+              presentation: "components",
+              model: scanModelConfiguration(await mergedCodexConfig(config)),
+              maxCostUsd: options.maxCost,
+              clock: dependencies,
+              color: dependencies.environment["NO_COLOR"] === undefined,
+              sanitize: safeErrorMessage,
+              input: process.stdin,
+              onInterrupt,
+            });
+            candidate.setStage(
+              options.auto ? "Planning components" : "Preparing components",
+            );
+            try {
+              candidate.start();
+              dashboard = candidate;
+            } catch {
+              try {
+                candidate.stop();
+              } catch {}
+            }
+          }
+          const result = await runComponentScans({
+            repository,
+            outputDir: resolveCliPath(directory, options.outputDir),
+            ...(options.auto ? { auto: true } : { components }),
+            planOnly: options.planOnly,
+            workers: options.workers,
+            config,
+            scanOptions: {
+              auth: options.auth,
+              knowledgeBasePaths: options.knowledgeBase.map((path) =>
+                resolveCliPath(directory, path),
+              ),
+              ...(await readPromptFiles(
+                directory,
+                options.scanPromptFile,
+                options.postScanPromptFile,
+                repository,
+              )),
+              ...(options.maxCost === undefined
+                ? {}
+                : { maxCostUsd: options.maxCost }),
+            },
+            createSecurity: dependencies.createSecurity,
+            planComponents: dependencies.planComponents,
+            matchFindings: dependencies.matchFindings,
+            onPlan: (components) => dashboard?.setComponents(components),
+            onScanEvent:
+              dashboard === null
+                ? undefined
+                : (event) => dashboard?.recordComponentEvent(event),
+            onDeduplicationStarted: () => {
+              if (dashboard !== null)
+                dashboard.showComponents("Combining duplicate findings");
+              else
+                errorOutput.write(
+                  "codex-security: Matching component findings by root cause...\n",
+                );
+            },
+            environment: dependencies.environment,
+            signal: controller.signal,
+            onProgress: (component) => {
+              if (dashboard !== null) dashboard.updateComponent(component);
+              else
+                errorOutput.write(
+                  `codex-security: ${component.name} ${component.status}${component.error === undefined ? "" : `: ${component.error}`}\n`,
+                );
+            },
+            onComplete: (result) => {
+              dashboard?.finishComponents(result);
+              stopDashboard();
+              errorOutput.write(
+                `Component scans: ${result.completed} complete, ${result.incomplete} incomplete, ${result.failed} failed.\n${result.sourceFindingCount} findings → ${result.findingCount} groups${result.deduplication?.status === "incomplete" ? " (matching incomplete)" : ""}.\nReport: ${errorMessage(result.reportPath)}\n`,
+              );
+              if (result.retryPlanPath !== undefined)
+                errorOutput.write(
+                  `Retry with --components-file ${JSON.stringify(errorMessage(result.retryPlanPath))} and a new --output-dir.\n`,
+                );
+            },
+          });
+          exitCode =
+            interruptedExitCode() ??
+            (result.failed ||
+            result.incomplete ||
+            result.deduplication?.status === "incomplete"
+              ? 2
+              : 0);
+          return { ...result };
+        } catch (error) {
+          stopDashboard();
+          exitCode = interruptedExitCode() ?? 2;
+          errorOutput.write(`codex-security: ${errorMessage(error)}\n`);
+        } finally {
+          stopDashboard();
+          dependencies.removeSignalListener("SIGINT", onInterrupt);
+          dependencies.removeSignalListener("SIGTERM", onTerminate);
+        }
+      },
+    })
     .command("bulk-scan", {
       description:
         "Discover repositories and run resumable bulk security scans.",
@@ -2359,6 +3056,11 @@ export async function main(
         scanPromptFile: optionValue("--scan-prompt-file")
           .optional()
           .describe("Append instructions from FILE to every scan."),
+        validationPromptFile: optionValue("--validation-prompt-file")
+          .optional()
+          .describe(
+            "Replace final validation with FILE for every standard scan.",
+          ),
         postScanPromptFile: optionValue("--post-scan-prompt-file")
           .optional()
           .describe("Run FILE after each scan, including failures."),
@@ -2423,6 +3125,8 @@ export async function main(
             currentDirectory,
             options.scanPromptFile,
             options.postScanPromptFile,
+            currentDirectory,
+            options.validationPromptFile,
           );
           let inputPath: string;
           let outputDir: string;
@@ -2604,6 +3308,223 @@ export async function main(
         } catch (error) {
           exitCode = 2;
           errorOutput.write(`codex-security: ${errorMessage(error)}\n`);
+        }
+      },
+    })
+    .command("verify-fix", {
+      description:
+        "Verify existing security fixes without changing the repository.",
+      destructive: false,
+      mcp: false,
+      args: z.object({
+        "findings...": z
+          .string()
+          .min(1, "A finding must not be empty.")
+          .optional()
+          .describe("Finding text, a file, or a saved finding identifier."),
+      }),
+      options: z.object({
+        effort: effortOption(),
+        scan: optionValue("--scan")
+          .optional()
+          .describe("Verify open findings from a saved scan."),
+        severity: z
+          .enum(REPORTABLE_SEVERITIES)
+          .optional()
+          .describe("Verify saved findings at or above LEVEL."),
+        linearIssue: z
+          .array(optionValue("--linear-issue"))
+          .default([])
+          .describe("Linear issue identifier or URL; repeat for more issues."),
+        linearProject: optionValue("--linear-project")
+          .optional()
+          .describe("Verify issues in this Linear project."),
+        linearFilter: optionValue("--linear-filter")
+          .optional()
+          .describe("JSON Linear issue filter for --linear-project."),
+        linearApiKey: linearApiKeyOption(),
+        codex: z
+          .array(optionValue("--codex"))
+          .default([])
+          .describe(
+            'Repeat TOML model="gpt-5.6-terra" or model_reasoning_effort="high" only.',
+          ),
+      }),
+      output: z.record(z.string(), z.unknown()).optional(),
+      async run({ format, options }) {
+        try {
+          const linear =
+            options.linearIssue.length > 0 || !!options.linearProject;
+          if (options.linearIssue.length > 0 && options.linearProject) {
+            throw new CodexSecurityError(
+              "Use either --linear-issue or --linear-project, not both.",
+            );
+          }
+          if (options.linearFilter && !options.linearProject) {
+            throw new CodexSecurityError(
+              "--linear-filter requires --linear-project.",
+            );
+          }
+          if (options.linearApiKey !== undefined && !linear) {
+            throw new CodexSecurityError(
+              "--linear-api-key requires --linear-issue or --linear-project.",
+            );
+          }
+          const savedFindings =
+            options.scan !== undefined ||
+            (positionals.length > 0 && positionals.every(isFindingIdentifier));
+          if (savedFindings && linear) {
+            throw new CodexSecurityError(
+              "Saved findings cannot be combined with Linear issues or projects.",
+            );
+          }
+          if (options.severity !== undefined && !savedFindings) {
+            throw new CodexSecurityError(
+              "--severity requires a saved finding identifier or --scan.",
+            );
+          }
+          if (positionals.length === 0 && !linear && !savedFindings) {
+            throw new CodexSecurityError(
+              "Verify-fix requires a finding, --scan, --linear-issue, or --linear-project.",
+            );
+          }
+
+          const selected = savedFindings
+            ? await selectSavedFindings(
+                positionals,
+                options.scan,
+                options.severity,
+                dependencies,
+              )
+            : undefined;
+          const imports = linear
+            ? await importLinearIssues({
+                issues: options.linearIssue,
+                project: options.linearProject,
+                filter: options.linearFilter,
+                apiKey: options.linearApiKey,
+                environment: dependencies.environment,
+                linearClient: dependencies.linearClient,
+              })
+            : [];
+          const identifiers =
+            selected === undefined
+              ? [
+                  ...positionals.map(
+                    (_finding, index) => `finding-${index + 1}`,
+                  ),
+                  ...imports.map(({ id }) => id),
+                ]
+              : selected.findings.map(({ occurrenceId }) => occurrenceId);
+          if (new Set(identifiers).size !== identifiers.length) {
+            throw new CodexSecurityError(
+              "Verification inputs must have unique finding or issue identifiers.",
+            );
+          }
+          const repository =
+            selected?.repository ?? dependencies.currentDirectory();
+          let results: FindingVerification[] = [];
+          if (identifiers.length > 0) {
+            const environment =
+              imports.length === 0
+                ? undefined
+                : Object.fromEntries(
+                    Object.entries(dependencies.environment).filter(
+                      ([name]) =>
+                        !/^(?:CODEX_SECURITY_)?LINEAR_(?:API_KEY|ACCESS_TOKEN)$/iu.test(
+                          name,
+                        ),
+                    ),
+                  );
+            let response = "";
+            const verificationOutput: Writable = {
+              write(value: string | Uint8Array): boolean {
+                response += value.toString();
+                return true;
+              },
+            };
+            const progress = new VerificationProgressPresenter(
+              errorOutput,
+              dependencies,
+              repository,
+              identifiers.length,
+            );
+            progress.start();
+            try {
+              exitCode = await runSkill(
+                "verify-fix",
+                selected === undefined ? [...positionals, ...imports] : [],
+                options.codex,
+                options.effort,
+                verificationOutput,
+                errorOutput,
+                dependencies,
+                {
+                  directory: repository,
+                  ...(selected === undefined
+                    ? {}
+                    : { findings: selected.findings }),
+                  verificationIds: identifiers,
+                  environment,
+                  onEvent: progress.observe.bind(progress),
+                },
+              );
+              if (exitCode !== 0) {
+                if (exitCode !== 130 && exitCode !== 143) exitCode = 2;
+                return undefined;
+              }
+
+              let reported: unknown;
+              try {
+                reported = JSON.parse(response);
+              } catch {
+                throw new CodexSecurityError(
+                  "Verification results were not valid JSON.",
+                );
+              }
+              const parsed = z
+                .object({ results: z.array(findingVerificationSchema) })
+                .safeParse(reported);
+              if (
+                !parsed.success ||
+                parsed.data.results.length !== identifiers.length ||
+                parsed.data.results.some(
+                  ({ id }, index) => id !== identifiers[index],
+                )
+              ) {
+                throw new CodexSecurityError(
+                  "Codex did not return an evidence-backed verification result for every finding.",
+                );
+              }
+              results = parsed.data.results;
+              progress.complete(results);
+              exitCode = results.some(({ status }) => status === "inconclusive")
+                ? 2
+                : results.some(({ status }) => status === "still_vulnerable")
+                  ? 1
+                  : 0;
+            } finally {
+              progress.stop();
+            }
+          }
+
+          if (format === "json" || format === "jsonl") {
+            return {
+              repository,
+              ...(selected === undefined ? {} : { scanId: selected.scanId }),
+              results,
+            };
+          }
+          for (const result of results) {
+            output.write(
+              `${result.status.toUpperCase()} ${safePatchText(result.id)}: ${safePatchText(result.evidence)}\n`,
+            );
+          }
+          return undefined;
+        } catch (error) {
+          exitCode = 2;
+          errorOutput.write(`codex-security: ${safeErrorMessage(error)}\n`);
+          return undefined;
         }
       },
     })
@@ -3030,10 +3951,19 @@ function defaultListCommand(argv: readonly string[]): readonly string[] {
 function scanArgumentsFromRecipe(
   recipe: JsonValue | undefined,
   parentScanId: string,
+  validationPromptFile?: string,
 ): ScanArguments {
   if (recipe === undefined || !isJsonObject(recipe)) {
     throw new CodexSecurityError(
       "This scan does not have a saved launch recipe.",
+    );
+  }
+  if (
+    recipe["validationMode"] === "custom" &&
+    validationPromptFile === undefined
+  ) {
+    throw new CodexSecurityError(
+      "This scan used custom validation. Supply --validation-prompt-file to rerun it.",
     );
   }
   const repository = recipe["repository"];
@@ -3149,6 +4079,7 @@ function scanArgumentsFromRecipe(
     repository,
     paths,
     knowledgeBasePaths,
+    validationPromptFile,
     diff: kind === "refs" ? reference : undefined,
     workingTree: kind === "working_tree",
     head: kind === "refs" ? head ?? "HEAD" : undefined,
@@ -3181,11 +4112,13 @@ function validateCliArguments(
       "scan",
       "install-hook",
       "bulk-scan",
+      "scan-components",
       "scans",
       "findings",
       "export",
       "publish",
       "validate",
+      "verify-fix",
       "patch",
       "login",
       "logout",
@@ -3314,6 +4247,7 @@ function validateCliArguments(
   }
   if (
     command !== "validate" &&
+    command !== "verify-fix" &&
     command !== "patch" &&
     positionals.length >
       (command === "logout" || command === "info"
@@ -3380,15 +4314,17 @@ async function matchAllScans(
       return { scanId, matches, uncertain };
     });
     for (const { scanId, matches, uncertain } of comparisons) {
-      await dependencies.runWorkbench([
-        "save-scan-comparison",
-        "--before-scan-id",
-        scanId,
-        "--after-scan-id",
-        afterScanId,
-        "--matches-json",
+      await dependencies.runWorkbench(
+        [
+          "save-scan-comparison",
+          "--before-scan-id",
+          scanId,
+          "--after-scan-id",
+          afterScanId,
+          "--matches-json-stdin",
+        ],
         JSON.stringify({ matches, uncertain }),
-      ]);
+      );
       matchedPairs += 1;
       findingMatches += matches.reduce(
         (count, { beforeOccurrenceIds, afterOccurrenceIds }) =>
@@ -3450,6 +4386,71 @@ async function* workbenchFindings(
     yield* page.findings;
     offset = typeof page.nextOffset === "number" ? page.nextOffset : undefined;
   } while (offset !== undefined);
+}
+
+async function resolvePublicationScan(
+  requestedId: string,
+  dependencies: CliDependencies,
+): Promise<SavedScan> {
+  let scanId = requestedId;
+  if (scanId === "latest") {
+    const history = await dependencies.runWorkbench([
+      "list-scans",
+      "--repository",
+      resolve(dependencies.currentDirectory()),
+      "--status",
+      "complete",
+    ]);
+    const scans = history["scans"];
+    const latest = Array.isArray(scans) ? scans[0] : undefined;
+    if (
+      latest === undefined ||
+      !isJsonObject(latest) ||
+      typeof latest["scanId"] !== "string"
+    ) {
+      throw new CodexSecurityError(
+        "No completed saved scan was found for this repository.",
+      );
+    }
+    scanId = latest["scanId"];
+  }
+  const context = await dependencies.runWorkbench([
+    "get-scan",
+    "--scan-id",
+    scanId,
+  ]);
+  const scan = context["scan"];
+  if (
+    scan === undefined ||
+    !isJsonObject(scan) ||
+    typeof scan["scanId"] !== "string"
+  ) {
+    throw new CodexSecurityError(`Could not read saved scan ${scanId}.`);
+  }
+  scanId = scan["scanId"];
+  const progress = scan["progress"];
+  if (
+    progress === undefined ||
+    !isJsonObject(progress) ||
+    progress["status"] !== "complete"
+  ) {
+    throw new CodexSecurityError(`Scan ${scanId} is not complete.`);
+  }
+  const storedDirectory = scan["scanDir"];
+  const scanDir =
+    typeof storedDirectory === "string" && storedDirectory.length > 0
+      ? resolveCliPath(dependencies.currentDirectory(), storedDirectory)
+      : undefined;
+  const metadata =
+    scanDir === undefined
+      ? undefined
+      : await lstat(scanDir).catch(() => undefined);
+  if (scanDir === undefined || metadata?.isDirectory() !== true) {
+    throw new CodexSecurityError(
+      `Artifacts for scan ${scanId} are unavailable. Restore the completed scan artifacts or run a new scan.`,
+    );
+  }
+  return { ...scan, scanId, scanDir };
 }
 
 async function selectSavedFindings(
@@ -3613,6 +4614,7 @@ async function publishPatchBranch(
       url = await run("gh", [
         "pr",
         "create",
+        "--draft",
         "--head",
         branch,
         "--title",
@@ -3693,7 +4695,9 @@ async function createPatchPullRequest(
   const branch = `codex-security/patch-${selected.scanId.replaceAll(/[^a-z\d._-]/giu, "-")}`;
   const run = (command: "git" | "gh", args: string[]) =>
     dependencies.runRepositoryCommand(command, args, selected.repository);
-  stderr.write("Creating a GitHub pull request for verified patches...\n");
+  stderr.write(
+    "Creating a draft GitHub pull request for verified patches...\n",
+  );
   await run("git", ["switch", "-c", branch]);
   await run("git", ["--literal-pathspecs", "add", "--", ...files]);
   await run("git", [
@@ -3818,7 +4822,7 @@ async function runFindingPatches(
 }
 
 async function runSkill(
-  skill: "validation" | "fix-finding",
+  skill: "validation" | "fix-finding" | "verify-fix",
   inputs: readonly (string | ImportedIssue)[],
   codexOverrides: readonly string[],
   effort: ScanReasoningEffort | undefined,
@@ -3918,13 +4922,31 @@ async function runSkill(
     contents.push(contentsOrLiteral);
   }
   const plugin = await bundledPluginRoot();
-  const inputLabel = skill === "validation" ? "Findings" : "Issues";
+  const verify = skill === "verify-fix";
+  const inputLabel = skill === "validation" || verify ? "Findings" : "Issues";
   const prompt = [
-    `Use the bundled $codex-security:${skill} skill at ${JSON.stringify(join(plugin, "skills", skill, "SKILL.md"))}.`,
-    ...(options.findings === undefined
-      ? []
+    ...(verify
+      ? [
+          "Use the bundled $codex-security:verify-fix skill. Its complete instructions and shared assessment reference are provided below; do not reread either file.",
+          await readFile(
+            join(plugin, "skills", "verify-fix", "SKILL.md"),
+            "utf8",
+          ),
+          "Shared static finding assessment reference:",
+          await readFile(
+            join(plugin, "references", "static-finding-assessment.md"),
+            "utf8",
+          ),
+          `Expected result identifiers (JSON array): ${JSON.stringify(options.verificationIds)}`,
+          "Return exactly one evidence-backed result per expected identifier in the same order, following the skill's JSON result contract.",
+        ]
       : [
-          'Return exactly one JSON object with a "patches" array. Include one object for every supplied finding: {"occurrenceId":"...","status":"verified|no_change|blocked|failed","files":["relative/path"],"verification":"proof that the original issue is fixed and legitimate behavior still works","reason":"required for blocked or failed outcomes"}. Use "verified" only after the original issue no longer reproduces and relevant checks pass. Preserve unrelated local changes.',
+          `Use the bundled $codex-security:${skill} skill at ${JSON.stringify(join(plugin, "skills", skill, "SKILL.md"))}.`,
+          ...(options.findings === undefined
+            ? []
+            : [
+                'Return exactly one JSON object with a "patches" array. Include one object for every supplied finding: {"occurrenceId":"...","status":"verified|no_change|blocked|failed","files":["relative/path"],"verification":"proof that the original issue is fixed and legitimate behavior still works","reason":"required for blocked or failed outcomes"}. Use "verified" only after the original issue no longer reproduces and relevant checks pass. Preserve unrelated local changes.',
+              ]),
         ]),
     ...(options.findingInstructions === undefined
       ? []
@@ -3936,12 +4958,13 @@ async function runSkill(
     JSON.stringify(contents),
   ].join("\n");
   const patch = skill === "fix-finding";
+  const appServer = patch || verify;
   return dependencies.runCodex(
     [
-      ...(patch ? ["app-server"] : ["exec", "--ignore-user-config"]),
+      ...(appServer ? ["app-server"] : ["exec", "--ignore-user-config"]),
       "--disable",
       "plugins",
-      ...(patch ? [] : ["--ephemeral", "--color", "never", "--json"]),
+      ...(appServer ? [] : ["--ephemeral", "--color", "never", "--json"]),
       "--config",
       `model=${JSON.stringify(model)}`,
       "--config",
@@ -3956,10 +4979,17 @@ async function runSkill(
         ],
       ),
       "--config",
-      'approval_policy="never"',
+      verify ? 'approval_policy="on-request"' : 'approval_policy="never"',
+      ...(verify ? ["--config", 'approvals_reviewer="auto_review"'] : []),
       "--config",
       'responses_api_metadata.codex_security_surface="cli"',
-      ...(patch
+      ...(options.safetyIdentifier === undefined
+        ? []
+        : [
+            "--config",
+            `safety_identifier=${JSON.stringify(options.safetyIdentifier)}`,
+          ]),
+      ...(appServer
         ? []
         : [
             "--sandbox",
@@ -3967,24 +4997,39 @@ async function runSkill(
             "--skip-git-repo-check",
             "--cd",
             directory,
-            prompt,
+            "-",
           ]),
     ],
     {
-      command: patch ? "patch" : "validate",
+      command: verify ? "verify-fix" : patch ? "patch" : "validate",
       stdout,
       stderr,
-      ...(patch ? { appServer: { directory, prompt } } : {}),
+      ...(appServer
+        ? {
+            appServer: {
+              directory,
+              prompt,
+              ...(verify ? { sandbox: "read-only" as const } : {}),
+              ...(options.onEvent === undefined
+                ? {}
+                : { onEvent: options.onEvent }),
+            },
+          }
+        : {}),
     },
     options.environment,
+    appServer ? undefined : prompt,
   );
 }
 
 export async function readSkillCommandOutput(
   stream: AsyncIterable<Buffer | string>,
   appServer?: {
+    readonly directory?: string;
     readonly prompt: string;
     readonly input: NodeJS.WritableStream;
+    readonly sandbox?: "read-only" | "workspace-write";
+    readonly onEvent?: (event: Readonly<Record<string, unknown>>) => void;
   },
 ): Promise<{
   message?: string;
@@ -4000,6 +5045,20 @@ export async function readSkillCommandOutput(
   let completed = false;
   const send = (request: JsonObject): void => {
     appServer?.input.write(`${JSON.stringify(request)}\n`);
+  };
+  const startThread = (config?: JsonObject): void => {
+    send({
+      id: 2,
+      method: "thread/start",
+      // An explicit cwd makes Codex persist trust for a new project.
+      // Inherit the child process cwd and preserve the user's decision.
+      params: {
+        approvalPolicy:
+          appServer?.sandbox === "read-only" ? "on-request" : "never",
+        sandbox: appServer?.sandbox ?? "workspace-write",
+        ...(config === undefined ? {} : { config }),
+      },
+    });
   };
   if (appServer !== undefined) {
     send({
@@ -4024,6 +5083,19 @@ export async function readSkillCommandOutput(
     }
     const value = event as Record<string, unknown>;
     if (appServer !== undefined) {
+      const params = value["params"];
+      if (
+        typeof params === "object" &&
+        params !== null &&
+        "threadId" in params &&
+        params.threadId === threadId &&
+        "turnId" in params &&
+        params.turnId === turnId
+      ) {
+        try {
+          appServer.onEvent?.(value);
+        } catch {}
+      }
       if (value["id"] !== undefined) {
         if (typeof value["method"] === "string") {
           send({
@@ -4035,13 +5107,83 @@ export async function readSkillCommandOutput(
           appServer.input.end();
         } else if (value["id"] === 1) {
           send({ method: "notifications/initialized" });
-          send({
-            id: 2,
-            method: "thread/start",
-            // An explicit cwd makes Codex persist trust for a new project.
-            // Inherit the child process cwd and preserve the user's decision.
-            params: { approvalPolicy: "never", sandbox: "workspace-write" },
-          });
+          if (appServer.sandbox === "read-only") {
+            if (appServer.directory === undefined) {
+              error =
+                "Codex did not receive the repository directory required for read-only verification.";
+              appServer.input.end();
+              continue;
+            }
+            send({
+              id: 4,
+              method: "config/read",
+              params: {
+                cwd: appServer.directory,
+                includeLayers: true,
+              },
+            });
+          } else {
+            startThread();
+          }
+        } else if (value["id"] === 4 && appServer.sandbox === "read-only") {
+          const result = value["result"];
+          const layers =
+            typeof result === "object" && result !== null && "layers" in result
+              ? result.layers
+              : undefined;
+          if (!Array.isArray(layers)) {
+            error =
+              "Codex did not provide the configuration layers required for read-only verification.";
+            appServer.input.end();
+            continue;
+          }
+          const repositoryServers = new Set<string>();
+          const configuredServers = new Set<string>();
+          for (const layer of layers) {
+            if (typeof layer !== "object" || layer === null) continue;
+            const name = layer["name"];
+            const configuration = layer["config"];
+            if (
+              typeof name !== "object" ||
+              name === null ||
+              typeof configuration !== "object" ||
+              configuration === null
+            ) {
+              continue;
+            }
+            const servers = configuration["mcp_servers"];
+            if (typeof servers !== "object" || servers === null) continue;
+            if (name["type"] === "project") {
+              if (layer["disabledReason"] !== undefined) continue;
+              for (const server of Object.keys(servers)) {
+                repositoryServers.add(server);
+              }
+            } else {
+              for (const server of Object.keys(servers)) {
+                configuredServers.add(server);
+              }
+            }
+          }
+          const conflict = [...repositoryServers].find((server) =>
+            configuredServers.has(server),
+          );
+          if (conflict !== undefined) {
+            error = `Repository-local MCP server ${JSON.stringify(conflict)} overrides a configured integration; remove the repository override before verifying fixes.`;
+            appServer.input.end();
+            continue;
+          }
+          startThread(
+            repositoryServers.size === 0
+              ? undefined
+              : {
+                  mcp_servers: Object.fromEntries(
+                    [...repositoryServers].map((server) => [
+                      server,
+                      { enabled: false },
+                    ]),
+                  ),
+                },
+          );
         } else if (value["id"] === 2) {
           threadId = (value["result"] as { thread: { id: string } }).thread.id;
           send({
@@ -4132,7 +5274,7 @@ export async function readSkillCommandOutput(
 }
 
 export function skillCommandFailure(
-  command: "validate" | "patch",
+  command: "validate" | "patch" | "verify-fix",
   status: number,
   detail: string,
 ): string {
@@ -4480,6 +5622,7 @@ async function executeScan(
       arguments_.scanPromptFile,
       arguments_.postScanPromptFile,
       resolve(directory, repository),
+      arguments_.validationPromptFile,
     );
     const config: CodexSecurityConfig = {
       pluginPath: arguments_.pluginPath,
@@ -4622,6 +5765,7 @@ async function executeScan(
     security = dependencies.createSecurity(config);
     const options: ScanOptions = {
       auth,
+      safetyIdentifier: arguments_.safetyIdentifier,
       target,
       knowledgeBasePaths: arguments_.knowledgeBasePaths,
       ...prompts,
@@ -4975,6 +6119,16 @@ async function executeScan(
       ? result.toJSON()
       : { ...result.toJSON(), warnings: targetWarnings };
   const incomplete = result.coverage.completeness !== "complete";
+  let deepScanStop: DeepScanStop | undefined;
+  if (arguments_.mode === "deep") {
+    deepScanStop = (await readDeepScanStop(
+      result,
+      arguments_.maxCostUsd,
+      dependencies.runWorkbench,
+    ).catch(() => undefined)) ?? {
+      reason: "Stop reason unavailable. See the report for details.",
+    };
+  }
   progress?.stage(`Scan complete · ${result.manifest.scan.id.slice(0, 8)}`);
   printScanSummary(
     result,
@@ -4983,6 +6137,7 @@ async function executeScan(
     progress?.interactive === true &&
       dependencies.environment["NO_COLOR"] === undefined &&
       dependencies.environment["TERM"] !== "dumb",
+    deepScanStop,
   );
   const completedScan = (exitCode: number): ScanOutcome => {
     diagnostic("scan.completed", {
@@ -5079,6 +6234,7 @@ async function executeScan(
         dependencies,
         {
           ...providerOptions,
+          safetyIdentifier: arguments_.safetyIdentifier,
           environment,
           findingInstructions: patchSelection?.instructions,
         },
@@ -5220,7 +6376,7 @@ function scanScope(arguments_: ScanArguments): string | null {
         isAbsolute(path) ||
         /^[A-Za-z]:\//u.test(portable) ||
         portable.startsWith("//")
-          ? portable.split("/").at(-1) ?? portable
+          ? basename(portable) || portable
           : portable;
       return errorMessage(scoped.replaceAll(/[\u0000-\u001F\u007F]/gu, " "));
     });
@@ -5231,17 +6387,73 @@ function scanScope(arguments_: ScanArguments): string | null {
   return null;
 }
 
-function scanPhase(value: ScanWorkerPhase | ScanPhase): string {
+interface DeepScanStop {
+  reason: string;
+  nextStep?: string;
+}
+
+async function readDeepScanStop(
+  result: ScanResult,
+  maxCostUsd: number | undefined,
+  runWorkbench: CliDependencies["runWorkbench"],
+): Promise<DeepScanStop | undefined> {
+  if (
+    maxCostUsd !== undefined &&
+    result.cost !== null &&
+    result.cost.estimatedUsd > maxCostUsd
+  ) {
+    return {
+      reason: `Reached the ${formatUsd(maxCostUsd)} cost limit. More issues may remain.`,
+      nextStep: "To scan further, rerun with a higher --max-cost.",
+    };
+  }
+  const response = await runWorkbench([
+    "get-deep-scan",
+    "--scan-id",
+    result.manifest.scan.id,
+    "--thread-id",
+    result.threadId,
+  ]);
+  const state = response["deepScan"] as
+    | {
+        terminalReason: string;
+        dispatchedCount: number;
+        completionSequence: number;
+        noNewStreak: number;
+        config: Required<DeepScanOptions>;
+        createdAt: string;
+        completedAt: string;
+      }
+    | undefined;
+  if (state?.terminalReason === "saturated") {
+    return {
+      reason: `The last ${state.noNewStreak} review rounds found no new issues. More issues may remain.`,
+    };
+  }
+  if (state?.terminalReason !== "capped") return undefined;
+  const { maxDiscoveryRuns, maxTimeHours } = state.config;
+  if (state.dispatchedCount >= maxDiscoveryRuns) {
+    const stillFindingIssues =
+      state.completionSequence > 0 && state.noNewStreak === 0;
+    return {
+      reason: `Reached the limit of ${maxDiscoveryRuns} review rounds. ${stillFindingIssues ? "The latest review still found new issues." : "More issues may remain."}`,
+      nextStep: `To scan further, rerun with --max-discovery-runs greater than ${maxDiscoveryRuns}.`,
+    };
+  }
+  const elapsedHours =
+    (Date.parse(state.completedAt) - Date.parse(state.createdAt)) / 3_600_000;
+  if (elapsedHours >= maxTimeHours) {
+    return {
+      reason: `Reached the ${maxTimeHours}-hour time limit. More issues may remain.`,
+      nextStep:
+        maxTimeHours < 96
+          ? "To scan further, rerun with a higher --max-time-hours."
+          : "To scan a smaller part of the repository, rerun with --path.",
+    };
+  }
   return {
-    preflight: "preflight",
-    threat_model: "building threat model",
-    discovery: "reviewing files",
-    ranking: "ranking scan targets",
-    file_review: "reviewing files",
-    validation: "validating findings",
-    attack_path: "analyzing attack paths",
-    reporting: "writing report",
-  }[value];
+    reason: "Stopped before the review finished. See the report for details.",
+  };
 }
 
 function printScanSummary(
@@ -5249,6 +6461,7 @@ function printScanSummary(
   progress: Progress | null,
   errorOutput: Writable,
   color: boolean,
+  deepScanStop?: DeepScanStop,
 ): void {
   const paint = (value: string, code: number | string): string =>
     color ? `\u001B[${code}m${value}\u001B[0m` : value;
@@ -5299,6 +6512,9 @@ function printScanSummary(
     `\n  ${paint("REPORT", "1;36")}    ${paint(errorMessage(result.reportPath), 4)}\n\n` +
       `  ${paint("FINDINGS", 1)}  ${paint(`${findingCount}${findingSummary === "" ? "" : ` (${findingSummary})`}`, findingColor)}\n` +
       `  ${paint("COVERAGE", 1)}  ${result.coverage.completeness}\n` +
+      (deepScanStop === undefined
+        ? ""
+        : `  ${paint("STOPPED", 1)}   ${deepScanStop.reason}\n`) +
       `  ${paint("ELAPSED", 1)}   ${duration}\n`,
   );
 
@@ -5314,6 +6530,9 @@ function printScanSummary(
   errorOutput.write(
     `  ${paint("RESULTS", 1)}   ${errorMessage(result.scanDir)}\n`,
   );
+  if (deepScanStop?.nextStep !== undefined) {
+    errorOutput.write(`\n  ${deepScanStop.nextStep}\n`);
+  }
 }
 
 function formatTokenUsage(usage: unknown): string | null {

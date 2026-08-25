@@ -51,6 +51,13 @@ SARIF_LEVELS = {
     "low": "note",
     "informational": "note",
 }
+SARIF_SECURITY_SCORES = {
+    "critical": 9.5,
+    "high": 8.0,
+    "medium": 5.0,
+    "low": 2.0,
+    "informational": 0.0,
+}
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*$")
 RFC3339_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
@@ -66,6 +73,10 @@ EXPORT_PATHS = {
     "json": "exports/findings.json",
     "sarif": "exports/results.sarif",
 }
+WINDOWS_UNSAFE_PATH_COMPONENT_RE = re.compile(
+    r'[<>:"|?*\x00-\x1f]|[ .]$|^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$',
+    re.IGNORECASE,
+)
 
 
 class ContractError(ValueError):
@@ -218,15 +229,32 @@ def _require_safe_relative_path(value: str, context: str, *, allow_dot: bool = F
     path = PurePosixPath(value)
     normalized = path.as_posix()
     if (
-        not value
+        not value.strip()
         or (normalized == "." and not allow_dot)
+        or (len(value) >= 2 and value[0].isalpha() and value[1] == ":")
         or "\\" in value
         or "\0" in value
+        or any(ord(character) < 32 for character in value)
         or path.is_absolute()
         or ".." in path.parts
     ):
         raise ContractError(f"{context}: expected a safe repository-relative POSIX path")
     return normalized
+
+
+def _require_portable_relative_path(
+    value: str, context: str, *, allow_dot: bool = False
+) -> str:
+    normalized = _require_safe_relative_path(value, context, allow_dot=allow_dot)
+    if any(_windows_unsafe_path_component(part) for part in value.split("/")):
+        raise ContractError(f"{context}: expected a safe scan-relative POSIX path")
+    return normalized
+
+
+def _windows_unsafe_path_component(value: str) -> bool:
+    if not value or value == ".":
+        return False
+    return WINDOWS_UNSAFE_PATH_COMPONENT_RE.search(value) is not None
 
 
 def _require_scan_directory(scan_dir: Path) -> Path:
@@ -340,7 +368,7 @@ def _open_scan_local_directory(root_fd: int, parts: tuple[str, ...], *, create: 
 
 def open_scan_local_file_descriptor(scan_dir: Path, relative_path: str, context: str) -> int:
     scan_dir = _require_scan_directory(scan_dir)
-    relative_path = _require_safe_relative_path(relative_path, context)
+    relative_path = _require_portable_relative_path(relative_path, context)
     if not _descriptor_relative_reads_available():
         if not _is_windows():
             raise ContractError("scan-local input requires descriptor-relative file operations")
@@ -471,7 +499,7 @@ def write_scan_local_bytes(
         if relative_path in {"", ".", ".."} or "/" in relative_path or "\0" in relative_path:
             raise ContractError("external output path: expected a safe file name")
     else:
-        relative_path = _require_safe_relative_path(relative_path, "scan-local output path")
+        relative_path = _require_portable_relative_path(relative_path, "scan-local output path")
     path = scan_dir / relative_path
     if not _descriptor_relative_writes_available():
         if not _is_windows():
@@ -522,7 +550,7 @@ def write_scan_local_bytes(
 
 def _remove_scan_local_file_if_exists(scan_dir: Path, relative_path: str) -> None:
     scan_dir = _require_scan_directory(scan_dir)
-    relative_path = _require_safe_relative_path(relative_path, "scan-local cleanup path")
+    relative_path = _require_portable_relative_path(relative_path, "scan-local cleanup path")
     if not _descriptor_relative_writes_available():
         if not _is_windows():
             raise ContractError("scan-local cleanup requires descriptor-relative file operations")
@@ -829,6 +857,20 @@ def _recover_unsealed_findings(
 
         if previous_position is not None:
             previous = recovered[previous_position]
+            strongest, earlier = (
+                (previous, finding)
+                if _finding_strength(finding) <= _finding_strength(previous)
+                else (finding, previous)
+            )
+            if strongest != earlier:
+                original = copy.deepcopy(earlier)
+                older = original["provenance"].pop("previousFindings", [])
+                if not isinstance(strongest["provenance"].get("previousFindings"), list):
+                    strongest["provenance"]["previousFindings"] = []
+                history = strongest["provenance"]["previousFindings"]
+                for record in [*(older if isinstance(older, list) else []), original]:
+                    if record not in history:
+                        history.append(record)
             if _finding_strength(finding) <= _finding_strength(previous):
                 warnings.append(
                     f"Skipped malformed finding {index + 1}: duplicate logical finding."
@@ -929,7 +971,7 @@ def _recover_unsealed_coverage(
                         try:
                             if not isinstance(ref, str):
                                 raise ContractError(f"{ref_context}: expected a string")
-                            normalized_ref = _require_safe_relative_path(ref, ref_context)
+                            normalized_ref = _require_portable_relative_path(ref, ref_context)
                             if not normalized_ref.startswith("artifacts/"):
                                 raise ContractError(
                                     f"{ref_context}: expected a file under artifacts/"
@@ -1032,7 +1074,9 @@ def _populate_unsealed_manifest_envelope(
 
     manifest["documentType"] = "codex-security.scan-manifest"
     manifest["schemaVersion"] = SCHEMA_VERSION
-    scan["status"] = "completed"
+    scan["status"] = (
+        completion_binding.get("status", "completed") if completion_binding else "completed"
+    )
     scan["coverageRef"] = "coverage.json"
     scan["findingsRef"] = "findings.json"
     if completion_binding is None:
@@ -1160,6 +1204,8 @@ def _validate_completion_binding(
     scan = _require_dict(manifest, "scan", "manifest")
     if scan.get("id") != completion_binding["scanId"]:
         raise ContractError("manifest.scan.id: must match the workbench scan")
+    if scan.get("status") != completion_binding.get("status", "completed"):
+        raise ContractError("manifest.scan.status: must match the workbench outcome")
     if scan.get("startedAt") != completion_binding["startedAt"]:
         raise ContractError("manifest.scan.startedAt: must match the workbench scan")
     if scan.get("completedAt") != completion_binding["completedAt"]:
@@ -1315,7 +1361,9 @@ def _validate_coverage(manifest: dict[str, Any], coverage: dict[str, Any], scan_
         for ref_index, ref in enumerate(receipt_refs):
             if not isinstance(ref, str):
                 raise ContractError(f"{context}.receiptRefs[{ref_index}]: expected a string")
-            normalized_ref = _require_safe_relative_path(ref, f"{context}.receiptRefs[{ref_index}]")
+            normalized_ref = _require_portable_relative_path(
+                ref, f"{context}.receiptRefs[{ref_index}]"
+            )
             if not normalized_ref.startswith("artifacts/"):
                 raise ContractError(
                     f"{context}.receiptRefs[{ref_index}]: expected a file under artifacts/"
@@ -1340,8 +1388,8 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
     scan = _require_dict(manifest, "scan", "manifest")
     for key in ("id", "startedAt", "completedAt", "sealedAt"):
         _require_str(scan, key, "manifest.scan")
-    if scan.get("status") != "completed":
-        raise ContractError("manifest.scan.status: expected completed")
+    if scan.get("status") not in {"completed", "failed", "canceled", "interrupted"}:
+        raise ContractError("manifest.scan.status: expected a terminal scan outcome")
     producer = _require_dict(scan, "producer", "manifest.scan")
     _require_str(producer, "name", "manifest.scan.producer")
     _require_str(producer, "version", "manifest.scan.producer")
@@ -1360,16 +1408,19 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
     if not artifacts:
         raise ContractError("manifest.scan.artifacts: expected generated artifact records")
     artifact_paths: set[str] = set()
+    artifact_collision_keys: set[str] = set()
     for index, artifact in enumerate(artifacts):
         context = f"manifest.scan.artifacts[{index}]"
         if not isinstance(artifact, dict):
             raise ContractError(f"{context}: expected an object")
-        path = _require_safe_relative_path(
+        path = _require_portable_relative_path(
             _require_str(artifact, "path", context), f"{context}.path"
         )
-        if path in artifact_paths:
+        collision_key = path.lower()
+        if collision_key in artifact_collision_keys:
             raise ContractError(f"{context}.path: duplicate artifact path")
         artifact_paths.add(path)
+        artifact_collision_keys.add(collision_key)
         _require_str(artifact, "sha256", context)
         _require_str(artifact, "mediaType", context)
     for required_path in ("findings.json", "coverage.json"):
@@ -1586,6 +1637,7 @@ def _legacy_sealed_findings_for_validation(findings: dict[str, Any]) -> dict[str
             and evidence["id"]
         }
         for section_name, list_fields in (
+            ("rootCause", ("evidenceRefs", "evidence_refs")),
             ("root_cause", ("evidenceRefs", "evidence_refs")),
             (
                 "validation",
@@ -1701,13 +1753,65 @@ def _validate_contract_refs(scan: dict[str, Any]) -> None:
             raise ContractError(f"manifest.scan.{field}: expected {expected!r}")
 
 
-def _sarif_rule(rule_id: str) -> dict[str, Any]:
+def _sarif_label(value: str) -> str:
+    words = re.sub(r"[-_./]+", " ", value).split()
+    acronyms = {"api", "csrf", "html", "http", "id", "rce", "sql", "ssrf", "url", "xml", "xss"}
+    label = " ".join(word.upper() if word.lower() in acronyms else word for word in words)
+    return label[:1].upper() + label[1:]
+
+
+def _sarif_rule(rule_id: str, findings: list[dict[str, Any]]) -> dict[str, Any]:
+    name = ": ".join(_sarif_label(part) for part in rule_id.split("."))
+    categories = sorted({finding["taxonomy"]["category"] for finding in findings})
+    cwes = sorted({cwe for finding in findings for cwe in finding["taxonomy"]["cwe"]})
+    tags = {"security", *categories}
+    for cwe in cwes:
+        match = re.fullmatch(r"CWE-([0-9]+)", cwe, re.IGNORECASE)
+        if match and int(match[1]) > 0:
+            tags.add(f"external/cwe/cwe-{int(match[1]):03d}")
+    description = f"{name}. Categories: {', '.join(map(_sarif_label, categories))}."
+    if cwes:
+        description += f" Weaknesses: {', '.join(cwes)}."
+    remediation = "\n\n".join(sorted({finding["remediation"] for finding in findings}))
+    properties: dict[str, Any] = {"tags": sorted(tags)}
+    # GitHub assigns security severity to the shared rule, not each result.
+    score = max(
+        finding["severity"].get("score", SARIF_SECURITY_SCORES[finding["severity"]["level"]])
+        for finding in findings
+    )
+    if score > 0:
+        properties["security-severity"] = str(score)
     return {
         "id": rule_id,
-        "name": rule_id,
-        "shortDescription": {"text": rule_id},
-        "properties": {"tags": ["security"]},
+        "name": name,
+        "shortDescription": {"text": name},
+        "fullDescription": {"text": description},
+        "help": {
+            "text": f"{description}\n\nRemediation:\n\n{remediation}",
+            "markdown": f"{description}\n\n## Remediation\n\n{remediation}",
+        },
+        "properties": properties,
     }
+
+
+def _sarif_finding_message(finding: dict[str, Any]) -> str:
+    taxonomy = finding["taxonomy"]
+    details = [
+        finding["title"],
+        finding["summary"],
+        f"Severity: {finding['severity']['level']}",
+        f"Category: {_sarif_label(taxonomy['category'])}",
+    ]
+    if taxonomy["cwe"]:
+        details.append(f"Weaknesses: {', '.join(taxonomy['cwe'])}")
+    details.append(f"Remediation:\n{finding['remediation']}")
+    for key, label in (
+        ("remediationTests", "Remediation tests"),
+        ("preventiveControls", "Preventive controls"),
+    ):
+        if finding.get(key):
+            details.append(f"{label}:\n" + "\n".join(f"- {item}" for item in finding[key]))
+    return "\n\n".join(details)
 
 
 def _utf16_code_units(value: str) -> Iterator[int]:
@@ -2013,7 +2117,7 @@ def _sarif_result(
         "ruleId": finding["ruleId"],
         "ruleIndex": rule_index,
         "level": SARIF_LEVELS[finding["severity"]["level"]],
-        "message": {"text": finding["summary"]},
+        "message": {"text": _sarif_finding_message(finding)},
         "locations": [_sarif_location(location) for location in _sarif_locations(finding)],
         "partialFingerprints": partial_fingerprints,
         "properties": properties,
@@ -2038,7 +2142,9 @@ def build_sarif(
             "driver": {
                 "name": "Codex Security",
                 "version": scan["producer"]["version"],
-                "rules": [_sarif_rule(rule_id) for rule_id in ordered_rule_ids],
+                "rules": [
+                    _sarif_rule(rule_id, findings_by_rule[rule_id]) for rule_id in ordered_rule_ids
+                ],
             }
         },
         "automationDetails": {"id": scan["id"]},
@@ -2085,9 +2191,9 @@ def _validate_sarif(sarif: dict[str, Any]) -> None:
 def _artifact_record(
     scan_dir: Path, relative_path: str, media_type: str, contents: bytes | None = None
 ) -> dict[str, str]:
-    relative_path = _require_safe_relative_path(relative_path, "artifact path")
+    relative_path = _require_portable_relative_path(relative_path, "artifact path")
     if contents is not None:
-        _require_scan_local_file(scan_dir, relative_path, relative_path)
+        _validate_scan_local_output_path(scan_dir, scan_dir / relative_path, relative_path)
     return {
         "mediaType": media_type,
         "path": relative_path,
@@ -2106,7 +2212,7 @@ def _coverage_receipt_refs(coverage: dict[str, Any]) -> list[str]:
 
 def _validate_sealed_coverage_receipts(scan: dict[str, Any], coverage: dict[str, Any]) -> None:
     artifact_paths = {
-        _require_safe_relative_path(artifact["path"], "sealed artifact path")
+        _require_portable_relative_path(artifact["path"], "sealed artifact path")
         for artifact in scan["artifacts"]
     }
     for ref in _coverage_receipt_refs(coverage):
@@ -2129,16 +2235,19 @@ def _validate_existing_seal(
     if not isinstance(artifacts, list) or not artifacts:
         raise ContractError("manifest.scan.artifacts: sealed manifest requires artifact records")
     artifact_paths: set[str] = set()
+    artifact_collision_keys: set[str] = set()
     for index, artifact in enumerate(artifacts):
         context = f"manifest.scan.artifacts[{index}]"
         if not isinstance(artifact, dict):
             raise ContractError(f"{context}: expected an object")
-        path = _require_safe_relative_path(
+        path = _require_portable_relative_path(
             _require_str(artifact, "path", context), f"{context}.path"
         )
-        if path in artifact_paths:
+        collision_key = path.lower()
+        if collision_key in artifact_collision_keys:
             raise ContractError(f"{context}.path: duplicate artifact path")
         artifact_paths.add(path)
+        artifact_collision_keys.add(collision_key)
         expected_sha256 = _require_str(artifact, "sha256", context)
         contents = (artifact_contents or {}).get(path)
         actual_sha256 = (
@@ -2199,19 +2308,23 @@ def build_sarif_projection(
             raise ContractError("source root: expected an existing directory")
     manifest, findings, coverage, _ = _read_sealed_scan(scan_dir, schema_dir, "SARIF projection")
     sarif = build_sarif(manifest, findings, source_root)
-    if coverage["completeness"] != "complete":
-        run = sarif["runs"][0]
-        run["properties"]["codexSecurityCoverageCompleteness"] = coverage["completeness"]
-        if coverage["deferred"]:
-            run["invocations"] = [
-                {
-                    "executionSuccessful": True,
-                    "toolExecutionNotifications": [
-                        {"level": "warning", "message": {"text": item["reason"]}}
-                        for item in coverage["deferred"]
-                    ],
-                }
+    run = sarif["runs"][0]
+    completeness = coverage["completeness"]
+    scan_status = manifest["scan"]["status"]
+    execution_successful = scan_status == "completed" and completeness == "complete"
+    run["invocations"] = [{"executionSuccessful": execution_successful}]
+    if not execution_successful:
+        run["properties"]["codexSecurityCoverageCompleteness"] = completeness
+        reasons = [item["reason"] for item in coverage["deferred"]]
+        if not reasons:
+            reasons = [
+                f"Scan status is {scan_status}; results may be incomplete."
+                if scan_status != "completed"
+                else f"Scan coverage is {completeness}; results may be incomplete."
             ]
+        run["invocations"][0]["toolExecutionNotifications"] = [
+            {"level": "warning", "message": {"text": reason}} for reason in reasons
+        ]
     _validate_sarif(sarif)
     return sarif
 
@@ -2237,6 +2350,13 @@ def csv_cell(value: Any) -> Any:
 
 
 def finding_candidate_id(finding: dict[str, Any]) -> str | None:
+    provenance = finding.get("provenance")
+    if (
+        isinstance(provenance, dict)
+        and isinstance(value := provenance.get("candidateId"), str)
+        and value.strip()
+    ):
+        return value
     extensions = finding.get("extensions")
     if not isinstance(extensions, dict):
         return None
@@ -2363,7 +2483,7 @@ def write_export_output(scan_dir: Path, output: Path, export_format: str, conten
     scan = _require_dict(manifest, "scan", "manifest")
     artifacts = _require_list(scan, "artifacts", "manifest.scan")
     artifact_paths = [
-        _require_safe_relative_path(
+        _require_portable_relative_path(
             _require_str(artifact, "path", f"manifest.scan.artifacts[{index}]"),
             f"manifest.scan.artifacts[{index}].path",
         )
@@ -2428,23 +2548,32 @@ def _prepare_scan_finalization(
     expected_coverage_mode: str | None = None,
     completion_binding: dict[str, Any] | None = None,
     completion_warnings: list[str] | None = None,
+    draft_documents: tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None = None,
 ) -> PreparedScanFinalization:
     """Read, populate, and validate a scan without writing any output files."""
 
     scan_dir = _require_scan_directory(scan_dir)
     schema_dir = schema_dir or Path(__file__).resolve().parent.parent / "schemas"
-    manifest = _read_scan_local_json(scan_dir, "scan-manifest.json", "scan-manifest.json")
+    manifest = (
+        copy.deepcopy(draft_documents[0])
+        if draft_documents is not None
+        else _read_scan_local_json(scan_dir, "scan-manifest.json", "scan-manifest.json")
+    )
     scan = _require_dict(manifest, "scan", "manifest")
     was_sealed = scan.get("sealedAt") is not None or scan.get("artifacts") is not None
     if not was_sealed:
         _populate_unsealed_manifest_envelope(manifest, scan, completion_binding)
     _validate_contract_refs(scan)
-    findings, findings_input_bytes = _read_scan_local_json_bytes(
-        scan_dir, scan["findingsRef"], scan["findingsRef"]
-    )
-    coverage, coverage_input_bytes = _read_scan_local_json_bytes(
-        scan_dir, scan["coverageRef"], scan["coverageRef"]
-    )
+    if draft_documents is None:
+        findings, findings_input_bytes = _read_scan_local_json_bytes(
+            scan_dir, scan["findingsRef"], scan["findingsRef"]
+        )
+        coverage, coverage_input_bytes = _read_scan_local_json_bytes(
+            scan_dir, scan["coverageRef"], scan["coverageRef"]
+        )
+    else:
+        findings, coverage = copy.deepcopy(draft_documents[1:])
+        findings_input_bytes, coverage_input_bytes = _json_bytes(findings), _json_bytes(coverage)
     if not was_sealed:
         _populate_unsealed_artifact_envelope(manifest, findings, coverage, completion_binding)
         _normalize_unsealed_deep_repository_inventory_strategy(
@@ -2455,8 +2584,8 @@ def _prepare_scan_finalization(
 
     if manifest.get("schemaVersion") != SCHEMA_VERSION:
         raise ContractError(f"manifest.schemaVersion: expected {SCHEMA_VERSION}")
-    if scan.get("status") != "completed":
-        raise ContractError("manifest.scan.status: expected completed before sealing")
+    if scan.get("status") not in {"completed", "failed", "canceled", "interrupted"}:
+        raise ContractError("manifest.scan.status: expected a terminal scan outcome before sealing")
     if (
         expected_coverage_mode is not None
         and completion_binding is not None
