@@ -41,6 +41,7 @@ class SourceScopeIndex:
     kind: str | None = None
     children: dict[str, SourceScopeIndex] = field(default_factory=dict)
     tree_entries: dict[str, TreeEntries] = field(default_factory=dict)
+    filesystem_root: Path | None = None
 
 
 SourceContext = tuple[Path, str, SourceScopeIndex]
@@ -218,6 +219,7 @@ def tree_path(
     *,
     selected_kinds: dict[int, str] | None = None,
     tree_cache: dict[str, TreeEntries] | None = None,
+    filesystem_root: Path | None = None,
 ) -> TreeEntry | None:
     path = relative_path(value)
     if path is None:
@@ -225,7 +227,7 @@ def tree_path(
     if selected_kinds is not None and selected_kinds.get(0, "directory") != "directory":
         return None
     kind, object_id = "directory", tree
-    filesystem_parent = repository
+    filesystem_parent = repository if filesystem_root is None else filesystem_root
     if not path.parts:
         return path.as_posix(), kind, object_id
     environment = os.environ.copy()
@@ -251,9 +253,11 @@ def tree_path(
         with ExitStack() as processes:
             process = None
             pending_tree_entries: dict[str, TreeEntries] = {}
+            resolved = True
             for depth, name in enumerate(path.parts, start=1):
                 if kind != "directory":
-                    return None
+                    resolved = False
+                    break
                 cached = (
                     tree_cache.get(object_id, pending_tree_entries.get(object_id))
                     if tree_cache is not None
@@ -284,7 +288,8 @@ def tree_path(
                     )
                 # The normalized name must be unique before an exact spelling can win.
                 if aliases is None or aliases[0] != name:
-                    return None
+                    resolved = False
+                    break
                 _, kind, object_id = aliases
                 filesystem_parent /= name
                 if (
@@ -292,7 +297,8 @@ def tree_path(
                     and (expected_kind := selected_kinds.get(depth)) is not None
                     and kind != expected_kind
                 ):
-                    return None
+                    resolved = False
+                    break
             if process is not None:
                 if process.stdin is None:
                     return None
@@ -301,6 +307,8 @@ def tree_path(
                     return None
                 if tree_cache is not None:
                     tree_cache.update(pending_tree_entries)
+            if not resolved:
+                return None
     except (MemoryError, OSError, ValueError):
         return None
     return path.as_posix(), kind, object_id
@@ -411,9 +419,10 @@ def capture_source_scopes(
         context = target_tree(target, revision)
         if context is None:
             return authority
-        _, tree = context
+        repository, tree = context
         authority["targetTree"] = tree
         captured: set[str] = set()
+        captured_tree_entries: dict[str, TreeEntries] = {}
         for requested in paths:
             parsed = relative_path(requested)
             if parsed is None or safe_source_path(target, requested) is None:
@@ -450,6 +459,18 @@ def capture_source_scopes(
             if kind is None:
                 continue
             selected = parsed.as_posix()
+            if diff_target_kind in {"commit", "range"}:
+                committed = tree_path(
+                    repository,
+                    tree,
+                    selected,
+                    tree_cache=captured_tree_entries,
+                    filesystem_root=target,
+                )
+                if committed is None or committed[1] not in {"directory", "file"}:
+                    continue
+                if kind == "file" or committed[1] == "file":
+                    kind = "file"
             if selected not in captured:
                 captured.add(selected)
                 authority["paths"].append({"kind": kind, "path": selected})
@@ -492,7 +513,7 @@ def load_source_scopes(
     repository, tree = context
     if tree != expected_tree:
         return None
-    index = SourceScopeIndex()
+    index = SourceScopeIndex(filesystem_root=target)
     for record in records:
         if not isinstance(record, dict) or set(record) != {"kind", "path"}:
             return None
@@ -581,6 +602,7 @@ def finding_source_excerpt_from_context(
                 path,
                 selected_kinds=selected_kinds,
                 tree_cache=scopes.tree_entries,
+                filesystem_root=scopes.filesystem_root,
             )
             if selected_kinds is not None
             else None

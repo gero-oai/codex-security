@@ -117,6 +117,7 @@ function collisionRepository(root: string): {
     ["040000", "tree", upperScope, "Scope"],
     ["040000", "tree", linkedTree, "alias"],
     ["040000", "tree", deepTree, "deep"],
+    ["100644", "blob", blob("historical_file = True\n"), "historical"],
     ["040000", "tree", mismatchTree, "mismatch"],
     ["040000", "tree", lowerScope, "scope"],
     ["100644", "blob", blob("outside = True\n"), "outside.py"],
@@ -142,6 +143,7 @@ function collisionRepository(root: string): {
   mkdirSync(join(repository, "src"));
   mkdirSync(join(repository, "Scope"));
   mkdirSync(join(repository, "deep"));
+  mkdirSync(join(repository, "historical"));
   mkdirSync(join(repository, "real", "subdir"), { recursive: true });
   symlinkSync(join(repository, "real"), join(repository, "alias"), "junction");
   writeFileSync(
@@ -159,6 +161,10 @@ function collisionRepository(root: string): {
   writeFileSync(join(repository, "src", "é.py"), "unicode_composed = True\n");
   writeFileSync(join(repository, "src", "trailing.py"), "plain_name = True\n");
   writeFileSync(join(repository, "src", "third.py"), "third = True\n");
+  writeFileSync(
+    join(repository, "historical", "checkout-only.py"),
+    "checkout_directory = True\n",
+  );
   writeFileSync(join(repository, "mismatch"), "selected_file = True\n");
   writeFileSync(
     join(repository, "Scope", "selected.py"),
@@ -384,6 +390,22 @@ file_descendant_excerpt = excerpt(
     "mismatch/secret.py", file_scan, ["mismatch"]
 )
 file_descendant_blob_reads = blob_reads[before:]
+historical_authority = excerpts.capture_source_scopes(
+    repository, identity, ["historical"], diff_target_kind="commit"
+)
+historical_scan = {
+    **scan,
+    "mode": "diff",
+    "diff_target_kind": "commit",
+    "source_scopes_json": json.dumps(historical_authority),
+}
+historical_context = excerpts.source_excerpt_context(
+    historical_scan, repository, ["historical"]
+)
+historical_excerpt = excerpts.finding_source_excerpt_from_context(
+    historical_context,
+    [{"path": "historical", "startLine": 1, "role": "root_control"}],
+)
 before = len(blob_reads)
 broadened = excerpt(
     "outside.py",
@@ -419,6 +441,37 @@ subtarget_authority = excerpts.capture_source_scopes(
     ),
     ["."],
 )
+subtarget_scan = {
+    **scan,
+    "source_scopes_json": json.dumps(subtarget_authority),
+}
+subtarget_context = excerpts.source_excerpt_context(
+    subtarget_scan, subtarget, ["."]
+)
+def distinct_subtarget_samefile(left, right):
+    right = Path(right)
+    if (
+        left.parent == subtarget
+        and right.parent == subtarget
+        and {left.name, right.name} == {"LOWER.py", "lower.py"}
+    ):
+        return False
+    return original_samefile(left, right)
+Path.samefile = distinct_subtarget_samefile
+try:
+    subtarget_case_excerpts = {
+        path: excerpts.finding_source_excerpt_from_context(
+            subtarget_context,
+            [{"path": path, "startLine": 1, "role": "root_control"}],
+        )
+        for path in ("LOWER.py", "lower.py")
+    }
+    subtarget_unicode_alias = excerpts.finding_source_excerpt_from_context(
+        subtarget_context,
+        [{"path": "é.py", "startLine": 1, "role": "root_control"}],
+    )
+finally:
+    Path.samefile = original_samefile
 subprocess.run(["git", "-C", str(subtarget), "init", "-q"], check=True)
 outer_git_dir = Path(
     subprocess.check_output(
@@ -432,10 +485,6 @@ subprocess.run(
     ["git", "-C", str(subtarget), "update-ref", "refs/heads/main", revision],
     check=True,
 )
-subtarget_scan = {
-    **scan,
-    "source_scopes_json": json.dumps(subtarget_authority),
-}
 nested_context = excerpts.source_excerpt_context(subtarget_scan, subtarget, ["."])
 before = len(blob_reads)
 nested_excerpt = excerpts.finding_source_excerpt_from_context(
@@ -589,6 +638,31 @@ try:
 finally:
     excerpts.matching_tree_entries = original_matching_tree_entries
     subprocess.Popen = original_popen
+missing_context = excerpts.source_excerpt_context(scan, repository, ["src"])
+missing_batch_processes = 0
+missing_tree_reads = 0
+def watched_missing_popen(arguments, *positional, **keywords):
+    global missing_batch_processes
+    if "cat-file" in arguments and "--batch" in arguments:
+        missing_batch_processes += 1
+    return original_popen(arguments, *positional, **keywords)
+def counted_missing_tree(*arguments, **keywords):
+    global missing_tree_reads
+    missing_tree_reads += 1
+    return original_matching_tree_entries(*arguments, **keywords)
+subprocess.Popen = watched_missing_popen
+excerpts.matching_tree_entries = counted_missing_tree
+try:
+    missing_excerpts = [
+        excerpts.finding_source_excerpt_from_context(
+            missing_context,
+            [{"path": f"src/missing-{index}.py", "startLine": 1}],
+        )
+        for index in range(3)
+    ]
+finally:
+    excerpts.matching_tree_entries = original_matching_tree_entries
+    subprocess.Popen = original_popen
 batch_object = "1" * 40
 entry_object = b"\1" * 20
 wide_tree = b"".join(
@@ -729,6 +803,8 @@ print(json.dumps({
     "fileAuthorityPaths": file_authority["paths"],
     "fileDescendantBlobReads": file_descendant_blob_reads,
     "fileDescendantExcerpt": file_descendant_excerpt,
+    "historicalAuthorityPaths": historical_authority["paths"],
+    "historicalExcerpt": historical_excerpt,
     "invalidReplacementBasePaths": invalid_replacement_base_paths,
     "immutable": immutable,
     "largeExcerpt": large_excerpt,
@@ -747,6 +823,9 @@ print(json.dumps({
     "invalid": invalid,
     "legacy": legacy,
     "malformedRevision": malformed_revision,
+    "missingBatchProcesses": missing_batch_processes,
+    "missingExcerpts": missing_excerpts,
+    "missingTreeReads": missing_tree_reads,
     "mutable": {"excerpts": mutable, "gitCalls": len(git_calls)},
     "nestedBlobReads": nested_blob_reads,
     "nestedExcerpt": nested_excerpt,
@@ -754,7 +833,9 @@ print(json.dumps({
     "pageBatchProcesses": page_batch_processes,
     "pageExcerpts": page_excerpts,
     "pageTreeReads": page_tree_reads,
+    "subtargetCaseExcerpts": subtarget_case_excerpts,
     "subtargetPaths": subtarget_authority["paths"],
+    "subtargetUnicodeAlias": subtarget_unicode_alias,
     "outside": outside,
     "pathCollisionBlobReads": scope_collision_blob_reads,
     "pathCollisionExcerpt": scope_collision_excerpt,
@@ -831,6 +912,8 @@ describe("workbench source excerpts", () => {
       fileAuthorityPaths: [{ kind: "file", path: "mismatch" }],
       fileDescendantBlobReads: [],
       fileDescendantExcerpt: null,
+      historicalAuthorityPaths: [{ kind: "file", path: "historical" }],
+      historicalExcerpt: expect.stringContaining("historical_file = True"),
       invalidReplacementBasePaths: [],
       immutable: {
         commit: expect.stringContaining("allowed = True"),
@@ -848,6 +931,9 @@ describe("workbench source excerpts", () => {
       invalid: null,
       legacy: null,
       malformedRevision: null,
+      missingBatchProcesses: 1,
+      missingExcerpts: [null, null, null],
+      missingTreeReads: 2,
       mutable: {
         excerpts: { working_tree: null, None: null },
         gitCalls: 0,
@@ -862,7 +948,12 @@ describe("workbench source excerpts", () => {
         "third.py": expect.stringContaining("third = True"),
       },
       pageTreeReads: 2,
+      subtargetCaseExcerpts: {
+        "LOWER.py": expect.stringContaining("case_upper = True"),
+        "lower.py": expect.stringContaining("case_lower = True"),
+      },
       subtargetPaths: [{ kind: "directory", path: "." }],
+      subtargetUnicodeAlias: null,
       outside: null,
       pathCollisionBlobReads: [],
       pathCollisionExcerpt: null,
