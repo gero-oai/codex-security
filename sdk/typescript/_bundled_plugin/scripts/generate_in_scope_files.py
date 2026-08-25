@@ -239,6 +239,8 @@ def generate_diff_in_scope_files(
                         _, is_binary = preview_for_changed_path(
                             path, repository, DEFAULT_PREVIEW_BYTES
                         )
+                    except (FileNotFoundError, PermissionError):
+                        continue
                     except (OSError, RuntimeError, ValueError) as error:
                         raise InventoryError(
                             "changed Git working-tree paths must stay inside the selected target"

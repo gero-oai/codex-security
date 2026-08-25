@@ -330,6 +330,87 @@ test("rejects parents replaced after local-diff confinement is checked", () => {
   }
 });
 
+test("skips working-tree files that disappear or become unreadable during preview", () => {
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "codex-security-diff-file-churn-")),
+  );
+  temporaryRoots.push(root);
+  const repository = join(root, "repository");
+  const source = join(repository, "src", "handler.py");
+  mkdirSync(join(repository, "src"), { recursive: true });
+  git(repository, "init", "-q");
+  writeFileSync(source, "inside = 1\n");
+  git(repository, "add", ".");
+  git(repository, "commit", "-qm", "base");
+  const base = git(repository, "rev-parse", "HEAD");
+
+  const python = pythonExecutable();
+  expect(python).not.toBeNull();
+  const scripts = join(PLUGIN_ROOT, "scripts");
+  const probe = [
+    "import sys",
+    "scripts, repository, base, output, generator, failure = sys.argv[1:]",
+    "sys.path.insert(0, scripts)",
+    "import generate_rank_input as ranking",
+    "read_changed_path = ranking.preview_for_changed_path",
+    "def unavailable_leaf(path, target, preview_bytes):",
+    "    if failure == 'unreadable':",
+    "        raise PermissionError('synthetic in-target file became unreadable')",
+    "    path.unlink()",
+    "    if failure == 'parent-missing':",
+    "        path.parent.rmdir()",
+    "    return read_changed_path(path, target, preview_bytes)",
+    "ranking.preview_for_changed_path = unavailable_leaf",
+    "if generator == 'ranking':",
+    "    sys.argv = ['ranking', 'make-diff-rank-input', '--repo', repository, '--base', base, '--mode', 'local-patch', '--out', output]",
+    "    ranking.main()",
+    "else:",
+    "    import generate_in_scope_files as inventory",
+    "    sys.argv = ['inventory', '--repo', repository, '--scope', '.', '--out', output, '--diff-base', base, '--diff-mode', 'local-patch']",
+    "    inventory.main()",
+  ].join("\n");
+
+  for (const generator of ["ranking", "inventory"]) {
+    for (const failure of ["missing", "unreadable", "parent-missing"]) {
+      mkdirSync(join(repository, "src"), { recursive: true });
+      writeFileSync(source, "inside = 2\n");
+      const output = join(root, `${generator}-${failure}.jsonl`);
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          probe,
+          scripts,
+          repository,
+          base,
+          output,
+          generator,
+          failure,
+        ],
+        { encoding: "utf8" },
+      );
+
+      if (failure === "parent-missing") {
+        expect(
+          result.status,
+          `${generator}/${failure}: ${result.stdout}\n${result.stderr}`,
+        ).toBe(generator === "ranking" ? 1 : 2);
+        expect(result.stderr.toLowerCase()).toContain(
+          "inside the selected target",
+        );
+      } else {
+        expect(
+          result.status,
+          `${generator}/${failure}: ${result.stdout}\n${result.stderr}`,
+        ).toBe(0);
+        expect(readFileSync(output, "utf8")).toBe("");
+      }
+    }
+  }
+});
+
 test("diff inventory and previews stay inside the selected repository", async () => {
   const root = realpathSync(
     mkdtempSync(join(tmpdir(), "codex-security-diff-rank-")),
