@@ -56,6 +56,21 @@ and test name, then set `CODEX_SECURITY_PROPERTY_SEED` and
 `CODEX_SECURITY_PROPERTY_RUNS` to increase the case count. Pure properties
 default to 100 cases; filesystem contract properties default to 20.
 
+### Python-to-TypeScript differential checks
+
+While a bundled helper is being migrated, keep the Python implementation as
+the executable oracle and run both implementations against the same fixtures:
+
+```sh
+pnpm run test:normalizer-differential
+CODEX_SECURITY_PROPERTY_RUNS=1000 bun test --timeout 900000 tests-ts/normalize-candidates.property.test.ts
+```
+
+The tests compare output bytes, rejected inputs, filesystem effects, and
+ordering invariants. Run them on Linux, macOS, and Windows before changing
+the production entrypoint. Subprocess-heavy properties default to eight cases
+to stay within the standard test timeout.
+
 ## GitHub Actions
 
 `node-ci` retains the required `ubuntu-latest / node-22`,
