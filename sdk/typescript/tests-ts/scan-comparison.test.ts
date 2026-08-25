@@ -507,6 +507,7 @@ describe("semantic scan comparison", () => {
                   {
                     afterScanId: "current",
                     afterFindings: [after],
+                    knownFindingGroups: [["dismissed", "historical-alias"]],
                     beforeScans: [
                       {
                         scanId: "another-target",
@@ -551,7 +552,11 @@ describe("semantic scan comparison", () => {
         },
       }),
     ).rejects.toThrow("conflicting confirmed and uncertain findings");
-    expect(input).toEqual({ before: [open, dismissed], after: [after] });
+    expect(input).toEqual({
+      before: [open, dismissed],
+      after: [after],
+      knownFindingGroups: [["dismissed", "historical-alias"]],
+    });
     expect(commands.map(({ args: [command] }) => command)).toEqual([
       "list-unmatched-scan-pairs",
     ]);
@@ -971,6 +976,146 @@ describe("semantic scan comparison", () => {
     );
   });
 
+  test("honors confirmed historical groups and preserves distinct related findings", async () => {
+    const input = {
+      before: [
+        { occurrenceId: "before-known", findingId: "known-a" },
+        { occurrenceId: "before-related", findingId: "related-a" },
+      ],
+      after: [
+        { occurrenceId: "after-known", findingId: "known-b" },
+        { occurrenceId: "after-related", findingId: "related-b" },
+      ],
+      knownFindingGroups: [["known-a", "known-b"]],
+    };
+    const response = {
+      matches: [
+        {
+          beforeOccurrenceIds: ["before-known"],
+          afterOccurrenceIds: ["after-known"],
+          confidence: "high" as const,
+          reason: "Previously confirmed root cause.",
+        },
+      ],
+      uncertain: [],
+      related: [
+        {
+          beforeOccurrenceId: "before-related",
+          afterOccurrenceId: "after-related",
+          reason: "Related controls remain independently vulnerable.",
+        },
+      ],
+    };
+    const { codex, calls } = fakeCodex(response);
+
+    expect(await matchScanFindings(input, { codex })).toEqual(response);
+    expect(JSON.parse(calls.prompt!.split("\n").at(-1)!)).toMatchObject({
+      findings: {
+        before: [
+          { occurrenceId: "before-known", issueId: "known-a" },
+          { occurrenceId: "before-related", issueId: "related-a" },
+        ],
+      },
+    });
+  });
+
+  test("confirms historical groups before contradictory model output can run", async () => {
+    const input = {
+      before: [{ occurrenceId: "before", findingId: "known-a" }],
+      after: [{ occurrenceId: "after", findingId: "known-b" }],
+      knownFindingGroups: [["known-a", "known-b"]],
+    };
+    const response = {
+      matches: [],
+      uncertain: [
+        {
+          beforeOccurrenceId: "before",
+          afterOccurrenceId: "after",
+          reason: "Contradicts a saved confirmed identity.",
+        },
+      ],
+    };
+
+    const { codex, calls } = fakeCodex(response);
+
+    expect(await matchScanFindings(input, { codex })).toEqual({
+      matches: [
+        {
+          beforeOccurrenceIds: ["before"],
+          afterOccurrenceIds: ["after"],
+          confidence: "high",
+          reason:
+            "The findings share a stable identity or a previously confirmed link.",
+        },
+      ],
+      uncertain: [],
+    });
+    expect(calls.prompt).toBeUndefined();
+  });
+
+  test("never lets a model split a confirmed historical group", async () => {
+    const input = {
+      before: [
+        { occurrenceId: "before-a", findingId: "known-a" },
+        { occurrenceId: "before-b", findingId: "known-b" },
+      ],
+      after: [{ occurrenceId: "after", findingId: "new" }],
+      knownFindingGroups: [["known-a", "known-b"]],
+    };
+    const response = {
+      matches: [
+        {
+          beforeOccurrenceIds: ["before-a"],
+          afterOccurrenceIds: ["after"],
+          confidence: "high" as const,
+          reason: "Incorrectly separates a confirmed identity.",
+        },
+      ],
+      uncertain: [],
+    };
+
+    const invalid = fakeCodex(response);
+
+    await expect(
+      matchScanFindings(input, { codex: invalid.codex }),
+    ).rejects.toThrow("unknown before occurrence");
+    expect(JSON.parse(invalid.calls.prompt!.split("\n").at(-1)!)).toMatchObject(
+      {
+        findings: {
+          before: [
+            {
+              occurrenceId: "before-b",
+              occurrenceCount: 2,
+              issueId: "known-a",
+            },
+          ],
+        },
+      },
+    );
+
+    const valid = {
+      ...response,
+      matches: [
+        {
+          ...response.matches[0]!,
+          beforeOccurrenceIds: ["before-b"],
+        },
+      ],
+    };
+    expect(
+      await matchScanFindings(input, { codex: fakeCodex(valid).codex }),
+    ).toMatchObject({
+      matches: [
+        {
+          beforeOccurrenceIds: ["before-a", "before-b"],
+          afterOccurrenceIds: ["after"],
+          confidence: "high",
+        },
+      ],
+      uncertain: [],
+    });
+  });
+
   const match = (beforeOccurrenceIds = ["before-1"]) => ({
     beforeOccurrenceIds,
     afterOccurrenceIds: ["after-1"],
@@ -1042,6 +1187,42 @@ describe("semantic scan comparison", () => {
       label: "duplicate uncertain pairs",
       result: { matches: [], uncertain: [uncertain(), uncertain()] },
       error: "duplicate uncertain pair",
+    },
+    {
+      label: "invented related occurrences",
+      result: {
+        matches: [],
+        uncertain: [],
+        related: [uncertain("invented")],
+      },
+      error: "invalid related pair",
+    },
+    {
+      label: "duplicate related pairs",
+      result: {
+        matches: [],
+        uncertain: [],
+        related: [uncertain(), uncertain()],
+      },
+      error: "invalid related pair",
+    },
+    {
+      label: "related pairs that contradict confirmed matches",
+      result: {
+        matches: [match()],
+        uncertain: [],
+        related: [uncertain()],
+      },
+      error: "invalid related pair",
+    },
+    {
+      label: "related pairs that duplicate uncertainty",
+      result: {
+        matches: [],
+        uncertain: [uncertain()],
+        related: [uncertain()],
+      },
+      error: "invalid related pair",
     },
   ])("rejects $label", async ({ result, error }) => {
     const { codex } = fakeCodex(result);

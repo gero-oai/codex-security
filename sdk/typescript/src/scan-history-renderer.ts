@@ -141,6 +141,11 @@ export function renderScanHistory(
       );
       if (showLinkedFindings) {
         for (const relation of related) {
+          if (relation["scanId"] !== undefined) {
+            lines.push(
+              `                ${strong("RELATED SCAN")} ${accent(clean(relation["scanId"]).slice(0, 8))}`,
+            );
+          }
           wrap(`↳ ${clean(relation["title"])}`, 18);
           wrap(clean(relation["reason"]), 20);
         }

@@ -258,11 +258,8 @@ export async function runComponentScans(
       );
     }
   }
-  const { findings, matches, uncertain, error } = await deduplicateFindings(
-    receipts,
-    results,
-    { ...options, environment },
-  );
+  const { findings, matches, uncertain, related, error } =
+    await deduplicateFindings(receipts, results, { ...options, environment });
   const deduplication: ComponentDeduplicationSummary = {
     status: error === undefined ? "completed" : "incomplete",
     confirmedGroups: matches.length,
@@ -298,7 +295,12 @@ export async function runComponentScans(
     documentType: "codex-security.component-findings",
     schemaVersion: "1.0",
     findings,
-    deduplication: { ...deduplication, matches, uncertain },
+    deduplication: {
+      ...deduplication,
+      matches,
+      uncertain,
+      ...(related === undefined ? {} : { related }),
+    },
   });
   await writeJson(summary.summaryPath, {
     ...summary,
@@ -375,6 +377,10 @@ async function deduplicateFindings(
       );
       matching.matches.push(...comparison.matches);
       matching.uncertain.push(...comparison.uncertain);
+      if (comparison.related !== undefined) {
+        matching.related ??= [];
+        matching.related.push(...comparison.related);
+      }
       for (const match of comparison.matches) {
         findings = mergeFindingGroups(
           findings,
@@ -388,18 +394,21 @@ async function deduplicateFindings(
       ? "Cross-component matching was canceled."
       : safeErrorMessage(failure);
   }
-  matching.uncertain = matching.uncertain.filter(
-    ({ beforeOccurrenceId, afterOccurrenceId }) =>
-      !findings.some(
-        ({ sources }) =>
-          sources.some(
-            ({ occurrenceId }) => occurrenceId === beforeOccurrenceId,
-          ) &&
-          sources.some(
-            ({ occurrenceId }) => occurrenceId === afterOccurrenceId,
-          ),
-      ),
-  );
+  const remainSeparate = ({
+    beforeOccurrenceId,
+    afterOccurrenceId,
+  }: ScanComparisonResult["uncertain"][number]): boolean =>
+    !findings.some(
+      ({ sources }) =>
+        sources.some(
+          ({ occurrenceId }) => occurrenceId === beforeOccurrenceId,
+        ) &&
+        sources.some(({ occurrenceId }) => occurrenceId === afterOccurrenceId),
+    );
+  matching.uncertain = matching.uncertain.filter(remainSeparate);
+  if (matching.related !== undefined) {
+    matching.related = matching.related.filter(remainSeparate);
+  }
   return { findings, ...matching, ...(error === undefined ? {} : { error }) };
 }
 

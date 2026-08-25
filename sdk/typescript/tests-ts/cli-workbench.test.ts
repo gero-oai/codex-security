@@ -5,7 +5,10 @@ import { describe, expect, test } from "bun:test";
 import type { CodexSecurityConfig, JsonObject } from "../src/index.js";
 import { DiffTarget } from "../src/index.js";
 import { main } from "../src/cli.js";
-import { matchScanFindings } from "../src/scan-comparison.js";
+import {
+  matchScanFindings,
+  type ScanComparisonInput,
+} from "../src/scan-comparison.js";
 import {
   capture,
   dependencies,
@@ -860,6 +863,124 @@ describe("CLI workbench", () => {
       relatedPairs: 0,
       uncertainPairs: 1,
     });
+  });
+
+  test("preserves confirmed groups and related pairs while matching all scans", async () => {
+    const before = [{ occurrenceId: "before", findingId: "known-a" }];
+    const after = [{ occurrenceId: "after", findingId: "other" }];
+    const knownFindingGroups = [["known-a", "known-b"]];
+    const related = {
+      beforeOccurrenceId: "before",
+      afterOccurrenceId: "after",
+      reason: "Separate controls share a nearby trust boundary.",
+    };
+    let saved: string | undefined;
+
+    expect(
+      await main(
+        ["scans", "match", "--all", "--json"],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          onWorkbench: (args, input): JsonObject => {
+            if (args[0] === "save-scan-comparison") saved = input;
+            return args[0] === "list-unmatched-scan-pairs"
+              ? {
+                  repository: "/current/repository",
+                  scanCount: 2,
+                  unavailableScans: 0,
+                  skippedPairs: 0,
+                  batches: [
+                    {
+                      afterScanId: "later-scan",
+                      afterFindings: after,
+                      beforeScans: [
+                        { scanId: "earlier-scan", findings: before },
+                      ],
+                      knownFindingGroups,
+                    },
+                  ],
+                }
+              : {};
+          },
+          onMatch: async (input) => {
+            expect(input).toEqual({ before, after, knownFindingGroups });
+            return { matches: [], uncertain: [], related: [related] };
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(JSON.parse(saved!)).toEqual({
+      matches: [],
+      uncertain: [],
+      related: [related],
+    });
+  });
+
+  test("carries newly confirmed finding identities into later matching batches", async () => {
+    const first = { occurrenceId: "first", findingId: "identity-first" };
+    const second = { occurrenceId: "second", findingId: "identity-second" };
+    const third = { occurrenceId: "third", findingId: "identity-third" };
+    const existingGroups = [["existing-first", "existing-second"]];
+    const matchedInputs: ScanComparisonInput[] = [];
+
+    expect(
+      await main(
+        ["scans", "match", "--all", "--json"],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          onWorkbench: (args): JsonObject =>
+            args[0] === "list-unmatched-scan-pairs"
+              ? {
+                  repository: "/current/repository",
+                  scanCount: 3,
+                  unavailableScans: 0,
+                  skippedPairs: 0,
+                  batches: [
+                    {
+                      afterScanId: "second-scan",
+                      afterFindings: [second],
+                      beforeScans: [
+                        { scanId: "first-scan", findings: [first] },
+                      ],
+                    },
+                    {
+                      afterScanId: "third-scan",
+                      afterFindings: [third],
+                      beforeScans: [
+                        { scanId: "first-scan", findings: [first] },
+                        { scanId: "second-scan", findings: [second] },
+                      ],
+                      knownFindingGroups: existingGroups,
+                    },
+                  ],
+                }
+              : {},
+          onMatch: async (input) => {
+            matchedInputs.push(input);
+            return matchedInputs.length === 1
+              ? {
+                  matches: [
+                    {
+                      beforeOccurrenceIds: [first.occurrenceId],
+                      afterOccurrenceIds: [second.occurrenceId],
+                      confidence: "high",
+                      reason: "The same root cause appears in both scans.",
+                    },
+                  ],
+                  uncertain: [],
+                }
+              : { matches: [], uncertain: [] };
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(matchedInputs).toHaveLength(2);
+    expect(matchedInputs[1]!.knownFindingGroups).toEqual([
+      ...existingGroups,
+      [first.findingId, second.findingId],
+    ]);
   });
 
   test("saves empty comparisons without starting Codex", async () => {

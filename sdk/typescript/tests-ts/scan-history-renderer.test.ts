@@ -321,11 +321,12 @@ describe("scan history renderer", () => {
     }
   });
 
-  test("shows related findings without presenting them as duplicate matches", () => {
+  test("renders related findings separately in scan details and comparisons", () => {
     const relation = {
       beforeTitle: "Archive writer boundary",
       afterTitle: "Archive reader boundary",
       title: "Archive reader boundary",
+      scanId: "12345678-abcd-4567-abcd-1234567890ab",
       reason: "The two controls require independent corrections.",
     };
     const comparison = renderScanHistory(
@@ -340,16 +341,17 @@ describe("scan history renderer", () => {
       "compare",
       { color: false },
     );
-    for (const text of [
+    for (const value of [
       "Related findings, kept separate",
       relation.beforeTitle,
       relation.afterTitle,
       relation.reason,
     ]) {
-      expect(comparison).toContain(text);
+      expect(comparison).toContain(value);
     }
+
     const scan = {
-      scanId: "scan",
+      scanId: "current-scan",
       targetPath: "/synthetic/repository",
       progress: { status: "complete" },
       findings: [
@@ -363,7 +365,12 @@ describe("scan history renderer", () => {
       color: false,
       showLinkedFindings: true,
     });
-    expect(expanded).toContain(relation.afterTitle);
-    expect(expanded).toContain(relation.reason);
+    for (const value of [
+      relation.afterTitle,
+      relation.scanId.slice(0, 8),
+      relation.reason,
+    ]) {
+      expect(expanded).toContain(value);
+    }
   });
 });
