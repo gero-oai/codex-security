@@ -126,6 +126,7 @@ import {
   comparisonFindingGroups,
   comparisonForScan,
   matchScanFindingsInternal,
+  unionFindingGroups,
   type matchScanFindings,
   type ScanComparisonInput,
   type ScanComparisonOptions,
@@ -4436,43 +4437,6 @@ function validateCliArguments(
   ) {
     return `Unexpected positional argument for ${command}${subcommand === undefined ? "" : ` ${subcommand}`}.`;
   }
-}
-
-function unionFindingGroups(
-  groups: readonly (readonly string[])[],
-): string[][] {
-  const parents = new Map<string, string>();
-  const representative = (identity: string): string => {
-    let root = identity;
-    while (parents.get(root) !== root) root = parents.get(root)!;
-    let current = identity;
-    while (parents.get(current) !== current) {
-      const previous = parents.get(current)!;
-      parents.set(current, root);
-      current = previous;
-    }
-    return root;
-  };
-
-  for (const [first, ...rest] of groups) {
-    if (first === undefined) continue;
-    if (!parents.has(first)) parents.set(first, first);
-    for (const identity of rest) {
-      if (!parents.has(identity)) parents.set(identity, identity);
-      const firstRoot = representative(first);
-      const identityRoot = representative(identity);
-      if (firstRoot !== identityRoot) parents.set(identityRoot, firstRoot);
-    }
-  }
-
-  const united = new Map<string, string[]>();
-  for (const identity of parents.keys()) {
-    const root = representative(identity);
-    const group = united.get(root);
-    if (group === undefined) united.set(root, [identity]);
-    else group.push(identity);
-  }
-  return [...united.values()];
 }
 
 async function matchAllScans(

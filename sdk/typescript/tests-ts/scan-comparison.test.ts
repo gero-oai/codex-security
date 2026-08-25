@@ -1053,6 +1053,45 @@ describe("semantic scan comparison", () => {
     expect(calls.prompt).toBeUndefined();
   });
 
+  test.each(["omitted", "uncertain", "related"] as const)(
+    "confirms overlapping historical groups before an %s model decision",
+    async (decision) => {
+      const input = {
+        before: [{ occurrenceId: "before", findingId: "identity-a" }],
+        after: [{ occurrenceId: "after", findingId: "identity-c" }],
+        knownFindingGroups: [
+          ["identity-a", "identity-b"],
+          ["identity-b", "identity-c"],
+        ],
+      };
+      const pair = {
+        beforeOccurrenceId: "before",
+        afterOccurrenceId: "after",
+        reason: "Contradicts a transitively confirmed identity.",
+      };
+      const response = {
+        matches: [],
+        uncertain: decision === "uncertain" ? [pair] : [],
+        ...(decision === "related" ? { related: [pair] } : {}),
+      };
+
+      const { codex, calls } = fakeCodex(response);
+      expect(await matchScanFindings(input, { codex })).toEqual({
+        matches: [
+          {
+            beforeOccurrenceIds: ["before"],
+            afterOccurrenceIds: ["after"],
+            confidence: "high",
+            reason:
+              "The findings share a stable identity or a previously confirmed link.",
+          },
+        ],
+        uncertain: [],
+      });
+      expect(calls.prompt).toBeUndefined();
+    },
+  );
+
   test("never accepts uncertainty between occurrences of the same stable finding", async () => {
     const input = {
       before: [{ occurrenceId: "before", findingId: "shared-identity" }],

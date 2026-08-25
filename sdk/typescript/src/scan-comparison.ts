@@ -77,6 +77,46 @@ export interface ScanComparisonResult {
   related?: ScanComparisonPair[];
 }
 
+export function unionFindingGroups(
+  groups: readonly (readonly string[])[],
+): string[][] {
+  const parents = new Map<string, string>();
+  const representative = (identity: string): string => {
+    let root = identity;
+    while (parents.get(root) !== root) root = parents.get(root)!;
+    let current = identity;
+    while (parents.get(current) !== current) {
+      const previous = parents.get(current)!;
+      parents.set(current, root);
+      current = previous;
+    }
+    return root;
+  };
+
+  for (const group of groups) {
+    const [first, ...rest] = group.filter(
+      (identity) => identity.trim().length > 0,
+    );
+    if (first === undefined) continue;
+    if (!parents.has(first)) parents.set(first, first);
+    for (const identity of rest) {
+      if (!parents.has(identity)) parents.set(identity, identity);
+      const firstRoot = representative(first);
+      const identityRoot = representative(identity);
+      if (firstRoot !== identityRoot) parents.set(identityRoot, firstRoot);
+    }
+  }
+
+  const united = new Map<string, string[]>();
+  for (const identity of parents.keys()) {
+    const root = representative(identity);
+    const group = united.get(root);
+    if (group === undefined) united.set(root, [identity]);
+    else group.push(identity);
+  }
+  return [...united.values()];
+}
+
 /** @internal */
 interface ReadOnlyCodex {
   startThread(options: ThreadOptions): {
@@ -1126,11 +1166,11 @@ function validateComparison(
     }
   }
 
+  const confirmedGroups = unionFindingGroups([
+    ...(input.knownFindingGroups ?? []),
+    ...[...new Set(findingIds.values())].map((findingId) => [findingId]),
+  ]);
   if (enforceConfirmedIdentities) {
-    const confirmedGroups = [
-      ...(input.knownFindingGroups ?? []),
-      ...[...new Set(findingIds.values())].map((findingId) => [findingId]),
-    ];
     for (const knownGroup of confirmedGroups) {
       const knownFindingIds = new Set(knownGroup);
       const knownBefore = input.before.filter(({ occurrenceId }) => {
@@ -1196,9 +1236,24 @@ function validateComparison(
     uncertainPairs.add(pair);
   }
 
+  const knownGroupByFindingId = new Map(
+    confirmedGroups.flatMap((group, index) =>
+      group.map((findingId) => [findingId, index] as const),
+    ),
+  );
   const relatedPairs = new Set<string>();
   for (const candidate of response.related ?? []) {
     const beforeGroup = matchedBefore.get(candidate.beforeOccurrenceId);
+    const beforeFindingId = findingIds.get(candidate.beforeOccurrenceId);
+    const afterFindingId = findingIds.get(candidate.afterOccurrenceId);
+    const knownBeforeGroup =
+      beforeFindingId === undefined
+        ? undefined
+        : knownGroupByFindingId.get(beforeFindingId);
+    const knownAfterGroup =
+      afterFindingId === undefined
+        ? undefined
+        : knownGroupByFindingId.get(afterFindingId);
     const pair = JSON.stringify([
       candidate.beforeOccurrenceId,
       candidate.afterOccurrenceId,
@@ -1208,6 +1263,9 @@ function validateComparison(
       !afterIds.has(candidate.afterOccurrenceId) ||
       (beforeGroup !== undefined &&
         beforeGroup === matchedAfter.get(candidate.afterOccurrenceId)) ||
+      (enforceConfirmedIdentities &&
+        knownBeforeGroup !== undefined &&
+        knownBeforeGroup === knownAfterGroup) ||
       uncertainPairs.has(pair) ||
       relatedPairs.has(pair)
     ) {
