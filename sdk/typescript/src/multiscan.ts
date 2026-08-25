@@ -292,6 +292,7 @@ async function runCampaign(
         receipt,
         checkout,
         options.signal,
+        options.githubHost,
       );
       if (resumed !== undefined) {
         if (!resumed.reportSealed) {
@@ -880,6 +881,7 @@ async function loadResumableScan(
   receipt: MultiscanReceipt,
   checkout: string,
   signal?: AbortSignal,
+  githubHost?: string,
 ): Promise<
   | {
       completeness: CoverageDocument["completeness"];
@@ -896,31 +898,67 @@ async function loadResumableScan(
     const targetId = `target_sha256_${createHash("sha256")
       .update(`local-workspace\0${checkout}`)
       .digest("hex")}`;
-    const expectedScope =
+    let expectedScope =
       receipt.scope === undefined
         ? "."
-        : receipt.resolvedScope ??
-          posix.normalize(receipt.scope).replace(/\/+$/, "");
+        : posix.normalize(receipt.scope).replace(/\/+$/, "");
     const expectedMode =
       receipt.scope !== undefined
         ? "scoped_path"
         : receipt.mode === "deep"
           ? "deep_repository"
           : "repository";
-    const expectedKind =
-      receipt.snapshotDigest === undefined ? "git_revision" : "git_worktree";
     if (
       producer.name !== "codex-security-plugin" ||
       target.targetId !== targetId ||
       (receipt.targetId !== undefined && receipt.targetId !== targetId) ||
-      target.kind !== expectedKind ||
-      target.snapshotDigest !== receipt.snapshotDigest ||
+      target.kind !== "git_revision" ||
+      target.snapshotDigest !== undefined ||
+      receipt.snapshotDigest !== undefined ||
       target.displayName !== receipt.id ||
       target.revision !== receipt.revision ||
       coverage.mode !== expectedMode ||
       scope.includePaths.length !== 1 ||
-      scope.includePaths[0] !== expectedScope ||
       scope.excludePaths.length !== 0
+    ) {
+      return undefined;
+    }
+    if (
+      receipt.scope !== undefined &&
+      scope.includePaths[0] !== expectedScope
+    ) {
+      if (receipt.resolvedScope === undefined) return undefined;
+      try {
+        await rm(checkout, { recursive: true, force: true });
+        await mkdir(checkout, { mode: 0o700 });
+        await checkoutRevision(receipt, checkout, signal, githubHost);
+        const resolvedScope = await realpath(join(checkout, receipt.scope));
+        const relativeScope = relative(await realpath(checkout), resolvedScope);
+        if (
+          relativeScope === ".." ||
+          relativeScope.startsWith(`..${sep}`) ||
+          isAbsolute(relativeScope)
+        ) {
+          return undefined;
+        }
+        expectedScope = relativeScope.split(sep).join("/") || ".";
+      } finally {
+        await rm(checkout, { recursive: true, force: true });
+      }
+    }
+    if (
+      scope.includePaths[0] !== expectedScope ||
+      (receipt.resolvedScope !== undefined &&
+        receipt.resolvedScope !== expectedScope)
+    ) {
+      return undefined;
+    }
+    const sealedArtifacts = new Set(
+      manifest.scan.artifacts.map((artifact) => artifact.path),
+    );
+    if (
+      !sealedArtifacts.has("findings.json") ||
+      !sealedArtifacts.has("coverage.json")
     ) {
       return undefined;
     }
@@ -934,6 +972,11 @@ async function loadResumableScan(
     ) {
       return undefined;
     }
+    const surfaceIds = new Set<string>();
+    for (const surface of coverage.surfaces) {
+      if (surfaceIds.has(surface.id)) return undefined;
+      surfaceIds.add(surface.id);
+    }
     const findingIds = new Set<string>();
     const occurrenceIds = new Set<string>();
     for (const finding of findings.findings) {
@@ -945,6 +988,38 @@ async function loadResumableScan(
       }
       findingIds.add(finding.findingId);
       occurrenceIds.add(finding.occurrenceId);
+      if (
+        finding.locations.some(
+          (location) =>
+            location.endLine !== undefined &&
+            location.endLine < location.startLine,
+        )
+      ) {
+        return undefined;
+      }
+      const evidenceIds = new Set<string>();
+      for (const evidence of finding.codeEvidence ?? []) {
+        if (evidenceIds.has(evidence.id)) return undefined;
+        evidenceIds.add(evidence.id);
+      }
+      for (const section of [
+        finding.rootCause,
+        finding.validation,
+        finding.attackPath,
+      ]) {
+        if (!isReceiptRecord(section)) continue;
+        const references = section["evidenceRefs"];
+        if (
+          references !== undefined &&
+          (!Array.isArray(references) ||
+            references.some(
+              (reference) =>
+                typeof reference !== "string" || !evidenceIds.has(reference),
+            ))
+        ) {
+          return undefined;
+        }
+      }
     }
     const matchesOutcome =
       completeness === "complete"

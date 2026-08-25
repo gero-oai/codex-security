@@ -100,7 +100,6 @@ async function repository(
 async function completedScan(
   outputDir: string,
   completeness: "complete" | "partial" | "unknown" = "complete",
-  targetKind: "git_revision" | "git_worktree" = "git_revision",
 ): Promise<ScanResult> {
   await mkdir(outputDir, { recursive: true, mode: 0o700 });
   await cp(join(PLUGIN_ROOT, "examples", "completed-scan"), outputDir, {
@@ -136,25 +135,13 @@ async function completedScan(
       skipEmptyLines: true,
     }).data.find((entry) => entry["id"] === id);
     if (task !== undefined) {
-      manifest.scan.target.kind = targetKind;
+      manifest.scan.target.kind = "git_revision";
       manifest.scan.target.targetId = `target_sha256_${createHash("sha256")
         .update(`local-workspace\0${join(campaignRoot, "checkouts", id)}`)
         .digest("hex")}`;
       manifest.scan.target.displayName = id;
       manifest.scan.target.revision = task["revision"]!;
-      if (targetKind === "git_worktree") {
-        const checkout = join(campaignRoot, "checkouts", id);
-        const contents = await readFile(join(checkout, "src", "app.ts"));
-        manifest.scan.target.snapshotDigest = `codex-security-snapshot/v1:sha256:${createHash(
-          "sha256",
-        )
-          .update(task["revision"]!)
-          .update("\0")
-          .update(contents)
-          .digest("hex")}`;
-      } else {
-        delete manifest.scan.target.snapshotDigest;
-      }
+      delete manifest.scan.target.snapshotDigest;
       const scope = task["scope"]?.trim();
       let normalizedScope = scope ? posix.normalize(scope) : ".";
       if (scope) {
@@ -1787,13 +1774,26 @@ describe("multiscan", () => {
 
   test.each([
     "forged campaign target identity",
+    "forged resolved repository scope",
+    "forged worktree snapshot digest",
     "deferred complete coverage",
     "follow-up complete coverage",
+    "unsealed canonical findings",
+    "unsealed canonical coverage",
+    "duplicate coverage surface identities",
     "duplicate finding identities",
+    "reversed finding line range",
+    "duplicate evidence identifiers",
+    "dangling root-cause evidence",
+    "dangling validation evidence",
+    "dangling attack-path evidence",
   ] as const)("rescans sealed artifacts with %s", async (corruption) => {
     const paths = await fixture();
     const source = await repository(paths.root, "sealed-resume-integrity");
-    const inventory = `id,repository,revision\nsealed-resume,${source.path},${source.revision}\n`;
+    const inventory =
+      corruption === "forged resolved repository scope"
+        ? `id,repository,revision,scope\nsealed-resume,${source.path},${source.revision},src\n`
+        : `id,repository,revision\nsealed-resume,${source.path},${source.revision}\n`;
     await writeFile(paths.input, inventory);
     let attempts = 0;
     const security = client(async (_repository, scanOptions = {}) => {
@@ -1803,7 +1803,9 @@ describe("multiscan", () => {
     let pluginRoot = PLUGIN_ROOT;
     if (
       corruption === "deferred complete coverage" ||
-      corruption === "follow-up complete coverage"
+      corruption === "follow-up complete coverage" ||
+      corruption === "unsealed canonical findings" ||
+      corruption === "unsealed canonical coverage"
     ) {
       pluginRoot = join(paths.root, "custom-plugin");
       await mkdir(pluginRoot);
@@ -1815,11 +1817,20 @@ describe("multiscan", () => {
       await cp(join(PLUGIN_ROOT, "schemas"), join(pluginRoot, "schemas"), {
         recursive: true,
       });
-      const schemaPath = join(pluginRoot, "schemas", "coverage.schema.json");
+      const coverageSchema =
+        corruption === "deferred complete coverage" ||
+        corruption === "follow-up complete coverage";
+      const schemaPath = join(
+        pluginRoot,
+        "schemas",
+        coverageSchema ? "coverage.schema.json" : "scan-manifest.schema.json",
+      );
       const schema = JSON.parse(await readFile(schemaPath, "utf8")) as {
         allOf?: unknown;
+        properties?: { scan?: { allOf?: unknown } };
       };
-      delete schema.allOf;
+      if (coverageSchema) delete schema.allOf;
+      else delete schema.properties?.scan?.allOf;
       await writeFile(schemaPath, `${JSON.stringify(schema, null, 2)}\n`);
     }
     const campaign = options(
@@ -1849,14 +1860,76 @@ describe("multiscan", () => {
       });
       receipt!["targetId"] = foreignReceipt!["targetId"];
       await writeFile(first.resultsPath, `${JSON.stringify(receipt)}\n`);
-    } else if (corruption === "duplicate finding identities") {
+    } else if (corruption === "forged resolved repository scope") {
+      const manifestPath = join(outputDir, "scan-manifest.json");
+      const manifest = JSON.parse(
+        await readFile(manifestPath, "utf8"),
+      ) as ScanResult["manifest"];
+      manifest.scan.scope.includePaths = ["."];
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const coveragePath = join(outputDir, "coverage.json");
+      const coverage = JSON.parse(
+        await readFile(coveragePath, "utf8"),
+      ) as ScanResult["coverage"];
+      coverage.includePaths = ["."];
+      await writeFile(coveragePath, `${JSON.stringify(coverage, null, 2)}\n`);
+      receipt!["resolvedScope"] = ".";
+      await writeFile(first.resultsPath, `${JSON.stringify(receipt)}\n`);
+    } else if (corruption === "forged worktree snapshot digest") {
+      const manifestPath = join(outputDir, "scan-manifest.json");
+      const manifest = JSON.parse(
+        await readFile(manifestPath, "utf8"),
+      ) as ScanResult["manifest"];
+      const forgedDigest = `codex-security-snapshot/v1:sha256:${"0".repeat(64)}`;
+      manifest.scan.target.kind = "git_worktree";
+      manifest.scan.target.snapshotDigest = forgedDigest;
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      receipt!["snapshotDigest"] = forgedDigest;
+      await writeFile(first.resultsPath, `${JSON.stringify(receipt)}\n`);
+    } else if (
+      corruption === "duplicate finding identities" ||
+      corruption === "reversed finding line range" ||
+      corruption === "duplicate evidence identifiers" ||
+      corruption === "dangling root-cause evidence" ||
+      corruption === "dangling validation evidence" ||
+      corruption === "dangling attack-path evidence"
+    ) {
       const findingsPath = join(outputDir, "findings.json");
       const findings = JSON.parse(
         await readFile(findingsPath, "utf8"),
       ) as ScanResult["findings"];
-      findings.findings.push(structuredClone(findings.findings[0]!));
+      const finding = findings.findings[0]!;
+      if (corruption === "duplicate finding identities") {
+        findings.findings.push(structuredClone(finding));
+      } else if (corruption === "reversed finding line range") {
+        finding.locations[0]!.endLine = finding.locations[0]!.startLine - 1;
+      } else if (corruption === "duplicate evidence identifiers") {
+        const evidence = {
+          id: "source-evidence",
+          label: "Source evidence",
+          path: "src/extract.py",
+          startLine: 41,
+          endLine: 44,
+          code: "extract()",
+          explanation: "Source evidence",
+        };
+        finding.codeEvidence = [evidence, structuredClone(evidence)];
+      } else if (corruption === "dangling root-cause evidence") {
+        finding.rootCause = {
+          summary: "Missing source evidence.",
+          evidenceRefs: ["missing-evidence"],
+        };
+      } else if (corruption === "dangling validation evidence") {
+        finding.validation = { evidenceRefs: ["missing-evidence"] };
+      } else {
+        finding.attackPath = { evidenceRefs: ["missing-evidence"] };
+      }
       await writeFile(findingsPath, `${JSON.stringify(findings, null, 2)}\n`);
-    } else {
+    } else if (
+      corruption === "deferred complete coverage" ||
+      corruption === "follow-up complete coverage" ||
+      corruption === "duplicate coverage surface identities"
+    ) {
       const coveragePath = join(outputDir, "coverage.json");
       const coverage = JSON.parse(
         await readFile(coveragePath, "utf8"),
@@ -1866,8 +1939,10 @@ describe("multiscan", () => {
           id: "unreviewed-surface",
           reason: "Review remains incomplete.",
         });
-      } else {
+      } else if (corruption === "follow-up complete coverage") {
         coverage.surfaces[0]!.disposition = "needs_follow_up";
+      } else {
+        coverage.surfaces.push(structuredClone(coverage.surfaces[0]!));
       }
       await writeFile(coveragePath, `${JSON.stringify(coverage, null, 2)}\n`);
     }
@@ -1876,6 +1951,15 @@ describe("multiscan", () => {
     const manifest = JSON.parse(
       await readFile(manifestPath, "utf8"),
     ) as ScanResult["manifest"];
+    if (corruption === "unsealed canonical findings") {
+      manifest.scan.artifacts = manifest.scan.artifacts.filter(
+        (artifact) => artifact.path !== "findings.json",
+      );
+    } else if (corruption === "unsealed canonical coverage") {
+      manifest.scan.artifacts = manifest.scan.artifacts.filter(
+        (artifact) => artifact.path !== "coverage.json",
+      );
+    }
     manifest.scan.artifacts.push({
       path: "report.md",
       sha256: "0".repeat(64),
@@ -1895,96 +1979,6 @@ describe("multiscan", () => {
     });
     expect(attempts).toBe(2);
   });
-
-  test.each(["complete", "partial"] as const)(
-    "binds sealed %s worktree snapshots to their validated attempt receipts",
-    async (completeness) => {
-      const paths = await fixture();
-      const source = await repository(paths.root, "worktree-snapshot");
-      await writeFile(
-        paths.input,
-        `id,repository,revision\nworktree,${source.path},${source.revision}\n`,
-      );
-      let attempts = 0;
-      const security = client(async (_repository, scanOptions = {}) => {
-        attempts += 1;
-        return await completedScan(
-          scanOptions.outputDir!,
-          completeness,
-          "git_worktree",
-        );
-      });
-      const outcome =
-        completeness === "complete"
-          ? { completed: 1, incomplete: 0 }
-          : { completed: 0, incomplete: 1 };
-
-      const first = await runMultiscan(options(paths, security));
-      const [originalReceipt] = await results(first.resultsPath);
-      const originalDigest = originalReceipt!["snapshotDigest"];
-      const originalTargetId = originalReceipt!["targetId"];
-      expect(originalDigest).toMatch(
-        /^codex-security-snapshot\/v1:sha256:[a-f\d]{64}$/,
-      );
-      expect(originalTargetId).toMatch(/^target_sha256_[a-f\d]{64}$/);
-      expect(await runMultiscan(options(paths, security))).toMatchObject({
-        ...outcome,
-        skipped: 1,
-      });
-      expect(attempts).toBe(1);
-
-      delete originalReceipt!["targetId"];
-      await writeFile(
-        first.resultsPath,
-        `${JSON.stringify(originalReceipt)}\n`,
-      );
-      expect(await runMultiscan(options(paths, security))).toMatchObject({
-        ...outcome,
-        skipped: 1,
-      });
-      expect(attempts).toBe(1);
-
-      const manifestPath = join(
-        originalReceipt!["outputDir"] as string,
-        "scan-manifest.json",
-      );
-      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
-        scan: { target: { snapshotDigest: string } };
-      };
-      manifest.scan.target.snapshotDigest = `codex-security-snapshot/v1:sha256:${"0".repeat(64)}`;
-      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-      await reseal(originalReceipt!["outputDir"] as string);
-      expect(await runMultiscan(options(paths, security))).toMatchObject({
-        ...outcome,
-        skipped: 0,
-      });
-      expect(attempts).toBe(2);
-
-      const receipts = await results(first.resultsPath);
-      delete receipts.at(-1)!["snapshotDigest"];
-      await writeFile(
-        first.resultsPath,
-        `${receipts.map((receipt) => JSON.stringify(receipt)).join("\n")}\n`,
-      );
-      expect(await runMultiscan(options(paths, security))).toMatchObject({
-        ...outcome,
-        skipped: 0,
-      });
-      expect(await runMultiscan(options(paths, security))).toMatchObject({
-        ...outcome,
-        skipped: 1,
-      });
-      expect(attempts).toBe(3);
-      expect((await results(first.resultsPath)).at(-1)).toMatchObject({
-        status:
-          completeness === "complete"
-            ? "completed"
-            : "completed_with_incomplete_coverage",
-        targetId: originalTargetId,
-        snapshotDigest: originalDigest,
-      });
-    },
-  );
 
   test.each([
     ["scoped", "src", "standard"],
