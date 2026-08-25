@@ -25,6 +25,7 @@ This script stays deliberately model-free:
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -328,6 +329,28 @@ def changed_path_parent_is_within_target(path: Path, target: Path) -> bool:
     return False
 
 
+def _open_windows_changed_path_descriptor(target: Path, relative_path: Path) -> int:
+    """Preserve ordinary missing-leaf behavior without relaxing parent checks."""
+
+    expected_path = target / relative_path
+    try:
+        return _windows_scan_local_files().open_read_fd(
+            target, relative_path.as_posix(), "changed Git working-tree path"
+        )
+    except OSError as error:
+        if error.filename is None or os.path.normcase(
+            os.path.normpath(os.fspath(error.filename))
+        ) != os.path.normcase(os.path.normpath(os.fspath(expected_path))):
+            raise
+        if error.errno in {errno.ENOENT, 3}:
+            raise FileNotFoundError(
+                error.errno, error.strerror, error.filename
+            ) from error
+        if error.errno in {errno.EACCES, 5}:
+            raise PermissionError(error.errno, error.strerror, error.filename) from error
+        raise
+
+
 def preview_for_changed_path(
     path: Path, target: Path, preview_bytes: int
 ) -> tuple[str, bool]:
@@ -340,9 +363,8 @@ def preview_for_changed_path(
     descriptor: int | None = None
     try:
         if os.name == "nt":
-            relative_path = (relative_parent / path.name).as_posix()
-            descriptor = _windows_scan_local_files().open_read_fd(
-                target, relative_path, "changed Git working-tree path"
+            descriptor = _open_windows_changed_path_descriptor(
+                target, relative_parent / path.name
             )
         elif _descriptor_relative_reads_available():
             root_descriptor = _open_verified_scan_directory(target)
