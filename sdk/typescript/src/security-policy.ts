@@ -1395,6 +1395,13 @@ export async function applySecurityPolicy(
       recoveryPath,
     };
   } catch (error) {
+    if (
+      !written &&
+      draft.previousContent !== draft.content &&
+      (await readSecurityPolicy(target.targetPath).catch(() => null)) ===
+        draft.content
+    )
+      written = true;
     if (written) {
       const retainedRecovery = recoveryPath ?? verificationRecoveryPath;
       throw new SecurityPolicyVerificationError(target.targetPath, {
