@@ -2302,6 +2302,51 @@ describe("live scan cost tracking", () => {
     expect(costs).toEqual([0.0032, 0.0048]);
   });
 
+  test("enforces budgets across equal-total field resets without counting duplicates", async () => {
+    const home = await codexHome();
+    const root = await writeSession(home, "scan-thread", {
+      input_tokens: 1_000,
+      cached_input_tokens: 400,
+      cache_write_input_tokens: 100,
+      output_tokens: 1_000,
+      reasoning_output_tokens: 800,
+    });
+    const costs: number[] = [];
+    const tracker = new ScanCostTracker({
+      codexHome: home,
+      model: "gpt-5.6-terra",
+      maxCostUsd: 0.017,
+      onCost: (cost) => costs.push(cost.estimatedUsd),
+    });
+    tracker.start("scan-thread");
+    expect((await tracker.refresh()).cost?.estimatedUsd).toBe(0.01333);
+    const reset = JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 1_500,
+            cached_input_tokens: 600,
+            cache_write_input_tokens: 200,
+            output_tokens: 500,
+            reasoning_output_tokens: 50,
+          },
+        },
+      },
+    });
+    await appendFile(root, `${reset}\n${reset}\n`);
+
+    expect((await tracker.stop()).cost).toMatchObject({
+      inputTokens: 1_500,
+      cachedInputTokens: 600,
+      cacheWriteInputTokens: 200,
+      outputTokens: 1_500,
+      estimatedUsd: 0.02002,
+    });
+    expect(costs).toEqual([0.01333, 0.02002]);
+  });
+
   test("keeps live and persisted usage aligned across counter resets", async () => {
     if (
       runMockInSubprocess(
@@ -2316,8 +2361,8 @@ describe("live scan cost tracking", () => {
       output_tokens: number;
     };
     const { PLUGIN_ROOT } = await import("./plugin-root.js");
-    const python = Bun.which("python3") ?? Bun.which("python");
-    expect(python).not.toBeNull();
+    const { resolvePluginPython } = await import("../src/runtime.js");
+    const python = await resolvePluginPython({ environment: process.env });
     const probe = [
       "import io, json, sys",
       "from datetime import datetime, timezone",
@@ -2369,6 +2414,39 @@ describe("live scan cost tracking", () => {
       copiedHistory?: boolean;
       limit?: number;
     }> = [
+      {
+        samples: [
+          {
+            input_tokens: 1_000,
+            cached_input_tokens: 400,
+            cache_write_input_tokens: 100,
+            output_tokens: 1_000,
+            reasoning_output_tokens: 800,
+          },
+          {
+            input_tokens: 1_500,
+            cached_input_tokens: 600,
+            cache_write_input_tokens: 200,
+            output_tokens: 500,
+            reasoning_output_tokens: 50,
+          },
+          {
+            input_tokens: 1_500,
+            cached_input_tokens: 600,
+            cache_write_input_tokens: 200,
+            output_tokens: 500,
+            reasoning_output_tokens: 50,
+          },
+        ],
+        expected: {
+          input_tokens: 1_500,
+          cached_input_tokens: 600,
+          cache_write_input_tokens: 200,
+          output_tokens: 1_500,
+          reasoning_output_tokens: 850,
+        },
+        limit: 0.017,
+      },
       {
         samples: [
           { input_tokens: 1_000, output_tokens: 1_000 },
@@ -2444,7 +2522,7 @@ describe("live scan cost tracking", () => {
           { input_tokens: 110, output_tokens: 90 },
           { input_tokens: 120, output_tokens: 100 },
         ],
-        expected: { input_tokens: 110, output_tokens: 110 },
+        expected: { input_tokens: 120, output_tokens: 200 },
       },
     ];
     for (const {
@@ -2462,7 +2540,7 @@ describe("live scan cost tracking", () => {
         total_tokens: counters.input_tokens + counters.output_tokens,
       };
       const persisted = spawnSync(
-        python!,
+        python,
         [
           "-I",
           "-B",
@@ -3212,26 +3290,38 @@ describe("live scan cost tracking", () => {
       {
         model: "gpt-5.6-terra",
         samples: reclassified,
-        expected: { input_tokens: 100, output_tokens: 10 },
+        expected: {
+          input_tokens: 200,
+          cached_input_tokens: 100,
+          output_tokens: 10,
+        },
       },
       {
         model: "unknown-model",
         samples: reclassified,
         expected: {
-          input_tokens: 110,
+          input_tokens: 200,
           cached_input_tokens: 100,
-          output_tokens: 0,
+          output_tokens: 10,
         },
       },
       {
         model: "gpt-5.6-terra",
         samples: equalPrice,
-        expected: { input_tokens: 100, output_tokens: 1 },
+        expected: {
+          input_tokens: 101,
+          cache_write_input_tokens: 20,
+          output_tokens: 1,
+        },
       },
       {
         model: "unknown-model",
         samples: equalPrice,
-        expected: { input_tokens: 100, output_tokens: 1 },
+        expected: {
+          input_tokens: 101,
+          cache_write_input_tokens: 20,
+          output_tokens: 1,
+        },
       },
       {
         model: "unknown-model",

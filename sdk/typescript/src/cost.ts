@@ -1262,8 +1262,10 @@ function accumulateTokenUsage(
     BigInt(previousRaw?.output_tokens ?? 0);
   const nextTotal = BigInt(next.input_tokens) + BigInt(next.output_tokens);
   const reset = nextTotal < previousTotal;
-  const totalDelta = reset ? nextTotal : nextTotal - previousTotal;
-  if (totalDelta === 0n) {
+  if (
+    next.input_tokens === (previousRaw?.input_tokens ?? 0) &&
+    next.output_tokens === (previousRaw?.output_tokens ?? 0)
+  ) {
     return accumulated ?? tokenUsage({ input_tokens: 0, output_tokens: 0 });
   }
   const addDelta = (

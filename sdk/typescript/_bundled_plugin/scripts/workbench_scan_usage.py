@@ -481,9 +481,9 @@ def _read_rollout_usage(
                 continue
             if completed_at is not None and timestamp > completed_at:
                 continue
+            delta["totalTokens"] = delta["inputTokens"] + delta["outputTokens"]
             if delta["totalTokens"] <= 0:
                 continue
-            delta["totalTokens"] = delta["inputTokens"] + delta["outputTokens"]
             _add_token_usage(total, delta)
 
     if not boundary_reached:

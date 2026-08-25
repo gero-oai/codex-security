@@ -1741,10 +1741,13 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
-  test("upgrades a plugin with the real bundled Codex executable", async () => {
+  test("upgrades the prior bundled plugin through the real Codex cache", async () => {
     const root = await temporaryDirectory();
-    const previous = await plugin(join(root, "previous"), "1.2.3");
-    const next = await plugin(join(root, "next"), "1.2.4");
+    const previous = await plugin(join(root, "previous"), "0.1.48");
+    await writeFile(
+      join(previous, "scripts", "workbench_scan_usage.py"),
+      "LEGACY_SCAN_USAGE_READER = True\n",
+    );
     const home = join(root, "home");
     await mkdir(home, { mode: 0o700 });
     await writeFile(
@@ -1769,12 +1772,81 @@ describe("plugin runtime preparation", () => {
     const credentials = await readFile(join(home, "auth.json"), "utf8");
 
     const options = { codexCommand: command, environment };
-    expect((await bootstrapPlugin(home, previous, options)).version).toBe(
-      "1.2.3",
-    );
-    const upgraded = await bootstrapPlugin(home, next, options);
+    const installedPrevious = await bootstrapPlugin(home, previous, options);
+    expect(installedPrevious.version).toBe("0.1.48");
+    expect(
+      await readFile(
+        join(
+          installedPrevious.installedRoot,
+          "scripts",
+          "workbench_scan_usage.py",
+        ),
+        "utf8",
+      ),
+    ).toContain("LEGACY_SCAN_USAGE_READER");
+    const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
 
-    expect(upgraded.version).toBe("1.2.4");
+    expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
+    expect(upgraded.installedRoot).toEndWith(
+      join("codex-security", BUNDLED_PLUGIN_VERSION),
+    );
+    const rollout = join(root, "rollout.jsonl");
+    const sample = (input: number, output: number) =>
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: "2026-07-26T12:02:00Z",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: input,
+              output_tokens: output,
+              total_tokens: input + output,
+            },
+          },
+        },
+      });
+    await writeFile(
+      rollout,
+      [
+        JSON.stringify({
+          type: "session_meta",
+          payload: { id: "scan-thread" },
+        }),
+        sample(1_000, 1_000),
+        sample(1_500, 500),
+        sample(1_500, 500),
+        "",
+      ].join("\n"),
+    );
+    const python = await resolvePluginPython({ environment });
+    const persisted = spawnSync(
+      python,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import json, sys",
+          "from datetime import datetime, timezone",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "import workbench_scan_usage as usage",
+          "session = usage.RolloutSession('scan-thread', None, Path(sys.argv[2]))",
+          "measured, warnings = usage._read_rollout_usage(session, started_at=datetime(2026, 7, 26, tzinfo=timezone.utc), completed_at=None)",
+          "print(json.dumps({'usage': measured, 'warnings': sorted(warnings)}))",
+        ].join("\n"),
+        join(upgraded.installedRoot, "scripts"),
+        rollout,
+      ],
+      { encoding: "utf8", env: environment, windowsHide: true },
+    );
+    expect(persisted.status, persisted.stderr).toBe(0);
+    expect(JSON.parse(persisted.stdout)).toMatchObject({
+      usage: { inputTokens: 1_500, outputTokens: 1_500, totalTokens: 3_000 },
+      warnings: [],
+    });
+
     expect(await readFile(join(home, "auth.json"), "utf8")).toBe(credentials);
     expect(
       spawnSync(command.command, ["login", "status"], {
