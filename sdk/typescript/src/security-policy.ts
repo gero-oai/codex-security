@@ -1289,7 +1289,7 @@ export async function applySecurityPolicy(
       previousContent: draft.content,
       inheritedPolicySha256: draft.inheritedPolicySha256,
     });
-    if (recoveryPath !== null && process.platform === "win32") {
+    if (recoveryPath !== null) {
       if (
         ((await stat(recoveryPath)).mode & 0o777) !==
         ((await stat(target.targetPath)).mode & 0o777)
@@ -1298,12 +1298,13 @@ export async function applySecurityPolicy(
           "SECURITY.md permissions changed while the replacement was being installed.",
         );
       }
-      await copyWindowsSecurityDescriptor(
-        recoveryPath,
-        target.targetPath,
-        undefined,
-        true,
-      );
+      if (process.platform === "win32")
+        await copyWindowsSecurityDescriptor(
+          recoveryPath,
+          target.targetPath,
+          undefined,
+          true,
+        );
     }
     return {
       status: alreadyApplied ? "unchanged" : "written",
@@ -1486,6 +1487,14 @@ async function copyWindowsSecurityDescriptor(
         [
           "$ErrorActionPreference = 'Stop'",
           `$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${sourceVariable} -Audit`,
+          "$identityType = [System.Security.Principal.SecurityIdentifier]",
+          [
+            "$auditRules = { param($descriptor)",
+            "$rules = @($descriptor.GetAuditRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Microsoft.PowerShell.Core\\ForEach-Object { '{0}:{1}:{2}:{3}:{4}:{5}' -f $_.IdentityReference.Value, [int]$_.FileSystemRights, [int]$_.AuditFlags, [int]$_.InheritanceFlags, [int]$_.PropagationFlags, [int]$_.IsInherited } | Microsoft.PowerShell.Utility\\Sort-Object);",
+            "[string]::Join([System.Environment]::NewLine, [string[]]$rules)",
+            "}",
+          ].join(" "),
+          "$sourceAuditRules = & $auditRules $acl",
           `Microsoft.PowerShell.Utility\\Add-Type -Name PolicyIntegrity -Namespace CodexSecurity -MemberDefinition '${integrityMethods}'`,
           "$descriptor = [System.IntPtr]::Zero",
           `$status = [CodexSecurity.PolicyIntegrity]::GetNamedSecurityInfo($env:${sourceVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$descriptor)`,
@@ -1507,24 +1516,21 @@ async function copyWindowsSecurityDescriptor(
           ...(verifyOnly
             ? []
             : [
-                `Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl`,
+                `$staged = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
+                [
+                  "if ($acl.AreAuditRulesProtected -eq $staged.AreAuditRulesProtected -and $sourceAuditRules -eq (& $auditRules $staged)) {",
+                  "$sections = [System.Security.AccessControl.AccessControlSections]::Access;",
+                  "if ($acl.GetOwner($identityType).Value -ne $staged.GetOwner($identityType).Value) { $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Owner };",
+                  "if ($acl.GetGroup($identityType).Value -ne $staged.GetGroup($identityType).Value) { $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Group };",
+                  "$access = [System.Security.AccessControl.FileSecurity]::new();",
+                  "$access.SetSecurityDescriptorBinaryForm($acl.GetSecurityDescriptorBinaryForm(), $sections);",
+                  `[System.IO.FileInfo]::new($env:${destinationVariable}).SetAccessControl($access)`,
+                  `} else { Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl }`,
+                ].join(" "),
               ]),
           `$copied = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
-          ...(verifyOnly
-            ? []
-            : [
-                `if ($acl.AreAuditRulesProtected -ne $copied.AreAuditRulesProtected) { $copied.SetAuditRuleProtection($acl.AreAuditRulesProtected, $false); Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $copied; $copied = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit }`,
-              ]),
-          "$identityType = [System.Security.Principal.SecurityIdentifier]",
           "if ($acl.GetOwner($identityType).Value -ne $copied.GetOwner($identityType).Value -or $acl.GetGroup($identityType).Value -ne $copied.GetGroup($identityType).Value) { throw 'The copied Windows security descriptor owner or group differs.' }",
-          [
-            "$auditRules = { param($descriptor)",
-            "$rules = @($descriptor.GetAuditRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Microsoft.PowerShell.Core\\ForEach-Object { '{0}:{1}:{2}:{3}:{4}' -f $_.IdentityReference.Value, [int]$_.FileSystemRights, [int]$_.AuditFlags, [int]$_.InheritanceFlags, [int]$_.PropagationFlags } | Microsoft.PowerShell.Utility\\Sort-Object);",
-            "[string]::Join([System.Environment]::NewLine, [string[]]$rules)",
-            "}",
-          ].join(" "),
           "if ($acl.AreAuditRulesProtected -ne $copied.AreAuditRulesProtected) { throw 'The copied Windows audit inheritance settings differ.' }",
-          "$sourceAuditRules = & $auditRules $acl",
           "$destinationAuditRules = & $auditRules $copied",
           "if ($sourceAuditRules -ne $destinationAuditRules) { throw 'The copied Windows audit rules differ.' }",
           [

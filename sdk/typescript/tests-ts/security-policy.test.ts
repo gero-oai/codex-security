@@ -1719,6 +1719,82 @@ describe("security policy review and application", () => {
   );
 
   test.skipIf(process.platform !== "win32")(
+    "preserves inherited Windows audit rules while applying an existing policy",
+    async () => {
+      const name =
+        "preserves inherited Windows audit rules while applying an existing policy";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      await writeFile(target, "# Existing policy\n");
+      const systemDirectory = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+      );
+      const powershell = join(
+        systemDirectory,
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+      const environment = {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([key]) => key.toUpperCase() !== "PSMODULEPATH",
+          ),
+        ),
+        CODEX_SECURITY_TEST_ACL_DIRECTORY: f.repository,
+        CODEX_SECURITY_TEST_ACL_PATH: target,
+        PSModulePath: join(
+          systemDirectory,
+          "WindowsPowerShell",
+          "v1.0",
+          "Modules",
+        ),
+      };
+      execFileSync(
+        powershell,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          [
+            "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()",
+            "$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_DIRECTORY -Audit",
+            "$rule = [System.Security.AccessControl.FileSystemAuditRule]::new($identity.User, 'Read', 'ContainerInherit, ObjectInherit', 'None', 'Success')",
+            "$acl.AddAuditRule($rule)",
+            "Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_DIRECTORY -AclObject $acl",
+          ].join("; "),
+        ],
+        { env: environment, windowsHide: true },
+      );
+      const audit = () =>
+        execFileSync(
+          powershell,
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            [
+              "$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -Audit",
+              "$rules = @($acl.GetAuditRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Microsoft.PowerShell.Core\\ForEach-Object { '{0}:{1}:{2}:{3}:{4}:{5}' -f $_.IdentityReference.Value, [int]$_.FileSystemRights, [int]$_.AuditFlags, [int]$_.InheritanceFlags, [int]$_.PropagationFlags, [int]$_.IsInherited } | Microsoft.PowerShell.Utility\\Sort-Object)",
+              "[string]::Join([System.Environment]::NewLine, [string[]]$rules)",
+            ].join("; "),
+          ],
+          { encoding: "utf8", env: environment, windowsHide: true },
+        ).trim();
+      const before = audit();
+      expect(before).toMatch(/:1(?:\r?\n|$)/u);
+      const draft = await f.generate();
+      await applySecurityPolicy(draft);
+      expect(await readFile(target, "utf8")).toBe(POLICY);
+      expect(audit()).toBe(before);
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
     "removes an inherited Windows integrity label when the existing policy has none",
     async () => {
       const name =
@@ -1871,6 +1947,55 @@ describe("security policy review and application", () => {
         mock.module("node:fs/promises", () => ({
           ...fsPromises,
           rename: originalRename,
+        }));
+      }
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "retains a recovery file when its permissions change during installation",
+    async () => {
+      const name =
+        "retains a recovery file when its permissions change during installation";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      const previous = "# Existing policy\n";
+      await writeFile(target, previous, { mode: 0o644 });
+      await chmod(target, 0o644);
+      const draft = await f.generate();
+      const writer = await open(target, "r+");
+      const originalLink = fsPromises.link;
+      let changedPermissions = false;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        link: async (...args: Parameters<typeof originalLink>) => {
+          await originalLink(...args);
+          if (args[1] === target && String(args[0]).endsWith(".tmp")) {
+            await writer.chmod(0o600);
+            changedPermissions = true;
+          }
+        },
+      }));
+      try {
+        const error = await applySecurityPolicy(draft).catch(
+          (value: unknown) => value,
+        );
+        expect(error).toBeInstanceOf(SecurityPolicyVerificationError);
+        const recovery = (error as SecurityPolicyVerificationError)
+          .recoveryPath;
+        expect(recovery).toBeDefined();
+        expect(changedPermissions).toBe(true);
+        expect(await readFile(target, "utf8")).toBe(POLICY);
+        expect(await readFile(recovery!, "utf8")).toBe(previous);
+        expect((await stat(target)).mode & 0o777).toBe(0o644);
+        expect((await stat(recovery!)).mode & 0o777).toBe(0o600);
+        expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
+      } finally {
+        await writer.close();
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          link: originalLink,
         }));
       }
     },
