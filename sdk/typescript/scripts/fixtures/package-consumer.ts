@@ -68,7 +68,7 @@ const comparisonInput: ScanComparisonInput = {
 const comparisonOptions: ScanComparisonOptions = {
   environment: { CODEX_SECURITY_STATE_DIR: "." },
   model: "synthetic-model",
-  reasoningEffort: "medium",
+  reasoningEffort: "max",
   signal: new AbortController().signal,
   workingDirectory: ".",
   onProgress: ({ phase }) => {

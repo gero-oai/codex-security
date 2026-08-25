@@ -133,7 +133,7 @@ export interface ReadOnlyCodexOptions {
   codex?: ReadOnlyCodex;
   environment?: NodeJS.ProcessEnv;
   model?: string;
-  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   signal?: AbortSignal;
   workingDirectory?: string;
 }
@@ -552,7 +552,7 @@ async function startReadOnlyCodexThread(
     });
   return codex.startThread({
     ...(model === undefined ? {} : { model }),
-    modelReasoningEffort: reasoningEffort,
+    modelReasoningEffort: reasoningEffort as ModelReasoningEffort,
     sandboxMode: "read-only",
     approvalPolicy: "never",
     networkAccessEnabled: false,
