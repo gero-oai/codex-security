@@ -120,6 +120,7 @@ import {
   matchScanFindingsInternal,
   type matchScanFindings,
   type ScanComparisonInput,
+  type ScanComparisonResult,
 } from "./scan-comparison.js";
 import { scanActivitiesFromEvent } from "./scan-activity.js";
 import { readScanLogs } from "./scan-logs.js";
@@ -896,6 +897,7 @@ interface MatchingBatch {
   afterScanId: string;
   afterFindings: ScanComparisonInput["after"];
   beforeScans: { scanId: string; findings: ScanComparisonInput["before"] }[];
+  knownFindingGroups?: ScanComparisonInput["knownFindingGroups"];
 }
 
 type MatchingPlan = JsonObject & {
@@ -1496,10 +1498,9 @@ export async function main(
             "--matches-json-stdin",
           ],
           JSON.stringify(
-            await dependencies.matchFindings({
-              before: input.before,
-              after: input.after,
-            }),
+            await dependencies.matchFindings(
+              force ? { ...input, knownFindingGroups: [] } : input,
+            ),
           ),
         );
       },
@@ -4071,13 +4072,24 @@ async function matchAllScans(
 
   let matchedPairs = 0;
   let findingMatches = 0;
-  for (const { afterScanId, afterFindings, beforeScans } of batches) {
+  for (const {
+    afterScanId,
+    afterFindings,
+    beforeScans,
+    knownFindingGroups,
+  } of batches) {
     const before = beforeScans.flatMap(({ findings }) => findings);
-    const matching =
+    const matching: ScanComparisonResult =
       before.length === 0 || afterFindings.length === 0
         ? { matches: [], uncertain: [] }
         : await dependencies.matchFindings(
-            { before, after: afterFindings },
+            {
+              before,
+              after: afterFindings,
+              ...(knownFindingGroups === undefined
+                ? {}
+                : { knownFindingGroups }),
+            },
             { allowHistoricalUncertainty: true },
           );
     const comparisons = beforeScans.map(({ scanId, findings }) => {
@@ -4095,6 +4107,9 @@ async function matchAllScans(
       const uncertain = matching.uncertain.filter(({ beforeOccurrenceId }) =>
         beforeIds.has(beforeOccurrenceId),
       );
+      const related = matching.related?.filter(({ beforeOccurrenceId }) =>
+        beforeIds.has(beforeOccurrenceId),
+      );
       const matchedAfter = new Set(
         matches.flatMap(({ afterOccurrenceIds }) => afterOccurrenceIds),
       );
@@ -4107,9 +4122,14 @@ async function matchAllScans(
           "Scan matching returned conflicting confirmed and uncertain findings.",
         );
       }
-      return { scanId, matches, uncertain };
+      return {
+        scanId,
+        matches,
+        uncertain,
+        ...(related === undefined ? {} : { related }),
+      };
     });
-    for (const { scanId, matches, uncertain } of comparisons) {
+    for (const { scanId, matches, uncertain, related } of comparisons) {
       await dependencies.runWorkbench(
         [
           "save-scan-comparison",
@@ -4119,7 +4139,11 @@ async function matchAllScans(
           afterScanId,
           "--matches-json-stdin",
         ],
-        JSON.stringify({ matches, uncertain }),
+        JSON.stringify({
+          matches,
+          uncertain,
+          ...(related === undefined ? {} : { related }),
+        }),
       );
       matchedPairs += 1;
       findingMatches += matches.reduce(

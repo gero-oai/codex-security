@@ -447,7 +447,11 @@ describe("CLI workbench", () => {
                 : { summary: { persisting: 1 } };
             },
             onMatch: async (input) => {
-              expect(input).toEqual({ before, after });
+              expect(input).toEqual({
+                before,
+                after,
+                knownFindingGroups: [["known-a", "known-b"]],
+              });
               return matching;
             },
           }),
@@ -638,6 +642,58 @@ describe("CLI workbench", () => {
       matchedPairs: 3,
       skippedPairs: 1,
       findingMatches: 4,
+    });
+  });
+
+  test("preserves confirmed groups and related pairs while matching all scans", async () => {
+    const before = [{ occurrenceId: "before", findingId: "known-a" }];
+    const after = [{ occurrenceId: "after", findingId: "other" }];
+    const knownFindingGroups = [["known-a", "known-b"]];
+    const related = {
+      beforeOccurrenceId: "before",
+      afterOccurrenceId: "after",
+      reason: "Separate controls share a nearby trust boundary.",
+    };
+    let saved: string | undefined;
+
+    expect(
+      await main(
+        ["scans", "match", "--all", "--json"],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          onWorkbench: (args, input): JsonObject => {
+            if (args[0] === "save-scan-comparison") saved = input;
+            return args[0] === "list-unmatched-scan-pairs"
+              ? {
+                  repository: "/current/repository",
+                  scanCount: 2,
+                  unavailableScans: 0,
+                  skippedPairs: 0,
+                  batches: [
+                    {
+                      afterScanId: "later-scan",
+                      afterFindings: after,
+                      beforeScans: [
+                        { scanId: "earlier-scan", findings: before },
+                      ],
+                      knownFindingGroups,
+                    },
+                  ],
+                }
+              : {};
+          },
+          onMatch: async (input) => {
+            expect(input).toEqual({ before, after, knownFindingGroups });
+            return { matches: [], uncertain: [], related: [related] };
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(JSON.parse(saved!)).toEqual({
+      matches: [],
+      uncertain: [],
+      related: [related],
     });
   });
 
