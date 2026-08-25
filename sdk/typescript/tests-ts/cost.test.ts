@@ -2347,6 +2347,76 @@ describe("live scan cost tracking", () => {
     expect(costs).toEqual([0.01333, 0.02002]);
   });
 
+  test.each([
+    [
+      "cached input",
+      { input_tokens: 100, cached_input_tokens: 100, output_tokens: 100 },
+      { input_tokens: 101, cached_input_tokens: 99, output_tokens: 99 },
+      { input_tokens: 101, cached_input_tokens: 101, output_tokens: 199 },
+      0.0015,
+    ],
+    [
+      "cache writes",
+      { input_tokens: 100, cache_write_input_tokens: 100, output_tokens: 100 },
+      { input_tokens: 101, cache_write_input_tokens: 99, output_tokens: 99 },
+      { input_tokens: 101, cache_write_input_tokens: 101, output_tokens: 199 },
+      0.0016,
+    ],
+    [
+      "premium cache-write allocation",
+      {
+        input_tokens: 100,
+        cached_input_tokens: 90,
+        cache_write_input_tokens: 10,
+        output_tokens: 100,
+        reasoning_output_tokens: 100,
+      },
+      {
+        input_tokens: 101,
+        cached_input_tokens: 91,
+        cache_write_input_tokens: 9,
+        output_tokens: 99,
+        reasoning_output_tokens: 99,
+      },
+      {
+        input_tokens: 101,
+        cached_input_tokens: 90,
+        cache_write_input_tokens: 11,
+        output_tokens: 199,
+        reasoning_output_tokens: 199,
+      },
+      0.0015,
+    ],
+    [
+      "reasoning output",
+      { input_tokens: 100, output_tokens: 100, reasoning_output_tokens: 100 },
+      { input_tokens: 99, output_tokens: 101, reasoning_output_tokens: 99 },
+      { input_tokens: 199, output_tokens: 101, reasoning_output_tokens: 101 },
+      0.0015,
+    ],
+  ] as const)(
+    "preserves %s invariants without accepting a stale scan budget",
+    async (_description, initial, next, expected, budget) => {
+      const home = await codexHome();
+      const root = await writeSession(home, "scan-thread", initial);
+      const costs: number[] = [];
+      const tracker = new ScanCostTracker({
+        codexHome: home,
+        model: "gpt-5.6-terra",
+        maxCostUsd: budget,
+        onCost: (cost) => costs.push(cost.estimatedUsd),
+      });
+      tracker.start("scan-thread");
+      expect((await tracker.refresh()).cost?.estimatedUsd).toBeLessThan(budget);
+      await appendFile(root, `${JSON.stringify(accountingEvent(next))}\n`);
+
+      const completed = await tracker.stop(initial);
+      expect(completed.usage).toMatchObject(expected);
+      expect(completed.cost?.estimatedUsd).toBeGreaterThan(budget);
+      expect(costs.at(-1)).toBe(completed.cost?.estimatedUsd);
+    },
+  );
+
   test("keeps live and persisted usage aligned across counter resets", async () => {
     if (
       runMockInSubprocess(
@@ -2370,6 +2440,7 @@ describe("live scan cost tracking", () => {
       "from unittest.mock import patch",
       "sys.path.insert(0, sys.argv[1])",
       "import workbench_scan_usage as usage",
+      "from workbench_validation import parse_scan_cost",
       "case = json.loads(sys.argv[2])",
       "inherited = case.get('inherited')",
       "fork = case['fork']",
@@ -2396,6 +2467,7 @@ describe("live scan cost tracking", () => {
       "session = usage.RolloutSession(thread, parent, Path('fixture-rollout'))",
       "with patch.object(Path, 'open', return_value=io.BytesIO(b'{}\\n' * len(events))), patch.object(usage.json, 'loads', side_effect=events):",
       "    measured, warnings = usage._read_rollout_usage(session, started_at=datetime(2026, 7, 26, 12, tzinfo=timezone.utc), completed_at=None)",
+      "parse_scan_cost(usage.measured_scan_cost_json({'coverage': 'complete', 'source': 'codex_rollout', 'threadCount': 1, **measured}))",
       "print(json.dumps({'usage': measured, 'warnings': sorted(warnings)}))",
     ].join("\n");
     const inheritedReset = {
@@ -2414,6 +2486,60 @@ describe("live scan cost tracking", () => {
       copiedHistory?: boolean;
       limit?: number;
     }> = [
+      {
+        samples: [
+          { input_tokens: 100, cached_input_tokens: 100, output_tokens: 100 },
+          { input_tokens: 101, cached_input_tokens: 99, output_tokens: 99 },
+        ],
+        expected: {
+          input_tokens: 101,
+          cached_input_tokens: 101,
+          output_tokens: 199,
+        },
+        limit: 0.0015,
+      },
+      {
+        samples: [
+          {
+            input_tokens: 100,
+            cached_input_tokens: 90,
+            cache_write_input_tokens: 10,
+            output_tokens: 100,
+            reasoning_output_tokens: 100,
+          },
+          {
+            input_tokens: 101,
+            cached_input_tokens: 91,
+            cache_write_input_tokens: 9,
+            output_tokens: 99,
+            reasoning_output_tokens: 99,
+          },
+        ],
+        expected: {
+          input_tokens: 101,
+          cached_input_tokens: 90,
+          cache_write_input_tokens: 11,
+          output_tokens: 199,
+          reasoning_output_tokens: 199,
+        },
+        limit: 0.0015,
+      },
+      {
+        samples: [
+          {
+            input_tokens: 100,
+            output_tokens: 100,
+            reasoning_output_tokens: 100,
+          },
+          { input_tokens: 99, output_tokens: 101, reasoning_output_tokens: 99 },
+        ],
+        expected: {
+          input_tokens: 199,
+          output_tokens: 101,
+          reasoning_output_tokens: 101,
+        },
+        limit: 0.0015,
+      },
       {
         samples: [
           {
@@ -3310,7 +3436,7 @@ describe("live scan cost tracking", () => {
         samples: equalPrice,
         expected: {
           input_tokens: 101,
-          cache_write_input_tokens: 20,
+          cache_write_input_tokens: 1,
           output_tokens: 1,
         },
       },
@@ -3319,7 +3445,7 @@ describe("live scan cost tracking", () => {
         samples: equalPrice,
         expected: {
           input_tokens: 101,
-          cache_write_input_tokens: 20,
+          cache_write_input_tokens: 1,
           output_tokens: 1,
         },
       },
@@ -3374,7 +3500,7 @@ describe("live scan cost tracking", () => {
         expected: {
           input_tokens: Number.MAX_SAFE_INTEGER - 1,
           cached_input_tokens: Number.MAX_SAFE_INTEGER - 2,
-          output_tokens: 1,
+          output_tokens: 2,
         },
       },
     ];
@@ -3647,11 +3773,19 @@ describe("live scan cost tracking", () => {
       cached_input_tokens: 800,
       output_tokens: 0,
     };
-    for (const [middle, latest, expectedInput] of [
+    for (const [
+      middle,
+      latest,
+      expectedInput,
+      expectedCached,
+      invalidSnapshot,
+    ] of [
       [
         accountingEvent(null),
         { input_tokens: 120, cached_input_tokens: 80, output_tokens: 0 },
         120,
+        80,
+        true,
       ],
       [
         accountingEvent({
@@ -3660,7 +3794,9 @@ describe("live scan cost tracking", () => {
           output_tokens: 0,
         }),
         { input_tokens: 160, cached_input_tokens: 50, output_tokens: 0 },
-        150,
+        160,
+        90,
+        false,
       ],
     ] as const) {
       for (const [scope, maxCostUsd] of [
@@ -3715,7 +3851,7 @@ describe("live scan cost tracking", () => {
             ? authoritative
             : {
                 input_tokens: expectedInput + rootUsage.input_tokens,
-                cached_input_tokens: 80,
+                cached_input_tokens: expectedCached,
                 output_tokens: rootUsage.output_tokens,
               };
         const expectedCost = estimateScanCost("gpt-5.6-terra", expected);
@@ -3729,7 +3865,11 @@ describe("live scan cost tracking", () => {
           },
           async (tracker) => {
             const final = tracker.stop(authoritative);
-            if (scope === "worker" && maxCostUsd !== undefined) {
+            if (
+              scope === "worker" &&
+              maxCostUsd !== undefined &&
+              invalidSnapshot
+            ) {
               await expect(final).rejects.toThrow(
                 "model pricing or token usage is unavailable",
               );
@@ -4709,6 +4849,31 @@ describe("live scan cost tracking", () => {
       "session-id",
     ],
     ["legacy unrelated session metadata", "unrelated", false, "session-id"],
+    [
+      "deleted delegated worker rollout",
+      "missing-file-delegated",
+      true,
+      "missing",
+    ],
+    [
+      "deleted independent Deep Scan worker rollout",
+      "missing-file-independent",
+      true,
+      "missing",
+    ],
+    [
+      "unobserved delegated worker rollout",
+      "unobserved-delegated",
+      true,
+      "unobserved",
+    ],
+    [
+      "unobserved independent Deep Scan worker rollout",
+      "unobserved-independent",
+      true,
+      "unobserved",
+    ],
+    ["complete root-only scan", "root-only", false, "missing"],
     ["incomplete ownership graph", "missing-worker", true, "partial"],
     ["missing scan root", "missing-root", true, "partial"],
     ["missing Codex state database", "missing-database", true, "partial"],
@@ -4721,14 +4886,16 @@ describe("live scan cost tracking", () => {
       await mkdir(stateDirectory);
       const rootUsage = { input_tokens: 100, output_tokens: 10 };
       const root = await writeSession(home, "scan-thread", rootUsage);
-      const incomplete = join(
-        home,
-        "sessions",
-        "2026",
-        "07",
-        "26",
-        "rollout-unrelated-incomplete.jsonl",
-      );
+      const incomplete = relationship.startsWith("unobserved-")
+        ? join(home, "unobserved-owned-worker.jsonl")
+        : join(
+            home,
+            "sessions",
+            "2026",
+            "07",
+            "26",
+            "rollout-unrelated-incomplete.jsonl",
+          );
       const workerUsage = JSON.stringify({
         type: "event_msg",
         payload: {
@@ -4745,16 +4912,19 @@ describe("live scan cost tracking", () => {
             ? '{"type":"session_meta","payload":\n'
             : contents === "usage"
               ? `${workerUsage}\n`
-              : contents === "session-id"
+              : contents === "session-id" || contents === "unobserved"
                 ? `${JSON.stringify({
                     type: "session_meta",
                     payload: {
-                      session_id: "pending-thread",
-                      ...(relationship === "delegated"
+                      ...(contents === "session-id"
+                        ? { session_id: "pending-thread" }
+                        : { id: "pending-thread" }),
+                      ...(relationship === "delegated" ||
+                      relationship === "unobserved-delegated"
                         ? { parent_thread_id: "scan-thread" }
                         : {}),
                     },
-                  })}\n${workerUsage}\n`
+                  })}\n${workerUsage}\n${taskEvent("task_complete")}\n`
                 : '{"type":"session_meta","payload":{"id":"unrelated-thread"';
       await writeFile(incomplete, unidentifiedContents);
       const { resolvePluginPython, resolveScanSessionPaths } = await import(
@@ -4778,7 +4948,7 @@ describe("live scan cost tracking", () => {
             "workbench.execute('CREATE TABLE deep_scan_workers (scan_id TEXT NOT NULL, sdk_thread_id TEXT)')",
             "workbench.execute('INSERT INTO scans VALUES (?, ?, ?)', ('fixture-scan', 'fixture-workspace', 'deep'))",
             "workbench.execute('INSERT INTO workspaces VALUES (?, ?)', ('fixture-workspace', 'scan-thread'))",
-            "if relationship == 'independent':",
+            "if relationship in ('independent', 'missing-file-independent', 'unobserved-independent'):",
             "    workbench.execute('INSERT INTO deep_scan_workers VALUES (?, ?)', ('fixture-scan', 'pending-thread'))",
             "workbench.commit()",
             "workbench.close()",
@@ -4788,9 +4958,9 @@ describe("live scan cost tracking", () => {
             "state.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL)')",
             "if relationship != 'missing-root':",
             "    state.execute('INSERT INTO threads VALUES (?, ?)', ('scan-thread', root))",
-            "if relationship != 'missing-worker':",
+            "if relationship not in ('missing-worker', 'root-only'):",
             "    state.execute('INSERT INTO threads VALUES (?, ?)', ('pending-thread', incomplete))",
-            "if relationship in ('delegated', 'missing-worker'):",
+            "if relationship in ('delegated', 'missing-worker', 'missing-file-delegated', 'unobserved-delegated'):",
             "    state.execute('INSERT INTO thread_spawn_edges VALUES (?, ?)', ('scan-thread', 'pending-thread'))",
             "state.commit()",
             "state.close()",
@@ -4800,6 +4970,9 @@ describe("live scan cost tracking", () => {
         { encoding: "utf8" },
       );
       expect(fixture.status, fixture.stderr).toBe(0);
+      if (contents === "missing") {
+        await rm(incomplete);
+      }
       if (relationship === "missing-database") {
         await rm(join(home, "state_7.sqlite"));
       }
@@ -5013,9 +5186,7 @@ describe("live scan cost tracking", () => {
           estimatedUsd: 0.00032,
         },
       });
-      expect(ownershipChecks).toBe(
-        scenario === "empty" && maxCostUsd !== undefined ? 1 : 0,
-      );
+      expect(ownershipChecks).toBe(maxCostUsd === undefined ? 0 : 1);
     },
   );
 

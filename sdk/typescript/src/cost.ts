@@ -105,6 +105,7 @@ interface ObservedSessionUsage {
   unverified: boolean;
   unfinishedWorkers: boolean;
   unidentifiedSessions: Set<string>;
+  accountedSessions: Set<string>;
 }
 
 const MODEL_PRICING_NANODOLLARS: Readonly<Record<string, ModelPricing>> = {
@@ -164,6 +165,7 @@ export class ScanCostTracker {
     unverified: false,
     unfinishedWorkers: false,
     unidentifiedSessions: new Set(),
+    accountedSessions: new Set(),
   };
   #lastCost: number | null = null;
   #rootOnlyReadError = false;
@@ -291,17 +293,19 @@ export class ScanCostTracker {
       }
     }
     let unidentifiedOwnedSession = false;
-    if (
-      this.#options.maxCostUsd !== undefined &&
-      observed.unidentifiedSessions.size > 0
-    ) {
+    if (finalizing && this.#options.maxCostUsd !== undefined) {
       const resolveOwnedSessionPaths = this.#options.resolveOwnedSessionPaths;
       if (resolveOwnedSessionPaths === undefined || this.#threadId === null) {
-        unidentifiedOwnedSession = true;
+        unidentifiedOwnedSession = observed.unidentifiedSessions.size > 0;
       } else {
         const ownedPaths = await resolveOwnedSessionPaths(this.#threadId);
-        for (const path of observed.unidentifiedSessions) {
-          if (ownedPaths.has(await realpath(path))) {
+        const accountedPaths = new Set(
+          await Promise.all(
+            [...observed.accountedSessions].map(async (path) => realpath(path)),
+          ),
+        );
+        for (const path of ownedPaths) {
+          if (!accountedPaths.has(path)) {
             unidentifiedOwnedSession = true;
             break;
           }
@@ -507,6 +511,7 @@ export class ScanCostTracker {
       unverified: hasUnverifiedWorkerAttribution,
       unfinishedWorkers: false,
       unidentifiedSessions: new Set(),
+      accountedSessions: new Set(),
     };
     for (const [path, session] of this.#sessions) {
       if (
@@ -517,6 +522,7 @@ export class ScanCostTracker {
         observed.unidentifiedSessions.add(path);
       }
       if (session.threadId !== null && included.has(session.threadId)) {
+        if (presentSessions.has(path)) observed.accountedSessions.add(path);
         await this.#reportSessionEvents(path, session);
         if (
           this.#options.maxCostUsd !== undefined &&
@@ -1268,21 +1274,40 @@ function accumulateTokenUsage(
   ) {
     return accumulated ?? tokenUsage({ input_tokens: 0, output_tokens: 0 });
   }
-  const addDelta = (
-    field: Exclude<keyof ScanTokenUsage, "total_tokens">,
-  ): number | null => {
+  type TokenField = Exclude<keyof ScanTokenUsage, "total_tokens">;
+  const fieldDelta = (field: TokenField): bigint => {
     const previous = BigInt(previousRaw?.[field] ?? 0);
     const value = BigInt(next[field]);
-    const delta = reset || value < previous ? value : value - previous;
+    return reset || value < previous ? value : value - previous;
+  };
+  const inputDelta = fieldDelta("input_tokens");
+  const outputDelta = fieldDelta("output_tokens");
+  const cacheWriteRaw = fieldDelta("cache_write_input_tokens");
+  const cacheWriteDelta =
+    cacheWriteRaw > inputDelta ? inputDelta : cacheWriteRaw;
+  const remainingInputDelta = inputDelta - cacheWriteDelta;
+  const cachedRaw = fieldDelta("cached_input_tokens");
+  const cachedDelta =
+    cachedRaw > remainingInputDelta ? remainingInputDelta : cachedRaw;
+  const reasoningRaw = fieldDelta("reasoning_output_tokens");
+  const reasoningDelta =
+    reasoningRaw > outputDelta ? outputDelta : reasoningRaw;
+  const addDelta = (field: TokenField, delta: bigint): number | null => {
     const total = BigInt(accumulated?.[field] ?? 0) + delta;
     return total <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(total) : null;
   };
   const usage = {
-    input_tokens: addDelta("input_tokens"),
-    cached_input_tokens: addDelta("cached_input_tokens"),
-    cache_write_input_tokens: addDelta("cache_write_input_tokens"),
-    output_tokens: addDelta("output_tokens"),
-    reasoning_output_tokens: addDelta("reasoning_output_tokens"),
+    input_tokens: addDelta("input_tokens", inputDelta),
+    cached_input_tokens: addDelta("cached_input_tokens", cachedDelta),
+    cache_write_input_tokens: addDelta(
+      "cache_write_input_tokens",
+      cacheWriteDelta,
+    ),
+    output_tokens: addDelta("output_tokens", outputDelta),
+    reasoning_output_tokens: addDelta(
+      "reasoning_output_tokens",
+      reasoningDelta,
+    ),
   };
   return Object.values(usage).some((value) => value === null)
     ? null

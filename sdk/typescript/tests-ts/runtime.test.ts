@@ -1743,7 +1743,7 @@ describe("plugin runtime preparation", () => {
 
   test("upgrades the prior bundled plugin through the real Codex cache", async () => {
     const root = await temporaryDirectory();
-    const previous = await plugin(join(root, "previous"), "0.1.48");
+    const previous = await plugin(join(root, "previous"), "0.1.52");
     await writeFile(
       join(previous, "scripts", "workbench_scan_usage.py"),
       "LEGACY_SCAN_USAGE_READER = True\n",
@@ -1773,7 +1773,7 @@ describe("plugin runtime preparation", () => {
 
     const options = { codexCommand: command, environment };
     const installedPrevious = await bootstrapPlugin(home, previous, options);
-    expect(installedPrevious.version).toBe("0.1.48");
+    expect(installedPrevious.version).toBe("0.1.52");
     expect(
       await readFile(
         join(
@@ -1791,7 +1791,7 @@ describe("plugin runtime preparation", () => {
       join("codex-security", BUNDLED_PLUGIN_VERSION),
     );
     const rollout = join(root, "rollout.jsonl");
-    const sample = (input: number, output: number) =>
+    const sample = (input: number, cached: number, output: number) =>
       JSON.stringify({
         type: "event_msg",
         timestamp: "2026-07-26T12:02:00Z",
@@ -1800,6 +1800,7 @@ describe("plugin runtime preparation", () => {
           info: {
             total_token_usage: {
               input_tokens: input,
+              cached_input_tokens: cached,
               output_tokens: output,
               total_tokens: input + output,
             },
@@ -1813,9 +1814,9 @@ describe("plugin runtime preparation", () => {
           type: "session_meta",
           payload: { id: "scan-thread" },
         }),
-        sample(1_000, 1_000),
-        sample(1_500, 500),
-        sample(1_500, 500),
+        sample(100, 100, 100),
+        sample(101, 99, 99),
+        sample(101, 99, 99),
         "",
       ].join("\n"),
     );
@@ -1832,8 +1833,10 @@ describe("plugin runtime preparation", () => {
           "from pathlib import Path",
           "sys.path.insert(0, sys.argv[1])",
           "import workbench_scan_usage as usage",
+          "from workbench_validation import parse_scan_cost",
           "session = usage.RolloutSession('scan-thread', None, Path(sys.argv[2]))",
           "measured, warnings = usage._read_rollout_usage(session, started_at=datetime(2026, 7, 26, tzinfo=timezone.utc), completed_at=None)",
+          "parse_scan_cost(usage.measured_scan_cost_json({'coverage': 'complete', 'source': 'codex_rollout', 'threadCount': 1, **measured}))",
           "print(json.dumps({'usage': measured, 'warnings': sorted(warnings)}))",
         ].join("\n"),
         join(upgraded.installedRoot, "scripts"),
@@ -1843,7 +1846,12 @@ describe("plugin runtime preparation", () => {
     );
     expect(persisted.status, persisted.stderr).toBe(0);
     expect(JSON.parse(persisted.stdout)).toMatchObject({
-      usage: { inputTokens: 1_500, outputTokens: 1_500, totalTokens: 3_000 },
+      usage: {
+        inputTokens: 101,
+        cachedInputTokens: 101,
+        outputTokens: 199,
+        totalTokens: 300,
+      },
       warnings: [],
     });
 

@@ -180,6 +180,7 @@ class TestClient extends TestClientBase {
     dependencies: Record<string, unknown>,
   ) {
     super(config, {
+      resolveScanSessionPaths: async () => new Set<string>(),
       runWorkbench: async (_options: unknown, args: readonly string[]) =>
         mockWorkbench(args),
       ...dependencies,
@@ -4045,6 +4046,82 @@ describe("CodexSecurity orchestration", () => {
         clearTimeout(keepAlive);
         await client.close();
       }
+    },
+  );
+
+  test.each([
+    ["explicitly budgeted", true],
+    ["optionally accounted", false],
+  ] as const)(
+    "requires every owned session only for an %s scan",
+    async (_description, enforceCostLimit) => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const codexHome = join(root, "codex-home");
+      const scanDir = join(root, "scan");
+      await Promise.all([
+        mkdir(repository),
+        mkdir(codexHome),
+        mkdir(scanDir, { mode: 0o700 }),
+      ]);
+      const commands: string[] = [];
+      let rootSession: string | null = null;
+      let ownershipChecks = 0;
+      const client = new TestClient(
+        {},
+        {
+          environment: {},
+          prepareRuntime: async () => preparedRuntime(codexHome),
+          resolvePluginPython: async () => "/managed/python",
+          resolveScanSessionPaths: async (
+            _options: unknown,
+            scanId: string,
+            threadId: string,
+          ) => {
+            ownershipChecks += 1;
+            expect(scanId).toBe("scan_example_001");
+            expect(threadId).toBe("thread-1");
+            return new Set([
+              rootSession!,
+              join(codexHome, "missing-owned-worker.jsonl"),
+            ]);
+          },
+          prepareOutputDir: async () => scanDir,
+          repositoryRevision: async () => "deadbeef",
+          runWorkbench: async (_options: unknown, args: readonly string[]) => {
+            commands.push(args[0]!);
+            return mockWorkbench(args);
+          },
+          createCodex: () => ({
+            startThread: () => ({
+              id: null,
+              async runStreamed() {
+                await copyCompletedScan(root);
+                rootSession = await writeUsageSession(codexHome, "thread-1", {
+                  input_tokens: 100,
+                  output_tokens: 10,
+                });
+                return { events: completedEvents() };
+              },
+            }),
+          }),
+        },
+      );
+
+      const scan = client.run(repository, {
+        ...(enforceCostLimit ? { maxCostUsd: 1 } : {}),
+      });
+      if (enforceCostLimit) {
+        await expect(scan).rejects.toThrow("cost limit could not be verified");
+        expect(ownershipChecks).toBe(2);
+        expect(commands).toContain("fail-scan");
+        expect(commands).not.toContain("complete-scan");
+      } else {
+        await expect(scan).resolves.toMatchObject({ threadId: "thread-1" });
+        expect(ownershipChecks).toBe(0);
+        expect(commands).toContain("complete-scan");
+      }
+      await client.close();
     },
   );
 

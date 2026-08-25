@@ -484,6 +484,16 @@ def _read_rollout_usage(
             delta["totalTokens"] = delta["inputTokens"] + delta["outputTokens"]
             if delta["totalTokens"] <= 0:
                 continue
+            delta["cacheWriteInputTokens"] = min(
+                delta["cacheWriteInputTokens"], delta["inputTokens"]
+            )
+            delta["cachedInputTokens"] = min(
+                delta["cachedInputTokens"],
+                delta["inputTokens"] - delta["cacheWriteInputTokens"],
+            )
+            delta["reasoningOutputTokens"] = min(
+                delta["reasoningOutputTokens"], delta["outputTokens"]
+            )
             _add_token_usage(total, delta)
 
     if not boundary_reached:

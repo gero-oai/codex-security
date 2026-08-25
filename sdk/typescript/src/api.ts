@@ -322,6 +322,7 @@ interface ClientDependencies {
     signal?: AbortSignal,
   ) => Promise<PreparedRuntime>;
   resolvePluginPython?: typeof resolvePluginPython;
+  resolveScanSessionPaths?: typeof resolveScanSessionPaths;
   prepareOutputDir?: typeof prepareOutputDir;
   repositoryRevision?: typeof repositoryRevision;
   resolveCodexCommand?: () => CodexCommand;
@@ -687,11 +688,10 @@ export class CodexSecurity {
                     "The scan session ownership could not be verified.",
                   );
                 }
-                return await resolveScanSessionPaths(
-                  scan.options,
-                  scan.id,
-                  threadId,
-                );
+                return await (
+                  this.#dependencies.resolveScanSessionPaths ??
+                  resolveScanSessionPaths
+                )(scan.options, scan.id, threadId);
               },
         onActivity:
           options.onActivity === undefined
