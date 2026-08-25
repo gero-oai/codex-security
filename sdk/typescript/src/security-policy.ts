@@ -1254,10 +1254,11 @@ export async function applySecurityPolicy(
               options.signal,
             );
           } else if (draft.previousContent !== null) {
-            await execFileAsync(
-              "/bin/cp",
-              ["-p", target.targetPath, temporary],
-              { encoding: "utf8", signal: options.signal },
+            await copyUnixPolicyFile(
+              target.targetPath,
+              temporary,
+              python,
+              options.signal,
             );
             await temporaryHandle.truncate(0);
           }
@@ -1759,14 +1760,17 @@ async function unixSecurityAccess(
   }
   if (process.platform === "linux") {
     const script = [
-      "import base64, errno, os, sys",
-      "try:",
-      "    value = os.getxattr(sys.argv[1], 'system.posix_acl_access', follow_symlinks=False)",
-      "except OSError as error:",
-      "    if error.errno not in {errno.ENODATA, errno.ENOTSUP, getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP)}:",
-      "        raise",
-      "    value = b''",
-      "sys.stdout.write(base64.b64encode(value).decode('ascii'))",
+      "import base64, errno, json, os, sys",
+      "values = []",
+      "for name in ('system.posix_acl_access', 'security.selinux'):",
+      "    try:",
+      "        value = os.getxattr(sys.argv[1], name, follow_symlinks=False)",
+      "    except OSError as error:",
+      "        if error.errno not in {errno.ENODATA, errno.ENOTSUP, getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP)}:",
+      "            raise",
+      "        value = None",
+      "    values.append(None if value is None else base64.b64encode(value).decode('ascii'))",
+      "sys.stdout.write(json.dumps(values, separators=(',', ':')))",
     ].join("\n");
     const { stdout } = await execFileAsync(python, ["-I", "-c", script, path], {
       encoding: "utf8",
@@ -1775,6 +1779,35 @@ async function unixSecurityAccess(
     return stdout;
   }
   return "";
+}
+
+async function copyUnixPolicyFile(
+  source: string,
+  destination: string,
+  python: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const arguments_ = ["-p"];
+  if (process.platform === "linux") {
+    const [sourceAccess, destinationAccess] = await Promise.all([
+      unixSecurityAccess(source, python, signal),
+      unixSecurityAccess(destination, python, signal),
+    ]);
+    const [, sourceContext] = JSON.parse(sourceAccess) as [
+      string | null,
+      string | null,
+    ];
+    const [, destinationContext] = JSON.parse(destinationAccess) as [
+      string | null,
+      string | null,
+    ];
+    if (sourceContext !== null && sourceContext !== destinationContext)
+      arguments_.push("--preserve=context");
+  }
+  await execFileAsync("/bin/cp", [...arguments_, source, destination], {
+    encoding: "utf8",
+    signal,
+  });
 }
 
 async function verifyUnixSecurityMetadata(
@@ -1874,16 +1907,23 @@ async function replaceExistingPolicy(
               flag: "wx",
               mode: 0o600,
             });
-            await execFileAsync(
-              "/bin/cp",
-              ["-p", recoveryPath, restoreTemporary],
-              { encoding: "utf8" },
-            );
+            const recoveryContent = await readSecurityPolicy(recoveryPath);
+            await copyUnixPolicyFile(recoveryPath, restoreTemporary, python);
             await verifyUnixSecurityMetadata(
               recoveryPath,
               restoreTemporary,
               python,
             );
+            if (
+              recoveryContent === null ||
+              (await readSecurityPolicy(restoreTemporary)) !==
+                recoveryContent ||
+              (await readSecurityPolicy(recoveryPath)) !== recoveryContent
+            ) {
+              throw new CodexSecurityError(
+                "SECURITY.md changed while its recovery snapshot was being copied.",
+              );
+            }
             await moveUnixPolicyFileNoClobber(
               restoreTemporary,
               targetPath,

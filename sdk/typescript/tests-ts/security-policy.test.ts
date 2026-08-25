@@ -1537,6 +1537,74 @@ describe("security policy review and application", () => {
     }
   });
 
+  test.skipIf(process.platform === "win32")(
+    "rejects a recovery snapshot changed while rollback copies it",
+    async () => {
+      const name =
+        "rejects a recovery snapshot changed while rollback copies it";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const original = "# Original policy\n";
+      await writeFile(join(f.repository, "SECURITY.md"), original);
+      const draft = await f.generate();
+      const writer = await open(draft.targetPath, "r+");
+      const controller = new AbortController();
+      const originalRename = fsPromises.rename;
+      const originalLink = fsPromises.link;
+      const originalStat = fsPromises.stat;
+      let changed = false;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        rename: async (source: string, destination: string) => {
+          await originalRename(source, destination);
+          if (source === draft.targetPath)
+            controller.abort("cancel before install");
+        },
+        link: async () => {
+          throw Object.assign(new Error("hard links are unsupported"), {
+            code: "ENOTSUP",
+          });
+        },
+        stat: async (path: string, ...options: []) => {
+          const metadata = await originalStat(path, ...options);
+          if (!changed && path.endsWith(".previous.restore")) {
+            changed = true;
+            await writer.truncate(0);
+            await writer.writeFile("# Complete concurrent save\n");
+          }
+          return metadata;
+        },
+      }));
+      try {
+        const error = await applySecurityPolicy(draft, {
+          signal: controller.signal,
+        }).catch((value: unknown) => value);
+        expect(error).toBeInstanceOf(SecurityPolicyRecoveryError);
+        expect(changed).toBe(true);
+        expect(await readSecurityPolicy(draft.targetPath)).toBeNull();
+        expect(
+          await readFile(
+            (error as SecurityPolicyRecoveryError).recoveryPath,
+            "utf8",
+          ),
+        ).toBe("# Complete concurrent save\n");
+        expect(
+          (await readdir(f.repository)).some((path) =>
+            path.endsWith(".restore"),
+          ),
+        ).toBe(false);
+      } finally {
+        await writer.close();
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          rename: originalRename,
+          link: originalLink,
+          stat: originalStat,
+        }));
+      }
+    },
+  );
+
   test("keeps recovery files outside checkouts and Git metadata", async () => {
     for (const kind of ["root", "submodule", "external_git"]) {
       const f = await fixture();
@@ -1789,6 +1857,37 @@ describe("security policy review and application", () => {
       expect(await readFile(target, "utf8")).toBe(POLICY);
       expect((await stat(target)).mode & 0o777).toBe(0o440);
       expect(accessControl(target)).toBe(previousAccess);
+    },
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "rejects an existing Linux policy when its security context cannot be preserved",
+    async () => {
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      const previous = "# Existing policy\n";
+      await writeFile(target, previous);
+      const draft = await f.generate();
+      const python = join(f.root, "synthetic-python");
+      await writeFile(
+        python,
+        [
+          `#!${PYTHON}`,
+          "import os, sys",
+          `python = ${JSON.stringify(PYTHON)}`,
+          "if len(sys.argv) > 4 and sys.argv[1:3] == ['-I', '-c'] and \"'security.selinux'\" in sys.argv[3]:",
+          "    print('[null,\"c3ludGhldGljX3Q6czA=\"]' if sys.argv[4].endswith('/SECURITY.md') else '[null,null]')",
+          "    raise SystemExit(0)",
+          "os.execv(python, [python, *sys.argv[1:]])",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      await expect(
+        applySecurityPolicy(draft, { pythonPath: python }),
+      ).rejects.toThrow();
+      expect(await readFile(target, "utf8")).toBe(previous);
+      expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
     },
   );
 
