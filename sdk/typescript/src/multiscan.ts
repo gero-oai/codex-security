@@ -923,11 +923,8 @@ async function loadResumableScan(
     ) {
       return undefined;
     }
-    if (
-      receipt.scope !== undefined &&
-      scope.includePaths[0] !== expectedScope
-    ) {
-      if (receipt.resolvedScope === undefined) return undefined;
+    if (receipt.scope !== undefined) {
+      const requestedScope = expectedScope;
       try {
         await rm(checkout, { recursive: true, force: true });
         await mkdir(checkout, { mode: 0o700 });
@@ -944,6 +941,12 @@ async function loadResumableScan(
         expectedScope = relativeScope.split(sep).join("/") || ".";
       } finally {
         await rm(checkout, { recursive: true, force: true });
+      }
+      if (
+        expectedScope !== requestedScope &&
+        receipt.resolvedScope === undefined
+      ) {
+        return undefined;
       }
     }
     if (

@@ -1775,6 +1775,7 @@ describe("multiscan", () => {
   test.each([
     "forged campaign target identity",
     "forged resolved repository scope",
+    "forged lexical symlink scope",
     "forged worktree snapshot digest",
     "deferred complete coverage",
     "follow-up complete coverage",
@@ -1790,10 +1791,28 @@ describe("multiscan", () => {
   ] as const)("rescans sealed artifacts with %s", async (corruption) => {
     const paths = await fixture();
     const source = await repository(paths.root, "sealed-resume-integrity");
+    let revision = source.revision;
+    if (corruption === "forged lexical symlink scope") {
+      await symlink("src", join(source.path, "alias"), "dir");
+      git(source.path, "add", "alias");
+      git(
+        source.path,
+        "-c",
+        "user.name=Multiscan Test",
+        "-c",
+        "user.email=multiscan@example.test",
+        "commit",
+        "-qm",
+        "add scoped directory alias",
+      );
+      revision = git(source.path, "rev-parse", "HEAD");
+    }
     const inventory =
       corruption === "forged resolved repository scope"
-        ? `id,repository,revision,scope\nsealed-resume,${source.path},${source.revision},src\n`
-        : `id,repository,revision\nsealed-resume,${source.path},${source.revision}\n`;
+        ? `id,repository,revision,scope\nsealed-resume,${source.path},${revision},src\n`
+        : corruption === "forged lexical symlink scope"
+          ? `id,repository,revision,scope\nsealed-resume,${source.path},${revision},alias\n`
+          : `id,repository,revision\nsealed-resume,${source.path},${revision}\n`;
     await writeFile(paths.input, inventory);
     let attempts = 0;
     const security = client(async (_repository, scanOptions = {}) => {
@@ -1860,20 +1879,25 @@ describe("multiscan", () => {
       });
       receipt!["targetId"] = foreignReceipt!["targetId"];
       await writeFile(first.resultsPath, `${JSON.stringify(receipt)}\n`);
-    } else if (corruption === "forged resolved repository scope") {
+    } else if (
+      corruption === "forged resolved repository scope" ||
+      corruption === "forged lexical symlink scope"
+    ) {
       const manifestPath = join(outputDir, "scan-manifest.json");
       const manifest = JSON.parse(
         await readFile(manifestPath, "utf8"),
       ) as ScanResult["manifest"];
-      manifest.scan.scope.includePaths = ["."];
+      const forgedScope =
+        corruption === "forged lexical symlink scope" ? "alias" : ".";
+      manifest.scan.scope.includePaths = [forgedScope];
       await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
       const coveragePath = join(outputDir, "coverage.json");
       const coverage = JSON.parse(
         await readFile(coveragePath, "utf8"),
       ) as ScanResult["coverage"];
-      coverage.includePaths = ["."];
+      coverage.includePaths = [forgedScope];
       await writeFile(coveragePath, `${JSON.stringify(coverage, null, 2)}\n`);
-      receipt!["resolvedScope"] = ".";
+      receipt!["resolvedScope"] = forgedScope;
       await writeFile(first.resultsPath, `${JSON.stringify(receipt)}\n`);
     } else if (corruption === "forged worktree snapshot digest") {
       const manifestPath = join(outputDir, "scan-manifest.json");
