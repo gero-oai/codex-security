@@ -262,7 +262,7 @@ async function bootstrapUpgradedUsagePlugin(root: string) {
   const previousManifest = JSON.parse(
     await readFile(previousManifestPath, "utf8"),
   ) as { version: string };
-  previousManifest.version = "0.1.25";
+  previousManifest.version = "0.1.45";
   await writeFile(
     previousManifestPath,
     JSON.stringify(previousManifest, null, 2) + "\n",
@@ -1382,7 +1382,7 @@ describe("live scan cost tracking", () => {
       safetyIdentifierKey: installation.safetyIdentifierKey,
       usage,
     }).toEqual({
-      predecessorVersion: "0.1.25",
+      predecessorVersion: "0.1.45",
       upgradedVersion: "0.1.47",
       installedRootChanged: true,
       safetyIdentifierKey: "CODEX_SAFETY_IDENTIFIER",

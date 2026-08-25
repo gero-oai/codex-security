@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from collections import Counter
@@ -37,9 +38,16 @@ from pathlib import Path
 
 # Some plugin hosts launch Python with safe-path isolation enabled.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from finalize_scan_contract import (
+    _descriptor_relative_reads_available,
+    _open_scan_local_directory,
+    _open_verified_scan_directory,
+    _windows_scan_local_files,
+)
 from rank_preview import (
     DEFAULT_PREVIEW_BYTES,
     TEXT_CODE_EXTENSIONS,
+    is_binary_sample,
     preview_for,
     preview_for_bytes,
 )
@@ -318,6 +326,53 @@ def changed_path_parent_is_within_target(path: Path, target: Path) -> bool:
         except OSError:
             continue
     return False
+
+
+def preview_for_changed_path(
+    path: Path, target: Path, preview_bytes: int
+) -> tuple[str, bool]:
+    """Bind working-tree reads to the checked repository and parent identities."""
+
+    relative_parent = path.parent.resolve(strict=True).relative_to(target)
+    descriptor: int | None = None
+    try:
+        if os.name == "nt":
+            relative_path = (relative_parent / path.name).as_posix()
+            descriptor = _windows_scan_local_files().open_read_fd(
+                target, relative_path, "changed Git working-tree path"
+            )
+        elif _descriptor_relative_reads_available():
+            root_descriptor = _open_verified_scan_directory(target)
+            try:
+                parent_descriptor = _open_scan_local_directory(
+                    root_descriptor, relative_parent.parts, create=False
+                )
+                try:
+                    descriptor = os.open(
+                        path.name,
+                        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                        dir_fd=parent_descriptor,
+                    )
+                finally:
+                    os.close(parent_descriptor)
+            finally:
+                os.close(root_descriptor)
+
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("changed Git working-tree path is not a regular file")
+        else:
+            raise OSError("changed Git working-tree input requires secure file operations")
+
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = None
+            sample = source.read(4096)
+            if is_binary_sample(sample):
+                return "", True
+            data = sample + source.read()
+        return preview_for_bytes(path, data, preview_bytes)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def windows_stream_component(path: Path) -> str | None:
@@ -761,7 +816,14 @@ def make_diff_rank_input(args: argparse.Namespace) -> None:
         elif path.is_symlink():
             preview = ""
         elif path.is_file():
-            preview, is_binary = preview_for(path, args.preview_bytes)
+            try:
+                preview, is_binary = preview_for_changed_path(
+                    path, repo, args.preview_bytes
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise SystemExit(
+                    "Changed Git working-tree paths must stay inside the selected target."
+                ) from error
             if is_binary:
                 continue
         else:
