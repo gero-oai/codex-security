@@ -4242,14 +4242,15 @@ describe("runtime directories and plugin Python boundary", () => {
   });
 
   test.each([
-    ["legacy", "0.1.22", false, false],
-    ["previous", "0.1.37", true, false],
-    ["independent version", "1.0.0", true, false],
-    ["development", "dev", true, true],
-    ["current", BUNDLED_PLUGIN_VERSION, true, true],
+    ["legacy", "0.1.22", false, false, undefined],
+    ["previous", "0.1.37", true, false, undefined],
+    ["independent version", "1.0.0", true, false, undefined],
+    ["development", "dev", true, true, undefined],
+    ["current", BUNDLED_PLUGIN_VERSION, true, true, undefined],
+    ["narrow-terminal", BUNDLED_PLUGIN_VERSION, true, true, "40"],
   ] as const)(
     "saves comparisons with a %s custom plugin",
-    async (_kind, version, supportsStdin, supportsRelated) => {
+    async (_kind, version, supportsStdin, supportsRelated, columns) => {
       const root = await temporaryDirectory();
       const pluginRoot = join(root, "custom plugin");
       const scripts = join(pluginRoot, "scripts");
@@ -4295,6 +4296,7 @@ describe("runtime directories and plugin Python boundary", () => {
         pluginRoot,
         environment: {
           PATH: process.env["PATH"],
+          ...(columns === undefined ? {} : { COLUMNS: columns }),
           OPENAI_API_KEY: "synthetic-openai-key",
           CODEX_API_KEY: "synthetic-codex-key",
           OPENROUTER_API_KEY: "synthetic-openrouter-key",

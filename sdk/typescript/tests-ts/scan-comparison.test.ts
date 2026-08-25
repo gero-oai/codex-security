@@ -693,6 +693,34 @@ describe("semantic scan comparison", () => {
     ).rejects.toThrow("confirmed finding groups");
   });
 
+  test.each(["omitted", "uncertain", "related"] as const)(
+    "rejects an %s result across overlapping confirmed finding groups",
+    async (decision) => {
+      const input = {
+        before: [{ occurrenceId: "before", findingId: "identity-a" }],
+        after: [{ occurrenceId: "after", findingId: "identity-c" }],
+        knownFindingGroups: [
+          ["identity-a", "identity-b"],
+          ["identity-b", "identity-c"],
+        ],
+      };
+      const pair = {
+        beforeOccurrenceId: "before",
+        afterOccurrenceId: "after",
+        reason: "Contradicts a transitively confirmed identity.",
+      };
+      const response = {
+        matches: [],
+        uncertain: decision === "uncertain" ? [pair] : [],
+        ...(decision === "related" ? { related: [pair] } : {}),
+      };
+
+      await expect(
+        matchScanFindings(input, { codex: fakeCodex(response).codex }),
+      ).rejects.toThrow("confirmed finding groups");
+    },
+  );
+
   test("rejects uncertainty between occurrences of the same stable finding", async () => {
     const input = {
       before: [{ occurrenceId: "before", findingId: "shared-identity" }],

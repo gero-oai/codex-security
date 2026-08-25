@@ -1452,9 +1452,9 @@ export async function runWorkbench(
         options.signal?.throwIfAborted();
         support = {
           stdin: help.includes("--matches-json-stdin"),
-          related: help.includes(
-            "Comparison payload supports related findings.",
-          ),
+          related: help
+            .replace(/\s+/gu, " ")
+            .includes("Comparison payload supports related findings."),
         };
         workbenchComparisonSupport.set(key, support);
       }
