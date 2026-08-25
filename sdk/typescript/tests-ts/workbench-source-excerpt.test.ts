@@ -83,6 +83,7 @@ function collisionRepository(root: string): {
   };
   const sourceTree = tree([
     ["100644", "blob", blob("allowed = True\n"), "allowed.py"],
+    ["100644", "blob", blob("another = True\n"), "another.py"],
     ["100644", "blob", blob("x".repeat(256 * 1024)), "large.py"],
     ["100644", "blob", blob("case_upper = True\n"), "LOWER.py"],
     ["100644", "blob", blob("case_lower = True\n"), "lower.py"],
@@ -90,6 +91,7 @@ function collisionRepository(root: string): {
     ["100644", "blob", blob("unicode_decomposed = True\n"), "é.py"],
     ["100644", "blob", blob("plain_name = True\n"), "trailing.py"],
     ["100644", "blob", blob("trailing_dot = True\n"), "trailing.py."],
+    ["100644", "blob", blob("third = True\n"), "third.py"],
     ["100644", "blob", blob("uncheckoutable = True\n"), "z".repeat(2048)],
   ]);
   const upperScope = tree([
@@ -147,6 +149,7 @@ function collisionRepository(root: string): {
     "linked_allowed = True\n",
   );
   writeFileSync(join(repository, "src", "allowed.py"), "allowed = True\n");
+  writeFileSync(join(repository, "src", "another.py"), "another = True\n");
   writeFileSync(join(repository, "src", "LOWER.py"), "case_upper = True\n");
   const lowercasePath = join(repository, "src", "lower.py");
   const caseSensitive = !existsSync(lowercasePath);
@@ -155,6 +158,7 @@ function collisionRepository(root: string): {
   }
   writeFileSync(join(repository, "src", "é.py"), "unicode_composed = True\n");
   writeFileSync(join(repository, "src", "trailing.py"), "plain_name = True\n");
+  writeFileSync(join(repository, "src", "third.py"), "third = True\n");
   writeFileSync(join(repository, "mismatch"), "selected_file = True\n");
   writeFileSync(
     join(repository, "Scope", "selected.py"),
@@ -559,6 +563,32 @@ try:
 finally:
     excerpts.local_git_bytes = original_git
     subprocess.Popen = original_popen
+page_context = excerpts.source_excerpt_context(scan, repository, ["src"])
+page_batch_processes = 0
+page_tree_reads = 0
+original_matching_tree_entries = excerpts.matching_tree_entries
+def watched_page_popen(arguments, *positional, **keywords):
+    global page_batch_processes
+    if "cat-file" in arguments and "--batch" in arguments:
+        page_batch_processes += 1
+    return original_popen(arguments, *positional, **keywords)
+def counted_page_tree(*arguments, **keywords):
+    global page_tree_reads
+    page_tree_reads += 1
+    return original_matching_tree_entries(*arguments, **keywords)
+subprocess.Popen = watched_page_popen
+excerpts.matching_tree_entries = counted_page_tree
+try:
+    page_excerpts = {
+        path: excerpts.finding_source_excerpt_from_context(
+            page_context,
+            [{"path": f"src/{path}", "startLine": 1, "role": "root_control"}],
+        )
+        for path in ("allowed.py", "another.py", "third.py")
+    }
+finally:
+    excerpts.matching_tree_entries = original_matching_tree_entries
+    subprocess.Popen = original_popen
 batch_object = "1" * 40
 entry_object = b"\1" * 20
 wide_tree = b"".join(
@@ -721,6 +751,9 @@ print(json.dumps({
     "nestedBlobReads": nested_blob_reads,
     "nestedExcerpt": nested_excerpt,
     "orderedExcerpt": ordered_excerpt,
+    "pageBatchProcesses": page_batch_processes,
+    "pageExcerpts": page_excerpts,
+    "pageTreeReads": page_tree_reads,
     "subtargetPaths": subtarget_authority["paths"],
     "outside": outside,
     "pathCollisionBlobReads": scope_collision_blob_reads,
@@ -822,6 +855,13 @@ describe("workbench source excerpts", () => {
       nestedBlobReads: [],
       nestedExcerpt: null,
       orderedExcerpt: expect.stringContaining("allowed = True"),
+      pageBatchProcesses: 1,
+      pageExcerpts: {
+        "allowed.py": expect.stringContaining("allowed = True"),
+        "another.py": expect.stringContaining("another = True"),
+        "third.py": expect.stringContaining("third = True"),
+      },
+      pageTreeReads: 2,
       subtargetPaths: [{ kind: "directory", path: "." }],
       outside: null,
       pathCollisionBlobReads: [],
@@ -858,10 +898,16 @@ import workbench_db
 active_connection = None
 current_command = None
 race_mutation = False
+race_replacement = False
 transaction_states = []
+digest_transaction_states = []
+blocked_digest_writers = []
+available_digest_writers = []
 original_connect = workbench_db.connect
 original_capture = workbench_db.capture_source_scopes
 original_deep_capture = workbench_db.deep_scan.capture_source_scopes
+original_deep_worktree_digest = workbench_db.deep_scan.worktree_content_digest
+original_deep_remediation_target = workbench_db.deep_scan.require_remediation_target
 def connect():
     global active_connection
     active_connection = original_connect()
@@ -875,6 +921,24 @@ def deep_capture(*arguments, **keywords):
     if race_mutation:
         (Path(repository) / "src" / "allowed.py").write_text("changed_after_capture = True\n")
     return authority
+def deep_worktree_digest(*arguments, **keywords):
+    digest_transaction_states.append([current_command, active_connection.in_transaction])
+    with sqlite3.connect(workbench_db.database_path(), timeout=0) as concurrent:
+        try:
+            concurrent.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as error:
+            blocked_digest_writers.append(str(error))
+        else:
+            available_digest_writers.append(current_command)
+            concurrent.rollback()
+    return original_deep_worktree_digest(*arguments, **keywords)
+def deep_remediation_target(value):
+    target = original_deep_remediation_target(value)
+    if race_replacement and active_connection.in_transaction:
+        target.rename(target.with_name(f"{target.name}-original"))
+        target.mkdir()
+        return original_deep_remediation_target(value)
+    return target
 def run(arguments):
     global current_command
     current_command = arguments[0]
@@ -886,6 +950,8 @@ def run(arguments):
 workbench_db.connect = connect
 workbench_db.capture_source_scopes = capture
 workbench_db.deep_scan.capture_source_scopes = deep_capture
+workbench_db.deep_scan.worktree_content_digest = deep_worktree_digest
+workbench_db.deep_scan.require_remediation_target = deep_remediation_target
 
 repository, scan_root, cli_scan_dir, workspace_id = sys.argv[3:7]
 run(["create-workspace", "--workspace-id", workspace_id, "--thread-id", "workspace-writer"])
@@ -904,9 +970,21 @@ except SystemExit as error:
 else:
     race_error = None
 (Path(repository) / "src" / "allowed.py").write_text("allowed = True\n")
+race_mutation = False
+race_replacement = True
+try:
+    run(["begin-deep-scan", "--thread-id", "replaced-deep-writer", "--target-path", repository, "--scan-root", scan_root, "--available-parallelism", "4"])
+except SystemExit as error:
+    replacement_error = str(error)
+else:
+    replacement_error = None
+finally:
+    replacement = Path(repository)
+    replacement.rmdir()
+    replacement.with_name(f"{replacement.name}-original").rename(replacement)
 with sqlite3.connect(workbench_db.database_path()) as connection:
     authorities = {row[0]: json.loads(row[1]) for row in connection.execute("SELECT id, source_scopes_json FROM scans")}
-print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headless": headless, "prompt": prompt, "raceError": race_error, "transactionStates": transaction_states, "workspace": workspace}))
+print(json.dumps({"authorities": authorities, "availableDigestWriters": available_digest_writers, "blockedDigestWriters": blocked_digest_writers, "cli": cli, "deep": deep, "digestTransactionStates": digest_transaction_states, "headless": headless, "prompt": prompt, "raceError": race_error, "replacementError": replacement_error, "transactionStates": transaction_states, "workspace": workspace}))
 `;
     const result = spawnSync(
       python(),
@@ -933,8 +1011,24 @@ print(json.dumps({"authorities": authorities, "cli": cli, "deep": deep, "headles
       ["register-cli-scan", false],
       ["begin-deep-scan", false],
       ["begin-deep-scan", false],
+      ["begin-deep-scan", false],
     ]);
+    expect(writers["digestTransactionStates"]).toEqual([
+      ["begin-deep-scan", false],
+      ["begin-deep-scan", false],
+      ["begin-deep-scan", false],
+      ["begin-deep-scan", false],
+      ["begin-deep-scan", false],
+      ["begin-deep-scan", false],
+    ]);
+    expect(writers["availableDigestWriters"]).toEqual(
+      Array.from({ length: 6 }, () => "begin-deep-scan"),
+    );
+    expect(writers["blockedDigestWriters"]).toEqual([]);
     expect(writers["raceError"]).toBe(
+      "The selected scan target changed while the scan was starting. Try again.",
+    );
+    expect(writers["replacementError"]).toBe(
       "The selected scan target changed while the scan was starting. Try again.",
     );
     const authorities = writers["authorities"] as Record<

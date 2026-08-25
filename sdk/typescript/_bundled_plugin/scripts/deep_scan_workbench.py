@@ -785,6 +785,23 @@ def begin_deep_scan_for_target(
     scope_file_count = directory_snapshot_regular_file_count(
         target if scope == "." else target / scope
     )
+    current_target = require_remediation_target(target_path)
+    current_metadata = current_target.stat()
+    current_revision = git_revision(current_target)
+    current_snapshot_digest = (
+        directory_content_digest(current_target)
+        if current_revision == "unversioned"
+        else worktree_content_digest(current_target)
+    )
+    if (
+        current_revision,
+        current_snapshot_digest,
+        serialize_filesystem_identity(current_metadata.st_dev),
+        serialize_filesystem_identity(current_metadata.st_ino),
+    ) != target_identity:
+        raise SystemExit(
+            "The selected scan target changed while the scan was starting. Try again."
+        )
     connection.execute("BEGIN IMMEDIATE")
     try:
         existing = existing_deep_scan_for_target(connection, thread_id, target_path, scope)
@@ -806,18 +823,10 @@ def begin_deep_scan_for_target(
             )
         current_target = require_remediation_target(target_path)
         current_metadata = current_target.stat()
-        current_revision = git_revision(current_target)
-        current_snapshot_digest = (
-            directory_content_digest(current_target)
-            if current_revision == "unversioned"
-            else worktree_content_digest(current_target)
-        )
         if (
-            current_revision,
-            current_snapshot_digest,
             serialize_filesystem_identity(current_metadata.st_dev),
             serialize_filesystem_identity(current_metadata.st_ino),
-        ) != target_identity:
+        ) != (target_device, target_inode):
             raise SystemExit(
                 "The selected scan target changed while the scan was starting. Try again."
             )

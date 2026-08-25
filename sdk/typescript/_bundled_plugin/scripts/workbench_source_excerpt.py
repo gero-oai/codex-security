@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import IO, Any
@@ -32,12 +33,14 @@ OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LINE_BREAK = re.compile(r"\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]")
 
 TreeEntry = tuple[str, str, str]
+TreeEntries = dict[str, list[TreeEntry]]
 
 
 @dataclass
 class SourceScopeIndex:
     kind: str | None = None
     children: dict[str, SourceScopeIndex] = field(default_factory=dict)
+    tree_entries: dict[str, TreeEntries] = field(default_factory=dict)
 
 
 SourceContext = tuple[Path, str, SourceScopeIndex]
@@ -82,6 +85,7 @@ def matching_tree_entries(
     object_id: str,
     name: str,
     filesystem_parent: Path | None = None,
+    tree_cache: dict[str, TreeEntries] | None = None,
 ) -> TreeEntry | None:
     encoded_object = object_id.encode("ascii")
     requests.write(encoded_object + b"\0")
@@ -148,13 +152,25 @@ def matching_tree_entries(
     expected_name = normalized_path_component(name)
     selected = None
     ambiguous = False
+    entries: TreeEntries | None = {} if tree_cache is not None else None
     while cursor < len(buffered) or unread:
         mode = bytes(read_field(ord(" "), 6))
         decoded_name = read_field(0).decode(
             sys.getfilesystemencoding(), errors="surrogateescape"
         )
         entry_object = read_object_id(object_id_bytes)
-        if not ambiguous and normalized_path_component(decoded_name) == expected_name:
+        normalized_name = normalized_path_component(decoded_name)
+        kind = (
+            "directory"
+            if mode in {b"40000", b"040000"}
+            else "file"
+            if mode in {b"100644", b"100755"}
+            else "other"
+        )
+        entry = (decoded_name, kind, entry_object.hex())
+        if entries is not None:
+            entries.setdefault(normalized_name, []).append(entry)
+        if not ambiguous and normalized_name == expected_name:
             if filesystem_parent is not None and decoded_name != name:
                 try:
                     if not (filesystem_parent / name).samefile(
@@ -167,16 +183,31 @@ def matching_tree_entries(
                 selected = None
                 ambiguous = True
             else:
-                kind = (
-                    "directory"
-                    if mode in {b"40000", b"040000"}
-                    else "file"
-                    if mode in {b"100644", b"100755"}
-                    else "other"
-                )
-                selected = (decoded_name, kind, entry_object.hex())
+                selected = entry
     if responses.read(1) != b"\n":
         raise ValueError("missing tree terminator")
+    if tree_cache is not None and entries is not None:
+        tree_cache[object_id] = entries
+    return selected
+
+
+def matching_cached_tree_entry(
+    entries: TreeEntries, name: str, filesystem_parent: Path
+) -> TreeEntry | None:
+    selected = None
+    for entry in entries.get(normalized_path_component(name), []):
+        decoded_name = entry[0]
+        if decoded_name != name:
+            try:
+                if not (filesystem_parent / name).samefile(
+                    filesystem_parent / decoded_name
+                ):
+                    continue
+            except OSError:
+                pass
+        if selected is not None:
+            return None
+        selected = entry
     return selected
 
 
@@ -186,6 +217,7 @@ def tree_path(
     value: str,
     *,
     selected_kinds: dict[int, str] | None = None,
+    tree_cache: dict[str, TreeEntries] | None = None,
 ) -> TreeEntry | None:
     path = relative_path(value)
     if path is None:
@@ -216,25 +248,40 @@ def tree_path(
         "-z",
     ]
     try:
-        with subprocess.Popen(
-            command,
-            env=environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        ) as process:
-            if process.stdin is None or process.stdout is None:
-                return None
+        with ExitStack() as processes:
+            process = None
+            pending_tree_entries: dict[str, TreeEntries] = {}
             for depth, name in enumerate(path.parts, start=1):
                 if kind != "directory":
                     return None
-                aliases = matching_tree_entries(
-                    process.stdin,
-                    process.stdout,
-                    object_id,
-                    name,
-                    filesystem_parent,
+                cached = (
+                    tree_cache.get(object_id, pending_tree_entries.get(object_id))
+                    if tree_cache is not None
+                    else None
                 )
+                if cached is not None:
+                    aliases = matching_cached_tree_entry(cached, name, filesystem_parent)
+                else:
+                    if process is None:
+                        process = processes.enter_context(
+                            subprocess.Popen(
+                                command,
+                                env=environment,
+                                stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                            )
+                        )
+                    if process.stdin is None or process.stdout is None:
+                        return None
+                    aliases = matching_tree_entries(
+                        process.stdin,
+                        process.stdout,
+                        object_id,
+                        name,
+                        filesystem_parent,
+                        pending_tree_entries if tree_cache is not None else None,
+                    )
                 # The normalized name must be unique before an exact spelling can win.
                 if aliases is None or aliases[0] != name:
                     return None
@@ -246,9 +293,14 @@ def tree_path(
                     and kind != expected_kind
                 ):
                     return None
-            process.stdin.close()
-            if process.wait() != 0:
-                return None
+            if process is not None:
+                if process.stdin is None:
+                    return None
+                process.stdin.close()
+                if process.wait() != 0:
+                    return None
+                if tree_cache is not None:
+                    tree_cache.update(pending_tree_entries)
     except (MemoryError, OSError, ValueError):
         return None
     return path.as_posix(), kind, object_id
@@ -523,7 +575,13 @@ def finding_source_excerpt_from_context(
     try:
         selected_kinds = selected_source_kinds(scopes, path)
         selected = (
-            tree_path(repository, tree, path, selected_kinds=selected_kinds)
+            tree_path(
+                repository,
+                tree,
+                path,
+                selected_kinds=selected_kinds,
+                tree_cache=scopes.tree_entries,
+            )
             if selected_kinds is not None
             else None
         )
