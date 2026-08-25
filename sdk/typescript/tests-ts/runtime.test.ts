@@ -1998,7 +1998,7 @@ describe("plugin runtime preparation", () => {
 
   test("upgrades the predecessor bundled cache and restores with the SDK-owned helper", async () => {
     const root = await temporaryDirectory();
-    const previous = await plugin(join(root, "previous"), "0.1.23");
+    const previous = await plugin(join(root, "previous"), "0.1.43");
     await copyFile(join(PLUGIN_ROOT, ".mcp.json"), join(previous, ".mcp.json"));
     await copyFile(
       join(PLUGIN_ROOT, "scripts", "workbench_target.py"),
@@ -2036,7 +2036,7 @@ describe("plugin runtime preparation", () => {
     const stale = await bootstrapPlugin(home, previous, options);
     const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
 
-    expect(stale.version).toBe("0.1.23");
+    expect(stale.version).toBe("0.1.43");
     expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
     expect(upgraded.version).not.toBe(stale.version);
     expect(upgraded.installedRoot).not.toBe(stale.installedRoot);
