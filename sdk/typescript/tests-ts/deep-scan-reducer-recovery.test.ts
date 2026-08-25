@@ -45,6 +45,7 @@ type ReducerFinding = {
     source: string;
     sourceFindingIds?: string[];
     sourceFindings?: Array<{ id: string; finding: ReducerFinding }>;
+    [field: string]: unknown;
   };
 };
 
@@ -186,6 +187,95 @@ test("retains every accepted observation when workers report the same identity",
     { id: "worker-second:0", finding: second },
   ]);
   expect(reduced.findings[0]!.summary).toBe(result.findings[0]!.summary);
+});
+
+test("preserves the accepted finding producer in canonical provenance", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const original = reducerFinding("accepted-producer");
+  const first = {
+    ...original,
+    provenance: {
+      ...original.provenance,
+      source: "local_plugin",
+      candidateId: "candidate-first",
+      workerId: "worker-first",
+      provider: "accepted-first-provider",
+    },
+  };
+  const second = {
+    ...original,
+    provenance: {
+      ...original.provenance,
+      source: "accepted_import",
+      candidateId: "candidate-second",
+      workerId: "worker-second",
+      provider: "accepted-second-provider",
+    },
+  };
+  const discoveries = [
+    { workerId: "first", result: reducerDraft([first]) },
+    { workerId: "second", result: reducerDraft([second]) },
+  ];
+  const result = (source: string, metadata: Record<string, unknown> = {}) =>
+    reducerDraft([
+      {
+        ...original,
+        provenance: {
+          source,
+          ...metadata,
+          sourceFindingIds: ["first:0", "second:0"],
+        },
+      },
+    ]);
+
+  for (const source of ["local_plugin", "accepted_import"]) {
+    const finding = reconcileDeepReduction(result(source), discoveries, null)
+      .findings[0]!;
+    const accepted = source === "local_plugin" ? first : second;
+    expect(finding.provenance).toMatchObject(accepted.provenance);
+    expect(finding.provenance.sourceFindings).toEqual([
+      { id: "first:0", finding: first },
+      { id: "second:0", finding: second },
+    ]);
+  }
+
+  expect(() =>
+    reconcileDeepReduction(result("fabricated_import"), discoveries, null),
+  ).toThrow("provenance.source");
+
+  for (const [field, value] of [
+    ["candidateId", "fabricated-candidate"],
+    ["workerId", "fabricated-worker"],
+    ["provider", "fabricated-provider"],
+    ["invented", "reducer-only-metadata"],
+  ]) {
+    expect(() =>
+      reconcileDeepReduction(
+        result("local_plugin", { [field!]: value }),
+        discoveries,
+        null,
+      ),
+    ).toThrow(`provenance.${field}`);
+  }
+
+  expect(() =>
+    reconcileDeepReduction(
+      result("local_plugin", {
+        candidateId: "candidate-second",
+        workerId: "worker-first",
+      }),
+      discoveries,
+      null,
+    ),
+  ).toThrow("provenance");
+
+  expect(
+    reconcileDeepReduction(
+      result("local_plugin", { previousFindings: "legacy-host-history" }),
+      discoveries,
+      null,
+    ).findings[0]?.provenance["previousFindings"],
+  ).toBe("legacy-host-history");
 });
 
 test("rejects a fabricated identity claiming an accepted source finding", async () => {
@@ -821,7 +911,7 @@ test("preserves conflicting categorical evidence without inventing combined outc
   }
 });
 
-test("binds related validation and attack-path evidence to one accepted source", async () => {
+test("binds related structured finding evidence to one accepted source", async () => {
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
   for (const { field, first, second, fabricated } of [
     {
@@ -854,6 +944,24 @@ test("binds related validation and attack-path evidence to one accepted source",
         },
       },
     },
+    ...["rootCause", "root_cause"].map((field) => ({
+      field,
+      first: {
+        summary: "Accepted root cause.",
+        code: "first()",
+        language: "javascript",
+      },
+      second: {
+        summary: "Accepted root cause.",
+        code: "second()",
+        language: "python",
+      },
+      fabricated: {
+        summary: "Accepted root cause.",
+        code: "first()",
+        language: "python",
+      },
+    })),
   ]) {
     for (const accepted of [
       [first, second],
