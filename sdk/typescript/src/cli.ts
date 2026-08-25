@@ -4104,7 +4104,7 @@ function defaultListCommand(argv: readonly string[]): readonly string[] {
   ) {
     return argv;
   }
-  const following = commandArguments[1];
+  const following = argv[commandIndex + 1];
   if (following !== undefined && !following.startsWith("-")) return argv;
   return [
     ...argv.slice(0, commandIndex + 1),
