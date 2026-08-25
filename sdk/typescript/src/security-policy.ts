@@ -1289,6 +1289,22 @@ export async function applySecurityPolicy(
       previousContent: draft.content,
       inheritedPolicySha256: draft.inheritedPolicySha256,
     });
+    if (recoveryPath !== null && process.platform === "win32") {
+      if (
+        ((await stat(recoveryPath)).mode & 0o777) !==
+        ((await stat(target.targetPath)).mode & 0o777)
+      ) {
+        throw new CodexSecurityError(
+          "SECURITY.md permissions changed while the replacement was being installed.",
+        );
+      }
+      await copyWindowsSecurityDescriptor(
+        recoveryPath,
+        target.targetPath,
+        undefined,
+        true,
+      );
+    }
     return {
       status: alreadyApplied ? "unchanged" : "written",
       targetPath: target.targetPath,
@@ -1491,10 +1507,14 @@ async function copyWindowsSecurityDescriptor(
           ...(verifyOnly
             ? []
             : [
-                "$acl.SetAuditRuleProtection($acl.AreAuditRulesProtected, $true)",
                 `Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl`,
               ]),
           `$copied = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
+          ...(verifyOnly
+            ? []
+            : [
+                `if ($acl.AreAuditRulesProtected -ne $copied.AreAuditRulesProtected) { $copied.SetAuditRuleProtection($acl.AreAuditRulesProtected, $false); Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $copied; $copied = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit }`,
+              ]),
           "$identityType = [System.Security.Principal.SecurityIdentifier]",
           "if ($acl.GetOwner($identityType).Value -ne $copied.GetOwner($identityType).Value -or $acl.GetGroup($identityType).Value -ne $copied.GetGroup($identityType).Value) { throw 'The copied Windows security descriptor owner or group differs.' }",
           [

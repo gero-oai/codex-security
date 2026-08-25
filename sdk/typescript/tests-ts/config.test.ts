@@ -39,13 +39,18 @@ async function temporaryDirectory(): Promise<string> {
   return path;
 }
 
-function runPinnedCodex(codexHome: string, arguments_: readonly string[]) {
+function runPinnedCodex(
+  codexHome: string,
+  arguments_: readonly string[],
+  environmentOverrides: NodeJS.ProcessEnv = {},
+) {
   const node = Bun.which("node");
   if (node === null) {
     throw new Error("The pinned Codex CLI requires Node.js.");
   }
   const environment: NodeJS.ProcessEnv = {
     ...process.env,
+    ...environmentOverrides,
     CODEX_HOME: codexHome,
   };
   delete environment["OPENAI_API_KEY"];
@@ -405,18 +410,28 @@ describe("Codex configuration", () => {
           await scanSandboxFixture();
         const node = Bun.which("node");
         expect(node).not.toBeNull();
+        const sandboxEnvironment =
+          process.platform === "darwin"
+            ? { OPENSSL_CONF: join(workspace, "openssl.cnf") }
+            : undefined;
+        if (sandboxEnvironment !== undefined)
+          await writeFile(sandboxEnvironment.OPENSSL_CONF, "");
         const sandbox = (arguments_: readonly string[]) =>
-          runPinnedCodex(codexHome, [
-            "sandbox",
-            "--config",
-            `permissions.${profile}.network.enabled=true`,
-            "--permission-profile",
-            profile,
-            "--cd",
-            workspace,
-            node!,
-            ...arguments_,
-          ]);
+          runPinnedCodex(
+            codexHome,
+            [
+              "sandbox",
+              "--config",
+              `permissions.${profile}.network.enabled=true`,
+              "--permission-profile",
+              profile,
+              "--cd",
+              workspace,
+              node!,
+              ...arguments_,
+            ],
+            sandboxEnvironment,
+          );
         const attemptWrite = (path: string) =>
           sandbox([
             "-e",
@@ -433,10 +448,15 @@ describe("Codex configuration", () => {
         if (read.exitCode !== 0) {
           const details = new TextDecoder().decode(read.stderr);
           if (
-            process.platform === "linux" &&
-            /bwrap: (?:setting up uid map: Permission denied|loopback: Failed RTM_NEWADDR: Operation not permitted)/u.test(
-              details,
-            )
+            (process.platform === "linux" &&
+              /bwrap: (?:setting up uid map: Permission denied|loopback: Failed RTM_NEWADDR: Operation not permitted)/u.test(
+                details,
+              )) ||
+            (process.platform === "win32" &&
+              purpose === "policy" &&
+              details.includes(
+                "Restricted read-only access requires the elevated Windows sandbox backend",
+              ))
           ) {
             expect(
               runPinnedCodex(codexHome, ["features", "list"]).exitCode,

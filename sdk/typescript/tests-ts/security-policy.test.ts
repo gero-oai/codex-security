@@ -1877,6 +1877,71 @@ describe("security policy review and application", () => {
   );
 
   test.skipIf(process.platform !== "win32")(
+    "retains a Windows recovery file when its descriptor changes during installation",
+    async () => {
+      const name =
+        "retains a Windows recovery file when its descriptor changes during installation";
+      if (runTestInSubprocess(import.meta.path, name)) return;
+      const f = await fixture();
+      const target = join(f.repository, "SECURITY.md");
+      const previous = "# Existing policy\n";
+      await writeFile(target, previous);
+      const draft = await f.generate();
+      const icacls = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+        "icacls.exe",
+      );
+      const descriptor = (path: string) => {
+        const lines = execFileSync(icacls, [path], {
+          encoding: "utf8",
+          windowsHide: true,
+        }).split(/\r?\n/u);
+        expect(lines[0]?.toLowerCase().startsWith(path.toLowerCase())).toBe(
+          true,
+        );
+        lines[0] = lines[0]!.slice(path.length);
+        return lines.map((line) => line.trim()).join("\n");
+      };
+      const originalLink = fsPromises.link;
+      let changedDescriptor: string | undefined;
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        link: async (...args: Parameters<typeof originalLink>) => {
+          await originalLink(...args);
+          if (args[1] === target && String(args[0]).endsWith(".tmp")) {
+            const recovery = `${args[0]}.previous`;
+            execFileSync(icacls, [recovery, "/grant", "*S-1-1-0:R"], {
+              windowsHide: true,
+            });
+            changedDescriptor = descriptor(recovery);
+          }
+        },
+      }));
+      try {
+        const error = await applySecurityPolicy(draft).catch(
+          (value: unknown) => value,
+        );
+        expect(error).toBeInstanceOf(SecurityPolicyVerificationError);
+        const recovery = (error as SecurityPolicyVerificationError)
+          .recoveryPath;
+        expect(recovery).toBeDefined();
+        expect(changedDescriptor).toBeDefined();
+        expect(await readFile(target, "utf8")).toBe(POLICY);
+        expect(await readFile(recovery!, "utf8")).toBe(previous);
+        expect(descriptor(recovery!)).toBe(changedDescriptor!);
+        expect(descriptor(target)).not.toBe(changedDescriptor!);
+        expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
+      } finally {
+        mock.module("node:fs/promises", () => ({
+          ...fsPromises,
+          link: originalLink,
+        }));
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
     "never replaces a concurrent Windows policy when native installation is required",
     async () => {
       const name =
