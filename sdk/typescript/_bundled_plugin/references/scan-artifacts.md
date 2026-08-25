@@ -11,7 +11,7 @@ Use these shared path conventions for Codex Security scan workflows unless the u
 - `security_scans_dir=<system_temp_dir>/codex-security-scans/<repo_name>`
 - `scan_id=<commit>_<scan timestamp>`
 - `scan_dir=<security_scans_dir>/<scan_id>`
-- `target_paths_file=$CODEX_SECURITY_TARGET_PATHS_FILE` for SDK scoped-path scans; this read-only scope input lives in the isolated Codex home outside the model-writable scan directory. Pass it directly to `make-repo-scope-input --scopes-file` and `bind-repo-scopes --scopes-file` before finalization, and do not print, evaluate, modify, or treat its contents as shell syntax.
+- `target_paths_file=<CODEX_SECURITY_TARGET_PATHS_FILE>` for SDK scoped-path scans; reference it as `"$CODEX_SECURITY_TARGET_PATHS_FILE"` in POSIX shells or `"$env:CODEX_SECURITY_TARGET_PATHS_FILE"` in PowerShell. This read-only scope input lives in the isolated Codex home outside the model-writable scan directory. Pass it directly to `make-repo-scope-input --scopes-file` and `bind-repo-scopes --scopes-file` before finalization, and do not print, evaluate, modify, or treat its contents as shell syntax.
 - `artifacts_dir=<scan_dir>/artifacts`
 - `context_dir=<artifacts_dir>/01_context`
 - `discovery_dir=<artifacts_dir>/02_discovery`
@@ -21,7 +21,7 @@ Use these shared path conventions for Codex Security scan workflows unless the u
 
 The plugin resolves the platform temporary directory automatically. For a manual workflow, use the active process temporary directory (for example, `%TEMP%` on Windows or `$TMPDIR` when configured on Unix-like hosts) instead of hardcoding `/tmp`.
 
-Resolve `<python_command>` to the configured Python interpreter (`$PYTHON` when one is provided), otherwise use `python` on Windows and `python3` on Unix-like hosts.
+Resolve `<python_command>` to the configured Python interpreter (`"$PYTHON"` in POSIX shells or `& "$env:PYTHON"` in PowerShell), otherwise use `python` on Windows and `python3` on Unix-like hosts.
 
 ## Threat Model (Phase 1) Paths
 
@@ -40,7 +40,7 @@ End each repository-scoped threat model with these two lines:
 
 ### Compact Deep And Workbench-Backed Diff Discovery
 
-Workbench-owned Standard scans submit findings and coverage through `record_codex_security_scan_draft`; SDK-owned Standard scans write unsealed canonical files directly. Deep scans run complete Standard scan workers, each of which submits its validated findings, coverage, threat model, and optional scope through its bound `record_codex_security_scan_draft` tool. The coordinator semantically reduces those complete results and writes the parent scan's unsealed `scan-manifest.json`, `findings.json`, and `coverage.json`. The parent does not list candidates, rerun validation or attack-path phases, or submit another draft. Workbench-backed diff scans retain the compact artifacts described below.
+Workbench-owned Standard scans submit findings and coverage through `record_codex_security_scan_draft`; SDK-owned Standard scans write unsealed canonical files directly. Deep scans run complete Standard scan workers, each of which saves `complete: false` checkpoints and submits its final validated findings, coverage, threat model, and optional scope through its bound `record_codex_security_scan_draft` tool. Pending candidates retain their original evidence in `coverage.deferred`. Host-owned immutable checkpoints survive retries, cancellation, and failure; a checkpoint alone is never an accepted complete worker result. The coordinator semantically reduces those complete results and writes the parent scan's unsealed `scan-manifest.json`, `findings.json`, and `coverage.json`. The parent does not list candidates, rerun validation or attack-path phases, or submit another draft. Workbench-backed diff scans retain the compact artifacts described below.
 
 - A workbench-backed diff scan records all candidates once with `record_codex_security_discovery_candidates({ scanId, candidates })` and reads the canonical candidates with `list_codex_security_candidates({ scanId, cursor?, limit? })`.
   - The writer validates candidates against assigned source paths, merges rows with the same CWE ids, locations, and optional instance, preserves their text, and assigns deterministic `candidate_id` values.
@@ -50,7 +50,7 @@ Workbench-owned Standard scans submit findings and coverage through `record_code
 - Optional compact validation evidence: `<discovery_dir>/validation_artifacts/<candidate_id>/`
   - Create this directory only for actual PoCs, crafted inputs, or logs and reference those paths from the row's `validation` object. Do not create placeholder per-candidate directories or narrative reports.
 
-The worklist, per-finding receipt, and phase-report paths below apply only to standalone or legacy Diff workflows. Compact Workbench Diff scans use one shared `<discovery_dir>/candidate_ledger.jsonl`, written by `record_codex_security_discovery_candidates` and updated by the bound batch tools `record_codex_security_candidate_validations` and `record_candidate_attack_paths`; they do not create per-finding ledgers, reports, or receipts. Standard and Deep scans assemble validated findings directly without source inventories or candidate ledgers.
+The worklist, per-finding receipt, and phase-report paths below apply only to standalone or legacy Diff workflows. Compact Workbench Diff scans use one shared `<discovery_dir>/candidate_ledger.jsonl`, written by `record_codex_security_discovery_candidates` and updated by the bound batch tools `record_codex_security_candidate_validations` and `record_candidate_attack_paths`; they do not create per-finding ledgers, reports, or receipts. Standard and Deep scans assemble validated findings directly without persisted source inventories or candidate ledgers.
 
 ### Diff Discovery And Coverage
 

@@ -1,4 +1,6 @@
 import {
+  appendFile,
+  copyFile,
   mkdir,
   mkdtemp,
   readFile,
@@ -8,10 +10,15 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import type { ThreadOptions, TurnOptions } from "@openai/codex-sdk";
-import { afterEach, describe, expect, test } from "bun:test";
+import { join, relative } from "node:path";
+import {
+  Codex,
+  type CodexOptions,
+  type ThreadOptions,
+  type TurnOptions,
+} from "@openai/codex-sdk";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { resolveCodexCommand, runCodexCommand } from "../src/runtime.js";
 import {
   comparisonEnvironment,
   matchCompletedScan,
@@ -62,6 +69,93 @@ function fakeCodex(response: unknown) {
 }
 
 describe("semantic scan comparison", () => {
+  test("disables explicit and inherited MCP servers for read-only helper turns", async () => {
+    const home = await mkdtemp(join(tmpdir(), "codex-security-comparison-"));
+    temporaryDirectories.push(home);
+    await writeFile(
+      join(home, "config.toml"),
+      '[mcp_servers.inherited]\ncommand = "synthetic-inherited"\n',
+    );
+    const executable = join(
+      home,
+      process.platform === "win32" ? "custom-codex.exe" : "custom-codex",
+    );
+    await copyFile(resolveCodexCommand({}).command, executable);
+    const environment = {
+      PATH: process.env["PATH"],
+      SystemRoot: process.env["SystemRoot"],
+      TEMP: process.env["TEMP"],
+      TMP: process.env["TMP"],
+      CODEX_HOME: home,
+      CODEX_CLI_PATH: executable,
+      OPENAI_API_KEY: "synthetic-key",
+    };
+    const { codex } = fakeCodex({ matches: [], uncertain: [] });
+    let config: CodexOptions["config"];
+    let codexPath: string | undefined;
+    const startThread = spyOn(
+      Codex.prototype,
+      "startThread",
+    ).mockImplementation(function (this: Codex, options) {
+      config = (this as unknown as { options: CodexOptions }).options.config;
+      codexPath = (this as unknown as { options: CodexOptions }).options
+        .codexPathOverride;
+      return codex.startThread(options!) as ReturnType<Codex["startThread"]>;
+    });
+    try {
+      await matchScanFindings(
+        { before: [], after: [] },
+        {
+          environment,
+          workingDirectory: relative(process.cwd(), home),
+          config: {
+            codexOverrides: {
+              mcp_servers: {
+                synthetic: { command: "synthetic-integration", enabled: true },
+              },
+            },
+          },
+        },
+      );
+      expect(config?.["mcp_servers"]).toEqual({
+        synthetic: { command: "synthetic-integration", enabled: false },
+        inherited: { enabled: false },
+      });
+      expect(codexPath).toBe(executable);
+      const effective = await runCodexCommand(
+        resolveCodexCommand(environment),
+        [
+          "-C",
+          home,
+          "-c",
+          'mcp_servers.synthetic.command="synthetic-integration"',
+          ...Object.keys(config!["mcp_servers"]!).flatMap((name) => [
+            "-c",
+            `mcp_servers.${name}.enabled=false`,
+          ]),
+          "mcp",
+          "list",
+          "--json",
+        ],
+        environment,
+      );
+      expect(effective.success).toBe(true);
+      expect(
+        JSON.parse(effective.stdout).map(
+          (server: { name: string; enabled: boolean }) => ({
+            name: server.name,
+            enabled: server.enabled,
+          }),
+        ),
+      ).toEqual([
+        { name: "inherited", enabled: false },
+        { name: "synthetic", enabled: false },
+      ]);
+    } finally {
+      startThread.mockRestore();
+    }
+  });
+
   test("preserves environment API-key precedence over managed credentials", async () => {
     const root = await mkdtemp(join(tmpdir(), "codex-security-comparison-"));
     temporaryDirectories.push(root);
@@ -95,11 +189,69 @@ describe("semantic scan comparison", () => {
       CODEX_SECURITY_STATE_DIR: stateDirectory,
       CODEX_SECURITY_SCAN_ID: "scan",
       CODEX_HOME: "/provider-home",
+      CODEX_CLI_PATH: "/compatible-codex",
+      CODEX_SAFETY_IDENTIFIER: "synthetic-user",
       FIREWORKS_API_KEY: "provider-key",
     };
     expect(await comparisonEnvironment(provider, account)).toEqual(provider);
     expect(statusProbed).toBe(false);
   });
+
+  test.skipIf(process.platform !== "win32")(
+    "recognizes provider scan variables regardless of Windows casing",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "codex-security-comparison-"));
+      temporaryDirectories.push(root);
+      const stateDirectory = join(root, "state");
+      const providerHome = join(root, "provider-home");
+      await mkdir(join(stateDirectory, "codex-home"), {
+        recursive: true,
+        mode: 0o700,
+      });
+      let statusProbed = false;
+      const provider = {
+        codex_security_scan_id: "scan",
+        CODEX_SECURITY_STATE_DIR: stateDirectory,
+        codex_home: providerHome,
+        FIREWORKS_API_KEY: "synthetic-provider-key",
+      };
+
+      const environment = await comparisonEnvironment(provider, async () => {
+        statusProbed = true;
+        return { authenticated: true, details: "Logged in using ChatGPT" };
+      });
+
+      expect(environment).toEqual(provider);
+      expect(statusProbed).toBe(false);
+    },
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "replaces differently cased Windows CODEX_HOME variables",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "codex-security-comparison-"));
+      temporaryDirectories.push(root);
+      const stateDirectory = join(root, "state");
+      const credentialHome = join(stateDirectory, "codex-home");
+      await mkdir(credentialHome, { recursive: true, mode: 0o700 });
+
+      const environment = await comparisonEnvironment(
+        {
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+          codex_home: join(root, "ambient-home"),
+        },
+        async () => ({
+          authenticated: true,
+          details: "Logged in using ChatGPT",
+        }),
+        undefined,
+        async () => await realpath(credentialHome),
+      );
+
+      expect(environment["CODEX_HOME"]).toBe(await realpath(credentialHome));
+      expect(environment["codex_home"]).toBeUndefined();
+    },
+  );
 
   test("reuses managed keyring credentials when no environment key is present", async () => {
     const root = await mkdtemp(join(tmpdir(), "codex-security-comparison-"));
@@ -205,6 +357,25 @@ describe("semantic scan comparison", () => {
     expect(environment["CODEX_HOME"]).toBe(ambientHome);
   });
 
+  test.skipIf(process.platform !== "win32")(
+    "recognizes stored credentials under a backslash home-relative path",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "codex-security-comparison-"));
+      temporaryDirectories.push(root);
+      const ambientHome = join(root, "ambient-codex-home");
+      await mkdir(ambientHome);
+      await writeFile(join(ambientHome, "auth.json"), "{}");
+      const environment = await comparisonEnvironment({
+        CODEX_HOME: "~\\ambient-codex-home",
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+        OPENAI_API_KEY: "",
+        USERPROFILE: root,
+      });
+
+      expect(environment["OPENAI_API_KEY"]).toBeUndefined();
+    },
+  );
+
   test("compares all findings with one restricted structured-output turn", async () => {
     const input: ScanComparisonInput = {
       before: [finding("before-1"), finding("before-2")],
@@ -287,21 +458,43 @@ describe("semantic scan comparison", () => {
         `[mcp_servers.${JSON.stringify(name)}]`,
         `command = ${JSON.stringify(node)}`,
         `args = [${JSON.stringify(mcpServer)}, ${JSON.stringify(join(markerDirectory, name))}]`,
+        "startup_timeout_sec = 5",
       ].join("\n");
     await writeFile(
       mcpServer,
       [
         'import { writeFileSync } from "node:fs";',
+        'import { createInterface } from "node:readline";',
         'writeFileSync(process.argv[2], "started");',
-        "process.stdin.resume();",
+        "for await (const line of createInterface({ input: process.stdin })) {",
+        "  const request = JSON.parse(line);",
+        "  if (request.id === undefined) continue;",
+        '  const result = request.method === "initialize"',
+        '    ? { protocolVersion: "2025-11-25", capabilities: { tools: {} },',
+        '        serverInfo: { name: "synthetic", version: "1.0.0" } }',
+        '    : request.method === "tools/list" ? { tools: [] } : {};',
+        '  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\\n");',
+        "}",
       ].join("\n"),
     );
     const requests: Record<string, unknown>[] = [];
+    const mcpRequests: Array<{
+      path: string;
+      providerKey: string | null;
+    }> = [];
     const response = { matches: [], uncertain: [] };
     const service = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       async fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path !== "/v1/responses") {
+          mcpRequests.push({
+            path,
+            providerKey: request.headers.get("X-Provider-Key"),
+          });
+          return new Response(null, { status: 404 });
+        }
         if (request.method !== "POST") {
           return new Response(null, { status: 404 });
         }
@@ -358,11 +551,24 @@ describe("semantic scan comparison", () => {
       serverConfiguration(projectServer),
     );
     const environment: NodeJS.ProcessEnv = {
-      ...process.env,
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(([name]) =>
+          [
+            "COMSPEC",
+            "HOME",
+            "PATH",
+            "PATHEXT",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "USERPROFILE",
+          ].includes(name.toUpperCase()),
+        ),
+      ),
       CODEX_HOME: codexHome,
       OPENAI_API_KEY: "synthetic-comparison-key",
     };
-    delete environment["CODEX_API_KEY"];
     try {
       const unrestricted = Bun.spawnSync(
         [
@@ -405,6 +611,15 @@ describe("semantic scan comparison", () => {
       await Promise.all(
         startedServers.map((server) => rm(join(markerDirectory, server))),
       );
+      await appendFile(
+        join(projectConfig, "config.toml"),
+        [
+          "",
+          "[mcp_servers.synthetic_http]",
+          `url = ${JSON.stringify(`${service.url}mcp`)}`,
+          'env_http_headers = { "X-Provider-Key" = "OPENAI_API_KEY" }',
+        ].join("\n"),
+      );
 
       expect(
         await matchScanFindings(
@@ -413,6 +628,7 @@ describe("semantic scan comparison", () => {
         ),
       ).toEqual(response);
       expect(requests).toHaveLength(1);
+      expect(mcpRequests).toEqual([]);
       expect(JSON.stringify(requests[0]?.["tools"] ?? [])).not.toContain(
         "synthetic",
       );
@@ -431,31 +647,58 @@ describe("semantic scan comparison", () => {
       await mkdtemp(join(tmpdir(), "codex-security-comparison-")),
     );
     temporaryDirectories.push(root);
-    const preload = join(root, "codex.mjs");
+    const executable = join(root, "app-server");
+    const scenario = join(root, "scenario.json");
     await writeFile(
-      preload,
+      executable,
       [
-        'import { basename } from "node:path";',
-        "const args = [basename(process.argv[1]), ...process.argv.slice(2)];",
-        'if (args.join(" ") !== "mcp list --json") process.exit(2);',
-        "if (process.cwd() !== process.env.SYNTHETIC_WORKING_DIRECTORY) process.exit(3);",
-        'process.stdout.write(process.env.SYNTHETIC_MCP_LIST ?? "", () => {',
-        '  process.exit(Number(process.env.SYNTHETIC_MCP_EXIT ?? "0"));',
+        'const { readFileSync } = require("node:fs");',
+        'const { dirname } = require("node:path");',
+        'const { createInterface } = require("node:readline");',
+        'if (process.argv.slice(2).join(" ") !== "-c features.plugins=false") process.exit(2);',
+        "if (process.cwd() !== dirname(process.argv[1])) process.exit(3);",
+        'if (["OPENAI_API_KEY", "CODEX_API_KEY", "AUTHORIZATION", "SYNTHETIC_SECRET", "HTTP_PROXY"].some((name) => process.env[name] !== undefined)) process.exit(4);',
+        'const scenario = JSON.parse(readFileSync("scenario.json", "utf8"));',
+        "if (scenario.exitCode !== undefined) process.exit(scenario.exitCode);",
+        'createInterface({ input: process.stdin }).on("line", (line) => {',
+        "  const request = JSON.parse(line);",
+        '  if (request.method === "initialize") {',
+        '    const response = scenario.initializationError ? { error: { code: -32601, message: "unsupported" } } : { result: {} };',
+        '    process.stdout.write(JSON.stringify({ id: request.id, ...response }) + "\\n");',
+        '  } else if (request.method === "config/read") {',
+        "    const output = scenario.raw ?? JSON.stringify({ id: request.id, ...scenario.response });",
+        '    process.stdout.write(output + "\\n", () => process.exit(0));',
+        "  }",
         "});",
       ].join("\n"),
     );
     const node = Bun.which("node");
     expect(node).not.toBeNull();
 
-    for (const result of [
-      { stdout: "[]", exitCode: 1 },
-      { stdout: "not-json", exitCode: 0 },
-      { stdout: "{}", exitCode: 0 },
-      { stdout: "[{}]", exitCode: 0 },
-      { stdout: '[{"name":1}]', exitCode: 0 },
-      { stdout: '[{"name":"unsafe.name"}]', exitCode: 0 },
-      { stdout: '[{"name":"unsafe=name"}]', exitCode: 0 },
+    for (const response of [
+      { exitCode: 1 },
+      { raw: "not-json" },
+      { raw: "{}" },
+      { initializationError: true },
+      { response: { error: { code: -32601, message: "unsupported" } } },
+      { response: { result: null } },
+      { response: { result: {} } },
+      { response: { result: { config: null } } },
+      { response: { result: { config: [] } } },
+      { response: { result: { config: { mcp_servers: null } } } },
+      { response: { result: { config: { mcp_servers: [] } } } },
+      {
+        response: {
+          result: { config: { mcp_servers: { "unsafe.name": {} } } },
+        },
+      },
+      {
+        response: {
+          result: { config: { mcp_servers: { "unsafe=name": {} } } },
+        },
+      },
     ]) {
+      await writeFile(scenario, JSON.stringify(response));
       await expect(
         matchScanFindings(
           { before: [], after: [] },
@@ -464,23 +707,49 @@ describe("semantic scan comparison", () => {
               ...process.env,
               CODEX_CLI_PATH: node!,
               OPENAI_API_KEY: "synthetic-comparison-key",
-              NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
-              SYNTHETIC_MCP_LIST: result.stdout,
-              SYNTHETIC_MCP_EXIT: String(result.exitCode),
-              SYNTHETIC_WORKING_DIRECTORY: root,
+              CODEX_API_KEY: "synthetic-secondary-key",
+              AUTHORIZATION: "synthetic-authorization",
+              SYNTHETIC_SECRET: "synthetic-secret",
+              HTTP_PROXY: "http://synthetic.invalid",
             },
             workingDirectory: root,
           },
         ),
-      ).rejects.toThrow("Could not inspect configured comparison MCP servers.");
+      ).rejects.toThrow(/Could not (read MCP configuration|safely disable)/u);
     }
+  });
+
+  test("uses the requested scan model and effort for component matching", async () => {
+    const { codex, calls } = fakeCodex({ matches: [], uncertain: [] });
+    const config = {
+      codexOverrides: {
+        model: "configured-model",
+        model_reasoning_effort: "high",
+        model_provider: "synthetic-provider",
+      },
+    };
+    await matchScanFindings({ before: [], after: [] }, { config, codex });
+    expect(calls.threadOptions).toMatchObject({
+      model: "configured-model",
+      modelReasoningEffort: "high",
+      sandboxMode: "read-only",
+      networkAccessEnabled: false,
+    });
+    await matchScanFindings(
+      { before: [], after: [] },
+      { config, codex, model: "explicit-model", reasoningEffort: "low" },
+    );
+    expect(calls.threadOptions).toMatchObject({
+      model: "explicit-model",
+      modelReasoningEffort: "low",
+    });
   });
 
   test("matches open and dismissed findings from the same target", async () => {
     const open = { findingId: "open", occurrenceId: "old-open" };
     const dismissed = { findingId: "dismissed", occurrenceId: "old-dismissed" };
     const after = { findingId: "renamed", occurrenceId: "new-renamed" };
-    const commands: (readonly string[])[] = [];
+    const commands: Array<{ args: readonly string[]; input?: string }> = [];
     let input: ScanComparisonInput | undefined;
     await matchCompletedScan({
       scanId: "current",
@@ -493,8 +762,8 @@ describe("semantic scan comparison", () => {
         CODEX_SECURITY_SCAN_ID: "current",
         FIREWORKS_API_KEY: "synthetic-provider-key",
       },
-      async workbench(args) {
-        commands.push(args);
+      async workbench(args, commandInput) {
+        commands.push({ args, input: commandInput });
         return args[0] === "list-unmatched-scan-pairs"
           ? {
               batches: [
@@ -541,11 +810,12 @@ describe("semantic scan comparison", () => {
       },
     });
     expect(input).toEqual({ before: [open, dismissed], after: [after] });
-    expect(commands.map(([command]) => command)).toEqual([
+    expect(commands.map(({ args: [command] }) => command)).toEqual([
       "list-unmatched-scan-pairs",
       "save-scan-comparison",
     ]);
-    const saved = JSON.parse(commands[1]!.at(-1)!) as ScanComparisonResult;
+    expect(commands[1]!.args.at(-1)).toBe("--matches-json-stdin");
+    const saved = JSON.parse(commands[1]!.input!) as ScanComparisonResult;
     expect(
       saved.matches.map(({ beforeOccurrenceIds }) => beforeOccurrenceIds),
     ).toEqual([["old-dismissed"]]);

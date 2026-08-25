@@ -1,8 +1,11 @@
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import {
   Codex,
+  type CodexOptions,
   type ModelReasoningEffort,
   type ThreadOptions,
   type TurnOptions,
@@ -10,13 +13,21 @@ import {
 import { z } from "incur";
 import type { CodexSecuritySurface } from "./api.js";
 import { accountStatus } from "./auth.js";
+import {
+  mergedCodexConfig,
+  scanModelConfiguration,
+  type CodexSecurityConfig,
+  type JsonObject,
+} from "./config.js";
 import { CodexSecurityError } from "./errors.js";
 import {
   codexSecurityCredentialHome,
+  expandHome,
   prepareCodexSecurityCredentialHome,
   resolveCodexCommand,
-  runCodexCommand,
+  type CodexCommand,
 } from "./runtime.js";
+import { VERSION } from "./version.js";
 
 type Finding = { occurrenceId: string } & Record<string, unknown>;
 
@@ -25,7 +36,7 @@ export interface ScanComparisonInput {
   after: readonly Finding[];
 }
 
-interface ComparisonCodex {
+interface ReadOnlyCodex {
   startThread(options: ThreadOptions): {
     run(
       input: string,
@@ -34,14 +45,18 @@ interface ComparisonCodex {
   };
 }
 
-export interface ScanComparisonOptions {
-  allowHistoricalUncertainty?: boolean;
-  codex?: ComparisonCodex;
+export interface ReadOnlyCodexOptions {
+  config?: CodexSecurityConfig;
+  codex?: ReadOnlyCodex;
   environment?: NodeJS.ProcessEnv;
   model?: string;
   reasoningEffort?: ModelReasoningEffort;
   signal?: AbortSignal;
   workingDirectory?: string;
+}
+
+export interface ScanComparisonOptions extends ReadOnlyCodexOptions {
+  allowHistoricalUncertainty?: boolean;
 }
 
 interface CompletedScanMatchingOptions
@@ -51,7 +66,10 @@ interface CompletedScanMatchingOptions
   previousFindings: readonly Record<string, unknown>[];
   falsePositives: readonly Record<string, unknown>[];
   findings: readonly Finding[];
-  workbench(args: readonly string[]): Promise<Record<string, unknown>>;
+  workbench(
+    args: readonly string[],
+    input?: string,
+  ): Promise<Record<string, unknown>>;
   matchFindings?: typeof matchScanFindings;
 }
 
@@ -97,100 +115,15 @@ export async function matchScanFindingsInternal(
   options: ScanComparisonOptions = {},
   runtimeOptions: { surface: CodexSecuritySurface },
 ): Promise<ScanComparisonResult> {
-  const workingDirectory = options.workingDirectory ?? process.cwd();
-  let codex = options.codex;
-  if (codex === undefined) {
-    const environment = await comparisonEnvironment(
-      options.environment,
-      accountStatus,
-      options.signal,
-    );
-    const command = resolveCodexCommand(environment);
-    const configuredServers = await runCodexCommand(
-      command,
-      ["mcp", "list", "--json"],
-      environment,
-      undefined,
-      options.signal,
-      workingDirectory,
-    );
-    if (!configuredServers.success) {
-      throw new CodexSecurityError(
-        "Could not inspect configured comparison MCP servers.",
-      );
-    }
-    let servers: unknown;
-    try {
-      servers = JSON.parse(configuredServers.stdout);
-    } catch {
-      throw new CodexSecurityError(
-        "Could not inspect configured comparison MCP servers.",
-      );
-    }
-    if (!Array.isArray(servers)) {
-      throw new CodexSecurityError(
-        "Could not inspect configured comparison MCP servers.",
-      );
-    }
-    const mcpServers: Record<string, { enabled: false }> = Object.create(null);
-    for (const server of servers) {
-      if (
-        typeof server !== "object" ||
-        server === null ||
-        !("name" in server) ||
-        typeof server.name !== "string" ||
-        server.name.length === 0 ||
-        /[.=]/u.test(server.name)
-      ) {
-        throw new CodexSecurityError(
-          "Could not inspect configured comparison MCP servers.",
-        );
-      }
-      mcpServers[server.name] = { enabled: false };
-    }
-    codex = new Codex({
-      codexPathOverride: command.command,
-      env: environment,
-      config: {
-        allow_login_shell: false,
-        responses_api_metadata: {
-          codex_security_surface: runtimeOptions.surface,
-        },
-        "features.apps": false,
-        "features.code_mode": false,
-        "features.code_mode_only": false,
-        "features.js_repl": false,
-        "features.multi_agent": false,
-        "features.multi_agent_v2": false,
-        "features.plugins": false,
-        "features.shell_tool": false,
-        "features.unified_exec": false,
-        ...(servers.length === 0 ? {} : { mcp_servers: mcpServers }),
-        shell_environment_policy: {
-          inherit: "core",
-          ignore_default_excludes: false,
-          exclude: ["CODEX_HOME", "*KEY*", "*SECRET*", "*TOKEN*"],
-        },
-      },
-    });
-  }
-  const thread = codex.startThread({
-    ...(options.model === undefined ? {} : { model: options.model }),
-    modelReasoningEffort: options.reasoningEffort ?? "medium",
-    sandboxMode: "read-only",
-    approvalPolicy: "never",
-    networkAccessEnabled: false,
-    webSearchMode: "disabled",
-    workingDirectory,
-    skipGitRepoCheck: true,
-  });
-  const turn = await thread.run(comparisonPrompt(input), {
-    outputSchema: z.toJSONSchema(comparisonSchema, { target: "openapi-3.0" }),
-    ...(options.signal === undefined ? {} : { signal: options.signal }),
-  });
+  const finalResponse = await runReadOnlyCodex(
+    comparisonPrompt(input),
+    z.toJSONSchema(comparisonSchema, { target: "openapi-3.0" }),
+    options,
+    runtimeOptions,
+  );
   let response: unknown;
   try {
-    response = JSON.parse(turn.finalResponse);
+    response = JSON.parse(finalResponse);
   } catch (error) {
     throw new CodexSecurityError("Scan comparison returned invalid JSON.", {
       cause: error,
@@ -201,6 +134,253 @@ export async function matchScanFindingsInternal(
     response,
     options.allowHistoricalUncertainty ?? false,
   );
+}
+
+export async function runReadOnlyCodex(
+  prompt: string,
+  outputSchema: unknown,
+  options: ReadOnlyCodexOptions,
+  runtimeOptions: { surface: CodexSecuritySurface },
+): Promise<string> {
+  const config =
+    options.config === undefined
+      ? undefined
+      : await mergedCodexConfig(options.config);
+  const configuredModel =
+    config === undefined ? undefined : scanModelConfiguration(config);
+  const model = options.model ?? configuredModel?.model;
+  const reasoningEffort =
+    options.reasoningEffort ??
+    (configuredModel?.reasoningEffort as ModelReasoningEffort | undefined) ??
+    "medium";
+  const environment =
+    options.codex === undefined
+      ? await comparisonEnvironment(
+          options.environment,
+          accountStatus,
+          options.signal,
+        )
+      : undefined;
+  const command =
+    environment === undefined ? undefined : resolveCodexCommand(environment);
+  const codex =
+    options.codex ??
+    new Codex({
+      codexPathOverride: command!.command,
+      env: environment,
+      config: {
+        ...config,
+        mcp_servers: await disabledMcpServers(
+          command!,
+          config,
+          environment!,
+          options,
+        ),
+        allow_login_shell: false,
+        responses_api_metadata: {
+          codex_security_surface: runtimeOptions.surface,
+        },
+        features: {
+          apps: false,
+          code_mode: false,
+          code_mode_only: false,
+          js_repl: false,
+          multi_agent: false,
+          multi_agent_v2: false,
+          plugins: false,
+          shell_tool: false,
+          unified_exec: false,
+        },
+        shell_environment_policy: {
+          inherit: "core",
+          ignore_default_excludes: false,
+          exclude: ["CODEX_HOME", "*KEY*", "*SECRET*", "*TOKEN*"],
+        },
+      } as NonNullable<CodexOptions["config"]>,
+    });
+  const thread = codex.startThread({
+    ...(model === undefined ? {} : { model }),
+    modelReasoningEffort: reasoningEffort,
+    sandboxMode: "read-only",
+    approvalPolicy: "never",
+    networkAccessEnabled: false,
+    webSearchMode: "disabled",
+    workingDirectory: options.workingDirectory ?? process.cwd(),
+    skipGitRepoCheck: true,
+  });
+  const turn = await thread.run(prompt, {
+    outputSchema,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  return turn.finalResponse;
+}
+
+async function disabledMcpServers(
+  command: CodexCommand,
+  config: JsonObject | undefined,
+  environment: Record<string, string>,
+  options: ReadOnlyCodexOptions,
+): Promise<JsonObject> {
+  const inherited = await configuredMcpServerNames(
+    command,
+    environment,
+    options,
+  );
+  const configured = (config?.["mcp_servers"] ?? {}) as JsonObject;
+  const names = new Set([...Object.keys(configured), ...inherited]);
+  if ([...names].some((name) => name.length === 0 || /[.=]/u.test(name))) {
+    throw new CodexSecurityError(
+      "Could not safely disable configured MCP servers for a read-only helper.",
+    );
+  }
+  return Object.fromEntries(
+    [...names].map((name) => [
+      name,
+      { ...(configured[name] as JsonObject), enabled: false },
+    ]),
+  );
+}
+
+async function configuredMcpServerNames(
+  command: CodexCommand,
+  environment: Record<string, string>,
+  options: ReadOnlyCodexOptions,
+): Promise<string[]> {
+  const directory = resolve(options.workingDirectory ?? process.cwd());
+  const allowedEnvironmentVariables = new Set([
+    "APPDATA",
+    "CODEX_HOME",
+    "COMSPEC",
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "PATH",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+  ]);
+  const inspectionEnvironment = Object.fromEntries(
+    Object.entries(environment).filter(([name]) =>
+      allowedEnvironmentVariables.has(name.toUpperCase()),
+    ),
+  );
+  const child = spawn(
+    command.command,
+    ["app-server", "-c", "features.plugins=false"],
+    {
+      cwd: directory,
+      env: inspectionEnvironment,
+      signal: options.signal,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  let stderr = "";
+  let processError: Error | undefined;
+  let protocolFailed = false;
+  let effectiveConfiguration: unknown;
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.once("error", (error) => {
+    processError = error;
+  });
+  child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+    if (
+      !["EPIPE", "ECONNRESET", "EOF", "ERR_STREAM_DESTROYED"].includes(
+        error.code ?? "",
+      )
+    ) {
+      processError = error;
+    }
+  });
+  const completion = new Promise<number | null>((resolve) => {
+    child.once("close", resolve);
+  });
+  const send = (message: Record<string, unknown>): void => {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  };
+
+  try {
+    send({
+      id: 1,
+      method: "initialize",
+      params: { clientInfo: { name: "codex-security", version: VERSION } },
+    });
+    for await (const line of createInterface({ input: child.stdout })) {
+      let message: unknown;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        protocolFailed = true;
+        child.stdin.end();
+        continue;
+      }
+      if (typeof message !== "object" || message === null) {
+        protocolFailed = true;
+        child.stdin.end();
+        continue;
+      }
+      const response = message as Record<string, unknown>;
+      if (response["id"] !== 1 && response["id"] !== 2) continue;
+      if (response["error"] !== undefined) {
+        protocolFailed = true;
+        child.stdin.end();
+      } else if (response["id"] === 1) {
+        send({ method: "notifications/initialized" });
+        send({
+          id: 2,
+          method: "config/read",
+          params: { cwd: directory, includeLayers: false },
+        });
+      } else {
+        effectiveConfiguration = response["result"];
+        child.stdin.end();
+      }
+    }
+  } finally {
+    if (!child.stdin.writableEnded) child.stdin.end();
+  }
+  const exitCode = await completion;
+  if (processError !== undefined) throw processError;
+  if (
+    exitCode !== 0 ||
+    protocolFailed ||
+    typeof effectiveConfiguration !== "object" ||
+    effectiveConfiguration === null ||
+    !("config" in effectiveConfiguration) ||
+    typeof effectiveConfiguration.config !== "object" ||
+    effectiveConfiguration.config === null ||
+    Array.isArray(effectiveConfiguration.config)
+  ) {
+    throw new CodexSecurityError(
+      `Could not read MCP configuration for a read-only helper: ${stderr.trim()}`,
+    );
+  }
+  const inherited = (effectiveConfiguration.config as Record<string, unknown>)[
+    "mcp_servers"
+  ];
+  if (inherited === undefined) return [];
+  if (
+    typeof inherited !== "object" ||
+    inherited === null ||
+    Array.isArray(inherited)
+  ) {
+    throw new CodexSecurityError(
+      "Could not read MCP configuration for a read-only helper.",
+    );
+  }
+  return Object.keys(inherited);
 }
 
 export async function matchCompletedScan(
@@ -307,15 +487,17 @@ export async function matchCompletedScan(
           !matchedAfter.has(afterOccurrenceId),
       ) ?? [];
     if (semanticComparison === undefined && scanMatches.length === 0) continue;
-    await options.workbench([
-      "save-scan-comparison",
-      "--before-scan-id",
-      scanId,
-      "--after-scan-id",
-      options.scanId,
-      "--matches-json",
+    await options.workbench(
+      [
+        "save-scan-comparison",
+        "--before-scan-id",
+        scanId,
+        "--after-scan-id",
+        options.scanId,
+        "--matches-json-stdin",
+      ],
       JSON.stringify({ matches: scanMatches, uncertain: scanUncertain }),
-    ]);
+    );
   }
 }
 
@@ -336,6 +518,7 @@ export async function comparisonEnvironment(
   source: NodeJS.ProcessEnv = process.env,
   nativeAccountStatus: typeof accountStatus = accountStatus,
   signal?: AbortSignal,
+  prepareCredentialHome: typeof prepareCodexSecurityCredentialHome = prepareCodexSecurityCredentialHome,
 ): Promise<Record<string, string>> {
   signal?.throwIfAborted();
   const environment = Object.fromEntries(
@@ -343,7 +526,9 @@ export async function comparisonEnvironment(
       (entry): entry is [string, string] => entry[1] !== undefined,
     ),
   );
-  if (environment["CODEX_SECURITY_SCAN_ID"] !== undefined) return environment;
+  if (environmentEntry(environment, "CODEX_SECURITY_SCAN_ID") !== undefined) {
+    return environment;
+  }
   if (
     Object.entries(environment).some(
       ([name, value]) =>
@@ -355,18 +540,19 @@ export async function comparisonEnvironment(
   }
   const credentialHome = codexSecurityCredentialHome(source);
   if (existsSync(credentialHome)) {
-    const canonicalCredentialHome =
-      await prepareCodexSecurityCredentialHome(source);
+    const canonicalCredentialHome = await prepareCredentialHome(source);
     signal?.throwIfAborted();
-    const storedEnvironment: Record<string, string> = {
-      ...environment,
-      CODEX_HOME: canonicalCredentialHome,
-    };
+    const storedEnvironment: Record<string, string> = { ...environment };
     for (const key of Object.keys(storedEnvironment)) {
-      if (["OPENAI_API_KEY", "CODEX_API_KEY"].includes(key.toUpperCase())) {
+      if (
+        ["CODEX_HOME", "OPENAI_API_KEY", "CODEX_API_KEY"].includes(
+          key.toUpperCase(),
+        )
+      ) {
         delete storedEnvironment[key];
       }
     }
+    storedEnvironment["CODEX_HOME"] = canonicalCredentialHome;
     const status = await nativeAccountStatus(
       resolveCodexCommand(source),
       storedEnvironment,
@@ -374,13 +560,9 @@ export async function comparisonEnvironment(
     );
     if (status.authenticated) return storedEnvironment;
   }
-  const configuredHome = environment["CODEX_HOME"]?.trim();
+  const configuredHome = environmentEntry(environment, "CODEX_HOME")?.trim();
   const codexHome = configuredHome
-    ? configuredHome === "~"
-      ? homedir()
-      : configuredHome.startsWith("~/")
-        ? join(homedir(), configuredHome.slice(2))
-        : configuredHome
+    ? expandHome(configuredHome, environment)
     : join(homedir(), ".codex");
   if (existsSync(join(codexHome, "auth.json"))) {
     for (const key of Object.keys(environment)) {
@@ -390,6 +572,18 @@ export async function comparisonEnvironment(
     }
   }
   return environment;
+}
+
+function environmentEntry(
+  environment: Record<string, string>,
+  requested: string,
+): string | undefined {
+  const exact = environment[requested];
+  if (exact !== undefined || process.platform !== "win32") return exact;
+  const upper = requested.toUpperCase();
+  return Object.entries(environment).find(
+    ([name]) => name.toUpperCase() === upper,
+  )?.[1];
 }
 
 function validateComparison(

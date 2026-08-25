@@ -87,6 +87,55 @@ function runPreflight(
 }
 
 describe("CodexSecurity preflight configuration", () => {
+  test.skipIf(process.platform !== "win32")(
+    "loads trusted project config through a Windows path alias",
+    async () => {
+      const root = await temporaryDirectory();
+      const codexHome = join(root, "codex-home");
+      const repository = join(root, "Repository");
+      const projectConfig = join(repository, ".codex", "config.toml");
+      await mkdir(join(repository, ".git"), { recursive: true });
+      await mkdir(join(repository, ".codex"), { recursive: true });
+      await mkdir(codexHome);
+      await writeFile(projectConfig, "[features]\ngoals = true\n");
+      await writeCodexConfig(join(codexHome, "config.toml"), {
+        projects: {
+          [repository.toUpperCase()]: { trust_level: "trusted" },
+        },
+      });
+
+      const interpreter =
+        process.env["PYTHON"] ??
+        Bun.which("python3") ??
+        Bun.which("python") ??
+        Bun.which("py");
+      expect(interpreter).not.toBeNull();
+      const result = spawnSync(
+        interpreter!,
+        [
+          "-I",
+          "-B",
+          join(PLUGIN_ROOT, "scripts", "config_preflight.py"),
+          "--profile",
+          "security_scan",
+          "--cwd",
+          repository,
+        ],
+        {
+          encoding: "utf8",
+          env: { PATH: process.env["PATH"], CODEX_HOME: codexHome },
+        },
+      );
+      expect(result.error).toBeUndefined();
+      const payload = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(payload["config_resolution"]).toBe("cwd-discovery");
+      expect(payload["config_discovery"]).toMatchObject({
+        project_layers_loaded: true,
+      });
+      expect(payload["config_paths"]).toContain(projectConfig);
+    },
+  );
+
   test("ignores unrelated runtime settings for profiles without parent-runtime requirements", async () => {
     const root = await temporaryDirectory();
     const config = join(root, "empty.toml");
@@ -311,6 +360,8 @@ describe("CodexSecurity preflight configuration", () => {
   test("uses a root-read filesystem profile with writable workspace and workbench state", () => {
     const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
     const original = {
+      approval_policy: "on-request",
+      approvals_reviewer: "user",
       sandbox_mode: "workspace-write",
       allow_login_shell: true,
       default_permissions: "unsafe",
@@ -324,6 +375,8 @@ describe("CodexSecurity preflight configuration", () => {
     };
 
     expect(scanRuntimeCodexConfig(original, stateDirectory)).toEqual({
+      approval_policy: "on-request",
+      approvals_reviewer: "auto_review",
       allow_login_shell: false,
       default_permissions: "codex_security_scan",
       permissions: {
@@ -338,6 +391,8 @@ describe("CodexSecurity preflight configuration", () => {
       },
     });
     expect(original).toMatchObject({
+      approval_policy: "on-request",
+      approvals_reviewer: "user",
       sandbox_mode: "workspace-write",
       allow_login_shell: true,
       default_permissions: "unsafe",
@@ -360,6 +415,84 @@ describe("CodexSecurity preflight configuration", () => {
           },
         },
       },
+    });
+  });
+
+  test("preserves an explicitly requested strict approval policy", () => {
+    const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
+
+    expect(
+      scanRuntimeCodexConfig(
+        { approval_policy: "never", approvals_reviewer: "user" },
+        stateDirectory,
+      ),
+    ).toMatchObject({
+      approval_policy: "never",
+      approvals_reviewer: "auto_review",
+      default_permissions: "codex_security_scan",
+    });
+  });
+
+  test("preserves a strict approval policy from the selected profile", () => {
+    const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
+    const config = {
+      approval_policy: "on-request",
+      profile: "strict",
+      profiles: {
+        strict: { approval_policy: "never", model: "profile-model" },
+        other: { approval_policy: "on-request" },
+      },
+    };
+
+    expect(scanRuntimeCodexConfig(config, stateDirectory)).toMatchObject({
+      approval_policy: "never",
+      approvals_reviewer: "auto_review",
+      profiles: { strict: { model: "profile-model" }, other: {} },
+    });
+    expect(config.profiles.strict.approval_policy).toBe("never");
+  });
+
+  test("removes execution and permission overrides from every configured profile", () => {
+    const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
+    const original = {
+      profile: "selected",
+      profiles: {
+        selected: {
+          model: "profile-model",
+          approval_policy: "on-request",
+          approvals_reviewer: "auto_review",
+          default_permissions: "unsafe",
+          permissions: { unsafe: { filesystem: { ":root": "write" } } },
+          sandbox_mode: "danger-full-access",
+        },
+        other: {
+          model_reasoning_effort: "high",
+          approval_policy: "untrusted",
+          approvals_reviewer: "guardian_subagent",
+          default_permissions: "other-unsafe",
+          permissions: { "other-unsafe": { filesystem: { ":root": "write" } } },
+          sandbox_mode: "workspace-write",
+        },
+      },
+    };
+
+    const hardened = scanRuntimeCodexConfig(original, stateDirectory);
+    expect(hardened).toMatchObject({
+      approval_policy: "on-request",
+      approvals_reviewer: "auto_review",
+      default_permissions: "codex_security_scan",
+      profile: "selected",
+    });
+    expect(hardened["profiles"]).toEqual({
+      selected: { model: "profile-model" },
+      other: { model_reasoning_effort: "high" },
+    });
+    expect(original.profiles.selected).toMatchObject({
+      approval_policy: "on-request",
+      approvals_reviewer: "auto_review",
+      default_permissions: "unsafe",
+      permissions: { unsafe: { filesystem: { ":root": "write" } } },
+      sandbox_mode: "danger-full-access",
     });
   });
 
