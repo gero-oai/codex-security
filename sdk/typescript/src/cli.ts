@@ -1653,10 +1653,7 @@ export async function main(
         );
       if (matchingCached && !force) return comparison;
       const input = matchingInputs as JsonObject & ScanComparisonInput;
-      const matching = await dependencies.matchFindings(
-        force ? { ...input, knownFindingGroups: [] } : input,
-        options,
-      );
+      const matching = await dependencies.matchFindings(input, options);
       options.signal?.throwIfAborted();
       return await dependencies.runWorkbench(
         [

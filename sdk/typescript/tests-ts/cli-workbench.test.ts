@@ -1202,7 +1202,7 @@ describe("CLI workbench", () => {
   });
 
   test.each([false, true])(
-    "reuses indirect matches unless force is requested (%s)",
+    "preserves surviving indirect matches during forced recomputation (%s)",
     async (force) => {
       const before = [{ occurrenceId: "old", findingId: "identity-old" }];
       const after = [{ occurrenceId: "new", findingId: "identity-new" }];
@@ -1252,11 +1252,11 @@ describe("CLI workbench", () => {
           }),
         ),
       ).toBe(0);
-      expect(modelCalls).toBe(force ? 1 : 0);
+      expect(modelCalls).toBe(0);
       expect(saved).toMatchObject({
-        matches: force
-          ? []
-          : [{ beforeOccurrenceIds: ["old"], afterOccurrenceIds: ["new"] }],
+        matches: [
+          { beforeOccurrenceIds: ["old"], afterOccurrenceIds: ["new"] },
+        ],
         uncertain: [],
       });
       expect(calls.map((args) => args[0])).toEqual([

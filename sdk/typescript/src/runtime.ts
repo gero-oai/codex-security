@@ -45,8 +45,6 @@ import { promisify } from "node:util";
 import { crc32 } from "node:zlib";
 import { setTimeout as delay } from "node:timers/promises";
 import extractZip from "extract-zip";
-import semverGte from "semver/functions/gte.js";
-import semverValid from "semver/functions/valid.js";
 import { parse } from "smol-toml";
 import {
   CodexSecurityError,
@@ -1398,8 +1396,10 @@ export async function preparePersistentOutputRoot(
   return root;
 }
 
-const workbenchComparisonStdinSupport = new Map<string, boolean>();
-const workbenchComparisonRelatedSupport = new Map<string, boolean>();
+const workbenchComparisonSupport = new Map<
+  string,
+  { stdin: boolean; related: boolean }
+>();
 
 export async function runWorkbench(
   options: WorkbenchCommandOptions,
@@ -1446,28 +1446,24 @@ export async function runWorkbench(
       input !== undefined
     ) {
       const key = JSON.stringify([options.python, script]);
-      let supportsStdin = workbenchComparisonStdinSupport.get(key);
-      if (supportsStdin === undefined) {
+      let support = workbenchComparisonSupport.get(key);
+      if (support === undefined) {
         const help = await run(["save-scan-comparison", "--help"]);
         options.signal?.throwIfAborted();
-        supportsStdin = help.includes("--matches-json-stdin");
-        workbenchComparisonStdinSupport.set(key, supportsStdin);
+        support = {
+          stdin: help.includes("--matches-json-stdin"),
+          related: help.includes(
+            "Comparison payload supports related findings.",
+          ),
+        };
+        workbenchComparisonSupport.set(key, support);
       }
       const comparison: unknown = JSON.parse(input);
-      if (isRecord(comparison) && "related" in comparison) {
-        let supportsRelated = workbenchComparisonRelatedSupport.get(key);
-        if (supportsRelated === undefined) {
-          const { version } = await pluginMetadata(options.pluginRoot);
-          supportsRelated =
-            semverValid(version) !== null && semverGte(version, "0.1.39");
-          workbenchComparisonRelatedSupport.set(key, supportsRelated);
-        }
-        if (!supportsRelated) {
-          delete comparison["related"];
-          input = JSON.stringify(comparison);
-        }
+      if (isRecord(comparison) && "related" in comparison && !support.related) {
+        delete comparison["related"];
+        input = JSON.stringify(comparison);
       }
-      if (!supportsStdin) {
+      if (!support.stdin) {
         arguments_.splice(matchesStdinIndex, 1, "--matches-json", input);
         input = undefined;
       }

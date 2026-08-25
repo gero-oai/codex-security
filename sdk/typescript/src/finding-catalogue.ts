@@ -34,19 +34,21 @@ export function groupFindings(
     ["occurrence", occurrenceGroups],
   ] as const) {
     for (const group of groups) {
-      const first = group[0];
+      const identities =
+        prefix === "finding"
+          ? group.filter((identity) => identity.trim().length > 0)
+          : group;
+      const first = identities[0];
       if (first === undefined) continue;
-      for (const value of group.slice(1)) {
+      for (const value of identities.slice(1)) {
         link(`${prefix}:${first}`, `${prefix}:${value}`);
       }
     }
   }
   for (const finding of findings) {
-    if (typeof finding["findingId"] === "string") {
-      link(
-        `finding:${finding["findingId"]}`,
-        `occurrence:${finding.occurrenceId}`,
-      );
+    const findingId = finding["findingId"];
+    if (typeof findingId === "string" && findingId.trim().length > 0) {
+      link(`finding:${findingId}`, `occurrence:${finding.occurrenceId}`);
     }
   }
 
@@ -94,8 +96,9 @@ export function findingCatalogue(
         card["occurrenceCount"] = occurrences.length;
         if (aliases.length > 0) card["earlierDescriptions"] = aliases;
       }
-      if (typeof occurrences[0]!["findingId"] === "string") {
-        card["issueId"] = occurrences[0]!["findingId"];
+      const findingId = occurrences[0]!["findingId"];
+      if (typeof findingId === "string" && findingId.trim().length > 0) {
+        card["issueId"] = findingId;
       }
       return [latest.occurrenceId, { card, occurrences }];
     }),

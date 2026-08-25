@@ -150,6 +150,47 @@ describe("finding catalogue", () => {
     ]);
   });
 
+  test.each(["", "   "])(
+    "does not treat a blank finding identity as a confirmed match (%j)",
+    async (findingId) => {
+      const before = finding("old", { findingId });
+      const after = finding("new", { findingId });
+      const observed = conversation(() => empty);
+
+      expect(findingCatalogue([before, after]).size).toBe(2);
+      expect(findingCatalogue([before]).get("old")?.card).not.toHaveProperty(
+        "issueId",
+      );
+      expect(
+        await matchScanFindings(
+          {
+            before: [before],
+            after: [after],
+            knownFindingGroups: [[findingId]],
+          },
+          { codex: observed.codex },
+        ),
+      ).toEqual(empty);
+      expect(observed.threads()).toBe(1);
+
+      const distinct = conversation(() => empty);
+      expect(
+        await matchScanFindings(
+          {
+            before: [finding("identity-before", { findingId: "identity-a" })],
+            after: [finding("identity-after", { findingId: "identity-b" })],
+            knownFindingGroups: [
+              [findingId, "identity-a"],
+              [findingId, "identity-b"],
+            ],
+          },
+          { codex: distinct.codex },
+        ),
+      ).toEqual(empty);
+      expect(distinct.threads()).toBe(1);
+    },
+  );
+
   test.each(["stable identity", "confirmed alias"] as const)(
     "reuses a %s across opposite sides without starting Codex",
     async (kind) => {
@@ -588,6 +629,46 @@ describe("finding catalogue", () => {
       expect(JSON.parse(pieces.join(""))).toEqual(input);
     },
   );
+
+  test("batches omitted evidence identifiers within the upstream message limit", async () => {
+    const identity = (prefix: string) => `${prefix}🙂${"x".repeat(360_000)}`;
+    const beforeIds = [identity("before-a"), identity("before-b")];
+    const afterIds = [identity("after")];
+    const rootCause = "🙂".repeat(700_000);
+    const selected = new Set<string>();
+    const selections = new Set<string>();
+    const observed = conversation((prompt) => {
+      expect(characters(prompt)).toBeLessThanOrEqual(1 << 20);
+      const payload = data<CatalogueData | EvidenceData>(prompt);
+      if (!("content" in payload)) return empty;
+
+      for (const identity of [
+        ...payload.beforeOccurrenceIds,
+        ...payload.afterOccurrenceIds,
+      ]) {
+        selected.add(identity);
+      }
+      selections.add(
+        JSON.stringify([
+          payload.beforeOccurrenceIds,
+          payload.afterOccurrenceIds,
+        ]),
+      );
+      return empty;
+    });
+
+    expect(
+      await matchScanFindings(
+        {
+          before: beforeIds.map((id) => finding(id, { rootCause })),
+          after: afterIds.map((id) => finding(id, { rootCause })),
+        },
+        { codex: observed.codex },
+      ),
+    ).toEqual(empty);
+    expect(selected).toEqual(new Set([...beforeIds, ...afterIds]));
+    expect(selections.size).toBeGreaterThan(1);
+  });
 
   test("finishes requested evidence before accepting a proposed match", async () => {
     const original = finding("old", {
