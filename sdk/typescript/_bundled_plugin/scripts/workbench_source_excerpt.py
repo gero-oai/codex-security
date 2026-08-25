@@ -81,6 +81,7 @@ def matching_tree_entries(
     responses: IO[bytes],
     object_id: str,
     name: str,
+    filesystem_parent: Path | None = None,
 ) -> TreeEntry | None:
     encoded_object = object_id.encode("ascii")
     requests.write(encoded_object + b"\0")
@@ -154,6 +155,14 @@ def matching_tree_entries(
         )
         entry_object = read_object_id(object_id_bytes)
         if not ambiguous and normalized_path_component(decoded_name) == expected_name:
+            if filesystem_parent is not None and decoded_name != name:
+                try:
+                    if not (filesystem_parent / name).samefile(
+                        filesystem_parent / decoded_name
+                    ):
+                        continue
+                except OSError:
+                    pass
             if selected is not None:
                 selected = None
                 ambiguous = True
@@ -184,6 +193,7 @@ def tree_path(
     if selected_kinds is not None and selected_kinds.get(0, "directory") != "directory":
         return None
     kind, object_id = "directory", tree
+    filesystem_parent = repository
     if not path.parts:
         return path.as_posix(), kind, object_id
     environment = os.environ.copy()
@@ -223,11 +233,13 @@ def tree_path(
                     process.stdout,
                     object_id,
                     name,
+                    filesystem_parent,
                 )
                 # The normalized name must be unique before an exact spelling can win.
                 if aliases is None or aliases[0] != name:
                     return None
                 _, kind, object_id = aliases
+                filesystem_parent /= name
                 if (
                     selected_kinds is not None
                     and (expected_kind := selected_kinds.get(depth)) is not None

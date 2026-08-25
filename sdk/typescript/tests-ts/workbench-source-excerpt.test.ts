@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -53,6 +54,7 @@ function git(
 }
 
 function collisionRepository(root: string): {
+  caseSensitive: boolean;
   deepPath: string;
   repository: string;
   replacement: string;
@@ -146,6 +148,11 @@ function collisionRepository(root: string): {
   );
   writeFileSync(join(repository, "src", "allowed.py"), "allowed = True\n");
   writeFileSync(join(repository, "src", "LOWER.py"), "case_upper = True\n");
+  const lowercasePath = join(repository, "src", "lower.py");
+  const caseSensitive = !existsSync(lowercasePath);
+  if (caseSensitive) {
+    writeFileSync(lowercasePath, "case_lower = True\n");
+  }
   writeFileSync(join(repository, "src", "é.py"), "unicode_composed = True\n");
   writeFileSync(join(repository, "src", "trailing.py"), "plain_name = True\n");
   writeFileSync(join(repository, "mismatch"), "selected_file = True\n");
@@ -153,7 +160,7 @@ function collisionRepository(root: string): {
     join(repository, "Scope", "selected.py"),
     "selected_scope = True\n",
   );
-  return { deepPath, repository, replacement, revision };
+  return { caseSensitive, deepPath, repository, replacement, revision };
 }
 
 function ordinaryRepository(root: string): {
@@ -349,6 +356,22 @@ collisions = {
     )
 }
 collision_blob_reads = blob_reads[before:]
+original_samefile = Path.samefile
+def distinct_case_samefile(left, right):
+    right = Path(right)
+    if left.parent == right.parent and {left.name, right.name} == {"LOWER.py", "lower.py"}:
+        return False
+    return original_samefile(left, right)
+Path.samefile = distinct_case_samefile
+before = len(blob_reads)
+try:
+    distinct_case_excerpts = {
+        path: excerpt(path)
+        for path in ("src/LOWER.py", "src/lower.py")
+    }
+finally:
+    Path.samefile = original_samefile
+distinct_case_blob_reads = blob_reads[before:]
 outside = excerpt("outside.py")
 file_authority = excerpts.capture_source_scopes(repository, identity, ["mismatch"])
 file_scan = {**scan, "source_scopes_json": json.dumps(file_authority)}
@@ -670,6 +693,8 @@ print(json.dumps({
     "deepExcerpt": deep_excerpt,
     "deepPathParses": path_parses,
     "deepTreeReads": tree_reads,
+    "distinctCaseBlobReads": distinct_case_blob_reads,
+    "distinctCaseExcerpts": distinct_case_excerpts,
     "duplicatePaths": len(authority["paths"]),
     "fileAuthorityPaths": file_authority["paths"],
     "fileDescendantBlobReads": file_descendant_blob_reads,
@@ -742,10 +767,16 @@ describe("workbench source excerpts", () => {
       allowed: expect.stringContaining("allowed = True"),
       broadened: null,
       broadenedBlobReads: [],
-      collisionBlobReads: [],
+      collisionBlobReads: fixture.caseSensitive
+        ? [expect.any(String), expect.any(String)]
+        : [],
       collisions: {
-        "src/LOWER.py": null,
-        "src/lower.py": null,
+        "src/LOWER.py": fixture.caseSensitive
+          ? expect.stringContaining("case_upper = True")
+          : null,
+        "src/lower.py": fixture.caseSensitive
+          ? expect.stringContaining("case_lower = True")
+          : null,
         "src/é.py": null,
         "src/é.py": null,
         "src/trailing.py": null,
@@ -758,6 +789,11 @@ describe("workbench source excerpts", () => {
       deepExcerpt: expect.stringContaining("deep = True"),
       deepPathParses: 1,
       deepTreeReads: 0,
+      distinctCaseBlobReads: [expect.any(String), expect.any(String)],
+      distinctCaseExcerpts: {
+        "src/LOWER.py": expect.stringContaining("case_upper = True"),
+        "src/lower.py": expect.stringContaining("case_lower = True"),
+      },
       duplicatePaths: 1,
       fileAuthorityPaths: [{ kind: "file", path: "mismatch" }],
       fileDescendantBlobReads: [],
