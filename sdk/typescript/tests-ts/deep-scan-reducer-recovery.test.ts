@@ -17,7 +17,7 @@ function bundledFunction(runtime: string, name: string): string {
 
 type ReducerFinding = {
   ruleId: string;
-  identity: { anchor: string };
+  identity: { anchor: string; instance?: string; [field: string]: unknown };
   title: string;
   locations: Array<{ path: string; startLine: number }>;
   summary: string;
@@ -130,7 +130,11 @@ function bundledReducer(
   )(
     () => ({ isDeepStrictEqual }),
     (finding: ReducerFinding) =>
-      JSON.stringify([finding.ruleId, finding.identity.anchor]),
+      JSON.stringify([
+        finding.ruleId,
+        finding.identity.anchor,
+        finding.identity.instance ?? null,
+      ]),
     () => {},
     preserveCoverage,
     (value: ReducerDraft) => value,
@@ -418,6 +422,80 @@ test("preserves inherited property names in structured finding evidence", async 
       null,
     ),
   ).toThrow("__proto__");
+});
+
+test("preserves every accepted source-backed identity field", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const original = reducerFinding("complete-identity");
+  const first = {
+    ...original,
+    identity: {
+      anchor: original.identity.anchor,
+      instance: "accepted-instance",
+      details: { candidate: "first-candidate" },
+      labels: ["first", "accepted"],
+    },
+    extensions: { candidateId: "first-candidate" },
+  };
+  const second = {
+    ...original,
+    identity: {
+      anchor: original.identity.anchor,
+      instance: "accepted-instance",
+      details: { candidate: "second-candidate" },
+      labels: ["second", "accepted"],
+    },
+    extensions: { candidateId: "second-candidate" },
+  };
+  const sources = [
+    { workerId: "first", result: reducerDraft([first]) },
+    { workerId: "second", result: reducerDraft([second]) },
+  ];
+  const reduced = (
+    source: typeof first,
+    overrides: Record<string, unknown> = {},
+  ) =>
+    reducerDraft([
+      {
+        ...source,
+        ...overrides,
+        provenance: {
+          ...source.provenance,
+          sourceFindingIds: ["first:0", "second:0"],
+        },
+      },
+    ]);
+
+  for (const source of [first, second]) {
+    expect(
+      reconcileDeepReduction(reduced(source), sources, null).findings[0]
+        ?.identity,
+    ).toEqual(source.identity);
+  }
+
+  for (const identity of [
+    { anchor: first.identity.anchor, instance: first.identity.instance },
+    {
+      ...first.identity,
+      details: { candidate: "fabricated-candidate" },
+    },
+    {
+      ...first.identity,
+      labels: ["accepted", "first"],
+    },
+  ]) {
+    expect(() =>
+      reconcileDeepReduction(reduced(first, { identity }), sources, null),
+    ).toThrow("finding.identity");
+  }
+
+  expect(() =>
+    reconcileDeepReduction(
+      reduced(first, { identity: second.identity }),
+      sources,
+      null,
+    ),
+  ).toThrow("finding evidence tuple");
 });
 
 test("preserves complete source-backed finding classifications and details", async () => {
@@ -834,7 +912,10 @@ test("retains complete source-backed ratings at their strongest accepted levels"
   );
 
   expect(reduced.findings[0]?.severity).toEqual(stronger.severity);
-  expect(reduced.findings[0]?.confidence).toEqual(stronger.confidence);
+  expect(reduced.findings[0]?.confidence).toEqual({
+    level: "high",
+    rationale: "Second accepted trace.\n\nFirst accepted trace.",
+  });
 });
 
 test("keeps accepted source evidence visible on the reduced finding", async () => {
@@ -1230,6 +1311,299 @@ test("preserves conflicting categorical evidence without inventing combined outc
   }
 });
 
+test("preserves every compatible source-backed assessment explanation", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const original = reducerFinding("accepted-assessments");
+
+  for (const field of ["impact", "likelihood"]) {
+    const first = {
+      ...original,
+      attackPath: {
+        [field]: {
+          level: "high",
+          why: "Production requests reach the accepted sink.",
+          rationale: "The accepted production route is reachable.",
+        },
+      },
+    };
+    const second = {
+      ...original,
+      attackPath: {
+        [field]: {
+          level: "high",
+          why: "The accepted test route also reaches the sink.",
+          rationale: "The accepted test route is independently reachable.",
+        },
+      },
+    };
+    const lower = {
+      ...original,
+      attackPath: {
+        [field]: {
+          level: "low",
+          why: "Only the rejected low-impact path is reachable.",
+          rationale: "The rejected low-impact route requires authentication.",
+        },
+      },
+    };
+
+    for (const accepted of [
+      [first, second, lower],
+      [lower, second, first],
+    ]) {
+      const discoveries = accepted.map((finding, index) => ({
+        workerId: `worker-${index}`,
+        result: reducerDraft([finding]),
+      }));
+      for (const selected of [first, second]) {
+        const result = reconcileDeepReduction(
+          reducerDraft([
+            {
+              ...selected,
+              provenance: {
+                ...original.provenance,
+                sourceFindingIds: ["worker-0:0", "worker-1:0", "worker-2:0"],
+              },
+            },
+          ]),
+          discoveries,
+          null,
+        ).findings[0]!;
+        const assessment = result.attackPath?.[field] as {
+          level: string;
+          why: string;
+          rationale: string;
+        };
+        expect(assessment.level).toBe("high");
+        for (const source of [first, second]) {
+          const details = source.attackPath[field]!;
+          expect(assessment.why.split(/\n\s*\n/u)).toContain(details.why);
+          expect(assessment.rationale.split(/\n\s*\n/u)).toContain(
+            details.rationale,
+          );
+        }
+        expect(assessment.why).not.toContain(lower.attackPath[field]!.why);
+        expect(assessment.rationale).not.toContain(
+          lower.attackPath[field]!.rationale,
+        );
+        expect(result.provenance.sourceFindings).toHaveLength(3);
+      }
+    }
+
+    expect(() =>
+      reconcileDeepReduction(
+        reducerDraft([
+          {
+            ...first,
+            attackPath: {
+              [field]: {
+                ...first.attackPath[field],
+                why: "The reducer invented dynamic exploitation.",
+              },
+            },
+            provenance: {
+              ...original.provenance,
+              sourceFindingIds: ["worker:0"],
+            },
+          },
+        ]),
+        [{ workerId: "worker", result: reducerDraft([first]) }],
+        null,
+      ),
+    ).toThrow(`attackPath.${field}.why`);
+  }
+
+  const first = {
+    ...original,
+    severity: {
+      level: "high",
+      score: 8,
+      rationale: "The accepted production exposure is high.",
+      changeConditions: "Exposure decreases when the production route closes.",
+    },
+    confidence: {
+      level: "high",
+      rationale: "The accepted production trace confirms reachability.",
+    },
+  };
+  const second = {
+    ...original,
+    severity: {
+      level: "high",
+      score: 8,
+      rationale: "The accepted test exposure independently confirms impact.",
+      changeConditions:
+        "Exposure decreases when request validation is enabled.",
+    },
+    confidence: {
+      level: "high",
+      rationale: "The accepted test trace independently confirms reachability.",
+    },
+  };
+  const lower = {
+    ...original,
+    severity: {
+      level: "low",
+      score: 2,
+      rationale:
+        "The incompatible low-severity explanation must stay separate.",
+      changeConditions:
+        "The incompatible low-severity conditions are different.",
+    },
+    confidence: {
+      level: "low",
+      rationale: "The incompatible low-confidence explanation is unverified.",
+    },
+  };
+
+  for (const accepted of [
+    [first, second, lower],
+    [lower, second, first],
+  ]) {
+    const discoveries = accepted.map((finding, index) => ({
+      workerId: `worker-${index}`,
+      result: reducerDraft([finding]),
+    }));
+    for (const selected of [first, second]) {
+      const result = reconcileDeepReduction(
+        reducerDraft([
+          {
+            ...selected,
+            provenance: {
+              ...original.provenance,
+              sourceFindingIds: ["worker-0:0", "worker-1:0", "worker-2:0"],
+            },
+          },
+        ]),
+        discoveries,
+        null,
+      ).findings[0]!;
+      expect(result.severity?.level).toBe("high");
+      expect(result.severity?.["score"]).toBe(8);
+      expect(result.confidence?.level).toBe("high");
+      for (const source of [first, second]) {
+        expect(
+          (result.severity?.["rationale"] as string).split(/\n\s*\n/u),
+        ).toContain(source.severity.rationale);
+        expect(
+          (result.severity?.["changeConditions"] as string).split(/\n\s*\n/u),
+        ).toContain(source.severity.changeConditions);
+        expect(result.confidence?.rationale?.split(/\n\s*\n/u)).toContain(
+          source.confidence.rationale,
+        );
+      }
+      expect(result.severity?.["rationale"]).not.toContain(
+        lower.severity.rationale,
+      );
+      expect(result.confidence?.rationale).not.toContain(
+        lower.confidence.rationale,
+      );
+      expect(result.provenance.sourceFindings).toHaveLength(3);
+    }
+  }
+});
+
+test("retains every accepted plain-text finding evidence observation", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const original = reducerFinding("plain-text-evidence");
+  const first = "The accepted production route reaches the sink.";
+  const second = "The accepted test route independently reaches the sink.";
+
+  for (const field of ["rootCause", "root_cause"]) {
+    for (const accepted of [
+      [first, second],
+      [second, first],
+    ]) {
+      const sources = accepted.map((value) => ({
+        ...original,
+        [field]: value,
+      }));
+      const result = reconcileDeepReduction(
+        reducerDraft([
+          {
+            ...sources[0]!,
+            provenance: {
+              ...original.provenance,
+              sourceFindingIds: ["worker-0:0", "worker-1:0"],
+            },
+          },
+        ]),
+        sources.map((finding, index) => ({
+          workerId: `worker-${index}`,
+          result: reducerDraft([finding]),
+        })),
+        null,
+      ).findings[0]!;
+      const value = result[field as "rootCause" | "root_cause"];
+      if (typeof value !== "string") {
+        throw new Error(`Expected a source-backed ${field} text value.`);
+      }
+      expect(value.split(/\n\s*\n/u)).toContain(first);
+      expect(value.split(/\n\s*\n/u)).toContain(second);
+    }
+  }
+
+  for (const field of ["dataFlow", "data_flow", "dataflow", "reachability"]) {
+    for (const accepted of [
+      [first, second],
+      [second, first],
+    ]) {
+      const sources = accepted.map((value) => ({
+        ...original,
+        attackPath: { [field]: value },
+      }));
+      const result = reconcileDeepReduction(
+        reducerDraft([
+          {
+            ...sources[0]!,
+            provenance: {
+              ...original.provenance,
+              sourceFindingIds: ["worker-0:0", "worker-1:0"],
+            },
+          },
+        ]),
+        sources.map((finding, index) => ({
+          workerId: `worker-${index}`,
+          result: reducerDraft([finding]),
+        })),
+        null,
+      ).findings[0]?.attackPath?.[field];
+      if (typeof result !== "string") {
+        throw new Error(`Expected a source-backed ${field} text value.`);
+      }
+      expect(result.split(/\n\s*\n/u)).toContain(first);
+      expect(result.split(/\n\s*\n/u)).toContain(second);
+    }
+  }
+
+  for (const accepted of [
+    [first, second],
+    [second, first],
+  ]) {
+    const sources = accepted.map((evidence) => ({
+      ...original,
+      validation: { evidence },
+    }));
+    const result = reconcileDeepReduction(
+      reducerDraft([
+        {
+          ...sources[0]!,
+          provenance: {
+            ...original.provenance,
+            sourceFindingIds: ["worker-0:0", "worker-1:0"],
+          },
+        },
+      ]),
+      sources.map((finding, index) => ({
+        workerId: `worker-${index}`,
+        result: reducerDraft([finding]),
+      })),
+      null,
+    ).findings[0]?.validation?.["evidence"];
+    expect(result).toEqual(accepted);
+  }
+});
+
 test("binds related structured finding evidence to one accepted source", async () => {
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
   for (const { field, first, second, fabricated } of [
@@ -1326,6 +1700,62 @@ test("binds related structured finding evidence to one accepted source", async (
         reconcileDeepReduction(reduced(fabricated), discoveries, null),
       ).toThrow(field);
     }
+  }
+
+  for (const accepted of [
+    [
+      { method: "dynamic", status: "exploited" },
+      { status: "not_exploited", result: "blocked" },
+    ],
+    [
+      { status: "not_exploited", result: "blocked" },
+      { method: "dynamic", status: "exploited" },
+    ],
+  ]) {
+    const original = reducerFinding("overlapping-evidence-fields");
+    const sources = accepted.map((validation) => ({ ...original, validation }));
+    const discoveries = sources.map((finding, index) => ({
+      workerId: `worker-${index}`,
+      result: reducerDraft([finding]),
+    }));
+    const draft = (validation: Record<string, unknown>) =>
+      reducerDraft([
+        {
+          ...original,
+          validation,
+          provenance: {
+            ...original.provenance,
+            sourceFindingIds: ["worker-0:0", "worker-1:0"],
+          },
+        },
+      ]);
+
+    for (const validation of accepted) {
+      const result = reconcileDeepReduction(
+        draft(validation),
+        discoveries,
+        null,
+      ).findings[0]!;
+      expect(result.validation).toEqual(validation);
+      expect(result.provenance.sourceFindings).toEqual(
+        sources.map((finding, index) => ({
+          id: `worker-${index}:0`,
+          finding,
+        })),
+      );
+    }
+
+    expect(() =>
+      reconcileDeepReduction(
+        draft({
+          method: "dynamic",
+          status: "not_exploited",
+          result: "blocked",
+        }),
+        discoveries,
+        null,
+      ),
+    ).toThrow("validation");
   }
 
   const original = reducerFinding("independent-evidence-fields");
@@ -1634,6 +2064,48 @@ test("preserves the complete accepted order of attack-path steps", async () => {
       expect(reconciled.filter((step) => step === input)).toHaveLength(2);
       expect(reconciled.filter((step) => step === bypass)).toHaveLength(3);
       for (const { attackPath } of repeatedBeyondSeeds) {
+        let index = 0;
+        for (const step of reconciled) {
+          if (attackPath.steps[index] === step) index += 1;
+        }
+        expect(index).toBe(attackPath.steps.length);
+      }
+    }
+  }
+
+  const repeatedBeyondUniformTies = [
+    { ...original, attackPath: { steps: [input, bypass, input] } },
+    { ...original, attackPath: { steps: [bypass, input, input, bypass] } },
+    { ...original, attackPath: { steps: [bypass, bypass, bypass, bypass] } },
+  ];
+  for (const order of [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+  ]) {
+    const discoveries = order.map((index, position) => ({
+      workerId: `pivot-${position}`,
+      result: reducerDraft([repeatedBeyondUniformTies[index]!]),
+    }));
+    for (const source of repeatedBeyondUniformTies) {
+      const reconciled = reconcileDeepReduction(
+        reducerDraft([
+          reducedFinding(source.attackPath.steps, [
+            "pivot-0:0",
+            "pivot-1:0",
+            "pivot-2:0",
+          ]),
+        ]),
+        discoveries,
+        null,
+      ).findings[0]?.attackPath?.["steps"] as string[];
+      expect(reconciled).toHaveLength(6);
+      expect(reconciled.filter((step) => step === input)).toHaveLength(2);
+      expect(reconciled.filter((step) => step === bypass)).toHaveLength(4);
+      for (const { attackPath } of repeatedBeyondUniformTies) {
         let index = 0;
         for (const step of reconciled) {
           if (attackPath.steps[index] === step) index += 1;
