@@ -512,7 +512,6 @@ export class ScanCostTracker {
       if (
         this.#options.maxCostUsd !== undefined &&
         session.threadId === null &&
-        session.pendingLineBytes > 0 &&
         presentSessions.has(path)
       ) {
         observed.unidentifiedSessions.add(path);

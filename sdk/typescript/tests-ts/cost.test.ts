@@ -4589,16 +4589,43 @@ describe("live scan cost tracking", () => {
   });
 
   test.each([
-    ["delegated worker", "delegated", true],
-    ["independent Deep Scan worker", "independent", true],
-    ["unrelated session", "unrelated", false],
-    ["incomplete ownership graph", "missing-worker", true],
-    ["missing scan root", "missing-root", true],
-    ["missing Codex state database", "missing-database", true],
-    ["missing workbench scan", "missing-scan", true],
+    ["delegated worker", "delegated", true, "partial"],
+    ["independent Deep Scan worker", "independent", true, "partial"],
+    ["unrelated session", "unrelated", false, "partial"],
+    ["empty delegated worker", "delegated", true, "empty"],
+    ["empty independent Deep Scan worker", "independent", true, "empty"],
+    ["empty unrelated session", "unrelated", false, "empty"],
+    ["malformed delegated worker", "delegated", true, "malformed"],
+    [
+      "malformed independent Deep Scan worker",
+      "independent",
+      true,
+      "malformed",
+    ],
+    ["malformed unrelated session", "unrelated", false, "malformed"],
+    ["unattributed delegated worker usage", "delegated", true, "usage"],
+    [
+      "unattributed independent Deep Scan worker usage",
+      "independent",
+      true,
+      "usage",
+    ],
+    ["unattributed unrelated usage", "unrelated", false, "usage"],
+    ["legacy delegated worker metadata", "delegated", true, "session-id"],
+    [
+      "legacy independent Deep Scan worker metadata",
+      "independent",
+      true,
+      "session-id",
+    ],
+    ["legacy unrelated session metadata", "unrelated", false, "session-id"],
+    ["incomplete ownership graph", "missing-worker", true, "partial"],
+    ["missing scan root", "missing-root", true, "partial"],
+    ["missing Codex state database", "missing-database", true, "partial"],
+    ["missing workbench scan", "missing-scan", true, "partial"],
   ] as const)(
     "checks incomplete metadata against trusted SQLite ownership for a %s",
-    async (_description, relationship, shouldReject) => {
+    async (_description, relationship, shouldReject, contents) => {
       const home = await codexHome();
       const stateDirectory = join(home, "workbench");
       await mkdir(stateDirectory);
@@ -4612,10 +4639,34 @@ describe("live scan cost tracking", () => {
         "26",
         "rollout-unrelated-incomplete.jsonl",
       );
-      await writeFile(
-        incomplete,
-        '{"type":"session_meta","payload":{"id":"unrelated-thread"',
-      );
+      const workerUsage = JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: { input_tokens: 10_000, output_tokens: 1_000 },
+          },
+        },
+      });
+      const unidentifiedContents =
+        contents === "empty"
+          ? ""
+          : contents === "malformed"
+            ? '{"type":"session_meta","payload":\n'
+            : contents === "usage"
+              ? `${workerUsage}\n`
+              : contents === "session-id"
+                ? `${JSON.stringify({
+                    type: "session_meta",
+                    payload: {
+                      session_id: "pending-thread",
+                      ...(relationship === "delegated"
+                        ? { parent_thread_id: "scan-thread" }
+                        : {}),
+                    },
+                  })}\n${workerUsage}\n`
+                : '{"type":"session_meta","payload":{"id":"unrelated-thread"';
+      await writeFile(incomplete, unidentifiedContents);
       const { resolvePluginPython, resolveScanSessionPaths } = await import(
         "../src/runtime.js"
       );
@@ -4761,7 +4812,61 @@ describe("live scan cost tracking", () => {
   });
 
   test.each([
+    ["empty", ""],
+    ["malformed", '{"type":"session_meta","payload":\n'],
+    [
+      "unattributed billable",
+      `${JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: { input_tokens: 10_000, output_tokens: 1_000 },
+          },
+        },
+      })}\n`,
+    ],
+    [
+      "legacy session metadata",
+      `${JSON.stringify({
+        type: "session_meta",
+        payload: { session_id: "worker-thread" },
+      })}\n`,
+    ],
+  ] as const)(
+    "rejects an unidentified %s rollout without trusted ownership",
+    async (_description, contents) => {
+      const home = await codexHome();
+      const rootUsage = { input_tokens: 100, output_tokens: 10 };
+      await writeSession(home, "scan-thread", rootUsage);
+      await writeFile(
+        join(
+          home,
+          "sessions",
+          "2026",
+          "07",
+          "26",
+          "rollout-unidentified.jsonl",
+        ),
+        contents,
+      );
+      const tracker = new ScanCostTracker({
+        codexHome: home,
+        model: "gpt-5.6-terra",
+        maxCostUsd: 0.001,
+      });
+      tracker.start("scan-thread");
+
+      await expect(tracker.stop(rootUsage)).rejects.toThrow(
+        "The scan cost limit could not be verified",
+      );
+    },
+  );
+
+  test.each([
     ["optional incomplete metadata", undefined, "partial"],
+    ["optional empty metadata", undefined, "empty"],
+    ["optional malformed metadata", undefined, "malformed"],
     ["empty discovered rollout", 0.001, "empty"],
     ["completed unrelated rollout", 0.001, "unrelated"],
     ["removed incomplete rollout", 0.001, "removed"],
@@ -4770,7 +4875,7 @@ describe("live scan cost tracking", () => {
     async (_description, maxCostUsd, scenario) => {
       const home = await codexHome();
       const rootUsage = { input_tokens: 100, output_tokens: 10 };
-      await writeSession(home, "scan-thread", rootUsage);
+      const root = await writeSession(home, "scan-thread", rootUsage);
       const path = join(
         home,
         "sessions",
@@ -4789,13 +4894,20 @@ describe("live scan cost tracking", () => {
           path,
           scenario === "empty"
             ? ""
-            : '{"type":"session_meta","payload":{"id":"pending-worker"',
+            : scenario === "malformed"
+              ? '{"type":"session_meta","payload":\n'
+              : '{"type":"session_meta","payload":{"id":"pending-worker"',
         );
       }
+      let ownershipChecks = 0;
       const tracker = new ScanCostTracker({
         codexHome: home,
         model: "gpt-5.6-terra",
         maxCostUsd,
+        resolveOwnedSessionPaths: async () => {
+          ownershipChecks += 1;
+          return new Set([root]);
+        },
       });
       tracker.start("scan-thread");
 
@@ -4811,6 +4923,9 @@ describe("live scan cost tracking", () => {
           estimatedUsd: 0.00032,
         },
       });
+      expect(ownershipChecks).toBe(
+        scenario === "empty" && maxCostUsd !== undefined ? 1 : 0,
+      );
     },
   );
 
