@@ -93,7 +93,7 @@ export interface ReadOnlyCodexOptions {
   codex?: ReadOnlyCodex;
   environment?: NodeJS.ProcessEnv;
   model?: string;
-  reasoningEffort?: ModelReasoningEffort;
+  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   signal?: AbortSignal;
   workingDirectory?: string;
 }
