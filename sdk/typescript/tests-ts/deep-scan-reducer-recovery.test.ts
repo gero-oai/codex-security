@@ -334,6 +334,86 @@ test("preserves the accepted finding producer in canonical provenance", async ()
   }
 });
 
+test("preserves inherited property names in structured finding evidence", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const original = reducerFinding("structured-inherited-names");
+  const inherited = JSON.parse(
+    '{"summary":"Accepted structured evidence.","__proto__":{"outcome":"accepted"},"constructor":{"outcome":"accepted constructor"},"prototype":{"outcome":"accepted prototype"}}',
+  ) as Record<string, unknown>;
+
+  for (const field of ["rootCause", "root_cause", "validation", "attackPath"]) {
+    const accepted = { ...original, [field]: inherited };
+    for (const supplied of [undefined, { summary: inherited["summary"] }]) {
+      const result = reconcileDeepReduction(
+        reducerDraft([
+          {
+            ...original,
+            ...(supplied === undefined ? {} : { [field]: supplied }),
+            provenance: {
+              ...original.provenance,
+              sourceFindingIds: ["worker:0"],
+            },
+          },
+        ]),
+        [{ workerId: "worker", result: reducerDraft([accepted]) }],
+        null,
+      ).findings[0]?.[field as keyof ReducerFinding] as Record<string, unknown>;
+
+      expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+      for (const key of ["__proto__", "constructor", "prototype"]) {
+        expect(Object.hasOwn(result, key)).toBe(true);
+        expect(result[key]).toEqual(inherited[key]);
+      }
+      expect(Object.getPrototypeOf(inherited)).toBe(Object.prototype);
+      expect(Object.hasOwn(inherited, "__proto__")).toBe(true);
+    }
+  }
+
+  const nested = { ...original, attackPath: { reachability: inherited } };
+  const restored = reconcileDeepReduction(
+    reducerDraft([
+      {
+        ...original,
+        attackPath: { reachability: { summary: inherited["summary"] } },
+        provenance: {
+          ...original.provenance,
+          sourceFindingIds: ["worker:0"],
+        },
+      },
+    ]),
+    [{ workerId: "worker", result: reducerDraft([nested]) }],
+    null,
+  ).findings[0]?.attackPath?.["reachability"] as Record<string, unknown>;
+  expect(Object.getPrototypeOf(restored)).toBe(Object.prototype);
+  expect(Object.hasOwn(restored, "__proto__")).toBe(true);
+  expect(restored["__proto__"]).toEqual(inherited["__proto__"]);
+
+  const fabricated = JSON.parse(
+    '{"summary":"Accepted structured evidence.","__proto__":{"outcome":"fabricated"}}',
+  ) as Record<string, unknown>;
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([
+        {
+          ...original,
+          validation: fabricated,
+          provenance: {
+            ...original.provenance,
+            sourceFindingIds: ["worker:0"],
+          },
+        },
+      ]),
+      [
+        {
+          workerId: "worker",
+          result: reducerDraft([{ ...original, validation: inherited }]),
+        },
+      ],
+      null,
+    ),
+  ).toThrow("__proto__");
+});
+
 test("rejects a fabricated identity claiming an accepted source finding", async () => {
   const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
   const accepted = reducerFinding("accepted");
@@ -1328,6 +1408,49 @@ test("preserves the complete accepted order of attack-path steps", async () => {
       expect(reconciled.filter((step) => step === input)).toHaveLength(2);
       expect(reconciled.filter((step) => step === bypass)).toHaveLength(3);
       for (const { attackPath } of repeatedGlobally) {
+        let index = 0;
+        for (const step of reconciled) {
+          if (attackPath.steps[index] === step) index += 1;
+        }
+        expect(index).toBe(attackPath.steps.length);
+      }
+    }
+  }
+
+  const repeatedBeyondSeeds = [
+    { ...original, attackPath: { steps: [input, input] } },
+    { ...original, attackPath: { steps: [bypass, input, bypass, bypass] } },
+    { ...original, attackPath: { steps: [bypass, bypass, input, bypass] } },
+  ];
+  for (const order of [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+  ]) {
+    const discoveries = order.map((index, position) => ({
+      workerId: `complex-${position}`,
+      result: reducerDraft([repeatedBeyondSeeds[index]!]),
+    }));
+    for (const source of repeatedBeyondSeeds) {
+      const reconciled = reconcileDeepReduction(
+        reducerDraft([
+          reducedFinding(source.attackPath.steps, [
+            "complex-0:0",
+            "complex-1:0",
+            "complex-2:0",
+          ]),
+        ]),
+        discoveries,
+        null,
+      ).findings[0]?.attackPath?.["steps"] as string[];
+
+      expect(reconciled).toHaveLength(5);
+      expect(reconciled.filter((step) => step === input)).toHaveLength(2);
+      expect(reconciled.filter((step) => step === bypass)).toHaveLength(3);
+      for (const { attackPath } of repeatedBeyondSeeds) {
         let index = 0;
         for (const step of reconciled) {
           if (attackPath.steps[index] === step) index += 1;
@@ -2593,27 +2716,126 @@ test("preserves conflicting scan-wide scope evidence without inventing statuses"
     ).toThrow(`scope.${field}`);
   }
 
-  for (const [field, first, second] of [
-    ["validationMode", "custom_pending", "custom"],
-    ["reviewCount", 1, 2],
-  ] as const) {
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([], { scope: { reviewCount: 1 } }),
+      [
+        {
+          workerId: "first",
+          result: reducerDraft([], { scope: { reviewCount: 1 } }),
+        },
+        {
+          workerId: "second",
+          result: reducerDraft([], { scope: { reviewCount: 2 } }),
+        },
+      ],
+      null,
+    ),
+  ).toThrow("scope.reviewCount");
+});
+
+test("preserves conflicting validation modes without disabling custom validation", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const pending = {
+    validationMode: "custom_pending",
+    context: "Accepted validation is still pending.",
+  };
+  const completed = {
+    validationMode: "custom",
+    context: "Accepted custom validation already ran.",
+  };
+
+  for (const sources of [
+    [pending, completed],
+    [completed, pending],
+  ]) {
+    const discoveries = sources.map((scope, index) => ({
+      workerId: `worker-${index}`,
+      result: reducerDraft([], { scope }),
+    }));
+    for (const supplied of ["custom_pending", "custom", undefined]) {
+      const scope = reconcileDeepReduction(
+        reducerDraft([], {
+          scope: {
+            ...(supplied === undefined ? {} : { validationMode: supplied }),
+          },
+        }),
+        discoveries,
+        null,
+      ).scope!;
+
+      // Custom validation starts only when this exact status remains pending.
+      expect(scope["validationMode"]).toBe("custom_pending");
+      const claims = (scope["context"] as string).split(/\n\s*\n/u);
+      expect(claims).toContain(pending.context);
+      expect(claims).toContain(completed.context);
+      expect(claims).toContain("custom_pending");
+      expect(claims).toContain("custom");
+    }
+
     expect(() =>
       reconcileDeepReduction(
-        reducerDraft([], { scope: { [field]: first } }),
-        [
-          {
-            workerId: "first",
-            result: reducerDraft([], { scope: { [field]: first } }),
-          },
-          {
-            workerId: "second",
-            result: reducerDraft([], { scope: { [field]: second } }),
-          },
-        ],
+        reducerDraft([], { scope: { validationMode: "fabricated" } }),
+        discoveries,
         null,
       ),
-    ).toThrow(`scope.${field}`);
+    ).toThrow("scope.validationMode");
+    expect(() =>
+      reconcileDeepReduction(
+        reducerDraft([], {
+          scope: { validationMode: "custom", context: "Invented outcome." },
+        }),
+        discoveries,
+        null,
+      ),
+    ).toThrow("scope.context");
   }
+
+  for (const selected of ["static", "dynamic", undefined]) {
+    const scope = reconcileDeepReduction(
+      reducerDraft([], {
+        scope: {
+          ...(selected === undefined ? {} : { validationMode: selected }),
+        },
+      }),
+      [
+        {
+          workerId: "static",
+          result: reducerDraft([], { scope: { validationMode: "static" } }),
+        },
+        {
+          workerId: "dynamic",
+          result: reducerDraft([], { scope: { validationMode: "dynamic" } }),
+        },
+      ],
+      null,
+    ).scope!;
+    expect(scope["validationMode"]).toBe(selected ?? "static");
+    expect((scope["context"] as string).split(/\n\s*\n/u)).toEqual([
+      "static",
+      "dynamic",
+    ]);
+  }
+
+  const matching = reconcileDeepReduction(
+    reducerDraft([], { scope: { validationMode: "custom_pending" } }),
+    [
+      {
+        workerId: "first",
+        result: reducerDraft([], {
+          scope: { validationMode: "custom_pending" },
+        }),
+      },
+      {
+        workerId: "second",
+        result: reducerDraft([], {
+          scope: { validationMode: "custom_pending" },
+        }),
+      },
+    ],
+    null,
+  ).scope!;
+  expect(matching).toEqual({ validationMode: "custom_pending" });
 });
 
 test("rejects reducer-only scope, coverage, and threat-model evidence", async () => {
