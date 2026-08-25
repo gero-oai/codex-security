@@ -1331,6 +1331,26 @@ async function copyWindowsSecurityDescriptor(
     process.env["SystemRoot"] ?? "C:\\Windows",
     "System32",
   );
+  const integrityMethods = [
+    '[System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint = "GetNamedSecurityInfoW", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]',
+    "public static extern uint GetNamedSecurityInfo(string path, uint type, uint information, System.IntPtr owner, System.IntPtr group, System.IntPtr dacl, System.IntPtr sacl, out System.IntPtr descriptor);",
+    '[System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint = "GetSecurityDescriptorSacl", SetLastError = true)]',
+    "public static extern bool GetSecurityDescriptorSacl(System.IntPtr descriptor, out int present, out System.IntPtr sacl, out int defaulted);",
+    '[System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint = "SetNamedSecurityInfoW", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]',
+    "public static extern uint SetNamedSecurityInfo(string path, uint type, uint information, System.IntPtr owner, System.IntPtr group, System.IntPtr dacl, System.IntPtr sacl);",
+    '[System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "LocalFree")]',
+    "public static extern System.IntPtr LocalFree(System.IntPtr memory);",
+    [
+      "public static bool SameAcl(System.IntPtr left, System.IntPtr right) {",
+      "if (left == right) return true;",
+      "if (left == System.IntPtr.Zero || right == System.IntPtr.Zero) return false;",
+      "int size = (ushort)System.Runtime.InteropServices.Marshal.ReadInt16(left, 2);",
+      "if (size != (ushort)System.Runtime.InteropServices.Marshal.ReadInt16(right, 2)) return false;",
+      "for (int index = 0; index < size; index++) if (System.Runtime.InteropServices.Marshal.ReadByte(left, index) != System.Runtime.InteropServices.Marshal.ReadByte(right, index)) return false;",
+      "return true;",
+      "}",
+    ].join(" "),
+  ].join(" ");
   try {
     await execFileAsync(
       join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"),
@@ -1342,7 +1362,35 @@ async function copyWindowsSecurityDescriptor(
         [
           "$ErrorActionPreference = 'Stop'",
           `$acl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${sourceVariable} -Audit`,
+          `Microsoft.PowerShell.Utility\\Add-Type -Name PolicyIntegrity -Namespace CodexSecurity -MemberDefinition '${integrityMethods}'`,
+          "$descriptor = [System.IntPtr]::Zero",
+          `$status = [CodexSecurity.PolicyIntegrity]::GetNamedSecurityInfo($env:${sourceVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$descriptor)`,
+          "if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) }",
+          "$destinationLabelDescriptor = [System.IntPtr]::Zero",
+          [
+            "try {",
+            "$present = 0; $label = [System.IntPtr]::Zero; $defaulted = 0;",
+            "if (-not [CodexSecurity.PolicyIntegrity]::GetSecurityDescriptorSacl($descriptor, [ref]$present, [ref]$label, [ref]$defaulted)) { throw [System.ComponentModel.Win32Exception]::new() };",
+            `$status = [CodexSecurity.PolicyIntegrity]::GetNamedSecurityInfo($env:${destinationVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$destinationLabelDescriptor); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) };`,
+            "$destinationPresent = 0; $destinationLabel = [System.IntPtr]::Zero; $destinationDefaulted = 0;",
+            "if (-not [CodexSecurity.PolicyIntegrity]::GetSecurityDescriptorSacl($destinationLabelDescriptor, [ref]$destinationPresent, [ref]$destinationLabel, [ref]$destinationDefaulted)) { throw [System.ComponentModel.Win32Exception]::new() };",
+            `if ($present -ne 0 -and $label -ne [System.IntPtr]::Zero -and -not [CodexSecurity.PolicyIntegrity]::SameAcl($label, $destinationLabel)) { $status = [CodexSecurity.PolicyIntegrity]::SetNamedSecurityInfo($env:${destinationVariable}, 1, 16, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [System.IntPtr]::Zero, $label); if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) } }`,
+            "} finally { if ($destinationLabelDescriptor -ne [System.IntPtr]::Zero) { [void][CodexSecurity.PolicyIntegrity]::LocalFree($destinationLabelDescriptor) }; if ($descriptor -ne [System.IntPtr]::Zero) { [void][CodexSecurity.PolicyIntegrity]::LocalFree($descriptor) } }",
+          ].join(" "),
           `Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl`,
+          `$copied = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
+          "if ($acl.Sddl -ne $copied.Sddl) { throw 'The copied Windows audit security descriptor differs.' }",
+          [
+            "$describe = { param([string]$path)",
+            "$lines = @(& ([System.IO.Path]::Combine($env:SystemRoot, 'System32', 'icacls.exe')) $path);",
+            "if ($LASTEXITCODE -ne 0 -or $lines.Count -eq 0 -or -not $lines[0].StartsWith($path, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Could not inspect the complete Windows security descriptor.' };",
+            "$lines[0] = $lines[0].Substring($path.Length);",
+            "$lines | Microsoft.PowerShell.Core\\ForEach-Object { $_.Trim() }",
+            "}",
+          ].join(" "),
+          `$sourceDescriptor = [string]::Join([System.Environment]::NewLine, (& $describe $env:${sourceVariable}))`,
+          `$destinationDescriptor = [string]::Join([System.Environment]::NewLine, (& $describe $env:${destinationVariable}))`,
+          "if ($sourceDescriptor -ne $destinationDescriptor) { throw 'The copied Windows security descriptor or integrity label differs.' }",
         ].join("; "),
       ],
       {

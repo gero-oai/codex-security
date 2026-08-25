@@ -1491,6 +1491,11 @@ describe("security policy review and application", () => {
         process.env["SystemRoot"] ?? "C:\\Windows",
         "System32",
       );
+      execFileSync(join(systemDirectory, "icacls.exe"), [
+        target,
+        "/setintegritylevel",
+        "L",
+      ]);
       const powershell = join(
         systemDirectory,
         "WindowsPowerShell",
@@ -1528,7 +1533,6 @@ describe("security policy review and application", () => {
             "$acl.SetAuditRuleProtection($true, $false)",
             "$audit = [System.Security.AccessControl.FileSystemAuditRule]::new($identity.User, 'Read', 'Success')",
             "$acl.AddAuditRule($audit)",
-            "$acl.SetSecurityDescriptorSddlForm($acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All) + '(ML;;NW;;;LW)')",
             "Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH -AclObject $acl",
           ].join("; "),
         ],
@@ -1556,11 +1560,27 @@ describe("security policy review and application", () => {
             windowsHide: true,
           },
         ).trim();
+      const integrity = (path = target) => {
+        const lines = execFileSync(
+          join(systemDirectory, "icacls.exe"),
+          [path],
+          {
+            encoding: "utf8",
+            windowsHide: true,
+          },
+        ).split(/\r?\n/u);
+        expect(lines[0]?.toLowerCase().startsWith(path.toLowerCase())).toBe(
+          true,
+        );
+        lines[0] = lines[0]!.slice(path.length);
+        return lines.map((line) => line.trim()).join("\n");
+      };
       const before = descriptor();
+      const beforeIntegrity = integrity();
       expect(before).toContain("D:P");
       expect(before).toContain("S:P");
       expect(before).toContain("(AU;SA;");
-      expect(before).toContain("(ML;;NW;;;LW)");
+      expect(beforeIntegrity).toContain("(NW)");
       const draft = await f.generate();
       const originalLink = fsPromises.link;
       const originalRename = fsPromises.rename;
@@ -1582,6 +1602,7 @@ describe("security policy review and application", () => {
             const temporary = join(f.repository, temporaryName!);
             expect(await readFile(temporary, "utf8")).toBe(POLICY);
             expect(descriptor(temporary)).toBe(before);
+            expect(integrity(temporary)).toBe(beforeIntegrity);
             const reopenError = await open(temporary, "r+").then(
               async (handle) => {
                 await handle.close();
@@ -1604,6 +1625,7 @@ describe("security policy review and application", () => {
         expect(inspectedTemporary).toBe(true);
         expect(await readFile(target, "utf8")).toBe(POLICY);
         expect(descriptor()).toBe(before);
+        expect(integrity()).toBe(beforeIntegrity);
       } finally {
         mock.module("node:fs/promises", () => ({
           ...fsPromises,

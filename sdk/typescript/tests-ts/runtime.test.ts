@@ -3295,7 +3295,20 @@ describe("runtime directories and plugin Python boundary", () => {
         ],
         {
           encoding: "utf8",
-          env: { ...process.env, CODEX_SECURITY_TEST_ACL_PATH: draft },
+          env: {
+            ...Object.fromEntries(
+              Object.entries(process.env).filter(
+                ([name]) => name.toUpperCase() !== "PSMODULEPATH",
+              ),
+            ),
+            CODEX_SECURITY_TEST_ACL_PATH: draft,
+            PSModulePath: join(
+              systemDirectory,
+              "WindowsPowerShell",
+              "v1.0",
+              "Modules",
+            ),
+          },
           windowsHide: true,
         },
       );
