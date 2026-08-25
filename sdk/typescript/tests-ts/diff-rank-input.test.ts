@@ -113,6 +113,14 @@ async function upgradeBundledPlugin(root: string): Promise<string> {
   expect(predecessor.version).toBe("0.1.44");
   expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
   expect(upgraded.installedRoot).not.toBe(predecessor.installedRoot);
+  const installedMcp = JSON.parse(
+    readFileSync(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
+  ) as { mcpServers: Record<string, { env_vars?: string[] }> };
+  expect(
+    installedMcp.mcpServers["codex-security"]?.env_vars?.find(
+      (name) => name === "CODEX_SAFETY_IDENTIFIER",
+    ),
+  ).toBe("CODEX_SAFETY_IDENTIFIER");
   expect(
     readFileSync(
       join(upgraded.installedRoot, "scripts", "generate_rank_input.py"),
