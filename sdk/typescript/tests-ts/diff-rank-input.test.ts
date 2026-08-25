@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  cpSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -11,9 +12,30 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
+import { BUNDLED_PLUGIN_VERSION, bootstrapPlugin } from "../src/index.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryRoots: string[] = [];
+
+function supportsFileSymlinks(): boolean {
+  const root = mkdtempSync(join(tmpdir(), "codex-security-symlink-probe-"));
+  try {
+    symlinkSync("missing.py", join(root, "broken.py"), "file");
+    return true;
+  } catch (error) {
+    if (
+      process.platform === "win32" &&
+      (error as NodeJS.ErrnoException).code === "EPERM"
+    ) {
+      return false;
+    }
+    throw error;
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const fileSymlinksAvailable = supportsFileSymlinks();
 
 function pythonExecutable(): string | null {
   return (
@@ -44,11 +66,165 @@ function git(repository: string, ...args: string[]): string {
   ).trim();
 }
 
-test("diff previews stay inside the selected repository", () => {
+async function upgradeBundledPlugin(root: string): Promise<string> {
+  const previous = join(root, "previous-plugin");
+  cpSync(PLUGIN_ROOT, previous, { recursive: true });
+  const previousManifestPath = join(previous, ".codex-plugin", "plugin.json");
+  const previousManifest = JSON.parse(
+    readFileSync(previousManifestPath, "utf8"),
+  ) as { version: string };
+  previousManifest.version = "0.1.38";
+  writeFileSync(previousManifestPath, JSON.stringify(previousManifest));
+  writeFileSync(
+    join(previous, "scripts", "generate_rank_input.py"),
+    "# synthetic previous plugin\n",
+  );
+  const previousMcpPath = join(previous, ".mcp.json");
+  const previousMcp = JSON.parse(readFileSync(previousMcpPath, "utf8")) as {
+    mcpServers: Record<string, { env_vars?: string[] }>;
+  };
+  const previousEnvironment =
+    previousMcp.mcpServers["codex-security"]?.env_vars ?? [];
+  previousMcp.mcpServers["codex-security"] = {
+    ...previousMcp.mcpServers["codex-security"],
+    env_vars: previousEnvironment.filter(
+      (name) => name !== "CODEX_SAFETY_IDENTIFIER",
+    ),
+  };
+  writeFileSync(previousMcpPath, JSON.stringify(previousMcp));
+
+  const home = join(root, "codex-home");
+  const marketplace = join(home, "sdk-marketplace");
+  mkdirSync(home, { mode: 0o700 });
+  const runCodex = async (_command: unknown, args: readonly string[]) => {
+    if (args[1] === "marketplace") {
+      writeFileSync(
+        join(home, "config.toml"),
+        `[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(marketplace)}\n`,
+      );
+      return "";
+    }
+    const selected = join(marketplace, "plugins", "codex-security");
+    const manifest = JSON.parse(
+      readFileSync(join(selected, ".codex-plugin", "plugin.json"), "utf8"),
+    ) as { version: string };
+    const installed = join(home, "installed", manifest.version);
+    rmSync(installed, { recursive: true, force: true });
+    mkdirSync(join(home, "installed"), { recursive: true });
+    cpSync(selected, installed, { recursive: true });
+    return JSON.stringify({
+      installedPath: installed,
+      version: manifest.version,
+    });
+  };
+  const options = {
+    codexCommand: { command: "/synthetic-codex" },
+    runCodex,
+  };
+
+  const predecessor = await bootstrapPlugin(home, previous, options);
+  const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
+  expect(predecessor.version).toBe("0.1.38");
+  expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
+  expect(upgraded.installedRoot).not.toBe(predecessor.installedRoot);
+  const installedMcp = JSON.parse(
+    readFileSync(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
+  ) as { mcpServers: Record<string, { env_vars?: string[] }> };
+  expect(installedMcp.mcpServers["codex-security"]?.env_vars).toContain(
+    "CODEX_SAFETY_IDENTIFIER",
+  );
+  expect(
+    readFileSync(
+      join(upgraded.installedRoot, "scripts", "generate_rank_input.py"),
+      "utf8",
+    ),
+  ).toBe(
+    readFileSync(
+      join(PLUGIN_ROOT, "scripts", "generate_rank_input.py"),
+      "utf8",
+    ),
+  );
+  return upgraded.installedRoot;
+}
+
+for (const kind of ["staged", "untracked"] as const) {
+  test.skipIf(!fileSymlinksAvailable)(
+    `local diff accepts ${kind} broken in-repository symlinks`,
+    () => {
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "codex-security-diff-broken-link-")),
+      );
+      temporaryRoots.push(root);
+      const repository = join(root, "repository");
+      mkdirSync(repository);
+      git(repository, "init", "-q");
+      writeFileSync(join(repository, "base.py"), "value = 1\n");
+      git(repository, "add", "base.py");
+      git(repository, "commit", "-qm", "base");
+      const base = git(repository, "rev-parse", "HEAD");
+      symlinkSync("missing.py", join(repository, "broken.py"), "file");
+      if (kind === "staged") {
+        git(repository, "add", "broken.py");
+      }
+
+      const python = pythonExecutable();
+      expect(python).not.toBeNull();
+      const inventoryOutput = join(root, "in-scope-files.txt");
+      const inventory = spawnSync(
+        python!,
+        [
+          "-B",
+          join(PLUGIN_ROOT, "scripts", "generate_in_scope_files.py"),
+          "--repo",
+          repository,
+          "--scope",
+          ".",
+          "--out",
+          inventoryOutput,
+          "--diff-base",
+          base,
+          "--diff-mode",
+          "local-patch",
+        ],
+        { encoding: "utf8" },
+      );
+      expect(inventory.status, inventory.stderr).toBe(0);
+      expect(readFileSync(inventoryOutput, "utf8")).toBe("");
+
+      const rankingOutput = join(root, "rank-input.jsonl");
+      const ranking = spawnSync(
+        python!,
+        [
+          "-B",
+          join(PLUGIN_ROOT, "scripts", "generate_rank_input.py"),
+          "make-diff-rank-input",
+          "--repo",
+          repository,
+          "--base",
+          base,
+          "--mode",
+          "local-patch",
+          "--out",
+          rankingOutput,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(ranking.status, ranking.stderr).toBe(0);
+      expect(JSON.parse(readFileSync(rankingOutput, "utf8"))).toEqual({
+        path: "broken.py",
+        area: "diff",
+        preview: "",
+      });
+    },
+  );
+}
+
+test("diff inventory and previews stay inside the selected repository", async () => {
   const root = realpathSync(
     mkdtempSync(join(tmpdir(), "codex-security-diff-rank-")),
   );
   temporaryRoots.push(root);
+  const installedPluginRoot = await upgradeBundledPlugin(root);
   const repository = join(root, "repository");
   const nested = join(repository, "src", "nested");
   mkdirSync(nested, { recursive: true });
@@ -94,7 +270,7 @@ test("diff previews stay inside the selected repository", () => {
   const output = join(root, "rank-input.jsonl");
   const args = [
     "-B",
-    join(PLUGIN_ROOT, "scripts", "generate_rank_input.py"),
+    join(installedPluginRoot, "scripts", "generate_rank_input.py"),
     "make-diff-rank-input",
     "--repo",
     repository,
@@ -107,9 +283,33 @@ test("diff previews stay inside the selected repository", () => {
     "--out",
     output,
   ];
+  const inventoryOutput = join(root, "in-scope-files.txt");
+  const inventoryArgs = [
+    "-B",
+    join(installedPluginRoot, "scripts", "generate_in_scope_files.py"),
+    "--repo",
+    repository,
+    "--scope",
+    ".",
+    "--out",
+    inventoryOutput,
+    "--diff-base",
+    base,
+    "--diff-head",
+    head,
+    "--diff-mode",
+    "local-patch",
+  ];
   const result = spawnSync(python!, args, { encoding: "utf8" });
+  const safeInventory = spawnSync(python!, inventoryArgs, {
+    encoding: "utf8",
+  });
 
   expect(result.status, result.stderr).toBe(0);
+  expect(safeInventory.status, safeInventory.stderr).toBe(0);
+  expect(readFileSync(inventoryOutput, "utf8")).toContain(
+    "removed/deleted.py\n",
+  );
   const rows = readFileSync(output, "utf8")
     .trim()
     .split("\n")
@@ -134,9 +334,13 @@ test("diff previews stay inside the selected repository", () => {
   symlinkSync(externalFixture, nested, "junction");
 
   const escaped = spawnSync(python!, args, { encoding: "utf8" });
-  expect(escaped.status).not.toBe(0);
+  const inventory = spawnSync(python!, inventoryArgs, { encoding: "utf8" });
+  expect([escaped.status, inventory.status]).toEqual([1, 2]);
   expect(escaped.stderr).toContain(
     "Changed Git working-tree paths must stay inside the selected target.",
+  );
+  expect(inventory.stderr).toContain(
+    "changed Git working-tree paths must stay inside the selected target",
   );
 });
 

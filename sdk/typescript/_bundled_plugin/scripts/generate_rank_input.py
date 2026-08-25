@@ -44,7 +44,7 @@ from rank_preview import (
     preview_for_bytes,
 )
 from workbench_target import (
-    existing_ancestor_is_within_target,
+    directory_is_within_target,
     git_blob_bytes,
     git_directory_snapshot_paths,
 )
@@ -295,6 +295,22 @@ def path_is_excluded(path: Path) -> bool:
     if path.name in EXCLUDED_FILENAMES:
         return True
     return path.name.endswith((".min.js", ".map"))
+
+
+def changed_path_parent_is_within_target(path: Path, target: Path) -> bool:
+    """Resolve the nearest existing parent without dereferencing the changed leaf."""
+    target = target.resolve(strict=True)
+    candidate = path.parent
+    while True:
+        try:
+            candidate.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            parent = candidate.parent
+            if parent == candidate:
+                return False
+            candidate = parent
+            continue
+        return directory_is_within_target(candidate.resolve(strict=True), target)
 
 
 def windows_stream_component(path: Path) -> str | None:
@@ -714,7 +730,7 @@ def make_diff_rank_input(args: argparse.Namespace) -> None:
         rel = path.relative_to(repo)
         if args.mode != "revisions":
             try:
-                within_target = existing_ancestor_is_within_target(path, repo)
+                within_target = changed_path_parent_is_within_target(path, repo)
             except (OSError, RuntimeError) as error:
                 raise SystemExit(
                     "Could not inspect a changed Git working-tree path."

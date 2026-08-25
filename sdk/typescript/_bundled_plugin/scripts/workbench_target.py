@@ -462,21 +462,6 @@ def directory_is_within_target(directory: Path, target: Path) -> bool:
         return False
 
 
-def existing_ancestor_is_within_target(path: Path, target: Path) -> bool:
-    """Resolve the nearest existing path without losing missing Git entries."""
-    candidate = path
-    while True:
-        try:
-            candidate.lstat()
-        except (FileNotFoundError, NotADirectoryError):
-            parent = candidate.parent
-            if parent == candidate:
-                return False
-            candidate = parent
-            continue
-        return directory_is_within_target(candidate.resolve(strict=True), target)
-
-
 def directory_content_digest(
     target: Path, *, excluded: tuple[Path, ...] = (), _selected_target: Path | None = None
 ) -> str:
