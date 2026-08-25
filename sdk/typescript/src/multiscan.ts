@@ -888,16 +888,14 @@ async function loadResumableScan(
   | undefined
 > {
   try {
-    const { manifest, coverage } = await loadContract(path, {
+    const { manifest, findings, coverage } = await loadContract(path, {
       pluginRoot,
       signal,
     });
     const { target, scope, producer } = manifest.scan;
-    const targetId =
-      receipt.targetId ??
-      `target_sha256_${createHash("sha256")
-        .update(`local-workspace\0${checkout}`)
-        .digest("hex")}`;
+    const targetId = `target_sha256_${createHash("sha256")
+      .update(`local-workspace\0${checkout}`)
+      .digest("hex")}`;
     const expectedScope =
       receipt.scope === undefined
         ? "."
@@ -914,6 +912,7 @@ async function loadResumableScan(
     if (
       producer.name !== "codex-security-plugin" ||
       target.targetId !== targetId ||
+      (receipt.targetId !== undefined && receipt.targetId !== targetId) ||
       target.kind !== expectedKind ||
       target.snapshotDigest !== receipt.snapshotDigest ||
       target.displayName !== receipt.id ||
@@ -926,6 +925,27 @@ async function loadResumableScan(
       return undefined;
     }
     const completeness = coverage.completeness;
+    if (
+      completeness === "complete" &&
+      (coverage.deferred.length !== 0 ||
+        coverage.surfaces.some(
+          (surface) => surface.disposition === "needs_follow_up",
+        ))
+    ) {
+      return undefined;
+    }
+    const findingIds = new Set<string>();
+    const occurrenceIds = new Set<string>();
+    for (const finding of findings.findings) {
+      if (
+        findingIds.has(finding.findingId) ||
+        occurrenceIds.has(finding.occurrenceId)
+      ) {
+        return undefined;
+      }
+      findingIds.add(finding.findingId);
+      occurrenceIds.add(finding.occurrenceId);
+    }
     const matchesOutcome =
       completeness === "complete"
         ? receipt.status === "completed"

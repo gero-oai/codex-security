@@ -1785,6 +1785,117 @@ describe("multiscan", () => {
     );
   });
 
+  test.each([
+    "forged campaign target identity",
+    "deferred complete coverage",
+    "follow-up complete coverage",
+    "duplicate finding identities",
+  ] as const)("rescans sealed artifacts with %s", async (corruption) => {
+    const paths = await fixture();
+    const source = await repository(paths.root, "sealed-resume-integrity");
+    const inventory = `id,repository,revision\nsealed-resume,${source.path},${source.revision}\n`;
+    await writeFile(paths.input, inventory);
+    let attempts = 0;
+    const security = client(async (_repository, scanOptions = {}) => {
+      attempts += 1;
+      return await completedScan(scanOptions.outputDir!);
+    });
+    let pluginRoot = PLUGIN_ROOT;
+    if (
+      corruption === "deferred complete coverage" ||
+      corruption === "follow-up complete coverage"
+    ) {
+      pluginRoot = join(paths.root, "custom-plugin");
+      await mkdir(pluginRoot);
+      await cp(
+        join(PLUGIN_ROOT, ".codex-plugin"),
+        join(pluginRoot, ".codex-plugin"),
+        { recursive: true },
+      );
+      await cp(join(PLUGIN_ROOT, "schemas"), join(pluginRoot, "schemas"), {
+        recursive: true,
+      });
+      const schemaPath = join(pluginRoot, "schemas", "coverage.schema.json");
+      const schema = JSON.parse(await readFile(schemaPath, "utf8")) as {
+        allOf?: unknown;
+      };
+      delete schema.allOf;
+      await writeFile(schemaPath, `${JSON.stringify(schema, null, 2)}\n`);
+    }
+    const campaign = options(
+      paths,
+      security,
+      pluginRoot === PLUGIN_ROOT ? {} : { config: { pluginPath: pluginRoot } },
+    );
+    const first = await runMultiscan(campaign);
+    const [receipt] = await results(first.resultsPath);
+    const outputDir = receipt!["outputDir"] as string;
+
+    if (corruption === "forged campaign target identity") {
+      const foreignPaths = await fixture();
+      await writeFile(foreignPaths.input, inventory);
+      const foreign = await runMultiscan(
+        options(
+          foreignPaths,
+          client(async (_repository, scanOptions = {}) =>
+            completedScan(scanOptions.outputDir!),
+          ),
+        ),
+      );
+      const [foreignReceipt] = await results(foreign.resultsPath);
+      await cp(foreignReceipt!["outputDir"] as string, outputDir, {
+        recursive: true,
+        force: true,
+      });
+      receipt!["targetId"] = foreignReceipt!["targetId"];
+      await writeFile(first.resultsPath, `${JSON.stringify(receipt)}\n`);
+    } else if (corruption === "duplicate finding identities") {
+      const findingsPath = join(outputDir, "findings.json");
+      const findings = JSON.parse(
+        await readFile(findingsPath, "utf8"),
+      ) as ScanResult["findings"];
+      findings.findings.push(structuredClone(findings.findings[0]!));
+      await writeFile(findingsPath, `${JSON.stringify(findings, null, 2)}\n`);
+    } else {
+      const coveragePath = join(outputDir, "coverage.json");
+      const coverage = JSON.parse(
+        await readFile(coveragePath, "utf8"),
+      ) as ScanResult["coverage"];
+      if (corruption === "deferred complete coverage") {
+        coverage.deferred.push({
+          id: "unreviewed-surface",
+          reason: "Review remains incomplete.",
+        });
+      } else {
+        coverage.surfaces[0]!.disposition = "needs_follow_up";
+      }
+      await writeFile(coveragePath, `${JSON.stringify(coverage, null, 2)}\n`);
+    }
+
+    const manifestPath = join(outputDir, "scan-manifest.json");
+    const manifest = JSON.parse(
+      await readFile(manifestPath, "utf8"),
+    ) as ScanResult["manifest"];
+    manifest.scan.artifacts.push({
+      path: "report.md",
+      sha256: "0".repeat(64),
+      mediaType: "text/markdown",
+    });
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await reseal(outputDir);
+    const imported = await loadContract(outputDir, { pluginRoot });
+    expect(
+      await contract.hasSealedReport(outputDir, imported.manifest),
+    ).toBeTrue();
+
+    expect(await runMultiscan(campaign)).toMatchObject({
+      completed: 1,
+      failed: 0,
+      skipped: 0,
+    });
+    expect(attempts).toBe(2);
+  });
+
   test.each(["complete", "partial"] as const)(
     "binds sealed %s worktree snapshots to their validated attempt receipts",
     async (completeness) => {
