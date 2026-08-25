@@ -3314,7 +3314,10 @@ describe("runtime directories and plugin Python boundary", () => {
       );
       expect(descriptor.status, descriptor.stderr).toBe(0);
       expect(
-        inspectWindowsCredentialAcl(descriptor.stdout, sid!, { scope: "file" }),
+        inspectWindowsCredentialAcl(descriptor.stdout, sid!, {
+          scope: "file",
+          resolvedAliases: { LA: sid! },
+        }),
       ).toMatchObject({
         grantsCurrentUserAccess: true,
         untrustedPrincipals: [],

@@ -1601,6 +1601,9 @@ describe("security policy review and application", () => {
             expect(temporaryName).toBeDefined();
             const temporary = join(f.repository, temporaryName!);
             expect(await readFile(temporary, "utf8")).toBe(POLICY);
+            expect((await stat(temporary)).mode & 0o777).toBe(
+              (await stat(target)).mode & 0o777,
+            );
             expect(descriptor(temporary)).toBe(before);
             expect(integrity(temporary)).toBe(beforeIntegrity);
             const reopenError = await open(temporary, "r+").then(

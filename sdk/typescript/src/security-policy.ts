@@ -1192,12 +1192,17 @@ export async function applySecurityPolicy(
           draft.previousContent === null ? 0o644 : 0o600,
         );
         try {
-          if (draft.previousContent !== null && process.platform === "win32")
+          if (draft.previousContent !== null && process.platform === "win32") {
+            await chmod(
+              temporary,
+              (await stat(target.targetPath)).mode & 0o777,
+            );
             await copyWindowsSecurityDescriptor(
               target.targetPath,
               temporary,
               options.signal,
             );
+          }
           await temporaryHandle.writeFile(draft.content, {
             encoding: "utf8",
             signal: options.signal,
@@ -1379,7 +1384,15 @@ async function copyWindowsSecurityDescriptor(
           ].join(" "),
           `Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $env:${destinationVariable} -AclObject $acl`,
           `$copied = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:${destinationVariable} -Audit`,
-          "if ($acl.Sddl -ne $copied.Sddl) { throw 'The copied Windows audit security descriptor differs.' }",
+          "$identityType = [System.Security.Principal.SecurityIdentifier]",
+          "if ($acl.GetOwner($identityType).Value -ne $copied.GetOwner($identityType).Value -or $acl.GetGroup($identityType).Value -ne $copied.GetGroup($identityType).Value) { throw 'The copied Windows security descriptor owner or group differs.' }",
+          [
+            "$auditRules = { param($descriptor)",
+            "$rules = @($descriptor.GetAuditRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Microsoft.PowerShell.Core\\ForEach-Object { '{0}:{1}:{2}:{3}:{4}' -f $_.IdentityReference.Value, [int]$_.FileSystemRights, [int]$_.AuditFlags, [int]$_.InheritanceFlags, [int]$_.PropagationFlags } | Microsoft.PowerShell.Utility\\Sort-Object);",
+            "[string]::Join([System.Environment]::NewLine, [string[]]$rules)",
+            "}",
+          ].join(" "),
+          "if ($acl.AreAuditRulesProtected -ne $copied.AreAuditRulesProtected -or (& $auditRules $acl) -ne (& $auditRules $copied)) { throw 'The copied Windows audit security descriptor differs.' }",
           [
             "$describe = { param([string]$path)",
             "$lines = @(& ([System.IO.Path]::Combine($env:SystemRoot, 'System32', 'icacls.exe')) $path);",
@@ -1443,7 +1456,12 @@ async function replaceExistingPolicy(
       );
     }
     const mode = (await stat(recoveryPath)).mode & 0o777;
-    await chmod(temporary, mode);
+    if (process.platform !== "win32") await chmod(temporary, mode);
+    else if (((await stat(temporary)).mode & 0o777) !== mode) {
+      throw new CodexSecurityError(
+        "SECURITY.md permissions changed while the replacement was being installed.",
+      );
+    }
     signal?.throwIfAborted();
     if (process.platform === "win32")
       await copyWindowsSecurityDescriptor(recoveryPath, temporary, signal);
