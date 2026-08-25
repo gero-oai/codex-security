@@ -1593,11 +1593,7 @@ export async function main(
             afterId,
             "--matches-json-stdin",
           ],
-          JSON.stringify(
-            await dependencies.matchFindings(
-              force ? { ...input, knownFindingGroups: [] } : input,
-            ),
-          ),
+          JSON.stringify(await dependencies.matchFindings(input)),
         );
       },
     );

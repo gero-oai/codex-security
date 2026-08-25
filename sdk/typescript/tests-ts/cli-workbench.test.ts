@@ -936,6 +936,11 @@ describe("CLI workbench", () => {
 
   test("force recomputes saved matches", async () => {
     const calls: Array<readonly string[]> = [];
+    const matchingInputs = {
+      before: [{ occurrenceId: "before", findingId: "identity-a" }],
+      after: [{ occurrenceId: "after", findingId: "identity-b" }],
+      knownFindingGroups: [["identity-a", "identity-c", "identity-b"]],
+    };
     expect(
       await main(
         ["scans", "match", "before", "after", "--force"],
@@ -947,9 +952,13 @@ describe("CLI workbench", () => {
             return args[0] === "compare-scans"
               ? {
                   matchingCached: true,
-                  matchingInputs: { before: [], after: [] },
+                  matchingInputs,
                 }
               : {};
+          },
+          onMatch: async (input) => {
+            expect(input).toEqual(matchingInputs);
+            return { matches: [], uncertain: [] };
           },
         }),
       ),

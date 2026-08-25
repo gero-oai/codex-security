@@ -4244,7 +4244,8 @@ describe("runtime directories and plugin Python boundary", () => {
   test.each([
     ["legacy", "0.1.22", false, false],
     ["previous", "0.1.37", true, false],
-    ["development", "dev", true, false],
+    ["independent version", "1.0.0", true, false],
+    ["development", "dev", true, true],
     ["current", BUNDLED_PLUGIN_VERSION, true, true],
   ] as const)(
     "saves comparisons with a %s custom plugin",
@@ -4267,7 +4268,7 @@ describe("runtime directories and plugin Python boundary", () => {
           "    with Path(__file__).with_name('help-calls').open('ab') as calls: calls.write(b'help\\n')",
           "    if os.environ.get('FAIL_COMPARISON_HELP'): sys.exit('Synthetic help failure')",
           "parser = argparse.ArgumentParser()",
-          "command = parser.add_subparsers(dest='command', required=True).add_parser('save-scan-comparison')",
+          `command = parser.add_subparsers(dest='command', required=True).add_parser('save-scan-comparison', description=${supportsRelated ? "'Comparison payload supports related findings.'" : "None"})`,
           "command.add_argument('--before-scan-id', required=True)",
           "command.add_argument('--after-scan-id', required=True)",
           ...(supportsStdin
