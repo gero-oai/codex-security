@@ -15,216 +15,606 @@ function bundledFunction(runtime: string, name: string): string {
   return source;
 }
 
-test("retains accepted findings, coverage completeness, and threat models", async () => {
-  const runtime = await loadBundledRuntime();
-  type Finding = {
-    ruleId: string;
-    identity: { anchor: string };
-    locations: Array<{ path: string; startLine: number; role: string }>;
-    severity?: { level: string };
+type ReducerFinding = {
+  ruleId: string;
+  identity: { anchor: string };
+  locations: Array<{ path: string; startLine: number }>;
+  summary: string;
+  severity?: { level: string };
+  confidence?: { level: string; rationale?: string };
+  rootCause?: { summary: string; evidenceRefs?: string[] };
+  codeEvidence?: Array<{ id: string; code: string }>;
+  validation?: { summary: string };
+  writeup?: { reportPath: string };
+  provenance: {
+    source: string;
+    sourceFindingIds?: string[];
+    sourceFindings?: Array<{ id: string; finding: ReducerFinding }>;
   };
-  const finding = (anchor: string, role = "sink"): Finding => ({
-    ruleId:
-      role === "root_control" ? "synthetic.shared" : `synthetic.${anchor}`,
-    identity: { anchor },
-    locations: [
-      {
-        path: `src/${role === "root_control" ? "shared" : anchor}.ts`,
-        startLine: 10,
-        role,
-      },
-    ],
-  });
-  const draft = (
-    findings: Finding[],
-    completeness: "complete" | "partial" | "unknown" = "complete",
-    threatModel?: { summary: string; assets?: string[] },
-  ) => ({
-    findings,
-    coverage: { completeness },
-    ...(threatModel === undefined ? {} : { threatModel }),
-  });
-  const validate = new Function(
-    "findingIdentity",
-    "import_node_util",
-    `${bundledFunction(runtime, "validateRetainedFindings")}\nreturn validateRetainedFindings;`,
-  )((value: Finding) => value.identity.anchor, { isDeepStrictEqual }) as (
-    result: ReturnType<typeof draft>,
-    sources: Array<ReturnType<typeof draft>>,
-    previous?: ReturnType<typeof draft>,
-  ) => void;
-  const first = finding("first");
-  const second = finding("second");
-  const threatModel = {
-    summary: "Administrator boundary.",
-    assets: ["accounts"],
-  };
-  const firstSurface = {
-    id: "shared",
-    disposition: "reviewed",
-    label: "Authentication",
-  };
-  const secondSurface = { ...firstSurface, label: "Authorization" };
-  const withSurfaces = (surfaces: Array<typeof firstSurface>) => ({
-    ...draft([first]),
-    coverage: { completeness: "complete" as const, surfaces },
-  });
+};
 
-  for (const fixture of [
-    {
-      result: draft([first]),
-      sources: [draft([first, second])],
-      error: "omitted",
+type ReducerDraft = {
+  scanId: string;
+  findings: ReducerFinding[];
+  coverage: {
+    completeness: "complete" | "partial" | "unknown";
+    surfaces: Array<Record<string, unknown>>;
+    explicitExclusions: Array<Record<string, unknown>>;
+    deferred: Array<Record<string, unknown>>;
+    [field: string]: unknown;
+  };
+  scope?: Record<string, unknown>;
+  threatModel?: Record<string, unknown>;
+};
+
+function reducerFinding(anchor: string, summary = "Accepted worker evidence.") {
+  return {
+    ruleId: "synthetic.shared-control",
+    identity: { anchor },
+    locations: [{ path: "src/shared.ts", startLine: 10 }],
+    summary,
+    provenance: { source: "local_plugin" },
+  } satisfies ReducerFinding;
+}
+
+function reducerDraft(
+  findings: ReducerFinding[],
+  metadata: Partial<Omit<ReducerDraft, "scanId" | "findings">> = {},
+): ReducerDraft {
+  return {
+    scanId: "synthetic-scan",
+    findings,
+    coverage: {
+      completeness: "complete",
+      surfaces: [],
+      explicitExclusions: [],
+      deferred: [],
     },
-    {
-      result: draft([first, second]),
-      sources: [draft([first])],
-      error: "unsupported",
+    ...metadata,
+  };
+}
+
+function bundledReducer(
+  runtime: string,
+  options: {
+    files?: Map<string, ReducerDraft>;
+    inspected?: Array<{ path: string; root: string }>;
+  } = {},
+) {
+  const start = runtime.indexOf("// src/deep-scan/artifact-validation.ts\n");
+  const end = runtime.indexOf("\n// src/artifact-deep-reducer.ts\n", start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  const preserveCoverage = new Function(
+    [
+      bundledFunction(runtime, "exactUnion"),
+      bundledFunction(runtime, "preserveScanCoverage"),
+      "return preserveScanCoverage;",
+    ].join("\n"),
+  )();
+  return new Function(
+    "require",
+    "scanFindingIdentity",
+    "preserveFindingDetails",
+    "preserveScanCoverage",
+    "parsePersistedScanDraft",
+    "requireRegularFile",
+    "readJsonObject",
+    "saveScanDraftCheckpoint",
+    "writeJsonAtomic",
+    `${runtime.slice(start, end)}\nreturn { reconcileDeepReduction, validateReducerArtifacts };`,
+  )(
+    () => ({ isDeepStrictEqual }),
+    (finding: ReducerFinding) =>
+      JSON.stringify([finding.ruleId, finding.identity.anchor]),
+    () => {},
+    preserveCoverage,
+    (value: ReducerDraft) => value,
+    async (path: string, root: string) => {
+      options.inspected?.push({ path, root });
     },
-    {
-      result: draft([first, first]),
-      sources: [draft([first])],
-      error: "duplicate",
+    async (path: string) => {
+      const result = options.files?.get(path);
+      if (!result) throw new Error(`Missing synthetic artifact: ${path}`);
+      return structuredClone(result);
     },
+    async () => {},
+    async () => {},
+  ) as {
+    reconcileDeepReduction: (
+      result: ReducerDraft,
+      discoveries: Array<{ workerId: string; result: ReducerDraft }>,
+      previous: ReducerDraft | null,
+    ) => ReducerDraft;
+    validateReducerArtifacts: (
+      input: Record<string, unknown>,
+      scanId: string,
+    ) => Promise<{ newFindings: number }>;
+  };
+}
+
+test("retains every accepted observation when workers report the same identity", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const first = reducerFinding("shared", "First accepted worker evidence.");
+  const second = reducerFinding("shared", "Second accepted worker evidence.");
+  const result = reducerDraft([
     {
-      result: draft([{ ...first, severity: { level: "low" } }]),
-      sources: [draft([{ ...first, severity: { level: "high" } }])],
-      error: "changed an accepted",
+      ...first,
+      summary: "The reducer grouped both independently accepted observations.",
+      provenance: {
+        ...first.provenance,
+        sourceFindingIds: ["worker-first:0", "worker-second:0"],
+      },
     },
-    {
-      result: draft([first]),
-      sources: [draft([first], "partial")],
-      error: "partial",
+  ]);
+
+  const reduced = reconcileDeepReduction(
+    result,
+    [
+      { workerId: "worker-first", result: reducerDraft([first]) },
+      { workerId: "worker-second", result: reducerDraft([second]) },
+    ],
+    null,
+  );
+
+  expect(reduced.findings).toHaveLength(1);
+  expect(reduced.findings[0]!.provenance.sourceFindings).toEqual([
+    { id: "worker-first:0", finding: first },
+    { id: "worker-second:0", finding: second },
+  ]);
+  expect(reduced.findings[0]!.summary).toBe(result.findings[0]!.summary);
+});
+
+test("rejects a fabricated identity claiming an accepted source finding", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const accepted = reducerFinding("accepted");
+  const fabricated = {
+    ...accepted,
+    ruleId: "synthetic.fabricated-control",
+    identity: { anchor: "fabricated" },
+    summary: "Unsupported reducer-authored finding.",
+    provenance: {
+      ...accepted.provenance,
+      sourceFindingIds: ["worker:0"],
     },
-    {
-      result: draft([first]),
-      sources: [draft([first], "unknown")],
-      error: "unknown",
-    },
-    {
-      result: draft([first, second]),
-      sources: [draft([second])],
-      previous: draft([first], "partial"),
-      error: "partial",
-    },
-    {
-      result: draft([first]),
-      sources: [draft([first], "complete", threatModel)],
-      error: "threat model",
-    },
-    {
-      result: draft([first], "complete", {
-        summary: "Different boundary.",
-        assets: ["accounts"],
-      }),
-      sources: [draft([first], "complete", threatModel)],
-      error: "threatModel summary",
-    },
-    {
-      result: draft([first], "complete", { summary: "Invented boundary." }),
-      sources: [draft([first])],
-      error: "unsupported Standard scan threat model",
-    },
-    {
-      result: withSurfaces([]),
-      sources: [withSurfaces([firstSurface])],
-      error: "coverage surfaces",
-    },
-    {
-      result: withSurfaces([firstSurface]),
-      sources: [withSurfaces([firstSurface, secondSurface])],
-      error: "coverage surfaces",
-    },
-    {
-      result: withSurfaces([{ ...firstSurface, label: "Documentation" }]),
-      sources: [withSurfaces([firstSurface])],
-      error: "coverage surfaces",
-    },
-    {
-      result: { ...draft([first]), scope: { limitations: [] } },
-      sources: [
-        { ...draft([first]), scope: { limitations: ["No runtime access."] } },
+  };
+
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([fabricated]),
+      [{ workerId: "worker", result: reducerDraft([accepted]) }],
+      null,
+    ),
+  ).toThrow("finding identity");
+});
+
+test("rejects duplicate result identities even when each source reference is valid", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const first = reducerFinding("shared", "First accepted worker evidence.");
+  const second = reducerFinding("shared", "Second accepted worker evidence.");
+
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([
+        {
+          ...first,
+          provenance: { ...first.provenance, sourceFindingIds: ["first:0"] },
+        },
+        {
+          ...second,
+          provenance: {
+            ...second.provenance,
+            sourceFindingIds: ["second:0"],
+          },
+        },
+      ]),
+      [
+        { workerId: "first", result: reducerDraft([first]) },
+        { workerId: "second", result: reducerDraft([second]) },
       ],
-      error: "scope limitations",
+      null,
+    ),
+  ).toThrow("duplicate");
+});
+
+test("recovers established duplicate identities only through distinct previous source groups", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const first = reducerFinding(
+    "shared",
+    "First previously accepted observation.",
+  );
+  const second = reducerFinding(
+    "shared",
+    "Second previously accepted observation.",
+  );
+  const previous = reducerDraft([
+    {
+      ...first,
+      provenance: {
+        ...first.provenance,
+        sourceFindingIds: ["origin:first"],
+        sourceFindings: [{ id: "origin:first", finding: first }],
+      },
     },
     {
-      result: { ...draft([first]), scope: { summary: "Invented review." } },
-      sources: [{ ...draft([first]), scope: { summary: "Accepted review." } }],
-      error: "scope summary",
+      ...second,
+      provenance: {
+        ...second.provenance,
+        sourceFindingIds: ["origin:second"],
+        sourceFindings: [{ id: "origin:second", finding: second }],
+      },
     },
+  ]);
+  const recovered = reconcileDeepReduction(
+    reducerDraft([
+      {
+        ...first,
+        provenance: {
+          ...first.provenance,
+          sourceFindingIds: ["origin:first"],
+        },
+      },
+      {
+        ...second,
+        provenance: {
+          ...second.provenance,
+          sourceFindingIds: ["origin:second"],
+        },
+      },
+    ]),
+    [],
+    previous,
+  );
+
+  expect(
+    recovered.findings.map((finding) => finding.provenance.sourceFindingIds),
+  ).toEqual([["origin:first"], ["origin:second"]]);
+});
+
+test("rejects reduced severity or confidence for accepted source findings", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const accepted: ReducerFinding = {
+    ...reducerFinding("accepted"),
+    severity: { level: "high" },
+    confidence: { level: "high", rationale: "Confirmed accepted evidence." },
+  };
+  const reduced = {
+    ...accepted,
+    provenance: { ...accepted.provenance, sourceFindingIds: ["worker:0"] },
+  };
+
+  for (const { finding, error } of [
+    { finding: { ...reduced, severity: { level: "low" } }, error: "severity" },
     {
-      result: draft([first, second], "complete", {
-        summary: "Administrator boundary.\n\nWorker boundary.\n\nInvented.",
-        assets: ["accounts", "workers"],
-      }),
-      sources: [
-        draft([first], "complete", threatModel),
-        draft([second], "complete", {
-          summary: "Worker boundary.",
-          assets: ["workers"],
-        }),
-      ],
-      error: "threatModel summary",
+      finding: {
+        ...reduced,
+        confidence: { level: "low", rationale: "Unsupported uncertainty." },
+      },
+      error: "confidence",
     },
   ]) {
     expect(() =>
-      validate(fixture.result, fixture.sources, fixture.previous),
-    ).toThrow(fixture.error);
+      reconcileDeepReduction(
+        reducerDraft([finding]),
+        [{ workerId: "worker", result: reducerDraft([accepted]) }],
+        null,
+      ),
+    ).toThrow(error);
+  }
+});
+
+test("keeps accepted source evidence visible on the reduced finding", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const accepted: ReducerFinding = {
+    ...reducerFinding("accepted"),
+    rootCause: { summary: "The request reaches an unescaped response." },
+    codeEvidence: [
+      { id: "source", code: "response.send(request.query.value)" },
+    ],
+    validation: { summary: "The accepted worker traced the request." },
+    writeup: { reportPath: "findings/accepted/accepted.md" },
+  };
+  const {
+    rootCause: _rootCause,
+    codeEvidence: _codeEvidence,
+    validation: _validation,
+    writeup: _writeup,
+    ...withoutEvidence
+  } = accepted;
+  const reduced = reconcileDeepReduction(
+    reducerDraft([
+      {
+        ...withoutEvidence,
+        provenance: {
+          ...withoutEvidence.provenance,
+          sourceFindingIds: ["worker:0"],
+        },
+        writeup: accepted.writeup,
+      },
+    ]),
+    [{ workerId: "worker", result: reducerDraft([accepted]) }],
+    null,
+  );
+
+  expect(reduced.findings[0]).toMatchObject({
+    rootCause: accepted.rootCause,
+    codeEvidence: accepted.codeEvidence,
+    validation: accepted.validation,
+    writeup: accepted.writeup,
+  });
+});
+
+test("rejects an omitted writeup instead of inventing an unbacked artifact path", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const accepted: ReducerFinding = {
+    ...reducerFinding("accepted"),
+    writeup: { reportPath: "findings/accepted/accepted.md" },
+  };
+  const { writeup: _writeup, ...withoutWriteup } = accepted;
+
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([
+        {
+          ...withoutWriteup,
+          provenance: {
+            ...withoutWriteup.provenance,
+            sourceFindingIds: ["worker:0"],
+          },
+        },
+      ]),
+      [{ workerId: "worker", result: reducerDraft([accepted]) }],
+      null,
+    ),
+  ).toThrow("writeup");
+});
+
+test("renames colliding accepted code-evidence IDs and preserves every reference", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const first: ReducerFinding = {
+    ...reducerFinding("shared", "First accepted worker evidence."),
+    rootCause: {
+      summary: "First independently accepted root cause.",
+      evidenceRefs: ["evidence-1"],
+    },
+    codeEvidence: [{ id: "evidence-1", code: "firstProof()" }],
+  };
+  const second: ReducerFinding = {
+    ...reducerFinding("shared", "Second accepted worker evidence."),
+    rootCause: {
+      summary: "Second independently accepted root cause.",
+      evidenceRefs: ["evidence-1"],
+    },
+    codeEvidence: [{ id: "evidence-1", code: "secondProof()" }],
+  };
+  const reduced = reconcileDeepReduction(
+    reducerDraft([
+      {
+        ...reducerFinding("shared", "Both accepted observations."),
+        provenance: {
+          source: "local_plugin",
+          sourceFindingIds: ["first:0", "second:0"],
+        },
+      },
+    ]),
+    [
+      { workerId: "first", result: reducerDraft([first]) },
+      { workerId: "second", result: reducerDraft([second]) },
+    ],
+    null,
+  ).findings[0]!;
+
+  expect(reduced.codeEvidence).toEqual([
+    { id: "evidence-1", code: "firstProof()" },
+    { id: "evidence-1-2", code: "secondProof()" },
+  ]);
+  expect(reduced.rootCause?.evidenceRefs).toEqual([
+    "evidence-1",
+    "evidence-1-2",
+  ]);
+  expect(reduced.rootCause?.summary).toContain(first.rootCause!.summary);
+  expect(reduced.rootCause?.summary).toContain(second.rootCause!.summary);
+});
+
+test("accepts threat-model synthesis grounded in accepted scope and finding evidence", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const threatModelSource = reducerDraft([], {
+    threatModel: { summary: "Requests may reach shared code." },
+  });
+  const scopeSource = reducerDraft([], {
+    scope: { summary: "Shared and independent request handling." },
+  });
+  const discoveries = [
+    { workerId: "threat-model", result: threatModelSource },
+    { workerId: "scope", result: scopeSource },
+  ];
+
+  const reduced = reconcileDeepReduction(
+    reducerDraft([], {
+      scope: scopeSource.scope,
+      threatModel: { summary: "Requests reach shared and independent code." },
+    }),
+    discoveries,
+    null,
+  );
+  expect(reduced.threatModel?.["summary"]).toBe(
+    "Requests reach shared and independent code.",
+  );
+
+  expect(() =>
+    reconcileDeepReduction(
+      reducerDraft([], {
+        scope: scopeSource.scope,
+        threatModel: {
+          summary: "Unauthenticated remote attackers exploit the service.",
+        },
+      }),
+      discoveries,
+      null,
+    ),
+  ).toThrow("threatModel.summary");
+});
+
+test("rejects reducer-only scope, coverage, and threat-model evidence", async () => {
+  const { reconcileDeepReduction } = bundledReducer(await loadBundledRuntime());
+  const acceptedScope = {
+    summary: "Accepted review.",
+    limitations: ["No runtime access."],
+    nested: { source: "accepted" },
+  };
+  const first = reducerFinding("first");
+  const second = reducerFinding("second");
+  const firstSource = reducerDraft([first], {
+    scope: acceptedScope,
+    threatModel: {
+      summary: "Administrator boundary.",
+      assets: ["accounts"],
+    },
+  });
+  const secondSource = reducerDraft([second], {
+    threatModel: {
+      summary: "Worker boundary.",
+      assets: ["workers"],
+    },
+  });
+  const firstResult = () =>
+    reducerDraft([first], {
+      scope: structuredClone(acceptedScope),
+      threatModel: structuredClone(firstSource.threatModel),
+    });
+
+  for (const { result, discoveries, error } of [
+    {
+      result: reducerDraft([first], {
+        scope: { runtimeStatus: "Dynamically validated." },
+      }),
+      discoveries: [{ workerId: "first", result: reducerDraft([first]) }],
+      error: "scope",
+    },
+    {
+      result: {
+        ...firstResult(),
+        scope: { ...acceptedScope, runtimeStatus: "Dynamically validated." },
+      },
+      discoveries: [{ workerId: "first", result: firstSource }],
+      error: "scope.runtimeStatus",
+    },
+    {
+      result: {
+        ...firstResult(),
+        scope: {
+          ...acceptedScope,
+          nested: { source: "accepted", invented: "reducer-only" },
+        },
+      },
+      discoveries: [{ workerId: "first", result: firstSource }],
+      error: "scope.nested.invented",
+    },
+    {
+      result: {
+        ...firstResult(),
+        scope: { ...acceptedScope, limitations: [] },
+      },
+      discoveries: [{ workerId: "first", result: firstSource }],
+      error: "scope.limitations",
+    },
+    {
+      result: {
+        ...firstResult(),
+        scope: { ...acceptedScope, summary: "Invented review." },
+      },
+      discoveries: [{ workerId: "first", result: firstSource }],
+      error: "scope.summary",
+    },
+    {
+      result: reducerDraft([first], {
+        threatModel: { summary: "Invented boundary." },
+      }),
+      discoveries: [{ workerId: "first", result: reducerDraft([first]) }],
+      error: "threatModel",
+    },
+    {
+      result: reducerDraft([first, second], {
+        scope: acceptedScope,
+        threatModel: {
+          summary: "Administrator boundary.\n\nWorker boundary.",
+          assets: ["accounts", "workers"],
+          attackerCapabilities: ["unauthenticated remote attacker"],
+        },
+      }),
+      discoveries: [
+        { workerId: "first", result: firstSource },
+        { workerId: "second", result: secondSource },
+      ],
+      error: "threatModel.attackerCapabilities",
+    },
+    {
+      result: {
+        ...firstResult(),
+        coverage: {
+          ...firstResult().coverage,
+          runtimeStatus: "Dynamically validated.",
+        },
+      },
+      discoveries: [{ workerId: "first", result: firstSource }],
+      error: "coverage.runtimeStatus",
+    },
+  ]) {
+    expect(() => reconcileDeepReduction(result, discoveries, null)).toThrow(
+      error,
+    );
   }
 
-  const firstRoot = finding("first-root", "root_control");
-  const secondRoot = finding("second-root", "root_control");
-  expect(() =>
-    validate(draft([firstRoot]), [draft([firstRoot]), draft([secondRoot])]),
-  ).toThrow("omitted");
-  expect(() =>
-    validate(draft([first, second], "partial", threatModel), [
-      draft([first], "partial", threatModel),
-      draft([second]),
-    ]),
-  ).not.toThrow();
+  const valid = reconcileDeepReduction(
+    reducerDraft([first, second], {
+      scope: acceptedScope,
+      threatModel: {
+        summary: "Administrator boundary.\n\nWorker boundary.",
+        assets: ["accounts", "workers"],
+      },
+    }),
+    [
+      { workerId: "first", result: firstSource },
+      { workerId: "second", result: secondSource },
+    ],
+    null,
+  );
+  expect(valid.threatModel?.["assets"]).toEqual(["accounts", "workers"]);
 });
 
 test("revalidates original workers when recovering a Deep reduction", async () => {
-  const runtime = await loadBundledRuntime();
-  const source =
-    /async function validateReducerArtifacts\([^\n]*\) \{[\s\S]*?\n\}/u.exec(
-      runtime,
-    )?.[0];
-  expect(source).toBeDefined();
-  const worker = {
-    scanId: "scan",
-    findings: [{ identity: { anchor: "first" } }],
-  };
-  let validatedSources: unknown[] = [];
-  const validate = new Function(
-    "requireRegularFile",
-    "parseStoredScanDraft",
-    "readJsonObject",
-    "validateRetainedFindings",
-    "findingIdentity",
-    `${source}\nreturn validateReducerArtifacts;`,
-  )(
-    async () => {},
-    (value: unknown) => value,
-    async () => worker,
-    (_result: unknown, sources: unknown[]) => {
-      validatedSources = sources;
-    },
-    (value: { identity: { anchor: string } }) => value.identity.anchor,
-  ) as (input: Record<string, unknown>, scanId: string) => Promise<unknown>;
-
-  await validate(
-    {
-      artifacts: { workersRoot: "workers", dedupRoot: "reducers" },
-      artifactDir: "reducer",
-      resultPath: "result.json",
-      reducerId: "reducer",
-      sourceDiscoveries: [{ id: "first", resultPath: "worker.json" }],
-    },
-    "scan",
+  const first = reducerFinding("first");
+  const worker = reducerDraft([first]);
+  const result = reducerDraft([first]);
+  const files = new Map([
+    ["worker.json", worker],
+    ["result.json", result],
+  ]);
+  const inspected: Array<{ path: string; root: string }> = [];
+  const { validateReducerArtifacts } = bundledReducer(
+    await loadBundledRuntime(),
+    { files, inspected },
   );
-  expect(validatedSources).toEqual([worker]);
+  const input = {
+    artifacts: { workersRoot: "workers", dedupRoot: "reducers" },
+    artifactDir: "reducer",
+    resultPath: "result.json",
+    reducerId: "reducer",
+    sourceDiscoveries: [{ id: "first", resultPath: "worker.json" }],
+  };
+
+  expect(await validateReducerArtifacts(input, "synthetic-scan")).toEqual({
+    newFindings: 1,
+  });
+  expect(inspected).toContainEqual({ path: "worker.json", root: "workers" });
+
+  files.set("result.json", {
+    ...result,
+    scope: { runtimeStatus: "Dynamically validated." },
+  });
+  await expect(
+    validateReducerArtifacts(input, "synthetic-scan"),
+  ).rejects.toThrow("scope");
 });
 
 test("keeps every advertised Deep worker tool within Codex's name limit", async () => {
@@ -384,6 +774,38 @@ test("classifies owned worker tool failures without exposing their contents", as
     error: null,
   });
   expect(unrelatedDiagnostics).toEqual([]);
+});
+
+test("does not retry textual missing-path worker failures", async () => {
+  const runtime = await loadBundledRuntime();
+  const errorClass =
+    /var DeepScanNonRetryableError = class extends Error \{[\s\S]*?\n\};/u.exec(
+      runtime,
+    )?.[0];
+  expect(errorClass).toBeDefined();
+  const classify = new Function(
+    "ARTIFACT_MCP_STARTUP_TIMEOUT_PATTERN",
+    "REMOTE_PLUGIN_AUTH_WARNING_PATTERN",
+    "isCodexCybersecurityPolicyRefusal",
+    [
+      errorClass!,
+      bundledFunction(runtime, "classifyCodexWorkerError"),
+      bundledFunction(runtime, "isCodexConfigurationFailure"),
+      "return classifyCodexWorkerError;",
+    ].join("\n"),
+  )(/$^/u, /$^/u, () => false) as (error: Error) => Error;
+
+  for (const diagnostic of [
+    "Error: No such file or directory (os error 2)",
+    "Error: The system cannot find the file specified. (os error 2)",
+  ]) {
+    const original = new Error(
+      ["Codex Exec exited with code 1:", diagnostic].join("\n"),
+    );
+    const classified = classify(original);
+    expect(classified.name).toBe("DeepScanNonRetryableError");
+    expect(classified.cause).toBe(original);
+  }
 });
 
 test("resumes only when the exact Standard worker or reducer result is missing", async () => {
