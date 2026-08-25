@@ -693,6 +693,27 @@ describe("semantic scan comparison", () => {
     ).rejects.toThrow("confirmed finding groups");
   });
 
+  test("rejects uncertainty between occurrences of the same stable finding", async () => {
+    const input = {
+      before: [{ occurrenceId: "before", findingId: "shared-identity" }],
+      after: [{ occurrenceId: "after", findingId: "shared-identity" }],
+    };
+    const response = {
+      matches: [],
+      uncertain: [
+        {
+          beforeOccurrenceId: "before",
+          afterOccurrenceId: "after",
+          reason: "Incorrectly treats the same stable identity as uncertain.",
+        },
+      ],
+    };
+
+    await expect(
+      matchScanFindings(input, { codex: fakeCodex(response).codex }),
+    ).rejects.toThrow("invalid uncertain pair");
+  });
+
   test("rejects a match that splits a confirmed historical group", async () => {
     const input = {
       before: [

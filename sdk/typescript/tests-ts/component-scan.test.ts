@@ -573,6 +573,11 @@ test("keeps uncertain findings separate even when their fingerprints match", asy
   });
   const saved = await json(summary.findingsPath!);
   expect(saved.findings).toHaveLength(2);
+  expect(
+    saved.findings.map(
+      ({ finding }: { finding: Finding }) => finding.findingId,
+    ),
+  ).toEqual(["same", "same"]);
   expect(saved.deduplication.uncertain).toHaveLength(1);
 });
 

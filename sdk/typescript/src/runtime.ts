@@ -45,6 +45,7 @@ import { promisify } from "node:util";
 import { crc32 } from "node:zlib";
 import { setTimeout as delay } from "node:timers/promises";
 import extractZip from "extract-zip";
+import semverGte from "semver/functions/gte.js";
 import { parse } from "smol-toml";
 import {
   CodexSecurityError,
@@ -1397,6 +1398,7 @@ export async function preparePersistentOutputRoot(
 }
 
 const workbenchComparisonStdinSupport = new Map<string, boolean>();
+const workbenchComparisonRelatedSupport = new Map<string, boolean>();
 
 export async function runWorkbench(
   options: WorkbenchCommandOptions,
@@ -1450,18 +1452,21 @@ export async function runWorkbench(
         supportsStdin = help.includes("--matches-json-stdin");
         workbenchComparisonStdinSupport.set(key, supportsStdin);
       }
-      if (!supportsStdin) {
-        // Older custom plugins accept only the original comparison format.
-        const comparison: unknown = JSON.parse(input);
-        if (isRecord(comparison) && "related" in comparison) {
-          delete comparison["related"];
+      const comparison: unknown = JSON.parse(input);
+      if (isRecord(comparison) && "related" in comparison) {
+        let supportsRelated = workbenchComparisonRelatedSupport.get(key);
+        if (supportsRelated === undefined) {
+          const { version } = await pluginMetadata(options.pluginRoot);
+          supportsRelated = semverGte(version, "0.1.39");
+          workbenchComparisonRelatedSupport.set(key, supportsRelated);
         }
-        arguments_.splice(
-          matchesStdinIndex,
-          1,
-          "--matches-json",
-          JSON.stringify(comparison),
-        );
+        if (!supportsRelated) {
+          delete comparison["related"];
+          input = JSON.stringify(comparison);
+        }
+      }
+      if (!supportsStdin) {
+        arguments_.splice(matchesStdinIndex, 1, "--matches-json", input);
         input = undefined;
       }
     }

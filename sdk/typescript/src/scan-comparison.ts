@@ -574,10 +574,13 @@ function validateComparison(
   }
 
   for (const candidate of parsed.data.uncertain) {
+    const beforeFindingId = findingIds.get(candidate.beforeOccurrenceId);
+    const afterFindingId = findingIds.get(candidate.afterOccurrenceId);
     if (
       !beforeIds.has(candidate.beforeOccurrenceId) ||
       matchedBefore.has(candidate.beforeOccurrenceId) ||
       !afterIds.has(candidate.afterOccurrenceId) ||
+      (beforeFindingId !== undefined && beforeFindingId === afterFindingId) ||
       (!allowHistoricalUncertainty &&
         matchedAfter.has(candidate.afterOccurrenceId))
     ) {

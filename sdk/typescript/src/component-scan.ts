@@ -350,12 +350,21 @@ async function deduplicateFindings(
   );
   const matching: ScanComparisonResult = { matches: [], uncertain: [] };
   const [first, ...remaining] = scans;
-  const previous = [...(first?.findings ?? [])];
+  const componentFindings = ({
+    receipt,
+    findings,
+  }: (typeof scans)[number]): Finding[] =>
+    findings.map((finding) => ({
+      ...finding,
+      findingId: `${receipt.id}:${finding.findingId}`,
+    }));
+  const previous = first === undefined ? [] : componentFindings(first);
   let error: string | undefined;
   try {
     options.signal?.throwIfAborted();
     if (remaining.length) notify(() => options.onDeduplicationStarted?.());
-    for (const { findings: current } of remaining) {
+    for (const component of remaining) {
+      const current = componentFindings(component);
       const comparison = await (options.matchFindings ?? matchScanFindings)(
         { before: [...previous], after: current },
         {
