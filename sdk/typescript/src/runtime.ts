@@ -46,6 +46,7 @@ import { crc32 } from "node:zlib";
 import { setTimeout as delay } from "node:timers/promises";
 import extractZip from "extract-zip";
 import semverGte from "semver/functions/gte.js";
+import semverValid from "semver/functions/valid.js";
 import { parse } from "smol-toml";
 import {
   CodexSecurityError,
@@ -1457,7 +1458,8 @@ export async function runWorkbench(
         let supportsRelated = workbenchComparisonRelatedSupport.get(key);
         if (supportsRelated === undefined) {
           const { version } = await pluginMetadata(options.pluginRoot);
-          supportsRelated = semverGte(version, "0.1.39");
+          supportsRelated =
+            semverValid(version) !== null && semverGte(version, "0.1.39");
           workbenchComparisonRelatedSupport.set(key, supportsRelated);
         }
         if (!supportsRelated) {

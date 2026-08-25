@@ -983,6 +983,75 @@ describe("CLI workbench", () => {
     ]);
   });
 
+  test("unions overlapping confirmed identities before later matching batches", async () => {
+    const first = { occurrenceId: "first", findingId: "identity-a" };
+    const second = { occurrenceId: "second", findingId: "identity-b" };
+    const third = { occurrenceId: "third", findingId: "identity-c" };
+    const fourth = { occurrenceId: "fourth", findingId: "identity-d" };
+    const existingGroups = [
+      [first.findingId, second.findingId],
+      [third.findingId, fourth.findingId],
+    ];
+    const matchedInputs: ScanComparisonInput[] = [];
+
+    expect(
+      await main(
+        ["scans", "match", "--all", "--json"],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          onWorkbench: (args): JsonObject =>
+            args[0] === "list-unmatched-scan-pairs"
+              ? {
+                  repository: "/current/repository",
+                  scanCount: 4,
+                  unavailableScans: 0,
+                  skippedPairs: 0,
+                  batches: [
+                    {
+                      afterScanId: "third-scan",
+                      afterFindings: [third],
+                      beforeScans: [
+                        { scanId: "first-scan", findings: [first] },
+                      ],
+                      knownFindingGroups: existingGroups,
+                    },
+                    {
+                      afterScanId: "fourth-scan",
+                      afterFindings: [fourth],
+                      beforeScans: [
+                        { scanId: "second-scan", findings: [second] },
+                      ],
+                      knownFindingGroups: existingGroups,
+                    },
+                  ],
+                }
+              : {},
+          onMatch: async (input) => {
+            matchedInputs.push(input);
+            return matchedInputs.length === 1
+              ? {
+                  matches: [
+                    {
+                      beforeOccurrenceIds: [first.occurrenceId],
+                      afterOccurrenceIds: [third.occurrenceId],
+                      confidence: "high",
+                      reason: "These confirmed identities describe one issue.",
+                    },
+                  ],
+                  uncertain: [],
+                }
+              : { matches: [], uncertain: [] };
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(matchedInputs).toHaveLength(2);
+    expect(matchedInputs[1]!.knownFindingGroups).toEqual([
+      [first.findingId, second.findingId, third.findingId, fourth.findingId],
+    ]);
+  });
+
   test("saves empty comparisons without starting Codex", async () => {
     const calls: Array<readonly string[]> = [];
     let comparisonInput: string | undefined;

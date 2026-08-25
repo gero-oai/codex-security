@@ -726,7 +726,7 @@ function reconcileComparison(
           ),
         }),
   };
-  validateComparison(input, comparison, allowHistoricalUncertainty);
+  validateComparison(input, comparison, allowHistoricalUncertainty, true);
   return { comparison, complete: matches.length === groups.length };
 }
 
@@ -1046,6 +1046,7 @@ function validateComparison(
   input: ScanComparisonInput,
   response: ScanComparisonResult,
   allowHistoricalUncertainty: boolean,
+  enforceConfirmedIdentities = false,
 ): void {
   const beforeIds = new Set(
     input.before.map(({ occurrenceId }) => occurrenceId),
@@ -1083,6 +1084,45 @@ function validateComparison(
     }
   }
 
+  if (enforceConfirmedIdentities) {
+    const confirmedGroups = [
+      ...(input.knownFindingGroups ?? []),
+      ...[...new Set(findingIds.values())].map((findingId) => [findingId]),
+    ];
+    for (const knownGroup of confirmedGroups) {
+      const knownFindingIds = new Set(knownGroup);
+      const knownBefore = input.before.filter(({ occurrenceId }) =>
+        knownFindingIds.has(findingIds.get(occurrenceId) ?? ""),
+      );
+      const knownAfter = input.after.filter(({ occurrenceId }) =>
+        knownFindingIds.has(findingIds.get(occurrenceId) ?? ""),
+      );
+      const matchedGroups = new Set(
+        [...knownBefore, ...knownAfter].flatMap(({ occurrenceId }) => {
+          const group =
+            matchedBefore.get(occurrenceId) ?? matchedAfter.get(occurrenceId);
+          return group === undefined ? [] : [group];
+        }),
+      );
+      if (
+        matchedGroups.size > 1 ||
+        (matchedGroups.size === 1 &&
+          [...knownBefore, ...knownAfter].some(
+            ({ occurrenceId }) =>
+              !matchedBefore.has(occurrenceId) &&
+              !matchedAfter.has(occurrenceId),
+          )) ||
+        (knownBefore.length > 0 &&
+          knownAfter.length > 0 &&
+          matchedGroups.size === 0)
+      ) {
+        throw new CodexSecurityError(
+          "Scan comparison contradicts previously confirmed finding groups.",
+        );
+      }
+    }
+  }
+
   for (const candidate of response.uncertain) {
     const beforeFindingId = findingIds.get(candidate.beforeOccurrenceId);
     const afterFindingId = findingIds.get(candidate.afterOccurrenceId);
@@ -1090,7 +1130,9 @@ function validateComparison(
       !beforeIds.has(candidate.beforeOccurrenceId) ||
       matchedBefore.has(candidate.beforeOccurrenceId) ||
       !afterIds.has(candidate.afterOccurrenceId) ||
-      (beforeFindingId !== undefined && beforeFindingId === afterFindingId) ||
+      (enforceConfirmedIdentities &&
+        beforeFindingId !== undefined &&
+        beforeFindingId === afterFindingId) ||
       (!allowHistoricalUncertainty &&
         matchedAfter.has(candidate.afterOccurrenceId))
     ) {

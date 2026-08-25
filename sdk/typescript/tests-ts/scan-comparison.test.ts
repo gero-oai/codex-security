@@ -1097,11 +1097,65 @@ describe("semantic scan comparison", () => {
       ],
     };
     const contradictory = fakeCodex(response);
-    await expect(
-      matchScanFindings(requiringModel, { codex: contradictory.codex }),
-    ).rejects.toThrow("invalid uncertain pair");
+    expect(
+      await matchScanFindings(requiringModel, { codex: contradictory.codex }),
+    ).toEqual({
+      matches: [
+        {
+          beforeOccurrenceIds: ["before"],
+          afterOccurrenceIds: ["after"],
+          confidence: "high",
+          reason:
+            "The findings share a stable identity or a previously confirmed link.",
+        },
+      ],
+      uncertain: [],
+    });
     expect(contradictory.calls.prompt).toBeDefined();
   });
+
+  test.each(["omitted", "split"] as const)(
+    "confirms stable finding identities before a model can return %s matches",
+    async (scenario) => {
+      const input = {
+        before: [
+          { occurrenceId: "before-a", findingId: "shared-identity" },
+          { occurrenceId: "before-b", findingId: "shared-identity" },
+        ],
+        after: [
+          { occurrenceId: "after-a", findingId: "shared-identity" },
+          { occurrenceId: "after-b", findingId: "shared-identity" },
+        ],
+      };
+      const response = {
+        matches:
+          scenario === "omitted"
+            ? []
+            : input.before.map(({ occurrenceId }, index) => ({
+                beforeOccurrenceIds: [occurrenceId],
+                afterOccurrenceIds: [input.after[index]!.occurrenceId],
+                confidence: "high" as const,
+                reason: "Incorrectly splits one stable finding identity.",
+              })),
+        uncertain: [],
+      };
+
+      const { codex, calls } = fakeCodex(response);
+      expect(await matchScanFindings(input, { codex })).toEqual({
+        matches: [
+          {
+            beforeOccurrenceIds: ["before-a", "before-b"],
+            afterOccurrenceIds: ["after-a", "after-b"],
+            confidence: "high",
+            reason:
+              "The findings share a stable identity or a previously confirmed link.",
+          },
+        ],
+        uncertain: [],
+      });
+      expect(calls.prompt).toBeUndefined();
+    },
+  );
 
   test("never lets a model split a confirmed historical group", async () => {
     const input = {
