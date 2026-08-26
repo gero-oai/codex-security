@@ -131,15 +131,13 @@ async function runGit(
 export async function runPatchReviewRepositoryMcp(
   args: readonly string[],
 ): Promise<number> {
-  const [git, repository, tree, objectDirectory, alternateObjectDirectory] =
-    args;
+  const [git, repository, tree, objectDirectory] = args;
   if (
     git === undefined ||
     repository === undefined ||
     tree === undefined ||
     objectDirectory === undefined ||
-    alternateObjectDirectory === undefined ||
-    args.length !== 5 ||
+    args.length !== 4 ||
     !isAbsolute(git)
   ) {
     return 2;
@@ -150,7 +148,6 @@ export async function runPatchReviewRepositoryMcp(
   ]);
   const environment = {
     GIT_OBJECT_DIRECTORY: objectDirectory,
-    GIT_ALTERNATE_OBJECT_DIRECTORIES: JSON.stringify(alternateObjectDirectory),
   };
   await runGit(
     canonicalGit,

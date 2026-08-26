@@ -1234,7 +1234,6 @@ interface PatchReviewRepositoryView {
   repository: string;
   tree: string;
   objectDirectory: string;
-  alternateObjectDirectory: string;
   runtimeSource: string;
   gitExecutable: string;
 }
@@ -6217,6 +6216,7 @@ async function hashNestedPatchReviewGitDirectory(
       digest,
       context,
       signal,
+      true,
     );
   }
 }
@@ -6240,6 +6240,11 @@ async function hashNestedPatchReviewGitMetadata(
     throw error;
   }
   if (!metadata.isDirectory()) {
+    if (metadata.isSymbolicLink()) {
+      throw new CodexSecurityError(
+        "Git metadata must not contain symbolic links.",
+      );
+    }
     await hashNestedPatchReviewPath(
       worktree,
       markerPath,
@@ -6294,6 +6299,11 @@ async function hashNestedPatchReviewGitMarker(
 ): Promise<void> {
   const markerPath = Buffer.from(".git");
   const metadata = await lstat(join(worktree, ".git"), { bigint: true });
+  if (metadata.isSymbolicLink()) {
+    throw new CodexSecurityError(
+      "Git metadata must not contain symbolic links.",
+    );
+  }
   if (metadata.isDirectory()) {
     updateNestedPatchReviewDigest(
       digest,
@@ -6371,6 +6381,7 @@ async function hashNestedPatchReviewPath(
   digest: ReturnType<typeof createHash>,
   context: NestedPatchReviewHashContext,
   signal?: AbortSignal,
+  rejectSymbolicLinks = false,
 ): Promise<void> {
   signal?.throwIfAborted();
   await validatePatchReviewGitPath(worktree, path, worktree);
@@ -6387,6 +6398,11 @@ async function hashNestedPatchReviewPath(
   }
 
   if (metadata.isSymbolicLink()) {
+    if (rejectSymbolicLinks) {
+      throw new CodexSecurityError(
+        "Git metadata must not contain symbolic links.",
+      );
+    }
     updateNestedPatchReviewDigest(
       digest,
       path,
@@ -6423,6 +6439,7 @@ async function hashNestedPatchReviewPath(
         digest,
         context,
         signal,
+        rejectSymbolicLinks,
       );
     }
     return;
@@ -6542,6 +6559,47 @@ async function validatePatchReviewObjectAlternates(
       visited,
     );
   }
+}
+
+async function patchReviewObjectDirectoryForGitDirectory(
+  gitDirectory: string,
+  allowedDirectories: readonly string[],
+): Promise<string> {
+  const commondirPath = join(gitDirectory, "commondir");
+  let commonDirectory = gitDirectory;
+  let metadata: Awaited<ReturnType<typeof lstat>> | undefined;
+  try {
+    metadata = await lstat(commondirPath);
+  } catch (error) {
+    if (!missingPatchReviewPath(error)) throw error;
+  }
+  if (metadata !== undefined) {
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new CodexSecurityError(
+        "Nested Git metadata must use a confined common directory.",
+      );
+    }
+    const bytes = await readFile(commondirPath);
+    const contents = bytes.toString("utf8");
+    const match = /^([^\r\n]+)\r?\n?$/u.exec(contents);
+    if (!Buffer.from(contents, "utf8").equals(bytes) || match === null) {
+      throw new CodexSecurityError(
+        "Nested Git metadata must use a confined common directory.",
+      );
+    }
+    commonDirectory = await realpath(resolve(gitDirectory, match[1]!));
+  }
+  if (
+    !allowedDirectories.some(
+      (directory) => !isOutsidePath(relative(directory, commonDirectory)),
+    ) ||
+    !(await lstat(commonDirectory)).isDirectory()
+  ) {
+    throw new CodexSecurityError(
+      "Nested Git metadata must use a confined common directory.",
+    );
+  }
+  return join(commonDirectory, "objects");
 }
 
 async function readPatchReviewBlob(
@@ -6669,6 +6727,78 @@ async function writePatchReviewBlob(
     );
   }
   return object;
+}
+
+async function sealPatchReviewIndexObjects(
+  repository: string,
+  entries: Buffer,
+  objectDirectory: string,
+  objectFormat: "sha1" | "sha256",
+  signal?: AbortSignal,
+): Promise<void> {
+  const objects = new Set(
+    [...parseRawPatchReviewIndexEntries(entries).values()]
+      .filter(({ mode }) => mode !== "160000")
+      .map(({ object }) => object),
+  );
+  if (objects.size === 0) return;
+  const objectList = [...objects];
+  const output = await runPatchReviewGitBytes(
+    repository,
+    ["cat-file", "--batch"],
+    {
+      input: `${objectList.join("\n")}\n`,
+      signal,
+    },
+  ).catch(() => {
+    signal?.throwIfAborted();
+    throw new CodexSecurityError(
+      "The patch review baseline contains an unreadable Git object.",
+    );
+  });
+  let offset = 0;
+  for (const object of objectList) {
+    signal?.throwIfAborted();
+    const headerEnd = output.indexOf(0x0a, offset);
+    const header =
+      headerEnd < 0
+        ? undefined
+        : output.subarray(offset, headerEnd).toString("ascii");
+    const match = /^([0-9a-f]+) blob ([0-9]+)$/u.exec(header ?? "");
+    const size = match === null ? undefined : Number(match[2]);
+    const contentsStart = headerEnd + 1;
+    const contentsEnd =
+      size === undefined || !Number.isSafeInteger(size)
+        ? -1
+        : contentsStart + size;
+    if (
+      match?.[1] !== object ||
+      size === undefined ||
+      size < 0 ||
+      contentsEnd < contentsStart ||
+      contentsEnd >= output.length ||
+      output[contentsEnd] !== 0x0a
+    ) {
+      throw new CodexSecurityError(
+        "The patch review baseline contains an unreadable Git object.",
+      );
+    }
+    const contents = output.subarray(contentsStart, contentsEnd);
+    if (
+      (await writePatchReviewBlob(objectDirectory, objectFormat, contents)) !==
+      object
+    ) {
+      throw new CodexSecurityError(
+        "The patch review baseline contains an invalid Git object.",
+      );
+    }
+    offset = contentsEnd + 1;
+  }
+  if (offset !== output.length) {
+    throw new CodexSecurityError(
+      "The patch review baseline contains an unreadable Git object.",
+    );
+  }
 }
 
 async function nestedPatchReviewRepository(
@@ -6878,6 +7008,73 @@ function parsePatchReviewIndexEntries(
     entries.set(path, { path, mode: entry.mode, object: entry.object });
   }
   return entries;
+}
+
+function parsePatchReviewTreeEntries(
+  output: Buffer,
+): Map<string, PatchReviewTreeEntry> {
+  const entries = new Map<string, PatchReviewTreeEntry>();
+  for (const record of splitNulRecords(output)) {
+    const separator = record.indexOf(0x09);
+    const metadata =
+      separator < 0
+        ? undefined
+        : record.subarray(0, separator).toString("ascii");
+    const match = /^([0-7]{6}) (blob|commit) ([0-9a-f]+)$/u.exec(
+      metadata ?? "",
+    );
+    const rawPath = separator < 0 ? undefined : record.subarray(separator + 1);
+    const path =
+      rawPath === undefined ? undefined : decodePatchReviewGitPath(rawPath);
+    if (match === null || rawPath === undefined) {
+      throw new CodexSecurityError(
+        "The selected repository contains an unreadable Git tree entry.",
+      );
+    }
+    if (path === undefined) continue;
+    if (entries.has(path)) {
+      throw new CodexSecurityError(
+        "The selected repository contains an unreadable Git tree entry.",
+      );
+    }
+    entries.set(path, { path, mode: match[1], object: match[3] });
+  }
+  return entries;
+}
+
+function patchReviewTreeIndexEntries(output: Buffer): Buffer {
+  const entries: Buffer[] = [];
+  for (const record of splitNulRecords(output)) {
+    const separator = record.indexOf(0x09);
+    const metadata =
+      separator < 0
+        ? undefined
+        : record.subarray(0, separator).toString("ascii");
+    const match = /^([0-7]{6}) (blob|commit) ([0-9a-f]+)$/u.exec(
+      metadata ?? "",
+    );
+    const path = separator < 0 ? undefined : record.subarray(separator + 1);
+    if (match === null || path === undefined) {
+      throw new CodexSecurityError(
+        "The selected repository contains an unreadable Git tree entry.",
+      );
+    }
+    entries.push(
+      Buffer.from(`${match[1]} ${match[3]}\t`, "ascii"),
+      path,
+      Buffer.from([0]),
+    );
+  }
+  return Buffer.concat(entries);
+}
+
+function changedPatchReviewTreeEntryPaths(
+  left: ReadonlyMap<string, PatchReviewTreeEntry>,
+  right: ReadonlyMap<string, PatchReviewTreeEntry>,
+): string[] {
+  return [...new Set([...left.keys(), ...right.keys()])].filter(
+    (path) => !samePatchReviewTreeEntry(left.get(path), right.get(path)),
+  );
 }
 
 function selectedPatchReviewTreeEntries(
@@ -7298,7 +7495,6 @@ async function snapshotPatchReviewWorktree(
   };
   const objectEnvironment = {
     GIT_OBJECT_DIRECTORY: objectDirectory,
-    GIT_ALTERNATE_OBJECT_DIRECTORIES: JSON.stringify(repositoryObjectDirectory),
   };
   const environment = {
     ...objectEnvironment,
@@ -7330,6 +7526,11 @@ async function snapshotPatchReviewWorktree(
     );
     const markerPath = Buffer.from(".git");
     const marker = await lstat(join(repository, ".git"), { bigint: true });
+    if (marker.isSymbolicLink()) {
+      throw new CodexSecurityError(
+        "Git metadata must not contain symbolic links.",
+      );
+    }
     if (marker.isDirectory()) {
       updateNestedPatchReviewDigest(
         digest,
@@ -7361,6 +7562,7 @@ async function snapshotPatchReviewWorktree(
           digest,
           hashContext,
           signal,
+          true,
         );
       }
       for (const modulePath of await patchReviewModuleGitDirectories(
@@ -7383,6 +7585,7 @@ async function snapshotPatchReviewWorktree(
             digest,
             hashContext,
             signal,
+            true,
           );
         }
       }
@@ -7410,6 +7613,14 @@ async function snapshotPatchReviewWorktree(
   const nestedRepositoryState = async (
     nested: NestedPatchReviewRepository,
   ): Promise<string> => {
+    await validatePatchReviewObjectAlternates(
+      await patchReviewObjectDirectoryForGitDirectory(
+        nested.gitDirectory,
+        allowedNestedGitDirectories,
+      ),
+      allowedNestedGitDirectories,
+      signal,
+    );
     const gitPrefix = [
       `--git-dir=${nested.gitDirectory}`,
       `--work-tree=${nested.worktree}`,
@@ -7656,6 +7867,7 @@ async function snapshotPatchReviewWorktree(
         digest,
         hashContext,
         signal,
+        true,
       );
     }
     return digest.digest("hex");
@@ -8266,31 +8478,41 @@ async function snapshotPatchReviewWorktree(
     const headCommit = await runPatchReviewGit(
       repository,
       ["rev-parse", "--verify", "HEAD"],
-      { environment: objectEnvironment, signal },
+      { signal },
     ).catch(() => {
       signal?.throwIfAborted();
       return undefined;
     });
-    const headTree =
+    const headTreeListing =
       headCommit === undefined
-        ? undefined
-        : await runPatchReviewGit(
+        ? Buffer.alloc(0)
+        : await runPatchReviewGitBytes(
             repository,
-            ["rev-parse", `${headCommit}^{tree}`],
-            { environment: objectEnvironment, signal },
+            ["ls-tree", "-r", "-z", "--full-tree", headCommit],
+            { signal },
           );
-    let publicationBaseTree = headTree;
-    if (publicationBaseTree === undefined) {
-      await runPatchReviewGit(repository, ["read-tree", "--empty"], {
-        environment: publicationEnvironment,
-        signal,
-      });
-      publicationBaseTree = await runPatchReviewGit(
+    const headEntries = parsePatchReviewTreeEntries(headTreeListing);
+    await runPatchReviewGit(repository, ["read-tree", "--empty"], {
+      environment: publicationEnvironment,
+      signal,
+    });
+    const headIndexEntries = patchReviewTreeIndexEntries(headTreeListing);
+    if (headIndexEntries.length > 0) {
+      await runPatchReviewGit(
         repository,
-        ["write-tree"],
-        { environment: publicationEnvironment, signal },
+        ["update-index", "-z", "--index-info"],
+        {
+          environment: publicationEnvironment,
+          input: headIndexEntries,
+          signal,
+        },
       );
     }
+    const publicationBaseTree = await runPatchReviewGit(
+      repository,
+      ["write-tree"],
+      { environment: publicationEnvironment, signal },
+    );
     const repositoryIndexState = async (): Promise<
       Map<
         string,
@@ -8306,12 +8528,12 @@ async function snapshotPatchReviewWorktree(
         runPatchReviewGitBytes(
           repository,
           ["ls-files", "-v", "-z", "--", "."],
-          { environment: objectEnvironment, signal },
+          { signal },
         ),
         runPatchReviewGitBytes(
           repository,
           ["ls-files", "-f", "-z", "--", "."],
-          { environment: objectEnvironment, signal },
+          { signal },
         ),
       ]);
       const parseFlags = (output: Buffer) => {
@@ -8383,6 +8605,7 @@ async function snapshotPatchReviewWorktree(
       return entries;
     };
     let repositoryIndexSnapshot = 0;
+    let baselineRepositoryIndexEntries: Buffer | undefined;
     const repositoryIndexTree = async (): Promise<{
       entries: Buffer;
       tree: string;
@@ -8399,8 +8622,23 @@ async function snapshotPatchReviewWorktree(
       const entries = await runPatchReviewGitBytes(
         repository,
         ["ls-files", "--stage", "-z", "--", "."],
-        { environment: objectEnvironment, signal },
+        { signal },
       );
+      if (repositoryIndexSnapshot === 1) {
+        await sealPatchReviewIndexObjects(
+          repository,
+          entries,
+          objectDirectory,
+          objectFormat,
+          signal,
+        );
+        baselineRepositoryIndexEntries = Buffer.from(entries);
+      } else if (
+        baselineRepositoryIndexEntries === undefined ||
+        !entries.equals(baselineRepositoryIndexEntries)
+      ) {
+        return { entries, tree: "" };
+      }
       await runPatchReviewGit(repository, ["read-tree", "--empty"], {
         environment: indexEnvironment,
         signal,
@@ -8434,7 +8672,7 @@ async function snapshotPatchReviewWorktree(
           "--",
           ".",
         ],
-        { environment: objectEnvironment, signal },
+        { signal },
       );
     const [indexSnapshot, indexState, intentToAddState] = await Promise.all([
       repositoryIndexTree(),
@@ -8500,7 +8738,7 @@ async function snapshotPatchReviewWorktree(
       const currentHead = await runPatchReviewGit(
         repository,
         ["rev-parse", "--verify", "HEAD"],
-        { environment: objectEnvironment, signal },
+        { signal },
       ).catch(() => {
         signal?.throwIfAborted();
         return undefined;
@@ -8555,33 +8793,6 @@ async function snapshotPatchReviewWorktree(
         "The patch worktree changed while its review baseline was captured. Retry from a stable worktree.",
       );
     }
-    const pathsChangedFromHead = async (tree: string): Promise<string[]> => {
-      const output = await runPatchReviewGitBytes(
-        repository,
-        headTree === undefined
-          ? ["ls-tree", "-r", "--name-only", "-z", tree]
-          : [
-              "--no-pager",
-              "diff",
-              "--no-color",
-              "--no-ext-diff",
-              "--no-textconv",
-              "--no-renames",
-              "--name-only",
-              "-z",
-              "--relative",
-              headTree,
-              tree,
-              "--",
-              ".",
-            ],
-        { environment, signal },
-      );
-      return splitNulRecords(output).flatMap((path) => {
-        const decoded = decodePatchReviewGitPath(path);
-        return decoded === undefined ? [] : [decoded];
-      });
-    };
     const normalizationEnvironment = {
       ...objectEnvironment,
       GIT_INDEX_FILE: join(temporaryDirectory, "normalization-index"),
@@ -8590,7 +8801,14 @@ async function snapshotPatchReviewWorktree(
       await runPatchReviewGitBytes(
         repository,
         ["ls-files", "--stage", "-z", "--", "."],
-        { environment: objectEnvironment, signal },
+        { signal },
+      ),
+    );
+    const baselineEntries = parsePatchReviewIndexEntries(
+      await runPatchReviewGitBytes(
+        repository,
+        ["ls-files", "--stage", "-z", "--", "."],
+        { environment, signal },
       ),
     );
     const normalizedPublicationTree = async (
@@ -8686,14 +8904,19 @@ async function snapshotPatchReviewWorktree(
         ),
       };
     };
-    const baselinePathsChangedFromHead =
-      await pathsChangedFromHead(baselineTree);
+    const baselinePathsChangedFromHead = changedPatchReviewTreeEntryPaths(
+      headEntries,
+      baselineEntries,
+    );
     const normalizedBaseline = await normalizedPublicationTree(
       baselinePathsChangedFromHead,
     );
     const preexistingPathSet = new Set([
-      ...(await pathsChangedFromHead(indexTree)),
-      ...(await pathsChangedFromHead(normalizedBaseline.tree)),
+      ...changedPatchReviewTreeEntryPaths(headEntries, indexEntries),
+      ...changedPatchReviewTreeEntryPaths(
+        headEntries,
+        normalizedBaseline.entries,
+      ),
     ]);
     const composeCandidateTree = async (
       baseTree: string,
@@ -8951,7 +9174,6 @@ async function snapshotPatchReviewWorktree(
         repository,
         tree: baselineTree,
         objectDirectory,
-        alternateObjectDirectory: repositoryObjectDirectory,
         runtimeSource,
         gitExecutable: reviewerGit.executable,
       },
@@ -10299,13 +10521,21 @@ async function runPatchReviewWorkflow(
       }
       context.options.signal?.throwIfAborted();
       if (review.status === "failed") {
+        const failedCandidate = await context.snapshot.candidate();
+        context.options.signal?.throwIfAborted();
+        const reason = samePatchReviewCandidate(candidate, failedCandidate)
+          ? review.reason
+          : `${stage} review candidate changed while the terminal outcome was being processed.`;
+        candidate = failedCandidate;
+        context.candidate = failedCandidate;
+        if (reason !== review.reason) context.stderr.write(`${reason}\n`);
         if (subject.response !== undefined) {
           stdout.write(
             renderTerminalReviewResponse(
               subject.response,
               candidate,
               "failed",
-              review.reason,
+              reason,
             ),
           );
           return PATCH_REVIEW_EXIT_CODE.success;
@@ -10346,6 +10576,26 @@ async function runPatchReviewWorkflow(
           context.options,
         )
       ) {
+        const terminalCandidate = await context.snapshot.candidate();
+        context.options.signal?.throwIfAborted();
+        if (!samePatchReviewCandidate(candidate, terminalCandidate)) {
+          const reason = `${stage} review candidate changed while the terminal outcome was being processed.`;
+          context.stderr.write(`${reason}\n`);
+          if (subject.response !== undefined) {
+            stdout.write(
+              renderTerminalReviewResponse(
+                subject.response,
+                terminalCandidate,
+                "failed",
+                reason,
+              ),
+            );
+            return PATCH_REVIEW_EXIT_CODE.success;
+          }
+          return PATCH_REVIEW_EXIT_CODE.failure;
+        }
+        candidate = terminalCandidate;
+        context.candidate = terminalCandidate;
         const details = verdict.findings
           .map((finding) =>
             stage === "patch-risk-assessment"
@@ -11131,7 +11381,6 @@ export async function readSkillCommandOutput(
                         reviewRepository!.repository,
                         reviewRepository!.tree,
                         reviewRepository!.objectDirectory,
-                        reviewRepository!.alternateObjectDirectory,
                       ],
                       enabled: true,
                     },
