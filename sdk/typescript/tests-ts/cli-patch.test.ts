@@ -357,6 +357,70 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("reverifies all accepted findings after the final reviewed patch", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const stages: string[] = [];
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--review-minimality", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        onCodex: (args, output) => {
+          const server = output!.appServer!;
+          if (output!.command === "verify-fix") {
+            stages.push("combined-verification");
+            expect(server.prompt).toContain(JSON.stringify(["occ_1", "occ_2"]));
+            output!.stdout.write(
+              JSON.stringify({
+                results: [
+                  {
+                    id: "occ_1",
+                    status: "still_vulnerable",
+                    evidence: "The later synthetic patch restores the issue.",
+                  },
+                  {
+                    id: "occ_2",
+                    status: "fixed",
+                    evidence: "The second synthetic issue remains fixed.",
+                  },
+                ],
+              }),
+            );
+          } else if (server.sandbox === "read-only") {
+            stages.push("review");
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            stages.push("author");
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(0);
+    expect(stages).toEqual([
+      "author",
+      "review",
+      "author",
+      "review",
+      "combined-verification",
+    ]);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      patches: [
+        {
+          occurrenceId: "occ_1",
+          status: "failed",
+          reason:
+            "Final combined verification found that a later patch reintroduced this finding.",
+        },
+        { occurrenceId: "occ_2", status: "verified" },
+      ],
+    });
+  });
+
   test("passes the configured revision budget to scan and saved-finding patching", async () => {
     for (const arguments_ of [
       ["scan", "--patch"],
@@ -2163,6 +2227,65 @@ describe("scan and patch workflow", () => {
         expect(reviews).toBe(0);
         expect(outcome.stderr).toContain(
           "file permission changed outside Git's reviewed mode",
+        );
+      } finally {
+        await rm(repository, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "fails closed when a reviewed path ancestor changes permissions",
+    async () => {
+      const repository = await realpath(
+        await mkdtemp(join(tmpdir(), "codex-security-directory-mode-")),
+      );
+      const directory = join(repository, "src");
+      const path = join(directory, "value.ts");
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      let reviews = 0;
+      try {
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        await mkdir(directory);
+        await writeFile(path, "unsafe\n");
+        await chmod(directory, 0o755);
+        git("add", "--", "src/value.ts");
+        git("commit", "-m", "Initial synthetic checkout");
+
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: async (_args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                reviews += 1;
+              } else {
+                await writeFile(path, "fixed\n");
+                await chmod(directory, 0o777);
+                output!.stdout.write("Verified synthetic patch.");
+              }
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode).toBe(2);
+        expect(reviews).toBe(0);
+        expect(outcome.stderr).toContain(
+          "directory permission changed outside Git's reviewed state",
         );
       } finally {
         await rm(repository, { recursive: true, force: true });
