@@ -7044,6 +7044,23 @@ describe("scan and patch workflow", () => {
     });
   });
 
+  test("uses the configured Python interpreter to load saved findings", async () => {
+    const result = resultWithFindings(["high"]);
+    const pythonPaths: Array<string | undefined> = [];
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--python", "/managed/python"],
+      {
+        onWorkbench: (_args, _input, pythonPath): JsonObject => {
+          pythonPaths.push(pythonPath);
+          return savedScan(result);
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(0);
+    expect(pythonPaths).toEqual(["/managed/python"]);
+  });
+
   test("creates a draft pull request for verified saved-finding patches", async () => {
     const result = resultWithFindings(["high"]);
     const url = "https://github.example.test/example/repository/pull/14";

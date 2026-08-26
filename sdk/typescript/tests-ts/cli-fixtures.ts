@@ -202,6 +202,7 @@ export function dependencies(
     onWorkbench?: (
       args: readonly string[],
       input?: string,
+      pythonPath?: string,
     ) => JsonObject | Promise<JsonObject>;
     onMatch?: MainDependencies["matchFindings"];
     onUpdateCheck?: (signal: AbortSignal) => Promise<UpdateNotice | undefined>;
@@ -273,8 +274,8 @@ export function dependencies(
     ...(options.importGitHubAlerts === undefined
       ? {}
       : { importGitHubAlerts: options.importGitHubAlerts }),
-    runWorkbench: async (args, input) =>
-      (await options.onWorkbench?.(args, input)) ?? { scans: [] },
+    runWorkbench: async (args, input, pythonPath) =>
+      (await options.onWorkbench?.(args, input, pythonPath)) ?? { scans: [] },
     matchFindings: async (input) =>
       (await options.onMatch?.(input)) ?? { matches: [], uncertain: [] },
     exportFindings: async (arguments_) =>
