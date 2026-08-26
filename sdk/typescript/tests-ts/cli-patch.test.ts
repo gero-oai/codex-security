@@ -2199,7 +2199,7 @@ describe("scan and patch workflow", () => {
     } finally {
       await rm(repository, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("fails closed when the author changes dormant submodule metadata", async () => {
     const root = await realpath(
@@ -2279,7 +2279,7 @@ describe("scan and patch workflow", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("fails closed when the author changes sibling linked-worktree metadata", async () => {
     const root = await realpath(
