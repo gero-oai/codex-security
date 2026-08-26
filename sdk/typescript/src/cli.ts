@@ -9327,12 +9327,16 @@ async function runIndependentPatchReview(
         : riskSnapshot === context.snapshot
           ? candidate
           : await riskSnapshot.candidate();
-    if (!candidate.paths.every((path) => riskCandidate!.paths.includes(path))) {
+    if (
+      context.options.createPr !== true &&
+      riskSnapshot !== context.snapshot &&
+      (candidate.head === undefined || candidate.head !== riskCandidate.head)
+    ) {
       return {
         status: "failed",
         exitCode: PATCH_REVIEW_EXIT_CODE.failure,
         reason:
-          "patch-risk-assessment review cannot bind the current patch into the cumulative candidate.",
+          "patch-risk-assessment review cannot bind the current patch tree into the cumulative candidate.",
       };
     }
     artifact = await createPatchRiskReviewArtifact(

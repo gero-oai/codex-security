@@ -160,7 +160,7 @@ function dependencies(
         tree: "synthetic-cumulative-baseline-tree",
         objectDirectory: resolve(directory, ".git", "objects"),
         alternateObjectDirectory: resolve(directory, ".git", "objects"),
-        runtime: PATCH_REVIEW_RUNTIME,
+        runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
         gitExecutable: GIT_EXECUTABLE,
       },
       candidate: async () => {
@@ -177,7 +177,7 @@ function dependencies(
           paths: [...selected.paths],
           diffBytes: Buffer.from(selected.diffBytes ?? selected.diff),
           base: selected.base ?? "c".repeat(40),
-          head: selected.head ?? "d".repeat(40),
+          head: selected.head ?? "b".repeat(40),
         };
       },
       dispose: async () => {},
@@ -536,6 +536,85 @@ describe("scan and patch workflow", () => {
     expect(assessedPaths).toEqual([[firstPath], [firstPath, secondPath]]);
     expect(authorFindingIds).toEqual([["occ_1"], ["occ_2"]]);
     expect(assessedFindingIds).toEqual([["occ_1"], ["occ_1", "occ_2"]]);
+  });
+
+  test("assesses a cumulative fix after it restores an earlier path", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const restoredPath = "src/finding-1.ts";
+    const finalPath = "src/finding-2.ts";
+    const firstHead = "e".repeat(40);
+    const finalHead = "f".repeat(40);
+    const assessedPaths: string[][] = [];
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--assess-patch-risk", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          {
+            paths: [restoredPath],
+            diff: `diff --git a/${restoredPath} b/${restoredPath}\n`,
+            head: firstHead,
+          },
+          {
+            paths: [restoredPath],
+            diff: `diff --git a/${restoredPath} b/${restoredPath}\n`,
+            head: firstHead,
+          },
+          {
+            paths: [restoredPath, finalPath],
+            diff: [restoredPath, finalPath]
+              .map((path) => `diff --git a/${path} b/${path}\n`)
+              .join(""),
+            head: finalHead,
+          },
+          {
+            paths: [restoredPath, finalPath],
+            diff: [restoredPath, finalPath]
+              .map((path) => `diff --git a/${path} b/${path}\n`)
+              .join(""),
+            head: finalHead,
+          },
+        ],
+        cumulativePatchReviewDeltas: [
+          {
+            paths: [restoredPath],
+            diff: `diff --git a/${restoredPath} b/${restoredPath}\n`,
+            head: firstHead,
+          },
+          {
+            paths: [finalPath],
+            diff: `diff --git a/${finalPath} b/${finalPath}\n`,
+            head: finalHead,
+          },
+        ],
+        onCodex: (args, output) => {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_2"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
+            const prompt = output!.appServer!.prompt;
+            assessedPaths.push(patchRiskArtifact(prompt).patch.changedFiles);
+            output!.stdout.write(
+              JSON.stringify(approvedPatchRiskVerdict(prompt)),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(assessedPaths).toEqual([[restoredPath], [finalPath]]);
   });
 
   test("keeps authors finding-scoped while cumulative risk review receives prior constraints", async () => {
