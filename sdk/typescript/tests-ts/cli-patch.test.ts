@@ -2405,6 +2405,58 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("fails closed when the author creates an empty untracked directory", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-new-empty-directory-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviews = 0;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              await mkdir(join(repository, "new-empty"));
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain(
+        "untracked directory changed after patch review started",
+      );
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
   test("allows a reviewed file inside a pre-existing empty directory", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-empty-directory-patch-")),
