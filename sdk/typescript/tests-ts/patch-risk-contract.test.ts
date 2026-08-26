@@ -387,6 +387,19 @@ describe("patch risk assessment contract", () => {
     };
     const noOp = await validate(emptyRange);
     expect(noOp.status, noOp.stderr).toBe(0);
+
+    const opaqueRange = assessment();
+    opaqueRange.patch.base = "\u00a0revision";
+    opaqueRange.patch.head = "revision";
+    const opaque = await validate(opaqueRange);
+    expect(opaque.status, opaque.stderr).toBe(0);
+  });
+
+  test("accepts uppercase SHA-256 digests", async () => {
+    const payload = assessment();
+    payload.patch.sha256 = "A".repeat(64);
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
   });
 
   test("rejects non-low impact for auto-merge", async () => {
@@ -1190,7 +1203,204 @@ describe("patch risk assessment contract", () => {
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
-      "a block outcome requires branch evidence of critical likelihood or a contradicted boundary",
+      "a block outcome requires branch evidence of critical likelihood, a contradicted boundary, or a patch-caused validation failure",
+    );
+  });
+
+  test("allows a patch-caused validation failure to block", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionLikelihood.rating = "moderate";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "unknown";
+    payload.unknowns = [
+      {
+        id: "failure-attribution",
+        summary: "The failed check attribution is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Did the patch cause the failed check?",
+        action: "Run the same check against the immutable base.",
+        resolvesUnknowns: ["failure-attribution"],
+        resolvesFailedValidation: ["focused request tests"],
+        outcomes: {
+          patch_caused: "block",
+          not_patch_caused: "merge",
+        },
+      },
+    ];
+
+    const valid = await validate(payload);
+    expect(valid.status, valid.stderr).toBe(0);
+
+    payload.evidencePlan[0]!.outcomes["inconclusive"] = "merge";
+    const inconclusive = await validate(payload);
+    expect(inconclusive.status).not.toBe(0);
+    expect(inconclusive.stderr).toContain(
+      "an inconclusive failed-validation outcome must remain on hold",
+    );
+  });
+
+  test("keeps terminal evidence branches on hold while another pivot remains", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "defect-signal",
+        summary: "The defect signal is unavailable.",
+        decisionCritical: true,
+      },
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the observed signal contradict the boundary?",
+        action: "Reproduce the signal against the immutable patch.",
+        resolvesUnknowns: ["defect-signal"],
+        remainingUnknowns: {
+          defect: [],
+          inconclusive: ["runtime-owner"],
+        },
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          defect: { "request-contract": "contradicted" },
+          inconclusive: { "request-contract": "unresolved" },
+        },
+        outcomes: {
+          defect: "revise",
+          inconclusive: "hold_for_evidence",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "a terminal outcome cannot retain a decision-critical unknown",
+    );
+  });
+
+  test("requires each claimed unknown resolver to make progress", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which runtime owns this path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        remainingUnknowns: {
+          unavailable: ["runtime-owner"],
+          still_unavailable: ["runtime-owner"],
+        },
+        outcomes: {
+          unavailable: "hold_for_evidence",
+          still_unavailable: "hold_for_evidence",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "'runtime-owner' remains unresolved in every outcome",
+    );
+  });
+
+  test("requires each claimed boundary resolver to make progress", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "boundary-evidence",
+        summary: "The boundary evidence is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the patch preserve the boundary?",
+        action: "Trace both controls through the immutable patch.",
+        resolvesUnknowns: ["boundary-evidence"],
+        remainingUnknowns: { first: [], second: [] },
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          first: { "request-contract": "unresolved" },
+          second: { "request-contract": "unresolved" },
+        },
+        outcomes: {
+          first: "hold_for_evidence",
+          second: "hold_for_evidence",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "'request-contract' remains unresolved in every outcome",
+    );
+  });
+
+  test("requires applicability evidence to make progress", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.applicability = {
+      status: "unknown",
+      rationale: "Runtime ownership remains unavailable.",
+    };
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which runtime owns this path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        remainingUnknowns: { first: [], second: [] },
+        applicabilityOutcomes: { first: "unknown", second: "unknown" },
+        outcomes: {
+          first: "hold_for_evidence",
+          second: "hold_for_evidence",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "applicability remains unknown in every outcome",
     );
   });
 
@@ -1361,11 +1571,11 @@ describe("patch risk assessment contract", () => {
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toBe(
-      "block requires critical regression likelihood or a contradicted material boundary\n",
+      "block requires critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure\n",
     );
   });
 
-  test("accepts either affirmative material failure signal for block", async () => {
+  test("accepts affirmative material failure signals for block", async () => {
     const critical = assessment();
     critical.recommendation = "block";
     critical.workflowLabel = "block";
@@ -1379,6 +1589,16 @@ describe("patch risk assessment contract", () => {
     contradicted.materialBoundaries[0]!.result = "contradicted";
     const contradictedResult = await validate(contradicted);
     expect(contradictedResult.status, contradictedResult.stderr).toBe(0);
+
+    const failed = assessment();
+    failed.recommendation = "block";
+    failed.workflowLabel = "block";
+    failed.regressionProtection.rating = "partial";
+    failed.regressionProtection.exactHeadChecksPassed = false;
+    failed.validation[0]!.status = "failed";
+    failed.validation[0]!.failureAttribution = "patch_caused";
+    const failedResult = await validate(failed);
+    expect(failedResult.status, failedResult.stderr).toBe(0);
   });
 
   test.each([
@@ -1467,6 +1687,17 @@ describe("patch risk assessment contract", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
       "strong regression protection requires an executed validation",
+    );
+  });
+
+  test("requires a passed validation for an exact-head pass claim", async () => {
+    const payload = assessment();
+    payload.regressionProtection.rating = "partial";
+    payload.validation[0]!.status = "skipped";
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "exact-head checks passed requires a passed validation",
     );
   });
 
