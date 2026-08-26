@@ -262,7 +262,7 @@ async function bootstrapUpgradedUsagePlugin(root: string) {
   const previousManifest = JSON.parse(
     await readFile(previousManifestPath, "utf8"),
   ) as { version: string };
-  previousManifest.version = "0.1.45";
+  previousManifest.version = "0.1.72";
   await writeFile(
     previousManifestPath,
     JSON.stringify(previousManifest, null, 2) + "\n",
@@ -1382,8 +1382,8 @@ describe("live scan cost tracking", () => {
       safetyIdentifierKey: installation.safetyIdentifierKey,
       usage,
     }).toEqual({
-      predecessorVersion: "0.1.45",
-      upgradedVersion: "0.1.46",
+      predecessorVersion: "0.1.72",
+      upgradedVersion: "0.1.73",
       installedRootChanged: true,
       safetyIdentifierKey: "CODEX_SAFETY_IDENTIFIER",
       usage: {
@@ -1391,7 +1391,7 @@ describe("live scan cost tracking", () => {
         warnings: [],
       },
     });
-    expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.46");
+    expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.73");
   });
 
   test("forwards actions from this scan's delegated workers only", async () => {
