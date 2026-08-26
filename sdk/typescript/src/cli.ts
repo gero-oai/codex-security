@@ -1160,6 +1160,7 @@ type FindingVerification = z.infer<typeof findingVerificationSchema>;
 interface SkillRunOptions extends PatchReviewOptions {
   signal?: AbortSignal;
   pythonPath?: string;
+  createPr?: boolean;
   safetyIdentifier?: string;
   directory?: string;
   findings?: readonly Finding[];
@@ -4207,6 +4208,7 @@ export async function main(
                 reviewMinimality: options.reviewMinimality,
                 reviewStyle: options.reviewStyle,
                 assessPatchRisk: options.assessPatchRisk,
+                createPr: options.createPr,
                 pythonPath: options.python,
                 maxReviewRevisions: options.maxReviewRevisions,
               },
@@ -9162,9 +9164,11 @@ async function runIndependentPatchReview(
     );
     riskSnapshot = context.patchRiskSnapshot ?? context.snapshot;
     riskCandidate =
-      riskSnapshot === context.snapshot
-        ? candidate
-        : await riskSnapshot.candidate();
+      context.options.createPr === true
+        ? publicationCandidate
+        : riskSnapshot === context.snapshot
+          ? candidate
+          : await riskSnapshot.candidate();
     if (!candidate.paths.every((path) => riskCandidate!.paths.includes(path))) {
       return {
         status: "failed",
@@ -11217,6 +11221,8 @@ async function executeScan(
           reviewMinimality: arguments_.reviewMinimality,
           reviewStyle: arguments_.reviewStyle,
           assessPatchRisk: arguments_.assessPatchRisk,
+          createPr:
+            arguments_.createPr || patchSelection?.createPullRequest === true,
           maxReviewRevisions: arguments_.maxReviewRevisions,
         },
       );
