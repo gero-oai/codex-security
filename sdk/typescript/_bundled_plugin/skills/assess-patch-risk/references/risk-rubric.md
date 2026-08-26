@@ -69,7 +69,7 @@ A trigger alone is not a defect. Mark the boundary contradicted only when a curr
 Use `auto_merge_candidate` only when all of the following are true:
 
 - impact and likelihood are `low`;
-- regression protection is `strong` and relevant exact-head checks pass;
+- regression protection is `strong` and every check marked required for merge passes at the exact head;
 - recovery is `easy` and confidence is `high`;
 - runtime reachability and ownership are established;
 - no privileged boundary, migration, persistent-state change, public contract change, architecture-specific rollout, or broad shared default is materially affected;
