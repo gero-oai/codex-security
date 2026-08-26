@@ -2101,6 +2101,70 @@ describe("scan and patch workflow", () => {
     },
   );
 
+  test("fails closed when the author changes sibling linked-worktree metadata", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-sibling-worktree-")),
+    );
+    const repository = join(root, "repository");
+    const sibling = join(root, "sibling");
+    const git = (directory: string, ...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: directory,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviews = 0;
+    try {
+      await mkdir(repository);
+      git(repository, "init", "--initial-branch=main");
+      git(repository, "config", "user.name", "Synthetic User");
+      git(repository, "config", "user.email", "synthetic@example.test");
+      git(repository, "config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git(repository, "add", "--", "value.ts");
+      git(repository, "commit", "-m", "Initial synthetic checkout");
+      git(repository, "worktree", "add", "-b", "sibling-review", sibling);
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              git(
+                sibling,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                git(repository, "rev-parse", "HEAD:value.ts"),
+                "admin-only.ts",
+              );
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain(
+        "Git metadata changed after patch review started",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test.skipIf(process.platform === "win32")(
     "cleans temporary review storage when baseline metadata capture fails",
     async () => {
