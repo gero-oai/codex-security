@@ -219,6 +219,11 @@
             "additionalProperties": { "$ref": "#/$defs/stringList" },
             "minProperties": 1
           },
+          "changedFilesOutcomes": {
+            "type": "object",
+            "additionalProperties": { "$ref": "#/$defs/nonBlankStringList" },
+            "minProperties": 2
+          },
           "resolvesBoundaries": { "$ref": "#/$defs/stringList" },
           "boundaryOutcomes": {
             "type": "object",
@@ -239,6 +244,13 @@
             "type": "object",
             "additionalProperties": {
               "enum": ["low", "moderate", "high", "critical", "unknown"]
+            },
+            "minProperties": 2
+          },
+          "confidenceOutcomes": {
+            "type": "object",
+            "additionalProperties": {
+              "enum": ["high", "moderate", "low"]
             },
             "minProperties": 2
           },
