@@ -4161,6 +4161,18 @@ describe("scan and patch workflow", () => {
           currentDirectory: repository,
           result,
           onCodex: async (args, output) => {
+            if (output!.command === "verify-fix") {
+              output!.stdout.write(
+                JSON.stringify({
+                  results: ["occ_1", "occ_2"].map((id) => ({
+                    id,
+                    status: "fixed",
+                    evidence: "The complete synthetic patch preserves the fix.",
+                  })),
+                }),
+              );
+              return 0;
+            }
             if (output!.appServer!.sandbox === "read-only") {
               const artifact = patchRiskArtifact(output!.appServer!.prompt);
               expect(output!.appServer!.reviewRepository?.tree).toBe(
@@ -4520,6 +4532,20 @@ describe("scan and patch workflow", () => {
             result,
             onCodex: async (args, output) => {
               const server = output!.appServer!;
+              if (output!.command === "verify-fix") {
+                output!.stdout.write(
+                  JSON.stringify({
+                    results: [
+                      {
+                        id: "occ_1",
+                        status: "fixed",
+                        evidence: "The complete synthetic patch preserves the fix.",
+                      },
+                    ],
+                  }),
+                );
+                return 0;
+              }
               if (server.sandbox === "read-only") {
                 const artifact = patchRiskArtifact(server.prompt);
                 assessedHead = artifact.patch.head;
