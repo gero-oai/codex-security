@@ -138,12 +138,14 @@ function patchRiskAssessment(
       protects: string;
     }>,
     unknowns: [] as Array<{
+      id: string;
       summary: string;
       decisionCritical: boolean;
     }>,
     evidencePlan: [] as Array<{
       question: string;
       action: string;
+      resolvesUnknowns: string[];
       outcomes: Record<string, string>;
     }>,
   };
@@ -176,6 +178,7 @@ function patchRiskAssessment(
     assessment.validation[0]!.status = "unavailable";
     assessment.unknowns = [
       {
+        id: "rollout-target",
         summary: "The rollout target is unavailable.",
         decisionCritical: true,
       },
@@ -184,6 +187,7 @@ function patchRiskAssessment(
       {
         question: "Does the changed path own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: { supported: "merge", contradicted: "no_op" },
       },
     ];
