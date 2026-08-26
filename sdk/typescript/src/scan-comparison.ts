@@ -429,7 +429,7 @@ export async function matchCompletedScan(
       JSON.stringify({
         matches: scanMatches,
         uncertain: scanUncertain,
-        ...(scanRelated === undefined ? {} : { related: scanRelated }),
+        related: scanRelated,
       }),
     );
   }
@@ -607,22 +607,16 @@ function validateComparison(
       knownFindingIds.has(findingIds.get(occurrenceId) ?? ""),
     );
     const matchedGroups = new Set(
-      [...knownBefore, ...knownAfter].flatMap(({ occurrenceId }) => {
-        const group =
-          matchedBefore.get(occurrenceId) ?? matchedAfter.get(occurrenceId);
-        return group === undefined ? [] : [group];
-      }),
+      [...knownBefore, ...knownAfter].map(
+        ({ occurrenceId }) =>
+          matchedBefore.get(occurrenceId) ?? matchedAfter.get(occurrenceId),
+      ),
     );
     if (
       matchedGroups.size > 1 ||
-      (matchedGroups.size === 1 &&
-        [...knownBefore, ...knownAfter].some(
-          ({ occurrenceId }) =>
-            !matchedBefore.has(occurrenceId) && !matchedAfter.has(occurrenceId),
-        )) ||
       (knownBefore.length > 0 &&
         knownAfter.length > 0 &&
-        matchedGroups.size === 0)
+        matchedGroups.has(undefined))
     ) {
       throw new CodexSecurityError(
         "Scan comparison contradicts previously confirmed finding groups.",
@@ -631,13 +625,10 @@ function validateComparison(
   }
 
   for (const candidate of parsed.data.uncertain) {
-    const beforeFindingId = findingIds.get(candidate.beforeOccurrenceId);
-    const afterFindingId = findingIds.get(candidate.afterOccurrenceId);
     if (
       !beforeIds.has(candidate.beforeOccurrenceId) ||
       matchedBefore.has(candidate.beforeOccurrenceId) ||
       !afterIds.has(candidate.afterOccurrenceId) ||
-      (beforeFindingId !== undefined && beforeFindingId === afterFindingId) ||
       (!allowHistoricalUncertainty &&
         matchedAfter.has(candidate.afterOccurrenceId))
     ) {
@@ -657,24 +648,9 @@ function validateComparison(
     uncertainPairs.add(pair);
   }
 
-  const knownGroupByFindingId = new Map(
-    confirmedGroups.flatMap((group, index) =>
-      group.map((findingId) => [findingId, index] as const),
-    ),
-  );
   const relatedPairs = new Set<string>();
   for (const candidate of parsed.data.related ?? []) {
     const beforeGroup = matchedBefore.get(candidate.beforeOccurrenceId);
-    const beforeFindingId = findingIds.get(candidate.beforeOccurrenceId);
-    const afterFindingId = findingIds.get(candidate.afterOccurrenceId);
-    const knownBeforeGroup =
-      beforeFindingId === undefined
-        ? undefined
-        : knownGroupByFindingId.get(beforeFindingId);
-    const knownAfterGroup =
-      afterFindingId === undefined
-        ? undefined
-        : knownGroupByFindingId.get(afterFindingId);
     const pair = JSON.stringify([
       candidate.beforeOccurrenceId,
       candidate.afterOccurrenceId,
@@ -684,9 +660,6 @@ function validateComparison(
       !afterIds.has(candidate.afterOccurrenceId) ||
       (beforeGroup !== undefined &&
         beforeGroup === matchedAfter.get(candidate.afterOccurrenceId)) ||
-      (beforeFindingId !== undefined && beforeFindingId === afterFindingId) ||
-      (knownBeforeGroup !== undefined &&
-        knownBeforeGroup === knownAfterGroup) ||
       uncertainPairs.has(pair) ||
       relatedPairs.has(pair)
     ) {

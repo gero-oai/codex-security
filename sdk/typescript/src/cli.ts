@@ -1610,7 +1610,6 @@ export async function main(
       ],
       async ({ matchingCached, matchingInputs, ...comparison }) => {
         if (matchingCached && !force) return comparison;
-        const input = matchingInputs as JsonObject & ScanComparisonInput;
         return await dependencies.runWorkbench(
           [
             "save-scan-comparison",
@@ -1620,7 +1619,11 @@ export async function main(
             afterId,
             "--matches-json-stdin",
           ],
-          JSON.stringify(await dependencies.matchFindings(input)),
+          JSON.stringify(
+            await dependencies.matchFindings(
+              matchingInputs as JsonObject & ScanComparisonInput,
+            ),
+          ),
         );
       },
     );
@@ -4580,12 +4583,7 @@ async function matchAllScans(
           "Scan matching returned conflicting confirmed and uncertain findings.",
         );
       }
-      return {
-        scanId,
-        matches,
-        uncertain,
-        ...(related === undefined ? {} : { related }),
-      };
+      return { scanId, matches, uncertain, related };
     });
     for (const { scanId, matches, uncertain, related } of comparisons) {
       await dependencies.runWorkbench(
@@ -4597,11 +4595,7 @@ async function matchAllScans(
           afterScanId,
           "--matches-json-stdin",
         ],
-        JSON.stringify({
-          matches,
-          uncertain,
-          ...(related === undefined ? {} : { related }),
-        }),
+        JSON.stringify({ matches, uncertain, related }),
       );
       matchedPairs += 1;
       findingMatches += matches.reduce(
