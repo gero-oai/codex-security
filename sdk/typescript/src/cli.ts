@@ -5548,7 +5548,9 @@ async function hashNestedPatchReviewPath(
       `directory:${metadata.mode.toString(8)}`,
       "",
     );
-    const entries = await readdir(filesystemPath, { encoding: "buffer" });
+    const entries = (await readdir(filesystemPath, { encoding: "buffer" })).map(
+      (name) => (Buffer.isBuffer(name) ? name : Buffer.from(name)),
+    );
     entries.sort(Buffer.compare);
     for (const name of entries) {
       if (name.equals(Buffer.from(".git"))) continue;
