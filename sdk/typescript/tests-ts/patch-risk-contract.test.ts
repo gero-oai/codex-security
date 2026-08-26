@@ -1400,6 +1400,58 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
+  test("rejects merge and applicable hold branches with critical safety failures", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "safety-result",
+        summary: "The material safety result is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the patch create a material safety failure?",
+        action: "Run the safety check against the immutable patch.",
+        resolvesUnknowns: ["safety-result"],
+        outcomes: { unsafe: "merge", safe: "merge" },
+        regressionLikelihoodOutcomes: { unsafe: "critical", safe: "low" },
+        materialSafetyFailureOutcomes: { unsafe: true, safe: false },
+      },
+    ];
+
+    const merge = await validate(payload);
+    expect(merge.status).not.toBe(0);
+    expect(merge.stderr).toContain(
+      "a merge outcome cannot establish critical regression likelihood",
+    );
+    expect(merge.stderr).toContain(
+      "a merge outcome cannot establish a material safety failure",
+    );
+
+    payload.unknowns.push({
+      id: "deployment-target",
+      summary: "The deployment target is unknown.",
+      decisionCritical: true,
+    });
+    payload.evidencePlan[0]!.outcomes["unsafe"] = "hold_for_evidence";
+    payload.evidencePlan[0]!.remainingUnknowns = {
+      unsafe: ["deployment-target"],
+      safe: ["deployment-target"],
+    };
+    const hold = await validate(payload);
+    expect(hold.status).not.toBe(0);
+    expect(hold.stderr).toContain(
+      "an applicable hold outcome cannot establish critical regression likelihood",
+    );
+    expect(hold.stderr).toContain(
+      "an applicable hold outcome cannot establish a material safety failure",
+    );
+  });
+
   test("rejects a hold branch that establishes a contradicted boundary", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";

@@ -594,6 +594,32 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: a block outcome requires critical regression likelihood and an established material safety failure"
                     )
+                if outcome_recommendation == "merge":
+                    if outcome_likelihood == "critical":
+                        errors.append(
+                            f"evidencePlan.{index}: a merge outcome cannot establish critical regression likelihood"
+                        )
+                    if outcome_safety_failure is True:
+                        errors.append(
+                            f"evidencePlan.{index}: a merge outcome cannot establish a material safety failure"
+                        )
+                effective_applicability = (
+                    outcome_applicability
+                    if outcome_applicability is not None
+                    else value["applicability"]["status"]
+                )
+                if (
+                    outcome_recommendation == "hold_for_evidence"
+                    and effective_applicability != "unknown"
+                ):
+                    if outcome_likelihood == "critical":
+                        errors.append(
+                            f"evidencePlan.{index}: an applicable hold outcome cannot establish critical regression likelihood"
+                        )
+                    if outcome_safety_failure is True:
+                        errors.append(
+                            f"evidencePlan.{index}: an applicable hold outcome cannot establish a material safety failure"
+                        )
                 remaining_decision_unknowns = (
                     decision_critical_unknowns - set(item["resolvesUnknowns"])
                 ) | outcome_remaining_unknowns
