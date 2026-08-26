@@ -298,7 +298,7 @@ describe("publish scan", () => {
   });
 
   test.each([false, true])(
-    "resolves a saved scan ID for Linear publication with skipExisting=%s",
+    "resolves a saved scan ID for Linear publication with skipExisting=%p",
     async (skipExisting) => {
       const scanDir = await publicationDirectory();
       const deps = dependencies({

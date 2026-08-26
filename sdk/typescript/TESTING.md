@@ -22,8 +22,9 @@ Bun's summary to `pnpm run test --seed 12345`.
 
 The local test commands pass a 30-second per-test timeout explicitly. Windows
 CI and the Windows runner experiment allow 120 seconds for slower native
-credential and document checks. `test:ci` writes `reports/junit.xml` and
-`coverage/lcov.info`. Coverage measures loaded
+credential and document checks. `test:ci` runs four independent Bun processes
+and writes `reports/junit-*.xml` and `coverage/shard-*/lcov.info`. These are
+per-shard reports, not four measurements of the full suite. Coverage measures loaded
 JavaScript and TypeScript, not the Python helpers or child processes. It is
 diagnostic for now. Use several successful CI runs to establish a baseline
 before proposing a coverage floor.
@@ -60,10 +61,37 @@ default to 100 cases; filesystem contract properties default to 20.
 
 `node-ci` retains the required `ubuntu-latest / node-22`,
 `macos-latest / node-22`, and `windows-latest / node-22` checks. Its Ubuntu
-Node 22 job runs static checks and uploads JUnit and LCOV. All supported runtime
-lanes still test and inspect an installed package. Package inspection includes
+Node 22 job runs static checks and uploads JUnit and LCOV. Every existing OS and
+Node runtime lane still runs the full suite: tests also launch Node subprocesses,
+so changing Node can affect more than the Bun test runtime. All supported runtime
+lanes still inspect an installed package. Package inspection includes
 a strict NodeNext TypeScript consumer and the actual installed CLI. Failed
 tests block CI; a failed diagnostic upload does not.
+
+`scripts/run-ci-tests.mjs` discovers the test files and balances them using
+rounded timings in `scripts/test-shards.mjs`. Unix jobs run four processes;
+Windows runs seven separate jobs with `node scripts/run-ci-tests.mjs 1/7`
+(substitute the shard number). Each file runs once. New files are included
+automatically; stale timing estimates can affect balance, but not coverage.
+The machine-wide Windows policy test still runs separately and serially.
+Windows dependency installation uses the same pinned pnpm action and store
+cache as Unix.
+
+To compare the serial and CI runners on the same machine, commit, and seed:
+
+```sh
+mkdir -p reports
+pnpm run test --seed 12345 --reporter=junit --reporter-outfile=reports/baseline.xml
+node scripts/run-ci-tests.mjs --seed 12345
+python3 scripts/compare-test-reports.py reports/baseline.xml 'reports/junit-*.xml'
+```
+
+Use a clean reports directory and compare wall time as well as the test
+identities and outcomes. Run both commands with the same coverage options
+when measuring coverage overhead. The Windows serial baseline includes a
+skipped machine-policy case that the shard runner excludes; compare that
+case separately. Update the timing estimates only when reports show a
+meaningful imbalance, not on every timing fluctuation.
 
 The separate `test-quality` workflow runs weekly, can be dispatched manually,
 and runs on pull requests that change its workflow file. It compares Bun's
@@ -80,7 +108,7 @@ that breaks the Ink UI tests under isolation. Keep the trial pin until a newer
 release passes the full SDK suite in every mode. Required CI and the mutation
 trial remain on Bun 1.3.14.
 
-Keep the current file-balanced Windows runner until the native runner has
+Keep the file-balanced CI runner until the native runner has
 matching inventories and acceptable Windows timings. Before promotion, compare
 native and file-balanced shards using the same commit and Bun version.
 Keep the machine-policy test serial. Do not replace the full required suite

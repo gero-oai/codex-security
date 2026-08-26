@@ -314,9 +314,9 @@ grandchild.once("error", (error) => {
     await writeFile(
       script,
       `
+process.on("SIGTERM", () => console.error("ignored SIGTERM"));
 console.error("Open https://auth.example.test/device");
 console.error("User code: ABCD-EFGH");
-process.on("SIGTERM", () => {});
 setInterval(() => {}, 1000);
 `,
     );
@@ -331,14 +331,18 @@ setInterval(() => {}, 1000);
     );
     await handle.waitForInstructions({ deviceCode: true });
     handle.cancel();
-    await expect(
-      Promise.race([
-        handle.wait(),
-        delay(5_000).then(() => {
-          throw new Error("Login cancellation did not settle.");
-        }),
-      ]),
-    ).resolves.toMatchObject({ success: false });
+    const result = await Promise.race([
+      handle.wait(),
+      delay(5_000).then(() => {
+        throw new Error("Login cancellation did not settle.");
+      }),
+    ]);
+    expect(result.success).toBe(false);
+    // Windows terminates the process directly; Unix must reach the handler
+    // before escalating, rather than passing because setup raced cancellation.
+    if (process.platform !== "win32") {
+      expect(result.stderr).toContain("ignored SIGTERM");
+    }
     expect(succeeded).toBe(false);
   });
 
@@ -349,9 +353,9 @@ setInterval(() => {}, 1000);
     await writeFile(
       script,
       `
+process.on("SIGTERM", () => process.exit(0));
 console.error("Open https://auth.example.test/device");
 console.error("User code: ABCD-EFGH");
-process.on("SIGTERM", () => process.exit(0));
 setInterval(() => {}, 1000);
 `,
     );
@@ -366,7 +370,9 @@ setInterval(() => {}, 1000);
     );
     await handle.waitForInstructions({ deviceCode: true });
     handle.cancel();
-    await expect(handle.wait()).resolves.toMatchObject({ success: false });
+    const result = await handle.wait();
+    expect(result.success).toBe(false);
+    if (process.platform !== "win32") expect(result.exitCode).toBe(0);
     expect(succeeded).toBe(false);
   });
 });

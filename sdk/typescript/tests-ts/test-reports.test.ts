@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,6 +74,90 @@ async function compare(baseline: string, ...candidates: string[]) {
   ]);
   return { status, stdout, stderr };
 }
+
+describe("CI file shards", () => {
+  test("balances slow files without dropping new files or depending on discovery order", async () => {
+    const { partitionTestFiles } = (await import(
+      new URL("../scripts/test-shards.mjs", import.meta.url).href
+    )) as {
+      partitionTestFiles: (
+        files: string[],
+        count: number,
+        platform: string,
+      ) => string[][];
+    };
+    const files = [
+      "runtime.test.ts",
+      "scan-recovery.test.ts",
+      "api.test.ts",
+      "new.test.ts",
+    ];
+    for (const platform of ["linux", "darwin", "win32"]) {
+      const shards = partitionTestFiles(files, 3, platform);
+      expect(shards.flat().sort()).toEqual([...files].sort());
+      expect(shards).toEqual(
+        partitionTestFiles([...files].reverse(), 3, platform),
+      );
+      expect(
+        shards.every(
+          (shard) =>
+            shard.filter((file) => file !== "new.test.ts").length === 1,
+        ),
+      ).toBe(true);
+    }
+  });
+
+  test("runs every shard, forwards Bun options, and preserves failures and separate reports", async () => {
+    const { root } = await fixtures();
+    await mkdir(join(root, "scripts"));
+    await mkdir(join(root, "tests-ts", "nested"), { recursive: true });
+    for (const file of ["run-ci-tests.mjs", "test-shards.mjs"]) {
+      await copyFile(
+        new URL(`../scripts/${file}`, import.meta.url),
+        join(root, "scripts", file),
+      );
+    }
+    for (const name of ["a", "b", "c", "nested/d"]) {
+      await writeFile(
+        join(root, "tests-ts", `${name}.test.ts`),
+        `import { test, expect } from "bun:test"; test("${name}", () => expect(${name !== "a"}).toBe(true));\n`,
+      );
+    }
+    const runner = join(root, "scripts", "run-ci-tests.mjs");
+    const node = Bun.which("node");
+    if (node === null) throw new Error("Node is required for the CI runner.");
+    const run = (...args: string[]) =>
+      spawnSync(node, [runner, ...args], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+
+    const failed = run("--seed", "12345");
+    expect(failed.status, failed.stderr).toBe(1);
+    expect((await readdir(join(root, "reports"))).sort()).toEqual([
+      "junit-1.xml",
+      "junit-2.xml",
+      "junit-3.xml",
+      "junit-4.xml",
+    ]);
+    expect(
+      await readFile(join(root, "reports", "junit-1.xml"), "utf8"),
+    ).toContain("<failure");
+    expect(
+      await readFile(join(root, "reports", "junit-4.xml"), "utf8"),
+    ).toContain('name="nested/d"');
+
+    // The filter is forwarded to Bun, so the failing test is no longer selected.
+    const selected = run("1/2", "--test-name-pattern", "^c$");
+    expect(selected.status, selected.stderr).toBe(0);
+    const report = await readFile(join(root, "reports", "junit-1.xml"), "utf8");
+    expect(report).toContain('name="c"');
+    expect(report).not.toContain("<failure");
+    expect(run("0/2").status).toBe(1);
+    expect(run("3/2").status).toBe(1);
+  });
+});
 
 describe("JUnit inventory comparison", () => {
   test("runs every workflow comparison before reporting a mismatch", async () => {

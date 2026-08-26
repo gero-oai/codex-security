@@ -172,7 +172,8 @@ jobs:
           TMP: ${{ runner.temp }}
           TMPDIR: ${{ runner.temp }}
           CODEX_SECURITY_ALLOW_MACHINE_POLICY_TEST: "false"
-        run: pnpm --dir sdk/typescript run ${{ matrix.os == 'ubuntu-latest' && matrix.node == '22.13.0' && 'test:ci' || 'test' }}
+        working-directory: sdk/typescript
+        run: ${{ matrix.os == 'ubuntu-latest' && matrix.node == '22.13.0' && 'pnpm run test:ci' || 'node scripts/run-ci-tests.mjs' }}
 
       - name: Upload test reports
         if: always() && matrix.os == 'ubuntu-latest' && matrix.node == '22.13.0'
@@ -182,8 +183,8 @@ jobs:
           name: node-22-test-reports
           overwrite: true
           path: |
-            sdk/typescript/reports/junit.xml
-            sdk/typescript/coverage/lcov.info
+            sdk/typescript/reports/junit-*.xml
+            sdk/typescript/coverage/shard-*/lcov.info
           if-no-files-found: warn
           retention-days: 14
 
@@ -239,7 +240,11 @@ jobs:
           node-version: ${{ matrix.node }}
 
       - name: Set up pnpm
-        run: npm install --global pnpm@11.9.0 --no-audit --no-fund
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          package_json_file: sdk/typescript/package.json
+          cache: true
+          cache_dependency_path: sdk/typescript/pnpm-lock.yaml
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -262,7 +267,7 @@ jobs:
           TMP: ${{ steps.windows-temp.outputs.path }}
           TMPDIR: ${{ steps.windows-temp.outputs.path }}
           CODEX_SECURITY_ALLOW_MACHINE_POLICY_TEST: "false"
-        run: node sdk/typescript/scripts/run-windows-ci-tests.mjs ${{ matrix.shard }}
+        run: node sdk/typescript/scripts/run-ci-tests.mjs ${{ matrix.shard }}/7
 
       - name: Test machine-wide PowerShell policy
         if: matrix.shard == 3 && runner.environment == 'github-hosted'
@@ -274,6 +279,17 @@ jobs:
           TMPDIR: ${{ steps.windows-temp.outputs.path }}
           CODEX_SECURITY_ALLOW_MACHINE_POLICY_TEST: "true"
         run: bun test --timeout 120000 ./tests-ts/windows-machine-policy.test.ts
+
+      - name: Upload Windows test report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-test-report-node-${{ matrix.node }}-${{ matrix.shard }}
+          overwrite: true
+          path: sdk/typescript/reports/junit-*.xml
+          if-no-files-found: warn
+          retention-days: 14
 
   windows-verify:
     name: windows-latest / node-${{ matrix.node == '22.13.0' && '22' || matrix.node }} / verify
@@ -300,7 +316,11 @@ jobs:
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
 
       - name: Set up pnpm
-        run: npm install --global pnpm@11.9.0 --no-audit --no-fund
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          package_json_file: sdk/typescript/package.json
+          cache: true
+          cache_dependency_path: sdk/typescript/pnpm-lock.yaml
 
       - name: Install dependencies
         working-directory: sdk/typescript
