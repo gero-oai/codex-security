@@ -55,7 +55,7 @@ interface Assessment {
     question: string;
     action: string;
     resolvesUnknowns: string[];
-    resolvesApplicability?: boolean;
+    applicabilityOutcomes?: Record<string, string>;
     resolvesFailedValidation?: string[];
     outcomes: Record<string, string>;
   }>;
@@ -482,10 +482,13 @@ describe("patch risk assessment contract", () => {
         question: "Does the changed path reach a supported runtime?",
         action: "Inspect the checked-in runtime registry.",
         resolvesUnknowns: ["runtime-impact"],
-        resolvesApplicability: true,
         outcomes: {
           reachable: "merge",
           unreachable: "no_op",
+        },
+        applicabilityOutcomes: {
+          reachable: "confirmed",
+          unreachable: "no_live_effect",
         },
       },
     ];
@@ -614,11 +617,15 @@ describe("patch risk assessment contract", () => {
         question: "Does the changed configuration own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
         resolvesUnknowns: ["rollout-target"],
-        resolvesApplicability: true,
         outcomes: {
           supported: "merge",
           contradicted: "no_op",
           unavailable: "hold_for_evidence",
+        },
+        applicabilityOutcomes: {
+          supported: "confirmed",
+          contradicted: "wrong_owner",
+          unavailable: "unknown",
         },
       },
     ];
@@ -649,10 +656,13 @@ describe("patch risk assessment contract", () => {
         question: "Does this repository own the affected runtime?",
         action: "Inspect the checked-in deployment registry.",
         resolvesUnknowns: ["runtime-owner"],
-        resolvesApplicability: true,
         outcomes: {
           owned: "revise",
           not_owned: "no_op",
+        },
+        applicabilityOutcomes: {
+          owned: "confirmed",
+          not_owned: "wrong_owner",
         },
       },
     ];
@@ -862,7 +872,7 @@ describe("patch risk assessment contract", () => {
     const applicableNoOp = await validate(payload);
     expect(applicableNoOp.status).not.toBe(0);
     expect(applicableNoOp.stderr).toContain(
-      "a no_op outcome requires the same action to resolve unknown applicability",
+      "a no_op outcome requires a non-applicable applicability outcome from the same action",
     );
 
     payload.applicability = {
@@ -873,10 +883,13 @@ describe("patch risk assessment contract", () => {
     const unboundNoOp = await validate(payload);
     expect(unboundNoOp.status).not.toBe(0);
     expect(unboundNoOp.stderr).toContain(
-      "a no_op outcome requires the same action to resolve unknown applicability",
+      "a no_op outcome requires a non-applicable applicability outcome from the same action",
     );
 
-    payload.evidencePlan[0]!.resolvesApplicability = true;
+    payload.evidencePlan[0]!.applicabilityOutcomes = {
+      patch_caused: "no_live_effect",
+      not_patch_caused: "confirmed",
+    };
     payload.evidencePlan[0]!.outcomes = {
       patch_caused: "merge",
       not_patch_caused: "revise",
@@ -903,6 +916,10 @@ describe("patch risk assessment contract", () => {
       applicable: "merge",
       not_applicable: "no_op",
     };
+    payload.evidencePlan[0]!.applicabilityOutcomes = {
+      applicable: "confirmed",
+      not_applicable: "no_live_effect",
+    };
     const establishedDefectMerge = await validate(payload);
     expect(establishedDefectMerge.status).not.toBe(0);
     expect(establishedDefectMerge.stderr).toContain(
@@ -916,6 +933,10 @@ describe("patch risk assessment contract", () => {
     payload.evidencePlan[0]!.outcomes = {
       patch_caused: "revise",
       not_patch_caused: "merge",
+    };
+    payload.evidencePlan[0]!.applicabilityOutcomes = {
+      patch_caused: "confirmed",
+      not_patch_caused: "confirmed",
     };
     const unattributedFailure = await validate(payload);
     expect(unattributedFailure.status, unattributedFailure.stderr).toBe(0);
@@ -962,6 +983,63 @@ describe("patch risk assessment contract", () => {
       "evidencePlan.0: requires at least two distinct outcome recommendations\n",
     );
     expect(second.stderr).toBe(first.stderr);
+  });
+
+  test("requires structured evidence for unknown applicability", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.applicability = {
+      status: "unknown",
+      rationale: "Runtime ownership remains unresolved.",
+    };
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which owned runtime applies?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: {
+          supported: "merge",
+          defective: "revise",
+        },
+      },
+    ];
+
+    const missing = await validate(payload);
+    expect(missing.status).not.toBe(0);
+    expect(missing.stderr).toContain(
+      "unknown applicability requires a matching applicability evidence plan",
+    );
+
+    payload.evidencePlan[0]!.applicabilityOutcomes = {
+      supported: "confirmed",
+      unavailable: "unknown",
+    };
+    const mismatched = await validate(payload);
+    expect(mismatched.status).not.toBe(0);
+    expect(mismatched.stderr).toContain(
+      "applicabilityOutcomes must name exactly the evidence outcome keys",
+    );
+
+    delete payload.evidencePlan[0]!.applicabilityOutcomes["unavailable"];
+    payload.evidencePlan[0]!.applicabilityOutcomes["defective"] = "unknown";
+    const unresolved = await validate(payload);
+    expect(unresolved.status).not.toBe(0);
+    expect(unresolved.stderr).toContain(
+      "unknown applicability requires hold_for_evidence",
+    );
+
+    payload.evidencePlan[0]!.applicabilityOutcomes["defective"] = "confirmed";
+    const complete = await validate(payload);
+    expect(complete.status, complete.stderr).toBe(0);
   });
 
   test.each(["high", "moderate"] as const)(
@@ -1104,6 +1182,20 @@ describe("patch risk assessment contract", () => {
     payload.validation[0]!.status = "passed";
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("rejects high confidence when regression protection is unknown", async () => {
+    const payload = assessment();
+    payload.regressionLikelihood.rating = "moderate";
+    payload.regressionProtection.rating = "unknown";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "unavailable";
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "unknown regression protection cannot support high confidence",
+    );
   });
 
   test.each(["none", "unknown"])(

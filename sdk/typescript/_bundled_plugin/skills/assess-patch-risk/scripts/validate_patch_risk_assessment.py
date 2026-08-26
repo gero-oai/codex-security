@@ -299,6 +299,11 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append(
                 "only hold_for_evidence may use regressionLikelihood.rating=unknown"
             )
+    if (
+        value["regressionProtection"]["rating"] == "unknown"
+        and value["confidence"]["rating"] == "high"
+    ):
+        errors.append("unknown regression protection cannot support high confidence")
 
     if recommendation == "merge":
         if workflow_label not in {"auto_merge_candidate", "human_review_required"}:
@@ -359,6 +364,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("hold_for_evidence cannot retain a contradicted material boundary")
         planned_failed_validations: set[str] = set()
         planned_unknowns: set[str] = set()
+        planned_applicability = False
         established_defect = (
             value["regressionLikelihood"]["rating"] == "critical"
             or any(item["result"] == "contradicted" for item in boundaries)
@@ -377,21 +383,56 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"evidencePlan.{index}: a merge outcome cannot retain an established defect"
                 )
-            resolves_applicability = item.get("resolvesApplicability") is True
-            if (
-                resolves_applicability
-                and value["applicability"]["status"] != "unknown"
-            ):
+            applicability_outcomes = item.get("applicabilityOutcomes")
+            if applicability_outcomes is not None:
+                planned_applicability = True
+            if applicability_outcomes is not None and value["applicability"][
+                "status"
+            ] != "unknown":
                 errors.append(
-                    f"evidencePlan.{index}: resolvesApplicability requires unknown applicability"
+                    f"evidencePlan.{index}: applicabilityOutcomes requires unknown applicability"
                 )
-            if "no_op" in item["outcomes"].values() and not (
-                resolves_applicability
-                and value["applicability"]["status"] == "unknown"
-            ):
+            if applicability_outcomes is not None and set(
+                applicability_outcomes
+            ) != set(item["outcomes"]):
                 errors.append(
-                    f"evidencePlan.{index}: a no_op outcome requires the same action to resolve unknown applicability"
+                    f"evidencePlan.{index}: applicabilityOutcomes must name exactly the evidence outcome keys"
                 )
+            for outcome, outcome_recommendation in item["outcomes"].items():
+                outcome_applicability = (
+                    applicability_outcomes.get(outcome)
+                    if applicability_outcomes is not None
+                    else None
+                )
+                if outcome_recommendation == "no_op" and (
+                    value["applicability"]["status"] != "unknown"
+                    or outcome_applicability not in NON_APPLICABLE
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a no_op outcome requires a non-applicable applicability outcome from the same action"
+                    )
+                if (
+                    outcome_applicability in NON_APPLICABLE
+                    and outcome_recommendation != "no_op"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a non-applicable applicability outcome requires no_op"
+                    )
+                if (
+                    outcome_recommendation == "merge"
+                    and outcome_applicability is not None
+                    and outcome_applicability != "confirmed"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a merge outcome requires confirmed applicability"
+                    )
+                if (
+                    outcome_applicability == "unknown"
+                    and outcome_recommendation != "hold_for_evidence"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: unknown applicability requires hold_for_evidence"
+                    )
             for unknown_id in item["resolvesUnknowns"]:
                 if unknown_id not in decision_critical_unknowns:
                     errors.append(
@@ -427,6 +468,13 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         for unknown_id in sorted(decision_critical_unknowns - planned_unknowns):
             errors.append(
                 f"decision-critical unknown {unknown_id!r} requires a matching evidence plan"
+            )
+        if (
+            value["applicability"]["status"] == "unknown"
+            and not planned_applicability
+        ):
+            errors.append(
+                "unknown applicability requires a matching applicability evidence plan"
             )
     elif evidence_plan:
         errors.append("only hold_for_evidence may include an evidence plan")
