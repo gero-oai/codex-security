@@ -18,7 +18,7 @@ npx @openai/codex-security --version
 The package supports macOS, Linux, and Windows and requires Node.js 22.13.0 or
 later in the 22.x release line, Node.js 24.x, or Node.js 26.x. Scans, bulk
 scans, exports, scan history, and saved findings also require Python 3.10 or
-later. Python 3.10 also requires `tomli`. Use `--python` with `scan`,
+later. Python 3.10 also requires `tomli`. Use `--python` with `scan`, `patch`,
 `bulk-scan`, or `export`; use `pythonPath` with the SDK. Set `PYTHON` to select
 an interpreter for any Python-backed command.
 

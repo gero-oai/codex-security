@@ -244,6 +244,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     unknown_ids = [item["id"] for item in unknowns]
     if len(set(unknown_ids)) != len(unknown_ids):
         errors.append("unknown identifiers must be unique")
+    boundary_ids = [item["id"] for item in boundaries]
+    if len(set(boundary_ids)) != len(boundary_ids):
+        errors.append("material boundary identifiers must be unique")
     decision_critical_unknowns = {
         item["id"] for item in unknowns if item["decisionCritical"]
     }
@@ -307,6 +310,8 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         and value["confidence"]["rating"] == "high"
     ):
         errors.append("unknown regression protection cannot support high confidence")
+    if unknowns and value["confidence"]["rating"] == "high":
+        errors.append("high confidence cannot retain an explicit unknown")
 
     if recommendation == "merge":
         if workflow_label not in {"auto_merge_candidate", "human_review_required"}:
@@ -384,6 +389,8 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     f"evidencePlan.{index}: requires at least two distinct outcome recommendations"
                 )
             applicability_outcomes = item.get("applicabilityOutcomes")
+            resolved_boundaries = item.get("resolvesBoundaries", [])
+            boundary_outcomes = item.get("boundaryOutcomes")
             if applicability_outcomes is not None:
                 planned_applicability = True
             if applicability_outcomes is not None and value["applicability"][
@@ -398,12 +405,56 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"evidencePlan.{index}: applicabilityOutcomes must name exactly the evidence outcome keys"
                 )
+            if resolved_boundaries and boundary_outcomes is None:
+                errors.append(
+                    f"evidencePlan.{index}: resolvesBoundaries requires boundaryOutcomes"
+                )
+            if boundary_outcomes is not None and not resolved_boundaries:
+                errors.append(
+                    f"evidencePlan.{index}: boundaryOutcomes requires resolvesBoundaries"
+                )
+            if boundary_outcomes is not None and set(boundary_outcomes) != set(
+                item["outcomes"]
+            ):
+                errors.append(
+                    f"evidencePlan.{index}: boundaryOutcomes must name exactly the evidence outcome keys"
+                )
             for outcome, outcome_recommendation in item["outcomes"].items():
                 outcome_applicability = (
                     applicability_outcomes.get(outcome)
                     if applicability_outcomes is not None
                     else None
                 )
+                outcome_boundaries = (
+                    boundary_outcomes.get(outcome)
+                    if boundary_outcomes is not None
+                    else None
+                )
+                if outcome_boundaries is not None and set(outcome_boundaries) != set(
+                    resolved_boundaries
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: boundaryOutcomes.{outcome} must name exactly the resolved material boundaries"
+                    )
+                if (
+                    outcome_recommendation == "merge"
+                    and outcome_boundaries is not None
+                    and any(
+                        result != "supported"
+                        for result in outcome_boundaries.values()
+                    )
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a merge outcome requires every resolved material boundary to be supported"
+                    )
+                if (
+                    value["applicability"]["status"] == "unknown"
+                    and outcome_recommendation != "hold_for_evidence"
+                    and outcome_applicability is None
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a terminal outcome must resolve unknown applicability"
+                    )
                 if outcome_recommendation == "no_op" and (
                     value["applicability"]["status"] != "unknown"
                     or outcome_applicability not in NON_APPLICABLE
@@ -481,7 +532,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     )
                     continue
                 planned_unknowns.add(unknown_id)
-            for boundary_id in item.get("resolvesBoundaries", []):
+            for boundary_id in resolved_boundaries:
                 if boundary_id not in unresolved_boundaries:
                     errors.append(
                         f"evidencePlan.{index}: {boundary_id!r} is not an unresolved material boundary"
