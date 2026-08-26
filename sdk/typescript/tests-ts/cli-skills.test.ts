@@ -559,10 +559,12 @@ describe("CLI skill commands", () => {
     });
     current.resolvePluginPython = async (options) => {
       expect(options?.configuredPath).toBe(pythonPath);
+      expect(options?.protectedRoot).toBe("/current/repository");
       return pythonPath;
     };
     current.validatePatchRiskAssessment = async (_response, options) => {
       configuredPython = options.pythonPath;
+      expect(options.protectedRoot).toBe("/current/repository");
       return true;
     };
 

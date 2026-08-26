@@ -1329,6 +1329,7 @@ interface CliDependencies {
     options: {
       environment?: NodeJS.ProcessEnv;
       pythonPath?: string;
+      protectedRoot: string;
       signal?: AbortSignal;
       pluginRoot: string;
       validatorPath: string;
@@ -6276,6 +6277,35 @@ function parseRawPatchReviewIndexEntries(
   return entries;
 }
 
+function parseRawPatchReviewIndexPaths(output: Buffer): Buffer[] {
+  const entries = new Set<string>();
+  const paths = new Map<string, Buffer>();
+  for (const record of splitNulRecords(output)) {
+    const separator = record.indexOf(0x09);
+    const metadata =
+      separator < 0
+        ? undefined
+        : record.subarray(0, separator).toString("ascii");
+    const match = /^([0-7]{6}) ([0-9a-f]+) ([0-3])$/u.exec(metadata ?? "");
+    const path = separator < 0 ? undefined : record.subarray(separator + 1);
+    if (path === undefined || match === null) {
+      throw new CodexSecurityError(
+        "The reviewed patch contains an unreadable Git index entry.",
+      );
+    }
+    const pathKey = patchReviewGitPathKey(path);
+    const entryKey = `${pathKey}:${match[3]}`;
+    if (entries.has(entryKey)) {
+      throw new CodexSecurityError(
+        "The reviewed patch contains an unreadable Git index entry.",
+      );
+    }
+    entries.add(entryKey);
+    paths.set(pathKey, path);
+  }
+  return [...paths.values()];
+}
+
 function parsePatchReviewIndexEntries(
   output: Buffer,
 ): Map<string, PatchReviewTreeEntry> {
@@ -6491,6 +6521,62 @@ async function snapshotPatchReviewWorktree(
   const baselineUnrepresentedFileModes = new Map<string, bigint>();
   const baselineUnrepresentedDirectoryModes = new Map<string, bigint>();
   let capturingBaseline = true;
+  const repositoryGitMetadataState = async (): Promise<string> => {
+    const digest = createHash("sha256");
+    const markerPath = Buffer.from(".git");
+    const marker = await lstat(join(repository, ".git"), { bigint: true });
+    if (marker.isDirectory()) {
+      updateNestedPatchReviewDigest(
+        digest,
+        markerPath,
+        `directory:${marker.mode.toString(8)}`,
+        "",
+      );
+    } else {
+      await hashNestedPatchReviewPath(repository, markerPath, digest, signal);
+    }
+    const gitDirectories = [...new Set(repositoryGitDirectories)];
+    const protectedPaths = [
+      "HEAD",
+      "config",
+      "config.worktree",
+      "hooks",
+      "info/attributes",
+      "info/exclude",
+      "objects/info/alternates",
+      "packed-refs",
+      "refs",
+    ];
+    for (const [index, gitDirectory] of gitDirectories.entries()) {
+      updateNestedPatchReviewDigest(
+        digest,
+        Buffer.from(String(index)),
+        "git-directory",
+        "",
+      );
+      for (const path of protectedPaths) {
+        await hashNestedPatchReviewPath(
+          gitDirectory,
+          Buffer.from(path),
+          digest,
+          signal,
+        );
+      }
+    }
+    return digest.digest("hex");
+  };
+  const baselineRepositoryGitMetadataState = await repositoryGitMetadataState();
+  const assertRepositoryGitMetadataUnchanged = async (): Promise<void> => {
+    const current = await repositoryGitMetadataState().catch(() => {
+      signal?.throwIfAborted();
+      return undefined;
+    });
+    if (current !== baselineRepositoryGitMetadataState) {
+      throw new CodexSecurityError(
+        "Git metadata changed after patch review started. Preserve repository settings and retry.",
+      );
+    }
+  };
   const nestedRepositoryState = async (
     nested: NestedPatchReviewRepository,
   ): Promise<string> => {
@@ -6575,10 +6661,8 @@ async function snapshotPatchReviewWorktree(
         paths.set(patchReviewGitPathKey(path), path);
       }
     }
-    for (const entry of parseRawPatchReviewIndexEntries(
-      indexEntries,
-    ).values()) {
-      paths.set(patchReviewGitPathKey(entry.path), entry.path);
+    for (const path of parseRawPatchReviewIndexPaths(indexEntries)) {
+      paths.set(patchReviewGitPathKey(path), path);
     }
     for (const path of [...paths.values()].sort(Buffer.compare)) {
       await hashNestedPatchReviewPath(nested.worktree, path, digest, signal);
@@ -6616,6 +6700,7 @@ async function snapshotPatchReviewWorktree(
     GIT_INDEX_FILE: join(temporaryDirectory, "publication-index"),
   };
   const stageWorktree = async (): Promise<void> => {
+    await assertRepositoryGitMetadataUnchanged();
     await validatePatchReviewObjectAlternates(
       repositoryObjectDirectory,
       allowedNestedGitDirectories,
@@ -7083,6 +7168,7 @@ async function snapshotPatchReviewWorktree(
       ["write-tree"],
       { environment, signal },
     );
+    await assertRepositoryGitMetadataUnchanged();
     await assertRepositoryIndexUnchanged();
     await assertRepositoryHeadUnchanged();
     if (confirmedBaselineTree !== baselineTree) {
@@ -7141,6 +7227,7 @@ async function snapshotPatchReviewWorktree(
         gitExecutable: reviewerGit.executable,
       },
       async assertBaselineUnchanged() {
+        await assertRepositoryGitMetadataUnchanged();
         await assertRepositoryHeadUnchanged();
         await assertRepositoryIndexUnchanged();
         await stageWorktree();
@@ -7148,6 +7235,7 @@ async function snapshotPatchReviewWorktree(
           environment,
           signal,
         });
+        await assertRepositoryGitMetadataUnchanged();
         await assertRepositoryIndexUnchanged();
         await assertRepositoryHeadUnchanged();
         if (current !== baselineTree) {
@@ -7163,6 +7251,7 @@ async function snapshotPatchReviewWorktree(
             "The patch review snapshot is no longer available.",
           );
         }
+        await assertRepositoryGitMetadataUnchanged();
         await assertRepositoryHeadUnchanged();
         await assertRepositoryIndexUnchanged();
         await stageWorktree();
@@ -7232,6 +7321,7 @@ async function snapshotPatchReviewWorktree(
             { environment, signal },
           ),
         );
+        await assertRepositoryGitMetadataUnchanged();
         await assertRepositoryIndexUnchanged();
         await assertRepositoryHeadUnchanged();
         signal?.throwIfAborted();
@@ -7573,6 +7663,7 @@ async function validatePatchRiskAssessment(
   options: {
     environment?: NodeJS.ProcessEnv;
     pythonPath?: string;
+    protectedRoot: string;
     signal?: AbortSignal;
     pluginRoot: string;
     validatorPath: string;
@@ -7584,6 +7675,8 @@ async function validatePatchRiskAssessment(
   const python = await resolvePluginPython({
     configuredPath: options.pythonPath,
     environment,
+    protectedRoot: options.protectedRoot,
+    signal,
   });
   const temporaryRoot = await realpath(tmpdir());
   const temporaryDirectory = await realpath(
@@ -8234,6 +8327,7 @@ async function runIndependentPatchReview(
         ? await context.validatePatchRiskAssessment(review.response, {
             environment: context.options.environment ?? context.environment,
             pythonPath: context.options.pythonPath,
+            protectedRoot: context.snapshot.directory,
             signal: context.options.signal,
             pluginRoot: context.options.patchRiskContract!.root,
             validatorPath: context.options.patchRiskContract!.validatorPath,
@@ -8667,6 +8761,8 @@ async function runSkill(
         environment: exportEnvironment(
           options.environment ?? dependencies.environment,
         ),
+        protectedRoot: snapshot.directory,
+        signal: options.signal,
       });
     }
     const workflowOptions: SkillRunOptions = {
