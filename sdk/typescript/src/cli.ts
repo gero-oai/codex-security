@@ -6047,6 +6047,17 @@ interface NestedPatchReviewRepository {
   gitDirectory: string;
 }
 
+interface NestedPatchReviewHashContext {
+  allowedGitDirectories: readonly string[];
+  visitedGitDirectories: Set<string>;
+}
+
+function nestedPatchReviewHashContext(
+  allowedGitDirectories: readonly string[],
+): NestedPatchReviewHashContext {
+  return { allowedGitDirectories, visitedGitDirectories: new Set() };
+}
+
 const PATCH_REVIEW_GIT_CONFIG_INCLUDE_SECTION =
   /^\s*\[\s*include(?:if)?(?:\s|"|\])/imu;
 
@@ -6081,19 +6092,6 @@ function nestedPatchReviewRepositoryKey(
   return JSON.stringify([nested.worktree, nested.gitDirectory]);
 }
 
-const NESTED_PATCH_REVIEW_GIT_METADATA_PATHS = [
-  "HEAD",
-  "config",
-  "config.worktree",
-  "hooks",
-  "info/attributes",
-  "info/exclude",
-  "info/sparse-checkout",
-  "objects/info/alternates",
-  "packed-refs",
-  "refs",
-] as const;
-
 function updateNestedPatchReviewDigest(
   digest: ReturnType<typeof createHash>,
   path: Buffer,
@@ -6111,10 +6109,71 @@ function updateNestedPatchReviewDigest(
   );
 }
 
+async function confinedNestedPatchReviewGitDirectory(
+  marker: string | Buffer,
+  allowedGitDirectories: readonly string[],
+): Promise<string> {
+  if (typeof marker !== "string") {
+    throw new CodexSecurityError(
+      "Nested Git metadata must use a confined Git directory.",
+    );
+  }
+  const markerBytes = await readFile(marker);
+  const markerText = markerBytes.toString("utf8");
+  const match = /^gitdir: ([^\r\n]+)\r?\n?$/u.exec(markerText);
+  if (!Buffer.from(markerText, "utf8").equals(markerBytes) || match === null) {
+    throw new CodexSecurityError(
+      "Nested Git metadata must use a confined Git directory.",
+    );
+  }
+  const gitDirectory = await realpath(resolve(dirname(marker), match[1]!));
+  if (
+    !allowedGitDirectories.some(
+      (directory) => !isOutsidePath(relative(directory, gitDirectory)),
+    ) ||
+    !(await lstat(gitDirectory)).isDirectory()
+  ) {
+    throw new CodexSecurityError(
+      "Nested Git metadata must remain inside the selected repository.",
+    );
+  }
+  return gitDirectory;
+}
+
+async function hashNestedPatchReviewGitDirectory(
+  gitDirectory: string,
+  markerPath: Buffer,
+  digest: ReturnType<typeof createHash>,
+  context: NestedPatchReviewHashContext,
+  signal?: AbortSignal,
+): Promise<void> {
+  updateNestedPatchReviewDigest(
+    digest,
+    markerPath,
+    "git-directory",
+    gitDirectory,
+  );
+  if (context.visitedGitDirectories.has(gitDirectory)) return;
+  context.visitedGitDirectories.add(gitDirectory);
+  for (const relativePath of [
+    ...PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS,
+    "index",
+  ]) {
+    await hashNestedPatchReviewPath(
+      gitDirectory,
+      Buffer.from(relativePath),
+      digest,
+      context,
+      signal,
+    );
+  }
+}
+
 async function hashNestedPatchReviewGitMetadata(
   worktree: string,
   markerPath: Buffer,
   digest: ReturnType<typeof createHash>,
+  context: NestedPatchReviewHashContext,
   signal?: AbortSignal,
 ): Promise<void> {
   const marker = patchReviewFilesystemPath(worktree, markerPath);
@@ -6129,7 +6188,25 @@ async function hashNestedPatchReviewGitMetadata(
     throw error;
   }
   if (!metadata.isDirectory()) {
-    await hashNestedPatchReviewPath(worktree, markerPath, digest, signal);
+    await hashNestedPatchReviewPath(
+      worktree,
+      markerPath,
+      digest,
+      context,
+      signal,
+    );
+    if (!metadata.isFile()) return;
+    const gitDirectory = await confinedNestedPatchReviewGitDirectory(
+      marker,
+      context.allowedGitDirectories,
+    );
+    await hashNestedPatchReviewGitDirectory(
+      gitDirectory,
+      markerPath,
+      digest,
+      context,
+      signal,
+    );
     return;
   }
   updateNestedPatchReviewDigest(
@@ -6138,19 +6215,29 @@ async function hashNestedPatchReviewGitMetadata(
     `directory:${metadata.mode.toString(8)}`,
     "",
   );
-  for (const relativePath of NESTED_PATCH_REVIEW_GIT_METADATA_PATHS) {
-    await hashNestedPatchReviewPath(
-      worktree,
-      Buffer.concat([markerPath, Buffer.from("/"), Buffer.from(relativePath)]),
-      digest,
-      signal,
+  const gitDirectory = await realpath(marker);
+  if (
+    !context.allowedGitDirectories.some(
+      (directory) => !isOutsidePath(relative(directory, gitDirectory)),
+    )
+  ) {
+    throw new CodexSecurityError(
+      "Nested Git metadata must remain inside the selected repository.",
     );
   }
+  await hashNestedPatchReviewGitDirectory(
+    gitDirectory,
+    markerPath,
+    digest,
+    context,
+    signal,
+  );
 }
 
 async function hashNestedPatchReviewGitMarker(
   worktree: string,
   digest: ReturnType<typeof createHash>,
+  context: NestedPatchReviewHashContext,
   signal?: AbortSignal,
 ): Promise<void> {
   const markerPath = Buffer.from(".git");
@@ -6164,7 +6251,13 @@ async function hashNestedPatchReviewGitMarker(
     );
     return;
   }
-  await hashNestedPatchReviewPath(worktree, markerPath, digest, signal);
+  await hashNestedPatchReviewPath(
+    worktree,
+    markerPath,
+    digest,
+    context,
+    signal,
+  );
 }
 
 async function hashNestedPatchReviewDirectoryMode(
@@ -6194,6 +6287,7 @@ async function hashNestedPatchReviewPath(
   worktree: string,
   path: Buffer,
   digest: ReturnType<typeof createHash>,
+  context: NestedPatchReviewHashContext,
   signal?: AbortSignal,
 ): Promise<void> {
   signal?.throwIfAborted();
@@ -6236,6 +6330,7 @@ async function hashNestedPatchReviewPath(
           worktree,
           Buffer.concat([path, Buffer.from("/"), name]),
           digest,
+          context,
           signal,
         );
         continue;
@@ -6244,6 +6339,7 @@ async function hashNestedPatchReviewPath(
         worktree,
         Buffer.concat([path, Buffer.from("/"), name]),
         digest,
+        context,
         signal,
       );
     }
@@ -6963,6 +7059,9 @@ async function snapshotPatchReviewWorktree(
   let capturingBaseline = true;
   const repositoryGitMetadataState = async (): Promise<string> => {
     const digest = createHash("sha256");
+    const hashContext = nestedPatchReviewHashContext(
+      allowedNestedGitDirectories,
+    );
     const markerPath = Buffer.from(".git");
     const marker = await lstat(join(repository, ".git"), { bigint: true });
     if (marker.isDirectory()) {
@@ -6973,7 +7072,13 @@ async function snapshotPatchReviewWorktree(
         "",
       );
     } else {
-      await hashNestedPatchReviewPath(repository, markerPath, digest, signal);
+      await hashNestedPatchReviewPath(
+        repository,
+        markerPath,
+        digest,
+        hashContext,
+        signal,
+      );
     }
     const gitDirectories = [...new Set(repositoryGitDirectories)];
     for (const [index, gitDirectory] of gitDirectories.entries()) {
@@ -6988,6 +7093,7 @@ async function snapshotPatchReviewWorktree(
           gitDirectory,
           Buffer.from(path),
           digest,
+          hashContext,
           signal,
         );
       }
@@ -7090,6 +7196,9 @@ async function snapshotPatchReviewWorktree(
         ),
       ]);
     const digest = createHash("sha256").update(status);
+    const hashContext = nestedPatchReviewHashContext(
+      allowedNestedGitDirectories,
+    );
     updateNestedPatchReviewDigest(
       digest,
       Buffer.from("worktree"),
@@ -7102,7 +7211,12 @@ async function snapshotPatchReviewWorktree(
       "identity",
       Buffer.from(nested.gitDirectory),
     );
-    await hashNestedPatchReviewGitMarker(nested.worktree, digest, signal);
+    await hashNestedPatchReviewGitMarker(
+      nested.worktree,
+      digest,
+      hashContext,
+      signal,
+    );
     const paths = new Map<string, Buffer>();
     for (const output of [changed, untracked, ignoredPaths]) {
       for (const path of splitNulRecords(output)) {
@@ -7142,7 +7256,13 @@ async function snapshotPatchReviewWorktree(
       );
     }
     for (const path of [...paths.values()].sort(Buffer.compare)) {
-      await hashNestedPatchReviewPath(nested.worktree, path, digest, signal);
+      await hashNestedPatchReviewPath(
+        nested.worktree,
+        path,
+        digest,
+        hashContext,
+        signal,
+      );
     }
     for (const path of [
       ...PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS,
@@ -7152,6 +7272,7 @@ async function snapshotPatchReviewWorktree(
         nested.gitDirectory,
         Buffer.from(path),
         digest,
+        hashContext,
         signal,
       );
     }
@@ -7500,6 +7621,7 @@ async function snapshotPatchReviewWorktree(
           repository,
           observedPathBytes,
           digest,
+          nestedPatchReviewHashContext(allowedNestedGitDirectories),
           signal,
         );
         const state = digest.digest("hex");
@@ -7655,7 +7777,13 @@ async function snapshotPatchReviewWorktree(
       }
       if (currentEntries.get(key)?.mode === "160000") {
         const digest = createHash("sha256");
-        await hashNestedPatchReviewPath(repository, pathBytes, digest, signal);
+        await hashNestedPatchReviewPath(
+          repository,
+          pathBytes,
+          digest,
+          nestedPatchReviewHashContext(allowedNestedGitDirectories),
+          signal,
+        );
         const state = digest.digest("hex");
         const baseline = baselineUninitializedGitlinkStates.get(key);
         if (capturingBaseline && baseline === undefined) {

@@ -3520,6 +3520,76 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("fails closed when the author changes linked-worktree descendant Git metadata", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-descendant-worktree-")),
+    );
+    const nested = join(repository, "nested");
+    const linked = join(nested, "linked");
+    const git = (directory: string, ...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: directory,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviews = 0;
+    try {
+      git(repository, "init", "--initial-branch=main");
+      git(repository, "config", "user.name", "Synthetic User");
+      git(repository, "config", "user.email", "synthetic@example.test");
+      git(repository, "config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git(repository, "add", "--", "value.ts");
+      git(repository, "commit", "-m", "Initial synthetic checkout");
+
+      await mkdir(nested);
+      git(nested, "init", "--initial-branch=main");
+      git(nested, "config", "user.name", "Synthetic User");
+      git(nested, "config", "user.email", "synthetic@example.test");
+      git(nested, "config", "commit.gpgsign", "false");
+      await writeFile(join(nested, "tracked.ts"), "nested baseline\n");
+      git(nested, "add", "--", "tracked.ts");
+      git(nested, "commit", "-m", "Initial nested checkout");
+      git(nested, "worktree", "add", "-b", "linked-review", linked);
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              git(
+                linked,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                git(nested, "rev-parse", "HEAD:tracked.ts"),
+                "admin-only.ts",
+              );
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain("nested Git worktree changed");
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
   test("preserves materialized symlink modes in review snapshots", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-materialized-link-")),
