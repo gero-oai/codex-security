@@ -305,8 +305,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         and value["confidence"]["rating"] == "high"
     ):
         errors.append("unknown regression protection cannot support high confidence")
+    if value["impact"]["rating"] == "unknown" and value["confidence"]["rating"] == "high":
+        errors.append("unknown impact cannot support high confidence")
     if unknowns and value["confidence"]["rating"] == "high":
         errors.append("high confidence cannot retain an explicit unknown")
+    if unresolved_boundaries and value["confidence"]["rating"] == "high":
+        errors.append("an unresolved material boundary cannot support high confidence")
 
     if recommendation == "merge":
         if workflow_label not in {"auto_merge_candidate", "human_review_required"}:
@@ -378,14 +382,15 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 for item in validations
             )
         )
+        established_block_reason = (
+            value["regressionLikelihood"]["rating"] == "critical"
+            or any(item["result"] == "contradicted" for item in boundaries)
+        )
         for index, item in enumerate(evidence_plan):
-            if len(set(item["outcomes"].values())) < 2:
-                errors.append(
-                    f"evidencePlan.{index}: requires at least two distinct outcome recommendations"
-                )
             applicability_outcomes = item.get("applicabilityOutcomes")
             resolved_boundaries = item.get("resolvesBoundaries", [])
             boundary_outcomes = item.get("boundaryOutcomes")
+            remaining_unknown_outcomes = item.get("remainingUnknowns")
             if applicability_outcomes is not None:
                 planned_applicability = True
             if applicability_outcomes is not None and value["applicability"][
@@ -414,6 +419,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"evidencePlan.{index}: boundaryOutcomes must name exactly the evidence outcome keys"
                 )
+            if remaining_unknown_outcomes is not None and set(
+                remaining_unknown_outcomes
+            ) != set(item["outcomes"]):
+                errors.append(
+                    f"evidencePlan.{index}: remainingUnknowns must name exactly the evidence outcome keys"
+                )
             for outcome, outcome_recommendation in item["outcomes"].items():
                 outcome_applicability = (
                     applicability_outcomes.get(outcome)
@@ -425,6 +436,16 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     if boundary_outcomes is not None
                     else None
                 )
+                outcome_remaining_unknowns = set(
+                    remaining_unknown_outcomes.get(outcome, [])
+                    if remaining_unknown_outcomes is not None
+                    else []
+                )
+                for unknown_id in outcome_remaining_unknowns:
+                    if unknown_id not in decision_critical_unknowns:
+                        errors.append(
+                            f"evidencePlan.{index}: remaining unknown {unknown_id!r} is not decision-critical"
+                        )
                 if outcome_boundaries is not None and set(outcome_boundaries) != set(
                     resolved_boundaries
                 ):
@@ -490,6 +511,63 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 if established_defect and outcome_recommendation == "merge":
                     errors.append(
                         f"evidencePlan.{index}: a merge outcome cannot retain an established defect"
+                    )
+                branch_contradiction = outcome_boundaries is not None and any(
+                    result == "contradicted"
+                    for result in outcome_boundaries.values()
+                )
+                branch_patch_failure = (
+                    outcome == "patch_caused"
+                    and bool(item.get("resolvesFailedValidation", []))
+                )
+                if outcome_recommendation == "revise" and not (
+                    established_defect
+                    or branch_contradiction
+                    or branch_patch_failure
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a revise outcome requires branch evidence of a defect"
+                    )
+                if outcome_recommendation == "block" and not (
+                    established_block_reason or branch_contradiction
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a block outcome requires branch evidence of critical likelihood or a contradicted boundary"
+                    )
+                remaining_decision_unknowns = (
+                    decision_critical_unknowns - set(item["resolvesUnknowns"])
+                ) | outcome_remaining_unknowns
+                remaining_failures = unknown_failed_validations - set(
+                    item.get("resolvesFailedValidation", [])
+                )
+                remaining_boundary_ids = unresolved_boundaries - set(
+                    resolved_boundaries
+                )
+                if outcome_boundaries is not None:
+                    remaining_boundary_ids |= {
+                        boundary_id
+                        for boundary_id, result in outcome_boundaries.items()
+                        if result == "unresolved"
+                    }
+                remaining_applicability = (
+                    value["applicability"]["status"] == "unknown"
+                    and outcome_applicability not in {"confirmed", *NON_APPLICABLE}
+                )
+                if outcome_recommendation == "hold_for_evidence" and not (
+                    remaining_decision_unknowns
+                    or remaining_failures
+                    or remaining_boundary_ids
+                    or remaining_applicability
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a hold outcome must retain an explicit unresolved pivot"
+                    )
+                if (
+                    outcome_recommendation != "hold_for_evidence"
+                    and outcome_remaining_unknowns
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: only a hold outcome may retain an explicit unknown"
                     )
                 if outcome_recommendation == "merge":
                     unresolved_unknowns = decision_critical_unknowns - set(
