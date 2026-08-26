@@ -620,9 +620,39 @@ describe("patch risk assessment contract", () => {
     const payload = assessment();
     payload.regressionProtection.rating = "partial";
     payload.regressionProtection.exactHeadChecksPassed = false;
-    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.status = "passed";
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("requires passing protection for a low-likelihood merge", async () => {
+    const payload = assessment();
+    payload.regressionProtection.rating = "none";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "unavailable";
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "merge with low regression likelihood requires passing protection",
+    );
+  });
+
+  test("validates large unique changed-file lists without dropping duplicates", async () => {
+    const payload = assessment();
+    payload.patch.changedFiles = Array.from(
+      { length: 5_000 },
+      (_, index) => `generated/file-${index}.ts`,
+    );
+    const unique = await validate(payload);
+    expect(unique.status, unique.stderr).toBe(0);
+
+    payload.patch.changedFiles.push(payload.patch.changedFiles[0]!);
+    const duplicate = await validate(payload);
+    expect(duplicate.status).not.toBe(0);
+    expect(duplicate.stderr).toContain(
+      "patch.changedFiles: array items must be unique",
+    );
   });
 
   test("requires every validation item to pass for strong protection", async () => {

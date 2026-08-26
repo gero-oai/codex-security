@@ -56,6 +56,27 @@ def json_equal(left: Any, right: Any) -> bool:
     return type(left) is type(right) and left == right
 
 
+def json_identity(value: Any) -> tuple[Any, ...]:
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("boolean", value)
+    if isinstance(value, (int, float)):
+        return ("number", value)
+    if isinstance(value, str):
+        return ("string", value)
+    if isinstance(value, list):
+        return ("array", tuple(json_identity(item) for item in value))
+    if isinstance(value, dict):
+        return (
+            "object",
+            tuple(
+                sorted((key, json_identity(item)) for key, item in value.items())
+            ),
+        )
+    raise TypeError(f"unsupported JSON value: {type(value).__name__}")
+
+
 def python_pattern(pattern: str) -> str:
     if not pattern.endswith("$"):
         return pattern
@@ -145,10 +166,13 @@ def structural_errors(
         if isinstance(maximum_items, int) and len(value) > maximum_items:
             yield f"{location}: array has more than {maximum_items} items"
         if schema.get("uniqueItems") is True:
-            for index, item in enumerate(value):
-                if any(json_equal(item, earlier) for earlier in value[:index]):
+            seen: set[tuple[Any, ...]] = set()
+            for item in value:
+                identity = json_identity(item)
+                if identity in seen:
                     yield f"{location}: array items must be unique"
                     break
+                seen.add(identity)
         item_schema = schema.get("items")
         if isinstance(item_schema, dict):
             for index, item in enumerate(value):
@@ -231,6 +255,13 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("merge cannot have critical regression likelihood")
         if value["confidence"]["rating"] == "low":
             errors.append("merge cannot have low confidence")
+        if value["regressionLikelihood"]["rating"] == "low" and (
+            value["regressionProtection"]["rating"] == "none"
+            or not any(item["status"] == "passed" for item in value["validation"])
+        ):
+            errors.append(
+                "merge with low regression likelihood requires passing protection"
+            )
         if evidence_plan:
             errors.append("merge cannot retain an evidence plan")
     elif workflow_label != recommendation:
