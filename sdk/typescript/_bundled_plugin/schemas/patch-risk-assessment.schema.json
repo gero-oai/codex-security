@@ -71,7 +71,7 @@
       "required": ["rating", "rationale", "exactHeadChecksPassed"],
       "properties": {
         "rating": { "enum": ["strong", "partial", "none", "unknown"] },
-        "rationale": { "$ref": "#/$defs/nonEmptyString" },
+        "rationale": { "$ref": "#/$defs/nonBlankString" },
         "exactHeadChecksPassed": { "type": "boolean" }
       }
     },
@@ -96,7 +96,7 @@
             "unknown"
           ]
         },
-        "rationale": { "$ref": "#/$defs/nonEmptyString" }
+        "rationale": { "$ref": "#/$defs/nonBlankString" }
       }
     },
     "statusQuoRisk": {
@@ -107,7 +107,7 @@
         "rating": {
           "enum": ["low", "moderate", "high", "critical", "unknown"]
         },
-        "rationale": { "$ref": "#/$defs/nonEmptyString" }
+        "rationale": { "$ref": "#/$defs/nonBlankString" }
       }
     },
     "autoMergeExclusions": {
@@ -125,10 +125,10 @@
       },
       "uniqueItems": true
     },
-    "affectedRuntimeRoots": { "$ref": "#/$defs/stringList" },
-    "importantCallers": { "$ref": "#/$defs/stringList" },
-    "riskDrivers": { "$ref": "#/$defs/stringList" },
-    "protectiveFactors": { "$ref": "#/$defs/stringList" },
+    "affectedRuntimeRoots": { "$ref": "#/$defs/nonBlankStringList" },
+    "importantCallers": { "$ref": "#/$defs/nonBlankStringList" },
+    "riskDrivers": { "$ref": "#/$defs/nonBlankStringList" },
+    "protectiveFactors": { "$ref": "#/$defs/nonBlankStringList" },
     "materialBoundaries": {
       "type": "array",
       "items": {
@@ -144,10 +144,10 @@
         ],
         "properties": {
           "id": { "$ref": "#/$defs/identifier" },
-          "invariant": { "$ref": "#/$defs/nonEmptyString" },
-          "runtimeRoot": { "$ref": "#/$defs/nonEmptyString" },
-          "counterexample": { "$ref": "#/$defs/nonEmptyString" },
-          "legitimateControl": { "$ref": "#/$defs/nonEmptyString" },
+          "invariant": { "$ref": "#/$defs/nonBlankString" },
+          "runtimeRoot": { "$ref": "#/$defs/nonBlankString" },
+          "counterexample": { "$ref": "#/$defs/nonBlankString" },
+          "legitimateControl": { "$ref": "#/$defs/nonBlankString" },
           "result": {
             "enum": ["supported", "contradicted", "unresolved"]
           }
@@ -162,11 +162,11 @@
         "additionalProperties": false,
         "required": ["name", "status", "protects"],
         "properties": {
-          "name": { "$ref": "#/$defs/nonEmptyString" },
+          "name": { "$ref": "#/$defs/nonBlankString" },
           "status": {
             "enum": ["passed", "failed", "skipped", "unavailable"]
           },
-          "protects": { "$ref": "#/$defs/nonEmptyString" },
+          "protects": { "$ref": "#/$defs/nonBlankString" },
           "failureAttribution": {
             "enum": ["patch_caused", "not_patch_caused", "unknown"]
           }
@@ -191,7 +191,7 @@
         "required": ["id", "summary", "decisionCritical"],
         "properties": {
           "id": { "$ref": "#/$defs/identifier" },
-          "summary": { "$ref": "#/$defs/nonEmptyString" },
+          "summary": { "$ref": "#/$defs/nonBlankString" },
           "decisionCritical": { "type": "boolean" }
         }
       }
@@ -203,8 +203,8 @@
         "additionalProperties": false,
         "required": ["question", "action", "resolvesUnknowns", "outcomes"],
         "properties": {
-          "question": { "$ref": "#/$defs/nonEmptyString" },
-          "action": { "$ref": "#/$defs/nonEmptyString" },
+          "question": { "$ref": "#/$defs/nonBlankString" },
+          "action": { "$ref": "#/$defs/nonBlankString" },
           "resolvesUnknowns": {
             "$ref": "#/$defs/stringList",
             "minItems": 1
@@ -224,6 +224,10 @@
       "type": "string",
       "minLength": 1
     },
+    "nonBlankString": {
+      "type": "string",
+      "pattern": "\\S"
+    },
     "identifier": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9_-]*$"
@@ -231,6 +235,11 @@
     "stringList": {
       "type": "array",
       "items": { "$ref": "#/$defs/nonEmptyString" },
+      "uniqueItems": true
+    },
+    "nonBlankStringList": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/nonBlankString" },
       "uniqueItems": true
     },
     "recommendation": {
@@ -244,7 +253,7 @@
         "rating": {
           "enum": ["low", "moderate", "high", "critical", "unknown"]
         },
-        "rationale": { "$ref": "#/$defs/nonEmptyString" }
+        "rationale": { "$ref": "#/$defs/nonBlankString" }
       }
     },
     "recoveryRating": {
@@ -253,7 +262,7 @@
       "required": ["rating", "rationale"],
       "properties": {
         "rating": { "enum": ["easy", "managed", "hard"] },
-        "rationale": { "$ref": "#/$defs/nonEmptyString" }
+        "rationale": { "$ref": "#/$defs/nonBlankString" }
       }
     },
     "confidenceRating": {
@@ -262,7 +271,7 @@
       "required": ["rating", "rationale"],
       "properties": {
         "rating": { "enum": ["high", "moderate", "low"] },
-        "rationale": { "$ref": "#/$defs/nonEmptyString" }
+        "rationale": { "$ref": "#/$defs/nonBlankString" }
       }
     }
   }

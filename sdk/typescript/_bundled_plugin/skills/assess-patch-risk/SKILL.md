@@ -60,10 +60,10 @@ Return both a concise Markdown report and a JSON object conforming to [`../../sc
 7. top risk drivers, protective factors, and status-quo risk; and
 8. unknowns plus the bounded evidence plan when held.
 
-Before returning the result, resolve `<python_command>` to the configured Python interpreter (`"$PYTHON"` in POSIX shells or `& "$env:PYTHON"` in PowerShell), otherwise use `python` on Windows and `python3` on Unix-like hosts. Resolve `<plugin_dir>` to the absolute root of this loaded plugin: the directory three levels above this `SKILL.md` that contains `.codex-plugin/plugin.json`, `schemas`, and `skills`. Substitute each placeholder using the host shell's quoting rules so paths remain single arguments. Then pass the JSON object on standard input to the validator. The command is written on one line so it works in PowerShell, Command Prompt, and POSIX shells:
+Before returning the result, resolve `<python_command>` to the configured Python interpreter (`"$PYTHON"` in POSIX shells or `& "$env:PYTHON"` in PowerShell), otherwise use `python` on Windows and `python3` on Unix-like hosts. Resolve `<plugin_dir>` to the absolute root of this loaded plugin: the directory three levels above this `SKILL.md` that contains `.codex-plugin/plugin.json`, `schemas`, and `skills`. Substitute each placeholder using the host shell's quoting rules so paths remain single arguments. Then invoke Python in isolated mode and pass the JSON object on standard input to the validator. The command is written on one line so it works in PowerShell, Command Prompt, and POSIX shells:
 
 ```text
-<python_command> <plugin_dir>/skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py -
+<python_command> -I -S -B <plugin_dir>/skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py -
 ```
 
 Use a file path instead of `-` only when the caller requests an artifact. Correct structural or invariant errors by revisiting the evidence; never change a recommendation merely to make validation pass. Return the validated JSON in the response. Write it to disk only when the caller requests an artifact, and keep every assessment-created file outside the subject checkout and its Git directories.

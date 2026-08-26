@@ -239,6 +239,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     unknown_ids = [item["id"] for item in unknowns]
     if len(set(unknown_ids)) != len(unknown_ids):
         errors.append("unknown identifiers must be unique")
+    decision_critical_unknowns = {
+        item["id"] for item in unknowns if item["decisionCritical"]
+    }
 
     unknown_failed_validations: set[str] = set()
     for index, item in enumerate(validations):
@@ -286,8 +289,6 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("merge requires an auto-merge or human-review workflow label")
         if value["applicability"]["status"] != "confirmed":
             errors.append("merge requires confirmed applicability")
-        if any(item["decisionCritical"] for item in unknowns):
-            errors.append("merge cannot retain a decision-critical unknown")
         if any(item["result"] != "supported" for item in boundaries):
             errors.append("merge requires every material boundary to be supported")
         if value["regressionLikelihood"]["rating"] == "critical":
@@ -311,10 +312,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     if value["applicability"]["status"] in NON_APPLICABLE and recommendation != "no_op":
         errors.append("an established non-applicable disposition requires no_op")
 
+    if recommendation != "hold_for_evidence" and decision_critical_unknowns:
+        errors.append(
+            f"{recommendation} cannot retain a decision-critical unknown"
+        )
+
     if recommendation == "hold_for_evidence":
-        decision_critical_unknowns = {
-            item["id"] for item in unknowns if item["decisionCritical"]
-        }
         if not decision_critical_unknowns:
             errors.append("hold_for_evidence requires a decision-critical unknown")
         if value["confidence"]["rating"] != "low":
@@ -373,8 +376,6 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     if recommendation == "no_op":
         if value["applicability"]["status"] not in NON_APPLICABLE:
             errors.append("no_op requires an established non-applicable disposition")
-        if any(item["decisionCritical"] for item in unknowns):
-            errors.append("no_op cannot retain a decision-critical unknown")
         if value["confidence"]["rating"] == "low":
             errors.append("no_op cannot have low confidence")
 

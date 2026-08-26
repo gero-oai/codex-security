@@ -193,12 +193,50 @@ describe("patch risk assessment contract", () => {
     const command = /```text\s+(.*?)\s+```/su.exec(skill)?.[1];
     expect(command?.trim().split(/\s+/u)).toEqual([
       "<python_command>",
+      "-I",
+      "-S",
+      "-B",
       "<plugin_dir>/skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py",
       "-",
     ]);
     expect(skill).not.toMatch(
       /^python\s+.*validate_patch_risk_assessment\.py/mu,
     );
+  });
+
+  test("isolates validator imports from the subject environment", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "codex-security-patch-risk-imports-"),
+    );
+    temporaryRoots.push(root);
+    const marker = join(root, "executed");
+    await writeFile(
+      join(root, "json.py"),
+      [
+        "from pathlib import Path",
+        `Path(${JSON.stringify(marker)}).write_text(\"executed\")`,
+        'raise RuntimeError("subject module executed")',
+      ].join("\n"),
+      "utf8",
+    );
+    const python =
+      process.env["PYTHON"] ??
+      Bun.which("python3") ??
+      Bun.which("python") ??
+      Bun.which("py");
+    expect(python).not.toBeNull();
+
+    const result = spawnSync(python!, ["-I", "-S", "-B", validatorPath, "-"], {
+      cwd: PLUGIN_ROOT,
+      encoding: "utf8",
+      input: JSON.stringify(assessment()),
+      env: { ...process.env, PYTHONPATH: root },
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(
+      await readFile(marker, "utf8").catch(() => undefined),
+    ).toBeUndefined();
   });
 
   test("validates a supported human-review merge without site packages", async () => {
@@ -233,6 +271,53 @@ describe("patch risk assessment contract", () => {
     payload.impact.rating = "low";
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("rejects whitespace-only decision evidence", async () => {
+    const cases: Array<[string, (payload: Assessment) => void]> = [
+      ["impact.rationale", (payload) => (payload.impact.rationale = " \t")],
+      [
+        "regressionLikelihood.rationale",
+        (payload) => (payload.regressionLikelihood.rationale = " \t"),
+      ],
+      [
+        "regressionProtection.rationale",
+        (payload) => (payload.regressionProtection.rationale = " \t"),
+      ],
+      [
+        "recoverability.rationale",
+        (payload) => (payload.recoverability.rationale = " \t"),
+      ],
+      [
+        "confidence.rationale",
+        (payload) => (payload.confidence.rationale = " \t"),
+      ],
+      [
+        "applicability.rationale",
+        (payload) => (payload.applicability.rationale = " \t"),
+      ],
+      [
+        "statusQuoRisk.rationale",
+        (payload) => (payload.statusQuoRisk.rationale = " \t"),
+      ],
+      [
+        "validation.0.protects",
+        (payload) => (payload.validation[0]!.protects = " \t"),
+      ],
+    ];
+
+    for (const [field, mutate] of cases) {
+      const payload = assessment();
+      payload.workflowLabel = "auto_merge_candidate";
+      payload.impact.rating = "low";
+      mutate(payload);
+
+      const result = await validate(payload);
+      expect(result.status, `${field}: ${result.stderr}`).not.toBe(0);
+      expect(result.stderr).toContain(
+        `${field}: string does not match the required pattern`,
+      );
+    }
   });
 
   test("rejects non-low impact for auto-merge", async () => {
@@ -272,6 +357,33 @@ describe("patch risk assessment contract", () => {
       "merge cannot retain a decision-critical unknown",
     );
   });
+
+  test.each(["revise", "block"] as const)(
+    "rejects a terminal %s verdict with a decision-critical unknown",
+    async (recommendation) => {
+      const payload = assessment();
+      payload.recommendation = recommendation;
+      payload.workflowLabel = recommendation;
+      payload.unknowns = [
+        {
+          id: "deployment-scope",
+          summary: "The deployment scope can still change the decision.",
+          decisionCritical: true,
+        },
+      ];
+      if (recommendation === "block") {
+        payload.regressionLikelihood.rating = "critical";
+      } else {
+        payload.materialBoundaries[0]!.result = "contradicted";
+      }
+
+      const result = await validate(payload);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        `${recommendation} cannot retain a decision-critical unknown`,
+      );
+    },
+  );
 
   test("rejects a merge with unknown applicability", async () => {
     const payload = assessment();
