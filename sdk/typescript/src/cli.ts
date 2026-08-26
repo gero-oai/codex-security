@@ -6872,6 +6872,13 @@ async function snapshotPatchReviewWorktree(
         baselineUntrackedDirectoryModes.set(key, state);
       }
     } else {
+      for (const key of untrackedDirectories.keys()) {
+        if (!baselineUntrackedDirectoryModes.has(key)) {
+          throw new CodexSecurityError(
+            "An untracked directory changed after patch review started. Preserve unrelated filesystem state and retry.",
+          );
+        }
+      }
       for (const baseline of baselineUntrackedDirectoryModes.values()) {
         let current: BigIntStats | undefined;
         try {
