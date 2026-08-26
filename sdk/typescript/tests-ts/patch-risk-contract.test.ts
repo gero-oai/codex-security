@@ -1968,6 +1968,81 @@ describe("patch risk assessment contract", () => {
     );
   });
 
+  test.each(["low", "moderate", "high"] as const)(
+    "rejects %s branch likelihood for an established safety failure",
+    async (rating) => {
+      const payload = assessment();
+      payload.recommendation = "hold_for_evidence";
+      payload.workflowLabel = "hold_for_evidence";
+      payload.confidence.rating = "low";
+      payload.unknowns = [
+        {
+          id: "safety-result",
+          summary: "The material safety result is unknown.",
+          decisionCritical: true,
+        },
+      ];
+      payload.evidencePlan = [
+        {
+          question: "Does the patch create a material safety failure?",
+          action: "Run the safety check against the immutable patch.",
+          resolvesUnknowns: ["safety-result"],
+          outcomes: { unsafe: "revise", safe: "merge" },
+          regressionLikelihoodOutcomes: { unsafe: rating, safe: "low" },
+          materialSafetyFailureOutcomes: { unsafe: true, safe: false },
+          confidenceOutcomes: { unsafe: "moderate", safe: "moderate" },
+        },
+      ];
+
+      const result = await validate(payload);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        "an established material safety failure requires critical regression likelihood",
+      );
+    },
+  );
+
+  test("rejects high-confidence branches with unknown protection", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionLikelihood.rating = "moderate";
+    payload.regressionProtection.rating = "unknown";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "unavailable";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which runtime owns the changed path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: { owned: "merge", retired: "no_op" },
+        applicabilityOutcomes: {
+          owned: "confirmed",
+          retired: "no_live_effect",
+        },
+        regressionLikelihoodOutcomes: {
+          owned: "moderate",
+          retired: "low",
+        },
+        confidenceOutcomes: { owned: "high", retired: "moderate" },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "unknown regression protection cannot support high confidence",
+    );
+  });
+
   test("rejects a hold branch that establishes a contradicted boundary", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
