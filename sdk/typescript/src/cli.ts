@@ -85,7 +85,12 @@ import {
   type JsonObject,
   type JsonValue,
 } from "./config.js";
-import { formatUsd, type ScanCost } from "./cost.js";
+import {
+  estimateScanCost,
+  formatUsd,
+  sumTokenUsage,
+  type ScanCost,
+} from "./cost.js";
 import {
   CodexSecurityError,
   ConfigurationError,
@@ -1134,6 +1139,9 @@ interface SkillRunOptions extends PatchReviewOptions {
   reviewAncestorInstructions?: readonly PatchReviewAncestorInstruction[];
   onReviewRepository?: (repository: string) => void;
   onReviewCandidate?: (candidate: PatchReviewCandidateDelta) => void;
+  beforeTurn?: () => void;
+  onTurnUsage?: (model: string, usage: unknown) => void;
+  requireTurnUsage?: boolean;
 }
 
 interface PatchReviewCandidateDelta {
@@ -6181,13 +6189,15 @@ function parsePatchReviewTreeEntry(
   output: string,
 ): PatchReviewTreeEntry {
   if (output.length === 0) return { path };
-  const match = /^([0-7]{6}) (?:blob|commit) ([0-9a-f]+)\t/u.exec(output);
+  const match = /^([0-7]{6}) (blob|commit|tree) ([0-9a-f]+)\t/u.exec(output);
   if (match === null) {
     throw new CodexSecurityError(
       "The reviewed patch contains an unreadable Git tree entry.",
     );
   }
-  return { path, mode: match[1], object: match[2] };
+  return match[2] === "tree"
+    ? { path }
+    : { path, mode: match[1], object: match[3] };
 }
 
 interface RawPatchReviewIndexEntry {
@@ -7132,14 +7142,22 @@ async function snapshotPatchReviewWorktree(
           { bigint: true },
         );
         if (metadata.isFile()) {
-          const mode = metadata.mode & 0o7666n;
+          const mode = metadata.mode & 0o7777n;
           const baseline = baselineUnrepresentedFileModes.get(observedKey);
           if (capturingBaseline && baseline === undefined) {
             baselineUnrepresentedFileModes.set(observedKey, mode);
-          } else if (baseline !== undefined && baseline !== mode) {
-            throw new CodexSecurityError(
-              "A file permission changed outside Git's reviewed mode. Preserve unrelated permission bits and retry.",
-            );
+          } else if (baseline !== undefined) {
+            const baselineExecutable = (baseline & 0o111n) !== 0n;
+            const executable = (mode & 0o111n) !== 0n;
+            const gitExecutableChanged = baselineExecutable !== executable;
+            if (
+              (baseline & 0o7666n) !== (mode & 0o7666n) ||
+              (!gitExecutableChanged && (baseline & 0o111n) !== (mode & 0o111n))
+            ) {
+              throw new CodexSecurityError(
+                "A file permission changed outside Git's reviewed mode. Preserve unrelated permission bits and retry.",
+              );
+            }
           }
         }
       } catch (error) {
@@ -8825,6 +8843,7 @@ async function runSkillStage(
   options: SkillRunOptions = {},
 ): Promise<number> {
   options.signal?.throwIfAborted();
+  options.beforeTurn?.();
   const overrides = parseCodexOverrides(codexOverrides, undefined, effort);
   if (
     Object.keys(overrides).some(
@@ -8922,8 +8941,14 @@ async function runSkillStage(
   const threadSource = patch
     ? CODEX_SECURITY_THREAD_SOURCES.remediation
     : CODEX_SECURITY_THREAD_SOURCES.validation;
+  let turnUsage: unknown;
+  const observeEvent = (event: Readonly<Record<string, unknown>>): void => {
+    const usage = patchReviewTurnUsage(event);
+    if (usage !== undefined) turnUsage = usage;
+    options.onEvent?.(event);
+  };
   options.signal?.throwIfAborted();
-  return dependencies.runCodex(
+  const status = await dependencies.runCodex(
     [
       ...(appServer
         ? ["app-server"]
@@ -8988,9 +9013,11 @@ async function runSkillStage(
                       : { reviewRepository: options.reviewRepository }),
                   }
                 : {}),
-              ...(options.onEvent === undefined
+              ...(options.onEvent === undefined &&
+              options.onTurnUsage === undefined &&
+              options.requireTurnUsage !== true
                 ? {}
-                : { onEvent: options.onEvent }),
+                : { onEvent: observeEvent }),
             },
           }
         : {}),
@@ -8998,6 +9025,53 @@ async function runSkillStage(
     options.environment,
     appServer ? undefined : prompt,
   );
+  if (turnUsage !== undefined) {
+    options.onTurnUsage?.(model, turnUsage);
+  } else if (
+    options.requireTurnUsage === true &&
+    status === PATCH_REVIEW_EXIT_CODE.success
+  ) {
+    throw new CodexSecurityError(
+      "Codex did not report a usage receipt for a patch turn, so the scan cost limit could not be verified.",
+    );
+  }
+  return status;
+}
+
+function patchReviewTurnUsage(
+  event: Readonly<Record<string, unknown>>,
+): unknown | undefined {
+  if (event["method"] !== "thread/tokenUsage/updated") return undefined;
+  const params = event["params"];
+  if (typeof params !== "object" || params === null) return undefined;
+  const tokenUsage = (params as Record<string, unknown>)["tokenUsage"];
+  if (typeof tokenUsage !== "object" || tokenUsage === null) return undefined;
+  const total = (tokenUsage as Record<string, unknown>)["total"];
+  if (typeof total !== "object" || total === null) return undefined;
+  const values = total as Record<string, unknown>;
+  return {
+    input_tokens: values["inputTokens"],
+    cached_input_tokens: values["cachedInputTokens"],
+    cache_write_input_tokens: 0,
+    output_tokens: values["outputTokens"],
+    reasoning_output_tokens: values["reasoningOutputTokens"],
+  };
+}
+
+function addScanCosts(
+  scan: Readonly<ScanCost>,
+  patch: Readonly<ScanCost>,
+): ScanCost {
+  return {
+    model:
+      scan.model === patch.model ? scan.model : `${scan.model},${patch.model}`,
+    inputTokens: scan.inputTokens + patch.inputTokens,
+    cachedInputTokens: scan.cachedInputTokens + patch.cachedInputTokens,
+    cacheWriteInputTokens:
+      scan.cacheWriteInputTokens + patch.cacheWriteInputTokens,
+    outputTokens: scan.outputTokens + patch.outputTokens,
+    estimatedUsd: scan.estimatedUsd + patch.estimatedUsd,
+  };
 }
 
 export async function readSkillCommandOutput(
@@ -10155,6 +10229,7 @@ async function executeScan(
     targetWarnings.length === 0
       ? result.toJSON()
       : { ...result.toJSON(), warnings: targetWarnings };
+  let workflowCost: Readonly<ScanCost> | null = result.cost;
   const incomplete = result.coverage.completeness !== "complete";
   let deepScanStop: DeepScanStop | undefined;
   if (arguments_.mode === "deep") {
@@ -10181,7 +10256,7 @@ async function executeScan(
       coverage: result.coverage.completeness,
       findings: findings.length,
       scan_id: result.manifest.scan.id,
-      estimated_usd: result.cost?.estimatedUsd,
+      estimated_usd: workflowCost?.estimatedUsd,
       exit_code: exitCode,
     });
     progress?.stopTimer();
@@ -10265,6 +10340,47 @@ async function executeScan(
     dependencies.addSignalListener("SIGINT", onInterrupt);
     dependencies.addSignalListener("SIGTERM", onTerminate);
     try {
+      let patchUsage: unknown;
+      const requirePatchTurnUsage = arguments_.maxCostUsd !== undefined;
+      const beforePatchTurn = (): void => {
+        if (arguments_.maxCostUsd === undefined) return;
+        if (workflowCost === null) {
+          throw new CodexSecurityError(
+            "The scan cost limit cannot cover patch turns because the scan cost is unavailable.",
+          );
+        }
+        if (workflowCost.estimatedUsd >= arguments_.maxCostUsd) {
+          throw new CodexSecurityError(
+            `The scan reached the ${formatUsd(arguments_.maxCostUsd)} cost limit before another patch turn could start.`,
+          );
+        }
+      };
+      const recordPatchTurnUsage = (model: string, usage: unknown): void => {
+        patchUsage =
+          patchUsage === undefined ? usage : sumTokenUsage(patchUsage, usage);
+        const patchCost = estimateScanCost(model, patchUsage);
+        if (patchCost === null) {
+          if (requirePatchTurnUsage) {
+            throw new CodexSecurityError(
+              "The patch turn cost could not be calculated, so the scan cost limit could not be verified.",
+            );
+          }
+          return;
+        }
+        if (result.cost === null) return;
+        workflowCost = addScanCosts(result.cost, patchCost);
+        scanData = { ...scanData, cost: workflowCost };
+        if (
+          arguments_.maxCostUsd !== undefined &&
+          workflowCost.estimatedUsd > arguments_.maxCostUsd
+        ) {
+          throw new ScanCostLimitExceededError(
+            arguments_.maxCostUsd,
+            workflowCost,
+            result.scanDir,
+          );
+        }
+      };
       const patchRun = await runFindingPatches(
         selected,
         [`model=${JSON.stringify(effectiveModel)}`],
@@ -10280,6 +10396,9 @@ async function executeScan(
           reviewMinimality: arguments_.reviewMinimality,
           reviewStyle: arguments_.reviewStyle,
           maxReviewRevisions: arguments_.maxReviewRevisions,
+          beforeTurn: beforePatchTurn,
+          onTurnUsage: recordPatchTurnUsage,
+          requireTurnUsage: requirePatchTurnUsage,
         },
       );
       patches = patchRun.patches;
