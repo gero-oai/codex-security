@@ -6210,6 +6210,7 @@ async function snapshotPatchReviewWorktree(
   >();
   const baselineIgnoredPathStates = new Map<string, string>();
   const baselineUnrepresentedFileModes = new Map<string, bigint>();
+  const baselineUnrepresentedDirectoryModes = new Map<string, bigint>();
   let capturingBaseline = true;
   const nestedRepositoryState = async (
     nested: NestedPatchReviewRepository,
@@ -6313,7 +6314,9 @@ async function snapshotPatchReviewWorktree(
     }
     return digest.digest("hex");
   };
-  const assertNestedRepositoriesUnchanged = async (): Promise<void> => {
+  const assertNestedRepositoriesUnchanged = async (
+    currentStates: Map<string, string>,
+  ): Promise<void> => {
     for (const {
       repository: nested,
       state: baseline,
@@ -6321,6 +6324,7 @@ async function snapshotPatchReviewWorktree(
       const current = await nestedRepositoryState(nested).catch(
         () => undefined,
       );
+      if (current !== undefined) currentStates.set(nested.worktree, current);
       if (current !== baseline) {
         throw new CodexSecurityError(
           "A nested Git worktree changed after patch review started. Review it as a separate patch target.",
@@ -6334,7 +6338,10 @@ async function snapshotPatchReviewWorktree(
       allowedNestedGitDirectories,
       signal,
     );
-    if (!capturingBaseline) await assertNestedRepositoriesUnchanged();
+    const currentNestedRepositoryStates = new Map<string, string>();
+    if (!capturingBaseline) {
+      await assertNestedRepositoriesUnchanged(currentNestedRepositoryStates);
+    }
     const [sparseEntries, listed, currentIgnored] = await Promise.all([
       runPatchReviewGitBytes(repository, ["ls-files", "-v", "-z", "--", "."], {
         signal,
@@ -6401,6 +6408,7 @@ async function snapshotPatchReviewWorktree(
     const removed: Buffer[] = [];
     const removedSet = new Set<string>();
     const actualPathDirectoryEntries = new Map<string, Buffer[]>();
+    const checkedDirectoryModes = new Set<string>();
     for (const observedPathBytes of paths.values()) {
       await validatePatchReviewGitPath(
         repository,
@@ -6416,6 +6424,48 @@ async function snapshotPatchReviewWorktree(
         observedPathBytes,
         actualPathDirectoryEntries,
       );
+      if (process.platform !== "win32") {
+        const parts = splitPatchReviewGitPath(actualPathBytes);
+        if (parts !== undefined) {
+          let directory = Buffer.alloc(0);
+          for (const part of [Buffer.alloc(0), ...parts.slice(0, -1)]) {
+            if (part.length > 0) {
+              directory =
+                directory.length === 0
+                  ? Buffer.from(part)
+                  : Buffer.concat([directory, Buffer.from("/"), part]);
+            }
+            const directoryKey = patchReviewGitPathKey(directory);
+            if (checkedDirectoryModes.has(directoryKey)) continue;
+            checkedDirectoryModes.add(directoryKey);
+            let metadata: Awaited<ReturnType<typeof lstat>>;
+            try {
+              metadata = await lstat(
+                patchReviewFilesystemPath(repository, directory),
+                { bigint: true },
+              );
+            } catch (error) {
+              if (missingPatchReviewPath(error)) break;
+              throw error;
+            }
+            if (!metadata.isDirectory()) {
+              throw new CodexSecurityError(
+                "A patch path ancestor is no longer a directory. Preserve unrelated filesystem state and retry.",
+              );
+            }
+            const mode = metadata.mode & 0o7777n;
+            const baseline =
+              baselineUnrepresentedDirectoryModes.get(directoryKey);
+            if (capturingBaseline && baseline === undefined) {
+              baselineUnrepresentedDirectoryModes.set(directoryKey, mode);
+            } else if (baseline !== undefined && baseline !== mode) {
+              throw new CodexSecurityError(
+                "A directory permission changed outside Git's reviewed state. Preserve unrelated permission bits and retry.",
+              );
+            }
+          }
+        }
+      }
       if (ignoredAtBaseline) {
         const digest = createHash("sha256");
         digest.update(actualPathBytes);
@@ -6520,7 +6570,11 @@ async function snapshotPatchReviewWorktree(
               allowedNestedGitDirectories,
             );
       if (nested !== undefined) {
-        const state = await nestedRepositoryState(nested);
+        let state = currentNestedRepositoryStates.get(nested.worktree);
+        if (state === undefined) {
+          state = await nestedRepositoryState(nested);
+          currentNestedRepositoryStates.set(nested.worktree, state);
+        }
         const baseline = baselineNestedRepositoryStates.get(nested.worktree);
         if (capturingBaseline && baseline === undefined) {
           baselineNestedRepositoryStates.set(nested.worktree, {
@@ -7082,6 +7136,83 @@ async function runFindingPatches(
       `  ${patch.status.toUpperCase()}  ${title}${patch.reason === undefined ? "" : `: ${safePatchText(patch.reason)}`}\n`,
     );
     patches.push(patch);
+  }
+  const verifiedPatchIds = new Set(
+    patches
+      .filter(({ status }) => status === "verified")
+      .map(({ occurrenceId }) => occurrenceId),
+  );
+  const finalVerificationFindings = selected.findings.filter(
+    ({ occurrenceId }) => verifiedPatchIds.has(occurrenceId),
+  );
+  if (
+    finalVerificationFindings.length > 1 &&
+    (options.reviewMinimality === true || options.reviewStyle === true)
+  ) {
+    let response = "";
+    const verificationOutput: Writable = {
+      write(value: string | Uint8Array): boolean {
+        response += value.toString();
+        return true;
+      },
+    };
+    const identifiers = finalVerificationFindings.map(
+      ({ occurrenceId }) => occurrenceId,
+    );
+    const status = await runSkill(
+      "verify-fix",
+      [],
+      codexOverrides,
+      effort,
+      verificationOutput,
+      stderr,
+      dependencies,
+      {
+        ...options,
+        directory: selected.repository,
+        findings: finalVerificationFindings,
+        verificationIds: identifiers,
+      },
+    );
+    if (isInterruptedPatchReview(status)) {
+      return { patches, interruptedExitCode: status };
+    }
+    let results: FindingVerification[] | undefined;
+    if (status === PATCH_REVIEW_EXIT_CODE.success) {
+      try {
+        const parsed = z
+          .object({ results: z.array(findingVerificationSchema) })
+          .safeParse(JSON.parse(response));
+        if (
+          parsed.success &&
+          parsed.data.results.length === identifiers.length &&
+          parsed.data.results.every(
+            ({ id }, index) => id === identifiers[index],
+          )
+        ) {
+          results = parsed.data.results;
+        }
+      } catch {
+        // A malformed verification response fails the affected patches below.
+      }
+    }
+    const resultsById = new Map(
+      results?.map((result) => [result.id, result] as const),
+    );
+    for (const [index, patch] of patches.entries()) {
+      if (patch.status !== "verified") continue;
+      const verification = resultsById.get(patch.occurrenceId);
+      if (verification?.status === "fixed") continue;
+      patches[index] = {
+        occurrenceId: patch.occurrenceId,
+        status: "failed",
+        files: patch.files,
+        reason:
+          verification?.status === "still_vulnerable"
+            ? "Final combined verification found that a later patch reintroduced this finding."
+            : "Final combined verification could not establish that the complete patch preserves this fix.",
+      };
+    }
   }
   return {
     patches,
