@@ -5523,10 +5523,9 @@ async function createPatchPullRequest(
 }
 
 function stripPatchControlCharacters(value: string): string {
-  return stripVTControlCharacters(value).replaceAll(
-    /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu,
-    " ",
-  );
+  return stripVTControlCharacters(value)
+    .replaceAll(/\u001B\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replaceAll(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu, " ");
 }
 
 function patchReviewGitProcessEnvironment(): NodeJS.ProcessEnv {
@@ -10749,7 +10748,7 @@ async function runPatchReviewWorkflow(
         const reason = `${stage} review ${
           blocked ? "blocked the patch" : "exhausted the revision budget"
         }${details.length === 0 ? "." : `: ${details}`}`;
-        context.stderr.write(`${reason}\n`);
+        context.stderr.write(`${safePatchText(reason)}\n`);
         if (subject.response !== undefined) {
           stdout.write(
             renderTerminalReviewResponse(
