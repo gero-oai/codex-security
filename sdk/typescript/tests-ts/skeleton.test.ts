@@ -114,6 +114,14 @@ describe("TypeScript package skeleton", () => {
         node,
       })),
     });
+    expect(jobs["unix-verify"]?.strategy?.matrix).toEqual(
+      jobs["test"]?.strategy?.matrix,
+    );
+    expect(jobs["required-test"]?.needs).toEqual([
+      "validate-title",
+      "test",
+      "unix-verify",
+    ]);
     expect(jobs["required-test"]?.name).toContain("${{ matrix.os }} / node-22");
     expect(jobs["required-test"]?.strategy?.matrix).toEqual({
       os: ["ubuntu-latest", "macos-latest"],
@@ -173,7 +181,7 @@ describe("TypeScript package skeleton", () => {
     ).toMatchObject({
       "continue-on-error": true,
     });
-    for (const name of ["test", "windows-verify"]) {
+    for (const name of ["unix-verify", "windows-verify"]) {
       expect(jobs[name]?.steps).toContainEqual(
         expect.objectContaining({
           run: "pnpm run check:package ../../dist/*.tgz",

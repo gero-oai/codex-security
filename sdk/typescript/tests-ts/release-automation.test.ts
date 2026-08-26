@@ -3880,6 +3880,85 @@ describe("GitHub release workflow safeguards", () => {
     expect(releaseLabelsWorkflow).toContain("return 0");
   });
 
+  test.each([
+    { name: "exact cache hit", cacheHit: "true", installExit: 0 },
+    { name: "cache miss", cacheHit: "false", installExit: 0 },
+    { name: "cache error", cacheHit: "", installExit: 0 },
+    { name: "installation failure", cacheHit: "false", installExit: 23 },
+  ])("sets up Windows pnpm after $name", async ({ cacheHit, installExit }) => {
+    const workflow = Bun.YAML.parse(nodeCiWorkflow) as {
+      jobs: Record<string, { steps: Array<{ name?: string; run?: string }> }>;
+    };
+    const directory = mkdtempSync(join(tmpdir(), "pnpm workflow-"));
+    const output = join(directory, "output");
+    const mock = [
+      'npm() { printf "npm:%s\\n" "$@"; return "$INSTALL_EXIT"; }',
+      'pnpm() { printf "%s/pnpm-store\\n" "$RUNNER_TEMP"; }',
+      'node() { printf "x64\\n"; }',
+    ].join("\n");
+    try {
+      for (const job of ["windows-test", "windows-verify"]) {
+        writeFileSync(output, "");
+        const script = workflow.jobs[job]?.steps.find(
+          (step) => step.name === "Set up pnpm",
+        )?.run;
+        expect(script).toBeDefined();
+        const child = Bun.spawn(
+          [
+            bash,
+            "--noprofile",
+            "--norc",
+            "-eo",
+            "pipefail",
+            "-c",
+            `${mock}\n${script}`,
+          ],
+          {
+            env: {
+              ...process.env,
+              GITHUB_OUTPUT: output,
+              RUNNER_TEMP: directory,
+              PNPM_PACKAGE: "pnpm@1.2.3",
+              PNPM_CACHE_HIT: cacheHit,
+              INSTALL_EXIT: String(installExit),
+            },
+            stdout: "pipe",
+            stderr: "pipe",
+            timeout: 10_000,
+          },
+        );
+        const [code, stdout, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ]);
+        expect(code, stderr).toBe(installExit);
+        if (cacheHit === "true") {
+          expect(stdout).not.toContain("npm:");
+        } else {
+          expect(stdout.trimEnd().split("\n")).toEqual([
+            "npm:install",
+            "npm:--global",
+            "npm:--prefix",
+            `npm:${directory}/pnpm`,
+            "npm:pnpm@1.2.3",
+            "npm:--prefer-offline",
+            "npm:--no-audit",
+            "npm:--no-fund",
+          ]);
+        }
+        const result = readFileSync(output, "utf8");
+        if (installExit === 0) {
+          expect(result).toBe(`store-path=${directory}/pnpm-store\narch=x64\n`);
+        } else {
+          expect(result).toBe("");
+        }
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("enforces the same Conventional Commit title in required CI", () => {
     const releasePattern = /conventional_title='([^']+)'/u.exec(
       releaseLabelsWorkflow,
@@ -3897,6 +3976,9 @@ describe("GitHub release workflow safeguards", () => {
     );
     expect(nodeCiWorkflow).toContain("needs: validate-title");
     expect(nodeCiWorkflow).toContain(
+      "needs: [validate-title, test, unix-verify]",
+    );
+    expect(nodeCiWorkflow).toContain(
       "needs: [validate-title, windows-test, windows-verify]",
     );
   });
@@ -3912,6 +3994,7 @@ describe("GitHub release workflow safeguards", () => {
         {
           name: string;
           if?: string;
+          needs?: string | string[];
           "timeout-minutes"?: number;
           strategy?: { matrix: Record<string, string[]> };
           steps: Array<{
@@ -3938,8 +4021,14 @@ describe("GitHub release workflow safeguards", () => {
     ).toContain("github.event.changes.base == null");
 
     const fullCiCondition = "needs.validate-title.outputs.ci-mode == 'full'";
-    for (const job of ["test", "windows-test", "windows-verify"]) {
+    for (const job of [
+      "test",
+      "unix-verify",
+      "windows-test",
+      "windows-verify",
+    ]) {
       expect(workflow.jobs[job]?.if).toBe(fullCiCondition);
+      expect(workflow.jobs[job]?.needs).toBe("validate-title");
     }
     expect(workflow.jobs["markdown-checks"]).toBeUndefined();
     const validationSteps = workflow.jobs["validate-title"]?.steps ?? [];
@@ -3968,7 +4057,7 @@ describe("GitHub release workflow safeguards", () => {
     expect(workflow.jobs["required-test"]?.if).toBe(requiredJobCondition);
     expect(workflow.jobs["windows"]?.if).toBe(requiredJobCondition);
     expect(workflow.jobs["required-test"]?.steps[0]?.if).toBe(
-      "needs.validate-title.result != 'success' || (needs.validate-title.outputs.ci-mode == 'full' && needs.test.result != 'success') || (needs.validate-title.outputs.ci-mode != 'full' && needs.validate-title.outputs.ci-mode != 'markdown')",
+      "needs.validate-title.result != 'success' || (needs.validate-title.outputs.ci-mode == 'full' && (needs.test.result != 'success' || needs.unix-verify.result != 'success')) || (needs.validate-title.outputs.ci-mode != 'full' && needs.validate-title.outputs.ci-mode != 'markdown')",
     );
     expect(workflow.jobs["windows"]?.steps[0]?.if).toBe(
       "needs.validate-title.result != 'success' || (needs.validate-title.outputs.ci-mode == 'full' && (needs.windows-test.result != 'success' || needs.windows-verify.result != 'success')) || (needs.validate-title.outputs.ci-mode != 'full' && needs.validate-title.outputs.ci-mode != 'markdown')",
@@ -3976,6 +4065,7 @@ describe("GitHub release workflow safeguards", () => {
     for (const [ciMode, validation, upstream, gateFailure] of [
       ["full", "success", "success", false],
       ["full", "success", "skipped", true],
+      ["full", "failure", "skipped", true],
       ["markdown", "success", "skipped", false],
       ["markdown", "failure", "skipped", true],
       ["skip", "success", "skipped", true],
@@ -3983,6 +4073,7 @@ describe("GitHub release workflow safeguards", () => {
     ] as const) {
       const values = {
         "needs.test.result": upstream,
+        "needs.unix-verify.result": upstream,
         "needs.validate-title.outputs.ci-mode": ciMode,
         "needs.validate-title.result": validation,
         "needs.windows-test.result": upstream,
@@ -4029,6 +4120,31 @@ describe("GitHub release workflow safeguards", () => {
       fullNames.filter((name) => requiredContexts.has(name)).sort(),
     ).toEqual([...requiredContexts].sort());
   });
+
+  test.each(["failure", "skipped"])(
+    "keeps required contexts truthful for full CI with package verification %s",
+    (verification) => {
+      const workflow = Bun.YAML.parse(nodeCiWorkflow) as {
+        jobs: Record<string, { steps: Array<{ if?: string }> }>;
+      };
+      const values = {
+        "needs.validate-title.outputs.ci-mode": "full",
+        "needs.validate-title.result": "success",
+        "needs.test.result": "success",
+        "needs.unix-verify.result": verification,
+        "needs.windows-test.result": "success",
+        "needs.windows-verify.result": verification,
+      };
+      for (const job of ["required-test", "windows"]) {
+        expect(
+          evaluateWorkflowCondition(
+            workflow.jobs[job]?.steps[0]?.if ?? "",
+            values,
+          ),
+        ).toBe(true);
+      }
+    },
+  );
 
   test.each([
     [

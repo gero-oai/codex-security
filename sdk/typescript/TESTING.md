@@ -62,11 +62,22 @@ default to 100 cases; filesystem contract properties default to 20.
 `node-ci` retains the required `ubuntu-latest / node-22`,
 `macos-latest / node-22`, and `windows-latest / node-22` checks. Its Ubuntu
 Node 22 job runs static checks and uploads JUnit and LCOV. Every existing OS and
-Node runtime lane still runs the full suite: tests also launch Node subprocesses,
+Node runtime lane still runs the full suite in full CI: tests also launch Node subprocesses,
 so changing Node can affect more than the Bun test runtime. All supported runtime
 lanes still inspect an installed package. Package inspection includes
 a strict NodeNext TypeScript consumer and the actual installed CLI. Failed
-tests block CI; a failed diagnostic upload does not.
+tests block CI; a failed diagnostic upload does not. Unix package verification
+runs in six separate jobs alongside the six test lanes, with the same OS and
+Node versions. Required checks depend on both matrices. This raises full CI
+from 27 to 33 jobs and duplicates checkout and dependency setup, trading more
+runner resources for less sequential work; it does not duplicate the test suite.
+
+Pull-request validation classifies changes before starting test and package
+jobs. Markdown-only diffs run changed-file formatting instead; pushes, base
+retargets, empty diffs, and changes to other file types run full CI. Required
+check names remain stable and reject failed validation or an unknown CI mode.
+Every pull-request edit is reclassified and shares the same cancellation group,
+so editing the body of a code pull request can restart its full CI run.
 
 `scripts/run-ci-tests.mjs` discovers the test files and balances them using
 rounded timings in `scripts/test-shards.mjs`. Unix estimates average measured
@@ -79,9 +90,12 @@ Credential-home locking and ACL checks live in `runtime-credentials.test.ts` so
 they can run independently of the plugin, output-directory, and Python checks
 in `runtime.test.ts`.
 The machine-wide Windows policy test still runs separately and serially.
-Windows installs the pnpm version from `packageManager` directly, reuses the
-npm download cache, and caches the resolved pnpm store separately. Cache
-failures do not suppress installation failures. Unix keeps its pinned pnpm
+Windows caches the exact pnpm version from `packageManager` in a dedicated
+runner-temp prefix. A cache miss or cache error installs it with npm; only an
+exact hit skips installation. The resolved pnpm store is cached separately.
+In full CI, only package-verification jobs restore the npm download cache for
+the fresh consumer; test jobs on either platform do not restore it. Cache failures do not suppress
+installation failures. Unix keeps its pinned pnpm
 setup action. Windows package inspection enables npm's native phase timings to
 diagnose installation delays without changing its failure or timeout behavior.
 It also logs npm cache/fetch activity and uses a 16-thread libuv pool for

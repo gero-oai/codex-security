@@ -145,8 +145,6 @@ jobs:
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
-          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -192,6 +190,50 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.node == '22.13.0'
         run: pnpm --dir sdk/typescript run format
 
+  unix-verify:
+    name: ${{ matrix.os }} / node-${{ matrix.node == '22.13.0' && '22' || matrix.node }} / verify
+    needs: validate-title
+    if: needs.validate-title.outputs.ci-mode == 'full'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["22.13.0"]
+        include:
+          - os: ubuntu-latest
+            node: "24.0.0"
+          - os: ubuntu-latest
+            node: "24"
+          - os: ubuntu-latest
+            node: "26.0.0"
+          - os: ubuntu-latest
+            node: "26"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          package_json_file: sdk/typescript/package.json
+          cache: true
+          cache_dependency_path: sdk/typescript/pnpm-lock.yaml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm --dir sdk/typescript install --frozen-lockfile
+
       - name: Pack
         working-directory: sdk/typescript
         run: pnpm pack --pack-destination ../../dist
@@ -203,7 +245,7 @@ jobs:
 
   required-test:
     name: ${{ matrix.os }} / node-22
-    needs: [validate-title, test]
+    needs: [validate-title, test, unix-verify]
     if: always()
     runs-on: ubuntu-latest
     strategy:
@@ -213,7 +255,7 @@ jobs:
 
     steps:
       - name: Require every Unix coverage job
-        if: needs.validate-title.result != 'success' || (needs.validate-title.outputs.ci-mode == 'full' && needs.test.result != 'success') || (needs.validate-title.outputs.ci-mode != 'full' && needs.validate-title.outputs.ci-mode != 'markdown')
+        if: needs.validate-title.result != 'success' || (needs.validate-title.outputs.ci-mode == 'full' && (needs.test.result != 'success' || needs.unix-verify.result != 'success')) || (needs.validate-title.outputs.ci-mode != 'full' && needs.validate-title.outputs.ci-mode != 'markdown')
         run: exit 1
 
   windows-test:
@@ -238,15 +280,33 @@ jobs:
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
-          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
+
+      - name: Select pnpm version
+        id: pnpm-version
+        shell: bash
+        run: |
+          pnpm_pin=$(node -p 'require("./sdk/typescript/package.json").packageManager')
+          printf 'pin=%s\npackage=%s\n' "$pnpm_pin" "${pnpm_pin%%+*}" >> "$GITHUB_OUTPUT"
+          printf '%s/pnpm\n' "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Cache pnpm executable
+        id: pnpm-tool
+        continue-on-error: true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/pnpm
+          key: pnpm-tool-${{ runner.os }}-${{ runner.arch }}-${{ steps.pnpm-version.outputs.pin }}
 
       - name: Set up pnpm
         id: pnpm
         shell: bash
+        env:
+          PNPM_PACKAGE: ${{ steps.pnpm-version.outputs.package }}
+          PNPM_CACHE_HIT: ${{ steps.pnpm-tool.outputs.cache-hit }}
         run: |
-          pnpm_package=$(node -p 'require("./sdk/typescript/package.json").packageManager.split("+")[0]')
-          npm install --global "$pnpm_package" --prefer-offline --no-audit --no-fund
+          if [[ "$PNPM_CACHE_HIT" != 'true' ]]; then
+            npm install --global --prefix "$RUNNER_TEMP/pnpm" "$PNPM_PACKAGE" --prefer-offline --no-audit --no-fund
+          fi
           pnpm_store=$(pnpm store path --silent)
           pnpm_arch=$(node -p 'process.arch')
           printf 'store-path=%s\narch=%s\n' "$pnpm_store" "$pnpm_arch" >> "$GITHUB_OUTPUT"
@@ -327,12 +387,32 @@ jobs:
           cache: npm
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
 
+      - name: Select pnpm version
+        id: pnpm-version
+        shell: bash
+        run: |
+          pnpm_pin=$(node -p 'require("./sdk/typescript/package.json").packageManager')
+          printf 'pin=%s\npackage=%s\n' "$pnpm_pin" "${pnpm_pin%%+*}" >> "$GITHUB_OUTPUT"
+          printf '%s/pnpm\n' "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Cache pnpm executable
+        id: pnpm-tool
+        continue-on-error: true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/pnpm
+          key: pnpm-tool-${{ runner.os }}-${{ runner.arch }}-${{ steps.pnpm-version.outputs.pin }}
+
       - name: Set up pnpm
         id: pnpm
         shell: bash
+        env:
+          PNPM_PACKAGE: ${{ steps.pnpm-version.outputs.package }}
+          PNPM_CACHE_HIT: ${{ steps.pnpm-tool.outputs.cache-hit }}
         run: |
-          pnpm_package=$(node -p 'require("./sdk/typescript/package.json").packageManager.split("+")[0]')
-          npm install --global "$pnpm_package" --prefer-offline --no-audit --no-fund
+          if [[ "$PNPM_CACHE_HIT" != 'true' ]]; then
+            npm install --global --prefix "$RUNNER_TEMP/pnpm" "$PNPM_PACKAGE" --prefer-offline --no-audit --no-fund
+          fi
           pnpm_store=$(pnpm store path --silent)
           pnpm_arch=$(node -p 'process.arch')
           printf 'store-path=%s\narch=%s\n' "$pnpm_store" "$pnpm_arch" >> "$GITHUB_OUTPUT"
