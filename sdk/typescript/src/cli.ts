@@ -5996,6 +5996,34 @@ interface NestedPatchReviewRepository {
   gitDirectory: string;
 }
 
+const PATCH_REVIEW_GIT_CONFIG_INCLUDE_SECTION =
+  /^\s*\[\s*include(?:if)?(?:\s|"|\])/imu;
+
+async function assertPatchReviewGitConfigHasNoIncludes(
+  gitDirectory: string,
+  name: "config" | "config.worktree",
+  errorMessage: string,
+): Promise<boolean> {
+  const path = join(gitDirectory, name);
+  let metadata: Awaited<ReturnType<typeof lstat>>;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (missingPatchReviewPath(error)) return false;
+    throw error;
+  }
+  if (!metadata.isFile()) throw new CodexSecurityError(errorMessage);
+  const bytes = await readFile(path);
+  const config = bytes.toString("utf8");
+  if (
+    !Buffer.from(config, "utf8").equals(bytes) ||
+    PATCH_REVIEW_GIT_CONFIG_INCLUDE_SECTION.test(config)
+  ) {
+    throw new CodexSecurityError(errorMessage);
+  }
+  return true;
+}
+
 function nestedPatchReviewRepositoryKey(
   nested: NestedPatchReviewRepository,
 ): string {
@@ -6423,16 +6451,22 @@ async function nestedPatchReviewRepository(
           "Nested Git metadata must remain inside the selected repository.",
         );
       }
-      const configBytes = await readFile(join(gitDirectory, "config"));
-      const config = configBytes.toString("utf8");
       if (
-        !Buffer.from(config, "utf8").equals(configBytes) ||
-        /^\s*\[\s*include(?:if)?(?:\s|")/imu.test(config)
+        !(await assertPatchReviewGitConfigHasNoIncludes(
+          gitDirectory,
+          "config",
+          "Nested Git metadata must not include external configuration.",
+        ))
       ) {
         throw new CodexSecurityError(
-          "Nested Git metadata must not include external configuration.",
+          "Nested Git metadata must use a confined Git directory.",
         );
       }
+      await assertPatchReviewGitConfigHasNoIncludes(
+        gitDirectory,
+        "config.worktree",
+        "Nested Git metadata must not include external configuration.",
+      );
       return { worktree: await realpath(current), gitDirectory };
     } catch (error) {
       if (!missingPatchReviewPath(error)) throw error;
@@ -6717,6 +6751,15 @@ async function snapshotPatchReviewWorktree(
       ),
     ),
   );
+  for (const gitDirectory of new Set(repositoryGitDirectories)) {
+    for (const name of ["config", "config.worktree"] as const) {
+      await assertPatchReviewGitConfigHasNoIncludes(
+        gitDirectory,
+        name,
+        "Git metadata must not include external configuration during patch review.",
+      );
+    }
+  }
   const allowedNestedGitDirectories = [repository, ...repositoryGitDirectories];
   await validatePatchReviewObjectAlternates(
     repositoryObjectDirectory,
