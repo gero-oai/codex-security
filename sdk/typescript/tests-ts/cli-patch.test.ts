@@ -2012,6 +2012,7 @@ describe("scan and patch workflow", () => {
   test.each([
     "common directory",
     "configuration",
+    "fetch state",
     "hook",
     "index lock",
     "merge state",
@@ -2057,6 +2058,11 @@ describe("scan and patch workflow", () => {
                   await writeFile(join(repository, ".git", "commondir"), ".\n");
                 } else if (kind === "configuration") {
                   git("config", "review.synthetic", "changed");
+                } else if (kind === "fetch state") {
+                  await writeFile(
+                    join(repository, ".git", "FETCH_HEAD"),
+                    `${git("rev-parse", "HEAD")}\tnot-for-merge\tbranch 'synthetic' of .\n`,
+                  );
                 } else if (kind === "hook") {
                   await writeFile(
                     join(repository, ".git", "hooks", "pre-commit"),

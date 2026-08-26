@@ -5938,6 +5938,36 @@ async function hashNestedPatchReviewDirectoryMode(
   );
 }
 
+async function assertOpenedPatchReviewFileConfined(
+  worktree: string,
+  path: Buffer,
+  opened: BigIntStats,
+  changedMessage: string,
+): Promise<void> {
+  await validatePatchReviewGitPath(worktree, path, worktree);
+  const filesystemPath = patchReviewFilesystemPath(worktree, path);
+  let canonicalPath: string;
+  let current: BigIntStats;
+  try {
+    canonicalPath = await realpath(filesystemPath);
+    current = await lstat(canonicalPath, { bigint: true });
+  } catch {
+    throw new CodexSecurityError(changedMessage);
+  }
+  if (isOutsidePath(relative(worktree, canonicalPath))) {
+    throw new CodexSecurityError(
+      "The observed patch contains a path through a link outside the selected repository.",
+    );
+  }
+  if (
+    !current.isFile() ||
+    current.dev !== opened.dev ||
+    current.ino !== opened.ino
+  ) {
+    throw new CodexSecurityError(changedMessage);
+  }
+}
+
 async function hashNestedPatchReviewPath(
   worktree: string,
   path: Buffer,
@@ -6027,6 +6057,12 @@ async function hashNestedPatchReviewPath(
         "A nested Git worktree changed while its review boundary was captured.",
       );
     }
+    await assertOpenedPatchReviewFileConfined(
+      worktree,
+      path,
+      opened,
+      "A nested Git worktree changed while its review boundary was captured.",
+    );
     const contents = createHash("sha256");
     const buffer = Buffer.alloc(64 * 1024);
     for (;;) {
@@ -6035,6 +6071,12 @@ async function hashNestedPatchReviewPath(
       if (bytesRead === 0) break;
       contents.update(buffer.subarray(0, bytesRead));
     }
+    await assertOpenedPatchReviewFileConfined(
+      worktree,
+      path,
+      opened,
+      "A nested Git worktree changed while its review boundary was captured.",
+    );
     updateNestedPatchReviewDigest(
       digest,
       path,
@@ -6110,12 +6152,14 @@ async function readPatchReviewBlob(
   path: Buffer,
   existingMode: string | undefined,
 ): Promise<{ contents: Buffer; mode: string }> {
+  await validatePatchReviewGitPath(worktree, path, worktree);
   const filesystemPath = patchReviewFilesystemPath(worktree, path);
   const before = await lstat(filesystemPath, { bigint: true });
   if (before.isSymbolicLink()) {
     const contents = Buffer.from(
       await readlink(filesystemPath, { encoding: "buffer" }),
     );
+    await validatePatchReviewGitPath(worktree, path, worktree);
     const after = await lstat(filesystemPath, { bigint: true });
     if (
       !after.isSymbolicLink() ||
@@ -6153,6 +6197,12 @@ async function readPatchReviewBlob(
         "The patch worktree changed while its review boundary was captured.",
       );
     }
+    await assertOpenedPatchReviewFileConfined(
+      worktree,
+      path,
+      opened,
+      "The patch worktree changed while its review boundary was captured.",
+    );
     const contents = await file.readFile();
     const after = await file.stat({ bigint: true });
     if (
@@ -6164,6 +6214,12 @@ async function readPatchReviewBlob(
         "The patch worktree changed while its review boundary was captured.",
       );
     }
+    await assertOpenedPatchReviewFileConfined(
+      worktree,
+      path,
+      after,
+      "The patch worktree changed while its review boundary was captured.",
+    );
     const preserveMaterializedMode =
       existingMode === "120000" ||
       (process.platform === "win32" &&
@@ -6493,6 +6549,7 @@ const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
   "BISECT_START",
   "BISECT_TERMS",
   "CHERRY_PICK_HEAD",
+  "FETCH_HEAD",
   "HEAD",
   "HEAD.lock",
   "MERGE_AUTOSTASH",
