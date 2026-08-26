@@ -384,7 +384,6 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         )
         established_block_reason = (
             value["regressionLikelihood"]["rating"] == "critical"
-            or any(item["result"] == "contradicted" for item in boundaries)
         )
         for index, item in enumerate(evidence_plan):
             applicability_outcomes = item.get("applicabilityOutcomes")
@@ -548,12 +547,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: a revise outcome requires branch evidence of a defect"
                     )
-                if outcome_recommendation == "block" and not (
-                    established_block_reason
-                    or branch_contradiction
-                ):
+                if outcome_recommendation == "block" and not established_block_reason:
                     errors.append(
-                        f"evidencePlan.{index}: a block outcome requires branch evidence of critical likelihood or a contradicted boundary"
+                        f"evidencePlan.{index}: a block outcome requires critical regression likelihood"
                     )
                 remaining_decision_unknowns = (
                     decision_critical_unknowns - set(item["resolvesUnknowns"])
@@ -732,11 +728,8 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     if (
         recommendation == "block"
         and value["regressionLikelihood"]["rating"] != "critical"
-        and not any(item["result"] == "contradicted" for item in boundaries)
     ):
-        errors.append(
-            "block requires critical regression likelihood or a contradicted material boundary"
-        )
+        errors.append("block requires critical regression likelihood")
 
     if value["regressionProtection"]["rating"] == "strong":
         if not value["regressionProtection"]["exactHeadChecksPassed"]:

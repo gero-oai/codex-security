@@ -1265,11 +1265,11 @@ describe("patch risk assessment contract", () => {
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
-      "a block outcome requires branch evidence of critical likelihood or a contradicted boundary",
+      "a block outcome requires critical regression likelihood",
     );
   });
 
-  test("requires material safety evidence for a patch-caused block", async () => {
+  test("requires critical likelihood for a patch-caused block", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
     payload.workflowLabel = "hold_for_evidence";
@@ -1302,7 +1302,7 @@ describe("patch risk assessment contract", () => {
     const unqualified = await validate(payload);
     expect(unqualified.status).not.toBe(0);
     expect(unqualified.stderr).toContain(
-      "a block outcome requires branch evidence of critical likelihood or a contradicted boundary",
+      "a block outcome requires critical regression likelihood",
     );
 
     payload.materialBoundaries[0]!.result = "unresolved";
@@ -1311,8 +1311,11 @@ describe("patch risk assessment contract", () => {
       patch_caused: { "request-contract": "contradicted" },
       not_patch_caused: { "request-contract": "supported" },
     };
-    const valid = await validate(payload);
-    expect(valid.status, valid.stderr).toBe(0);
+    const contradicted = await validate(payload);
+    expect(contradicted.status).not.toBe(0);
+    expect(contradicted.stderr).toContain(
+      "a block outcome requires critical regression likelihood",
+    );
 
     payload.evidencePlan[0]!.outcomes["inconclusive"] = "merge";
     const inconclusive = await validate(payload);
@@ -1740,7 +1743,7 @@ describe("patch risk assessment contract", () => {
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toBe(
-      "block requires critical regression likelihood or a contradicted material boundary\n",
+      "block requires critical regression likelihood\n",
     );
 
     payload.validation[0]!.status = "failed";
@@ -1748,11 +1751,11 @@ describe("patch risk assessment contract", () => {
     const patchFailure = await validate(payload);
     expect(patchFailure.status).not.toBe(0);
     expect(patchFailure.stderr).toContain(
-      "block requires critical regression likelihood or a contradicted material boundary",
+      "block requires critical regression likelihood",
     );
   });
 
-  test("accepts affirmative material failure signals for block", async () => {
+  test("requires critical regression likelihood for block", async () => {
     const critical = assessment();
     critical.recommendation = "block";
     critical.workflowLabel = "block";
@@ -1765,7 +1768,10 @@ describe("patch risk assessment contract", () => {
     contradicted.workflowLabel = "block";
     contradicted.materialBoundaries[0]!.result = "contradicted";
     const contradictedResult = await validate(contradicted);
-    expect(contradictedResult.status, contradictedResult.stderr).toBe(0);
+    expect(contradictedResult.status).not.toBe(0);
+    expect(contradictedResult.stderr).toContain(
+      "block requires critical regression likelihood",
+    );
   });
 
   test.each([
@@ -2011,6 +2017,22 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
+  test("allows no validation entries when no check is relevant", async () => {
+    const payload = assessment();
+    payload.recommendation = "no_op";
+    payload.workflowLabel = "no_op";
+    payload.applicability = {
+      status: "superseded",
+      rationale: "A narrower patch already landed.",
+    };
+    payload.validation = [];
+    payload.regressionProtection.rating = "none";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
   test.each(["revise", "block"])(
     "requires an evidence hold when applicability is unknown before %s",
     async (recommendation) => {
@@ -2247,13 +2269,6 @@ describe("patch risk assessment contract", () => {
         payload.patch.repository = "\uFEFF";
       },
       "patch.repository: string does not match the required pattern",
-    ],
-    [
-      "empty validation evidence",
-      (payload: Assessment) => {
-        payload.validation = [];
-      },
-      "validation: array has fewer than 1 items",
     ],
     [
       "duplicate string-list items",
