@@ -68,6 +68,18 @@ interface Assessment {
     changedFilesOutcomes?: Record<string, string[]>;
     resolvesBoundaries?: string[];
     boundaryOutcomes?: Record<string, Record<string, string>>;
+    boundaryEvidenceOutcomes?: Record<
+      string,
+      Record<
+        string,
+        {
+          legitimateControl?: string;
+          legitimateControlPath?: string;
+          retirementEvidence?: string;
+          retirementEvidencePath?: string;
+        }
+      >
+    >;
     applicabilityOutcomes?: Record<string, string>;
     impactOutcomes?: Record<string, string>;
     confidenceOutcomes?: Record<string, string>;
@@ -103,7 +115,7 @@ afterEach(async () => {
 
 function assessment(): Assessment {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     patch: {
       repository: "example/project",
       sourceType: "pull_request_diff",
@@ -241,6 +253,23 @@ describe("patch risk assessment contract", () => {
     ambiguousControl.materialBoundaries[0]!.retirementEvidencePath =
       "docs/request-v2.md";
     expect(validateSchema(ambiguousControl)).toBe(false);
+
+    const versionOne = assessment();
+    versionOne.schemaVersion = 1;
+    expect(validateSchema(versionOne)).toBe(false);
+
+    const unresolved = assessment();
+    const unresolvedBoundary = unresolved.materialBoundaries[0]!;
+    unresolvedBoundary.result = "unresolved";
+    delete unresolvedBoundary.legitimateControl;
+    delete unresolvedBoundary.legitimateControlPath;
+    expect(
+      validateSchema(unresolved),
+      JSON.stringify(validateSchema.errors),
+    ).toBe(true);
+
+    unresolvedBoundary.result = "supported";
+    expect(validateSchema(unresolved)).toBe(false);
 
     const digestWithTrailingNewline = assessment();
     digestWithTrailingNewline.patch.sha256 = `${"c".repeat(64)}\n`;
@@ -1259,6 +1288,67 @@ describe("patch risk assessment contract", () => {
     };
     const covered = await validate(payload);
     expect(covered.status, covered.stderr).toBe(0);
+  });
+
+  test("binds deferred boundary evidence to every resolving outcome", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    const boundary = payload.materialBoundaries[0]!;
+    boundary.result = "unresolved";
+    delete boundary.legitimateControl;
+    delete boundary.legitimateControlPath;
+    payload.unknowns = [
+      {
+        id: "request-contract-evidence",
+        summary: "The governing request contract is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the governing contract retain or retire the request?",
+        action: "Inspect the authoritative request contract.",
+        resolvesUnknowns: ["request-contract-evidence"],
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          retained: { "request-contract": "supported" },
+          retired: { "request-contract": "supported" },
+        },
+        boundaryEvidenceOutcomes: {
+          retained: {
+            "request-contract": {
+              legitimateControl: "The contract retains bounded requests.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
+          retired: {
+            "request-contract": {
+              retirementEvidence: "The contract retires the request surface.",
+              retirementEvidencePath: "docs/request-v2.md",
+            },
+          },
+        },
+        outcomes: { retained: "merge", retired: "merge" },
+        confidenceOutcomes: {
+          retained: "moderate",
+          retired: "moderate",
+        },
+      },
+    ];
+
+    const complete = await validate(payload);
+    expect(complete.status, complete.stderr).toBe(0);
+
+    delete payload.evidencePlan[0]!.boundaryEvidenceOutcomes!["retired"]![
+      "request-contract"
+    ];
+    const incomplete = await validate(payload);
+    expect(incomplete.status).not.toBe(0);
+    expect(incomplete.stderr).toContain(
+      "boundaryEvidenceOutcomes.retired must supply evidence for exactly the resolved boundaries that lack it",
+    );
   });
 
   test("requires unique material boundary identifiers", async () => {
@@ -3532,8 +3622,8 @@ describe("patch risk assessment contract", () => {
 
   test("rejects duplicate JSON object keys deterministically", async () => {
     const raw = JSON.stringify(assessment()).replace(
-      '"schemaVersion":1',
-      '"schemaVersion":1,"schemaVersion":1',
+      '"schemaVersion":2',
+      '"schemaVersion":2,"schemaVersion":2',
     );
     const first = await validateRaw(raw);
     const second = await validateRaw(raw);

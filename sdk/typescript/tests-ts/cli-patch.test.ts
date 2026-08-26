@@ -271,7 +271,7 @@ function approvedPatchRiskVerdict(prompt: string) {
     findings: [],
     report: "## Patch risk\n\nThe synthetic patch is mergeable.",
     assessment: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       patch: artifact.patch,
       recommendation: "merge",
       workflowLabel: "human_review_required",

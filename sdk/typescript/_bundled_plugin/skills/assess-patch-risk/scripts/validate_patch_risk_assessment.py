@@ -249,6 +249,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         errors.append("material boundary identifiers must be unique")
     control_fields = {"legitimateControl", "legitimateControlPath"}
     retirement_fields = {"retirementEvidence", "retirementEvidencePath"}
+    boundary_has_evidence: dict[str, bool] = {}
     for index, item in enumerate(boundaries):
         present_controls = control_fields & item.keys()
         present_retirement = retirement_fields & item.keys()
@@ -260,11 +261,20 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append(
                 f"materialBoundaries.{index}: retirement evidence requires both value and path"
             )
-        if (present_controls == control_fields) == (
-            present_retirement == retirement_fields
-        ):
+        complete_control = present_controls == control_fields
+        complete_retirement = present_retirement == retirement_fields
+        boundary_has_evidence[item["id"]] = complete_control or complete_retirement
+        if complete_control and complete_retirement:
             errors.append(
                 f"materialBoundaries.{index}: exactly one of legitimate control or retirement evidence is required"
+            )
+        elif (
+            not complete_control
+            and not complete_retirement
+            and item["result"] != "unresolved"
+        ):
+            errors.append(
+                f"materialBoundaries.{index}: a resolved boundary requires legitimate control or retirement evidence"
             )
     decision_critical_unknowns = {
         item["id"] for item in unknowns if item["decisionCritical"]
@@ -429,6 +439,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             safety_failure_outcomes = item.get("materialSafetyFailureOutcomes")
             resolved_boundaries = item.get("resolvesBoundaries", [])
             boundary_outcomes = item.get("boundaryOutcomes")
+            boundary_evidence_outcomes = item.get("boundaryEvidenceOutcomes")
             remaining_unknown_outcomes = item.get("remainingUnknowns")
             if applicability_outcomes is not None:
                 if any(
@@ -515,6 +526,16 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"evidencePlan.{index}: boundaryOutcomes must name exactly the evidence outcome keys"
                 )
+            if boundary_evidence_outcomes is not None and not resolved_boundaries:
+                errors.append(
+                    f"evidencePlan.{index}: boundaryEvidenceOutcomes requires resolvesBoundaries"
+                )
+            if boundary_evidence_outcomes is not None and set(
+                boundary_evidence_outcomes
+            ) != set(item["outcomes"]):
+                errors.append(
+                    f"evidencePlan.{index}: boundaryEvidenceOutcomes must name exactly the evidence outcome keys"
+                )
             if remaining_unknown_outcomes is not None and set(
                 remaining_unknown_outcomes
             ) != set(item["outcomes"]):
@@ -531,6 +552,11 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     boundary_outcomes.get(outcome)
                     if boundary_outcomes is not None
                     else None
+                )
+                outcome_boundary_evidence = (
+                    boundary_evidence_outcomes.get(outcome, {})
+                    if boundary_evidence_outcomes is not None
+                    else {}
                 )
                 effective_unresolved_boundaries = unresolved_boundaries - set(
                     resolved_boundaries
@@ -605,6 +631,16 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 ):
                     errors.append(
                         f"evidencePlan.{index}: boundaryOutcomes.{outcome} must name exactly the resolved material boundaries"
+                    )
+                expected_boundary_evidence = {
+                    boundary_id
+                    for boundary_id, result in (outcome_boundaries or {}).items()
+                    if result != "unresolved"
+                    and not boundary_has_evidence.get(boundary_id, False)
+                }
+                if set(outcome_boundary_evidence) != expected_boundary_evidence:
+                    errors.append(
+                        f"evidencePlan.{index}: boundaryEvidenceOutcomes.{outcome} must supply evidence for exactly the resolved boundaries that lack it"
                     )
                 if (
                     outcome_recommendation == "merge"
