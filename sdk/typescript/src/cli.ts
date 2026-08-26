@@ -1329,6 +1329,7 @@ interface CliDependencies {
     options: {
       environment?: NodeJS.ProcessEnv;
       pythonPath?: string;
+      protectedRoot: string;
       signal?: AbortSignal;
       pluginRoot: string;
       validatorPath: string;
@@ -7662,6 +7663,7 @@ async function validatePatchRiskAssessment(
   options: {
     environment?: NodeJS.ProcessEnv;
     pythonPath?: string;
+    protectedRoot: string;
     signal?: AbortSignal;
     pluginRoot: string;
     validatorPath: string;
@@ -7673,6 +7675,8 @@ async function validatePatchRiskAssessment(
   const python = await resolvePluginPython({
     configuredPath: options.pythonPath,
     environment,
+    protectedRoot: options.protectedRoot,
+    signal,
   });
   const temporaryRoot = await realpath(tmpdir());
   const temporaryDirectory = await realpath(
@@ -8323,6 +8327,7 @@ async function runIndependentPatchReview(
         ? await context.validatePatchRiskAssessment(review.response, {
             environment: context.options.environment ?? context.environment,
             pythonPath: context.options.pythonPath,
+            protectedRoot: context.snapshot.directory,
             signal: context.options.signal,
             pluginRoot: context.options.patchRiskContract!.root,
             validatorPath: context.options.patchRiskContract!.validatorPath,
@@ -8756,6 +8761,8 @@ async function runSkill(
         environment: exportEnvironment(
           options.environment ?? dependencies.environment,
         ),
+        protectedRoot: snapshot.directory,
+        signal: options.signal,
       });
     }
     const workflowOptions: SkillRunOptions = {
