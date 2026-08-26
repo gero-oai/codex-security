@@ -359,7 +359,12 @@ describe("CodexSecurity orchestration", () => {
         ),
       );
       for (const result of results) {
-        expect(result).toMatchObject({
+        expect(
+          result,
+          result.status === "rejected" && result.reason instanceof Error
+            ? result.reason.stack
+            : undefined,
+        ).toMatchObject({
           status: "rejected",
           reason: expect.objectContaining({
             message: "parallel managed scan reached",
