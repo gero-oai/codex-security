@@ -646,6 +646,7 @@ describe("scan and patch workflow", () => {
     let observed: { paths: string[]; diff: string } | undefined;
     let authorDirectory: string | undefined;
     let reviewerDirectory: string | undefined;
+    const issueInputs: string[][] = [];
     try {
       await mkdir(selected, { recursive: true });
       await mkdir(sibling, { recursive: true });
@@ -654,16 +655,19 @@ describe("scan and patch workflow", () => {
       git("config", "user.email", "synthetic@example.test");
       git("config", "commit.gpgsign", "false");
       await writeFile(join(selected, "entry.ts"), "selected\n");
+      await writeFile(join(selected, "issue.txt"), "nested issue\n");
+      await writeFile(join(repository, "issue.txt"), "root issue\n");
       await writeFile(join(sibling, "value.ts"), "unsafe\n");
       git("add", "--", ".");
       git("commit", "-m", "Initial synthetic checkout");
 
       const outcome = await runWorkflow(
-        ["patch", "Synthetic security issue", "--review-minimality"],
+        ["patch", "issue.txt", "--review-minimality"],
         {
           currentDirectory: selected,
           onCodex: async (_args, output) => {
             const server = output!.appServer!;
+            issueInputs.push(JSON.parse(server.prompt.split("\n").at(-1)!));
             if (server.sandbox === "read-only") {
               reviewerDirectory = server.directory;
               const lines = server.prompt.split("\n");
@@ -689,13 +693,139 @@ describe("scan and patch workflow", () => {
         },
       );
 
-      expect(outcome.exitCode).toBe(0);
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
       expect(authorDirectory).toBe(selected);
       expect(reviewerDirectory).toBe(repository);
+      expect(issueInputs).toEqual([["nested issue\n"], ["nested issue\n"]]);
       expect(observed?.paths).toEqual(["packages/sibling/value.ts"]);
       expect(observed?.diff).toContain("-unsafe");
       expect(observed?.diff).toContain("+fixed");
     } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps baseline ignored files out of reviews in paths with list separators", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-ignored-patch-")),
+    );
+    const repository = join(
+      root,
+      process.platform === "win32" ? "repository;review" : "repository:review",
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let observed: { paths: string[]; diff: string } | undefined;
+    try {
+      await mkdir(join(repository, "src"), { recursive: true });
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, ".gitignore"), ".env\n");
+      await writeFile(join(repository, "src", "value.ts"), "unsafe\n");
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+      await writeFile(join(repository, ".env"), "SYNTHETIC_SECRET=value\n");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            const server = output!.appServer!;
+            if (server.sandbox === "read-only") {
+              const lines = server.prompt.split("\n");
+              const marker = lines.findIndex((line) =>
+                line.startsWith("Review scope is exactly"),
+              );
+              observed = JSON.parse(lines[marker + 1]!);
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, ".gitignore"), "");
+              await writeFile(join(repository, "src", "value.ts"), "fixed\n");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(observed?.paths).toEqual([".gitignore", "src/value.ts"]);
+      expect(observed?.diff).not.toContain("SYNTHETIC_SECRET");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects patch-review storage inside the reviewed worktree", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-review-temp-root-")),
+    );
+    const nestedTemporaryRoot = join(repository, "tmp");
+    const previous = {
+      TMPDIR: process.env["TMPDIR"],
+      TMP: process.env["TMP"],
+      TEMP: process.env["TEMP"],
+    };
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let authorStarted = false;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "tracked.ts"), "unsafe\n");
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+      await mkdir(nestedTemporaryRoot);
+      process.env["TMPDIR"] = nestedTemporaryRoot;
+      process.env["TMP"] = nestedTemporaryRoot;
+      process.env["TEMP"] = nestedTemporaryRoot;
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: () => {
+            authorStarted = true;
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(authorStarted).toBe(false);
+      expect(outcome.stderr).toContain(
+        "temporary storage must be outside the selected Git worktree",
+      );
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
       await rm(repository, { recursive: true, force: true });
     }
   });
@@ -1222,6 +1352,71 @@ describe("scan and patch workflow", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  test("publishes reviewed paths from the Git root for nested scan targets", async () => {
+    const root = resolve("/review/root");
+    const selected = join(root, "packages", "selected");
+    const result = resultWithFindings(["high"]);
+    const url = "https://github.example.test/example/repository/pull/18";
+    const commandDirectories: string[] = [];
+    const saved = savedScan(result);
+    (saved["scan"] as JsonObject)["targetPath"] = selected;
+
+    const outcome = await runWorkflow(
+      [
+        "patch",
+        "--scan",
+        "scan-1",
+        "--review-minimality",
+        "--create-pr",
+        "--json",
+      ],
+      {
+        currentDirectory: selected,
+        result,
+        onWorkbench: () => saved,
+        onPatchReviewSnapshot: async (directory) => {
+          expect(directory).toBe(selected);
+          return {
+            directory: root,
+            candidate: async () => ({
+              paths: ["packages/selected/src/finding-1.ts"],
+              diff: "diff --git a/packages/selected/src/finding-1.ts b/packages/selected/src/finding-1.ts\n",
+            }),
+            dispose: async () => {},
+          };
+        },
+        onCodex: (args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+        onRepositoryCommand: (command, args, workingDirectory) => {
+          commandDirectories.push(workingDirectory);
+          if (command === "gh") return args[1] === "list" ? "" : url;
+          return args[0] === "rev-parse" ? "verified-commit" : "";
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(commandDirectories.length).toBeGreaterThan(0);
+    expect(new Set(commandDirectories)).toEqual(new Set([root]));
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      patches: [
+        {
+          status: "verified",
+          files: ["packages/selected/src/finding-1.ts"],
+        },
+      ],
+      pullRequest: { url },
+    });
   });
 
   test("removes patch signal listeners before create and resume publication", async () => {

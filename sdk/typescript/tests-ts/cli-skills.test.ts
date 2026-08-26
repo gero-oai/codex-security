@@ -15,6 +15,7 @@ import type { LinearClientFactory } from "../src/linear.js";
 import {
   capture,
   dependencies as fixtureDependencies,
+  FakeSignals,
 } from "./cli-fixtures.js";
 import { runTestInSubprocess } from "./support/test-subprocess.js";
 
@@ -710,6 +711,7 @@ describe("CLI skill commands", () => {
   });
 
   test("imports selected Linear issues without exposing its credential to Codex", async () => {
+    const signals = new FakeSignals();
     const requests: string[] = [];
     const description =
       "# Report\n\n## Reproduction\n\n```ts\nreadRecord(id);\n```";
@@ -732,6 +734,7 @@ describe("CLI skill commands", () => {
         capture().stream,
         capture().stream,
         dependencies({
+          signals,
           environment: {
             CODEX_SECURITY_LINEAR_API_KEY: "lin_api_SYNTHETIC_SECRET",
             LINEAR_API_KEY: "lin_api_SYNTHETIC_FALLBACK",
@@ -743,6 +746,8 @@ describe("CLI skill commands", () => {
             expect(redirect).toBe("error");
             return {
               issue: async (id: string) => {
+                expect(signals.listeners.get("SIGINT")?.size ?? 0).toBe(0);
+                expect(signals.listeners.get("SIGTERM")?.size ?? 0).toBe(0);
                 requests.push(id);
                 return {
                   ...linearIssue(id, [
@@ -755,6 +760,8 @@ describe("CLI skill commands", () => {
             } as ReturnType<LinearClientFactory>;
           },
           onCodex: (_args, output, processEnvironment) => {
+            expect(signals.listeners.get("SIGINT")?.size ?? 0).toBe(1);
+            expect(signals.listeners.get("SIGTERM")?.size ?? 0).toBe(1);
             inputs = JSON.parse(output!.appServer!.prompt.split("\n").at(-1)!);
             environment = processEnvironment;
             return 0;
@@ -778,6 +785,8 @@ describe("CLI skill commands", () => {
     expect(environment).toEqual({
       OPENAI_API_KEY: "sk-proj-SYNTHETIC_MODEL_KEY",
     });
+    expect(signals.listeners.get("SIGINT")?.size ?? 0).toBe(0);
+    expect(signals.listeners.get("SIGTERM")?.size ?? 0).toBe(0);
     expect(JSON.stringify(inputs)).not.toContain("lin_api_SYNTHETIC_SECRET");
     expect(JSON.stringify(inputs)).not.toContain("lin_api_SYNTHETIC_EXPLICIT");
   });

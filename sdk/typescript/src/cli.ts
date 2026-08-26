@@ -1121,6 +1121,7 @@ interface SkillRunOptions extends PatchReviewOptions {
   reviewStage?: PatchReviewStage;
   reviewFindings?: readonly string[];
   reviewCandidate?: PatchReviewCandidateDelta;
+  onReviewRepository?: (repository: string) => void;
 }
 
 interface PatchReviewCandidateDelta {
@@ -3929,12 +3930,19 @@ export async function main(
         const controller = new AbortController();
         const onInterrupt = (): void => controller.abort("SIGINT");
         const onTerminate = (): void => controller.abort("SIGTERM");
+        let signalListenersAdded = false;
+        const addSignalListeners = (): void => {
+          if (signalListenersAdded) return;
+          dependencies.addSignalListener("SIGINT", onInterrupt);
+          dependencies.addSignalListener("SIGTERM", onTerminate);
+          signalListenersAdded = true;
+        };
         const removeSignalListeners = (): void => {
+          if (!signalListenersAdded) return;
           dependencies.removeSignalListener("SIGINT", onInterrupt);
           dependencies.removeSignalListener("SIGTERM", onTerminate);
+          signalListenersAdded = false;
         };
-        dependencies.addSignalListener("SIGINT", onInterrupt);
-        dependencies.addSignalListener("SIGTERM", onTerminate);
         try {
           const linear =
             options.linearIssue.length > 0 || !!options.linearProject;
@@ -4009,6 +4017,7 @@ export async function main(
               options.severity,
               dependencies,
             );
+            addSignalListeners();
             const patchRun = await runFindingPatches(
               selected,
               options.codex,
@@ -4035,6 +4044,7 @@ export async function main(
                 patches,
                 errorOutput,
                 dependencies,
+                patchRun.reviewRepository,
               );
             }
             if (format === "json" || format === "jsonl") {
@@ -4089,6 +4099,7 @@ export async function main(
                       ),
                   ),
                 );
+          addSignalListeners();
           controller.signal.throwIfAborted();
           exitCode = await runSkill(
             "fix-finding",
@@ -5069,7 +5080,9 @@ async function createPatchPullRequest(
   patches: readonly FindingPatch[],
   stderr: Writable,
   dependencies: CliDependencies,
+  reviewRepository?: string,
 ): Promise<{ branch: string; url: string } | undefined> {
+  const repository = reviewRepository ?? selected.repository;
   const files = [
     ...new Set(
       patches.flatMap(({ status, files }) =>
@@ -5077,10 +5090,7 @@ async function createPatchPullRequest(
       ),
     ),
   ].map((file) => {
-    const path = relative(
-      selected.repository,
-      resolve(selected.repository, file),
-    );
+    const path = relative(repository, resolve(repository, file));
     if (path === "" || isOutsidePath(path)) {
       throw new CodexSecurityError(
         "Patch files must remain inside the scanned repository.",
@@ -5095,7 +5105,7 @@ async function createPatchPullRequest(
 
   const branch = `codex-security/patch-${selected.scanId.replaceAll(/[^a-z\d._-]/giu, "-")}`;
   const run = (command: "git" | "gh", args: string[]) =>
-    dependencies.runRepositoryCommand(command, args, selected.repository);
+    dependencies.runRepositoryCommand(command, args, repository);
   stderr.write(
     "Creating a draft GitHub pull request for verified patches...\n",
   );
@@ -5112,7 +5122,7 @@ async function createPatchPullRequest(
   ]);
   const commit = await run("git", ["rev-parse", "HEAD"]);
   await run("git", ["config", "--local", patchCommitKey(branch), commit]);
-  return publishPatchBranch(selected.repository, branch, stderr, dependencies);
+  return publishPatchBranch(repository, branch, stderr, dependencies);
 }
 
 function safePatchText(value: string): string {
@@ -5247,17 +5257,73 @@ async function snapshotPatchReviewWorktree(
   );
 
   const temporaryRoot = await realpath(tmpdir());
+  if (!isOutsidePath(relative(repository, temporaryRoot))) {
+    throw new CodexSecurityError(
+      "Patch review temporary storage must be outside the selected Git worktree.",
+    );
+  }
+  const ignored = await runPatchReviewGit(
+    repository,
+    [
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ".",
+    ],
+    { signal, trim: false },
+  );
+  const ignoredPaths = ignored.split("\0");
+  if (ignoredPaths.at(-1) === "") ignoredPaths.pop();
+  const ignoredPathSet = new Set(ignoredPaths);
   const temporaryDirectory = await mkdtemp(
     join(temporaryRoot, "codex-security-patch-review-"),
   );
   const objectDirectory = join(temporaryDirectory, "objects");
+  const pathspecFile = join(temporaryDirectory, "candidate-pathspecs");
   const objectEnvironment = {
     GIT_OBJECT_DIRECTORY: objectDirectory,
-    GIT_ALTERNATE_OBJECT_DIRECTORIES: repositoryObjectDirectory,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: JSON.stringify(repositoryObjectDirectory),
   };
   const environment = {
     ...objectEnvironment,
     GIT_INDEX_FILE: join(temporaryDirectory, "index"),
+  };
+  const stageWorktree = async (): Promise<void> => {
+    const listed = await runPatchReviewGit(
+      repository,
+      [
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ".",
+      ],
+      { environment, signal, trim: false },
+    );
+    const paths = listed.split("\0");
+    if (paths.at(-1) === "") paths.pop();
+    const included = paths.filter((path) => !ignoredPathSet.has(path));
+    if (included.length === 0) return;
+    await writeFile(
+      pathspecFile,
+      [...included.map((path) => `:(top,literal)${path}`), ""].join("\0"),
+      { mode: 0o600 },
+    );
+    await runPatchReviewGit(
+      repository,
+      [
+        "add",
+        "--all",
+        `--pathspec-from-file=${pathspecFile}`,
+        "--pathspec-file-nul",
+      ],
+      { environment, signal },
+    );
   };
   try {
     signal?.throwIfAborted();
@@ -5270,11 +5336,7 @@ async function snapshotPatchReviewWorktree(
       environment,
       signal,
     });
-    await runPatchReviewGit(
-      repository,
-      ["--literal-pathspecs", "add", "--all", "--", "."],
-      { environment, signal },
-    );
+    await stageWorktree();
     const baselineTree = await runPatchReviewGit(repository, ["write-tree"], {
       environment,
       signal,
@@ -5289,11 +5351,7 @@ async function snapshotPatchReviewWorktree(
             "The patch review snapshot is no longer available.",
           );
         }
-        await runPatchReviewGit(
-          repository,
-          ["--literal-pathspecs", "add", "--all", "--", "."],
-          { environment, signal },
-        );
+        await stageWorktree();
         const candidateTree = await runPatchReviewGit(
           repository,
           ["write-tree"],
@@ -5368,6 +5426,7 @@ async function runFindingPatches(
 ): Promise<{
   patches: FindingPatch[];
   interruptedExitCode?: 130 | 143;
+  reviewRepository?: string;
 }> {
   if (selected.findings.length === 0) {
     stderr.write("No matching open findings to patch.\n");
@@ -5378,6 +5437,7 @@ async function runFindingPatches(
     `\nPatching ${selected.findings.length} confirmed finding${selected.findings.length === 1 ? "" : "s"}...\n`,
   );
   const patches: FindingPatch[] = [];
+  let reviewRepository: string | undefined;
   for (const finding of selected.findings) {
     const interruptedBeforeFinding = interruptedPatchExitCode(options.signal);
     if (interruptedBeforeFinding !== undefined) {
@@ -5405,6 +5465,17 @@ async function runFindingPatches(
           ...options,
           directory: selected.repository,
           findings: [finding],
+          onReviewRepository: (repository) => {
+            if (
+              reviewRepository !== undefined &&
+              reviewRepository !== repository
+            ) {
+              throw new CodexSecurityError(
+                "Patch reviews must use one Git worktree.",
+              );
+            }
+            reviewRepository = repository;
+          },
           findingInstructions: instruction?.trim()
             ? { [finding.occurrenceId]: instruction }
             : undefined,
@@ -5475,7 +5546,10 @@ async function runFindingPatches(
     );
     patches.push(patch);
   }
-  return { patches };
+  return {
+    patches,
+    ...(reviewRepository === undefined ? {} : { reviewRepository }),
+  };
 }
 
 const PATCH_REVIEW_EXIT_CODE = {
@@ -5867,85 +5941,15 @@ async function runPatchReviewWorkflow(
   return PATCH_REVIEW_EXIT_CODE.success;
 }
 
-async function runSkill(
-  skill: "validation" | "fix-finding" | "verify-fix",
+async function prepareSkillContents(
   inputs: readonly (string | ImportedIssue)[],
-  codexOverrides: readonly string[],
-  effort: ScanReasoningEffort | undefined,
-  stdout: Writable,
-  stderr: Writable,
-  dependencies: CliDependencies,
-  options: SkillRunOptions = {},
-): Promise<number> {
-  options.signal?.throwIfAborted();
-  const stages: PatchReviewStage[] =
-    skill === "fix-finding"
-      ? [
-          ...(options.reviewMinimality ? ["minimality" as const] : []),
-          ...(options.reviewStyle ? ["local-coding-style" as const] : []),
-        ]
-      : [];
-  const run = (output: Writable, configuration: SkillRunOptions = options) =>
-    runSkillStage(
-      skill,
-      inputs,
-      codexOverrides,
-      effort,
-      output,
-      stderr,
-      dependencies,
-      configuration,
-    );
-  if (stages.length === 0) {
-    const status = await run(stdout);
-    if (!isInterruptedPatchReview(status)) options.signal?.throwIfAborted();
-    return status;
-  }
-  const directory = options.directory ?? dependencies.currentDirectory();
-  const snapshot = await (
-    dependencies.snapshotPatchReviewWorktree ?? snapshotPatchReviewWorktree
-  )(directory, options.signal);
-  try {
-    options.signal?.throwIfAborted();
-    return await runPatchReviewWorkflow(stages, stdout, {
-      run,
-      options,
-      stderr,
-      snapshot,
-    });
-  } finally {
-    await snapshot.dispose().catch(() => {});
-  }
-}
-
-async function runSkillStage(
-  skill: "validation" | "fix-finding" | "verify-fix",
-  inputs: readonly (string | ImportedIssue)[],
-  codexOverrides: readonly string[],
-  effort: ScanReasoningEffort | undefined,
-  stdout: Writable,
-  stderr: Writable,
-  dependencies: CliDependencies,
-  options: SkillRunOptions = {},
-): Promise<number> {
-  options.signal?.throwIfAborted();
-  const overrides = parseCodexOverrides(codexOverrides, undefined, effort);
-  if (
-    Object.keys(overrides).some(
-      (key) => key !== "model" && key !== "model_reasoning_effort",
-    )
-  ) {
-    throw new CodexSecurityError(
-      "Validation and patching only support model and model_reasoning_effort overrides.",
-    );
-  }
-  const { model, reasoningEffort } = scanModelConfiguration(
-    await mergedCodexConfig({ codexOverrides: overrides }),
-  );
-  const directory = options.directory ?? dependencies.currentDirectory();
-  const contents: Array<string | Finding> = [...(options.findings ?? [])];
+  findings: readonly Finding[] | undefined,
+  directory: string,
+  signal?: AbortSignal,
+): Promise<Array<string | Finding>> {
+  const contents: Array<string | Finding> = [...(findings ?? [])];
   for (const input of inputs) {
-    options.signal?.throwIfAborted();
+    signal?.throwIfAborted();
     if (typeof input !== "string") {
       contents.push(
         `Source: ${input.source}\nIssue: ${input.id}\nURL: ${input.url}\n\n${input.text}`,
@@ -6020,6 +6024,92 @@ async function runSkillStage(
     }
     contents.push(contentsOrLiteral);
   }
+  return contents;
+}
+
+async function runSkill(
+  skill: "validation" | "fix-finding" | "verify-fix",
+  inputs: readonly (string | ImportedIssue)[],
+  codexOverrides: readonly string[],
+  effort: ScanReasoningEffort | undefined,
+  stdout: Writable,
+  stderr: Writable,
+  dependencies: CliDependencies,
+  options: SkillRunOptions = {},
+): Promise<number> {
+  options.signal?.throwIfAborted();
+  const directory = options.directory ?? dependencies.currentDirectory();
+  const contents = await prepareSkillContents(
+    inputs,
+    options.findings,
+    directory,
+    options.signal,
+  );
+  const stages: PatchReviewStage[] =
+    skill === "fix-finding"
+      ? [
+          ...(options.reviewMinimality ? ["minimality" as const] : []),
+          ...(options.reviewStyle ? ["local-coding-style" as const] : []),
+        ]
+      : [];
+  const run = (output: Writable, configuration: SkillRunOptions = options) =>
+    runSkillStage(
+      skill,
+      contents,
+      codexOverrides,
+      effort,
+      output,
+      stderr,
+      dependencies,
+      configuration,
+    );
+  if (stages.length === 0) {
+    const status = await run(stdout);
+    if (!isInterruptedPatchReview(status)) options.signal?.throwIfAborted();
+    return status;
+  }
+  const snapshot = await (
+    dependencies.snapshotPatchReviewWorktree ?? snapshotPatchReviewWorktree
+  )(directory, options.signal);
+  try {
+    options.signal?.throwIfAborted();
+    options.onReviewRepository?.(snapshot.directory);
+    return await runPatchReviewWorkflow(stages, stdout, {
+      run,
+      options,
+      stderr,
+      snapshot,
+    });
+  } finally {
+    await snapshot.dispose().catch(() => {});
+  }
+}
+
+async function runSkillStage(
+  skill: "validation" | "fix-finding" | "verify-fix",
+  contents: readonly (string | Finding)[],
+  codexOverrides: readonly string[],
+  effort: ScanReasoningEffort | undefined,
+  stdout: Writable,
+  stderr: Writable,
+  dependencies: CliDependencies,
+  options: SkillRunOptions = {},
+): Promise<number> {
+  options.signal?.throwIfAborted();
+  const overrides = parseCodexOverrides(codexOverrides, undefined, effort);
+  if (
+    Object.keys(overrides).some(
+      (key) => key !== "model" && key !== "model_reasoning_effort",
+    )
+  ) {
+    throw new CodexSecurityError(
+      "Validation and patching only support model and model_reasoning_effort overrides.",
+    );
+  }
+  const { model, reasoningEffort } = scanModelConfiguration(
+    await mergedCodexConfig({ codexOverrides: overrides }),
+  );
+  const directory = options.directory ?? dependencies.currentDirectory();
   const plugin = await bundledPluginRoot();
   const verify = skill === "verify-fix";
   const reviewStage = options.reviewStage;
@@ -7408,6 +7498,7 @@ async function executeScan(
           patches,
           errorOutput,
           dependencies,
+          patchRun.reviewRepository,
         );
         if (pullRequest !== undefined) {
           scanData = { ...scanData, pullRequest };
