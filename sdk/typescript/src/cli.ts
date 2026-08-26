@@ -6100,7 +6100,9 @@ async function snapshotPatchReviewWorktree(
     GIT_INDEX_FILE: join(temporaryDirectory, "index"),
   };
   const baselineMaterializedSkipWorktreePaths = new Set<string>();
+  const baselineMaterializedTrackedPaths = new Set<string>();
   let baselineTrackedPaths: Buffer[] = [];
+  let baselineTrackedPathSet = new Set<string>();
   const baselineNestedRepositoryStates = new Map<
     string,
     { repository: NestedPatchReviewRepository; state: string }
@@ -6244,6 +6246,20 @@ async function snapshotPatchReviewWorktree(
       if (ignoredPathSet.has(key) && !ignoredInstructionPathSet.has(key)) {
         continue;
       }
+      if (baselineTrackedPathSet.has(key)) {
+        try {
+          await lstat(patchReviewFilesystemPath(repository, pathBytes));
+          if (capturingBaseline) baselineMaterializedTrackedPaths.add(key);
+        } catch (error) {
+          if (!missingPatchReviewPath(error)) throw error;
+          if (!capturingBaseline) {
+            if (baselineMaterializedTrackedPaths.has(key)) {
+              removed.push(pathBytes);
+            }
+            continue;
+          }
+        }
+      }
       const path = decodePatchReviewGitPath(pathBytes);
       const nested =
         path === undefined
@@ -6374,6 +6390,9 @@ async function snapshotPatchReviewWorktree(
         ["ls-files", "--cached", "-z", "--", "."],
         { environment, signal },
       ),
+    );
+    baselineTrackedPathSet = new Set(
+      baselineTrackedPaths.map(patchReviewGitPathKey),
     );
     await stageWorktree();
     capturingBaseline = false;
