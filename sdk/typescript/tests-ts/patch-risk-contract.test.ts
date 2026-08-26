@@ -55,6 +55,7 @@ interface Assessment {
     question: string;
     action: string;
     resolvesUnknowns: string[];
+    resolvesApplicability?: boolean;
     resolvesFailedValidation?: string[];
     outcomes: Record<string, string>;
   }>;
@@ -844,6 +845,28 @@ describe("patch risk assessment contract", () => {
     );
 
     payload.evidencePlan[0]!.outcomes = {
+      patch_caused: "no_op",
+      not_patch_caused: "merge",
+    };
+    const applicableNoOp = await validate(payload);
+    expect(applicableNoOp.status).not.toBe(0);
+    expect(applicableNoOp.stderr).toContain(
+      "a no_op outcome requires the same action to resolve unknown applicability",
+    );
+
+    payload.applicability = {
+      status: "unknown",
+      rationale:
+        "The same evidence action determines whether the patch still applies.",
+    };
+    const unboundNoOp = await validate(payload);
+    expect(unboundNoOp.status).not.toBe(0);
+    expect(unboundNoOp.stderr).toContain(
+      "a no_op outcome requires the same action to resolve unknown applicability",
+    );
+
+    payload.evidencePlan[0]!.resolvesApplicability = true;
+    payload.evidencePlan[0]!.outcomes = {
       patch_caused: "merge",
       not_patch_caused: "revise",
     };
@@ -853,11 +876,6 @@ describe("patch risk assessment contract", () => {
       "a patch_caused outcome must recommend revise, block, or no_op",
     );
 
-    payload.applicability = {
-      status: "unknown",
-      rationale:
-        "The same evidence action determines whether the patch still applies.",
-    };
     payload.evidencePlan[0]!.outcomes = {
       patch_caused: "no_op",
       not_patch_caused: "merge",
@@ -868,6 +886,22 @@ describe("patch risk assessment contract", () => {
       inapplicablePatchOutcome.stderr,
     ).toBe(0);
 
+    payload.validation[0]!.failureAttribution = "patch_caused";
+    delete payload.evidencePlan[0]!.resolvesFailedValidation;
+    payload.evidencePlan[0]!.outcomes = {
+      applicable: "merge",
+      not_applicable: "no_op",
+    };
+    const establishedDefectMerge = await validate(payload);
+    expect(establishedDefectMerge.status).not.toBe(0);
+    expect(establishedDefectMerge.stderr).toContain(
+      "a merge outcome cannot retain an established defect",
+    );
+
+    payload.validation[0]!.failureAttribution = "unknown";
+    payload.evidencePlan[0]!.resolvesFailedValidation = [
+      "focused request tests",
+    ];
     payload.evidencePlan[0]!.outcomes = {
       patch_caused: "revise",
       not_patch_caused: "merge",

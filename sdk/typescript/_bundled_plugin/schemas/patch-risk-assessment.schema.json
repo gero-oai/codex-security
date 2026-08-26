@@ -209,6 +209,7 @@
             "$ref": "#/$defs/stringList",
             "minItems": 1
           },
+          "resolvesApplicability": { "type": "boolean" },
           "resolvesFailedValidation": { "$ref": "#/$defs/stringList" },
           "outcomes": {
             "type": "object",
