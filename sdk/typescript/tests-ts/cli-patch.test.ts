@@ -59,6 +59,7 @@ function dependencies(
       paths: string[];
       diff: string;
       diffBytes?: Buffer;
+      publicationBaseCommit?: string | null;
       publicationUnsafePaths?: string[];
       publicationBaseEntries?: Array<{
         path: string;
@@ -107,6 +108,9 @@ function dependencies(
           ...(selected.diffBytes === undefined
             ? {}
             : { diffBytes: Buffer.from(selected.diffBytes) }),
+          ...(selected.publicationBaseCommit === undefined
+            ? {}
+            : { publicationBaseCommit: selected.publicationBaseCommit }),
           publicationUnsafePaths: [...(selected.publicationUnsafePaths ?? [])],
           publicationBaseEntries: [...(selected.publicationBaseEntries ?? [])],
           publicationEntries: [...(selected.publicationEntries ?? [])],
@@ -1323,6 +1327,67 @@ describe("scan and patch workflow", () => {
       expect(observed?.diff).toContain("+materialized");
       expect(observed?.diff).not.toContain("\u001B[");
       expect(git("show", "HEAD:omit/value.ts")).toBe("preserved");
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("reviews deletion of a pre-existing untracked file", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-untracked-delete-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    const untracked = join(repository, "extra.ts");
+    let observed: { paths: string[]; diff: string } | undefined;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+      await writeFile(untracked, "pre-existing helper\n");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            const server = output!.appServer!;
+            if (server.sandbox === "read-only") {
+              const lines = server.prompt.split("\n");
+              const marker = lines.findIndex((line) =>
+                line.startsWith("Review scope is exactly"),
+              );
+              observed = JSON.parse(lines[marker + 1]!);
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              await rm(untracked);
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(observed?.paths).toEqual(["extra.ts", "value.ts"]);
+      expect(observed?.diff).toContain("-pre-existing helper");
+      expect(observed?.diff).toContain("+fixed");
     } finally {
       await rm(repository, { recursive: true, force: true });
     }
@@ -3137,6 +3202,65 @@ describe("scan and patch workflow", () => {
         ({ command, args }) => command === "git" && args[0] === "commit",
       ),
     ).toBe(false);
+  });
+
+  test("does not publish from a HEAD that changed after review", async () => {
+    const result = resultWithFindings(["high"]);
+    const commands: Array<{ command: string; args: readonly string[] }> = [];
+    const outcome = await runWorkflow(
+      [
+        "patch",
+        "--scan",
+        "scan-1",
+        "--review-minimality",
+        "--create-pr",
+        "--json",
+      ],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        onCodex: (args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+        patchReviewDeltas: [
+          {
+            paths: ["src/finding-1.ts"],
+            diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n",
+            publicationBaseCommit: "a".repeat(40),
+          },
+        ],
+        onRepositoryCommand: (command, args) => {
+          commands.push({ command, args });
+          if (
+            command === "git" &&
+            args[0] === "rev-parse" &&
+            args[1] === "--verify" &&
+            args[2] === "HEAD"
+          ) {
+            return "b".repeat(40);
+          }
+          return "";
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(2);
+    expect(outcome.stderr).toContain(
+      "repository HEAD changed after independent review",
+    );
+    expect(
+      commands.some(
+        ({ command, args }) => command === "git" && args[0] === "switch",
+      ),
+    ).toBe(false);
+    expect(commands.some(({ command }) => command === "gh")).toBe(false);
   });
 
   test("does not publish edits interleaved between reviewed findings", async () => {

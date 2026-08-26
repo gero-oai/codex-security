@@ -1139,6 +1139,7 @@ interface PatchReviewCandidateDelta {
   paths: string[];
   diff: string;
   diffBytes?: Buffer;
+  publicationBaseCommit?: string | null;
   publicationUnsafePaths?: string[];
   publicationBaseEntries?: PatchReviewTreeEntry[];
   publicationEntries?: PatchReviewTreeEntry[];
@@ -4095,6 +4096,7 @@ export async function main(
                 patchRun.reviewRepository,
                 patchRun.reviewUnsafePublicationPaths,
                 patchRun.reviewPublicationEntries,
+                patchRun.reviewBaseCommit,
               );
             }
             if (format === "json" || format === "jsonl") {
@@ -5133,6 +5135,7 @@ async function createPatchPullRequest(
   reviewRepository?: string,
   reviewUnsafePublicationPaths: readonly string[] = [],
   reviewPublicationEntries: readonly PatchReviewTreeEntry[] = [],
+  reviewBaseCommit?: string | null,
 ): Promise<{ branch: string; url: string } | undefined> {
   const repository = reviewRepository ?? selected.repository;
   const files = [
@@ -5177,9 +5180,15 @@ async function createPatchPullRequest(
       dependencies.runRepositoryCommand("git", args, repository, {
         gitIndexFile: temporaryIndex,
       });
-    const head = await run("git", ["rev-parse", "--verify", "HEAD"]).catch(
-      () => undefined,
-    );
+    const readHead = () =>
+      run("git", ["rev-parse", "--verify", "HEAD"]).catch(() => undefined);
+    const head = await readHead();
+    const expectedHead = reviewBaseCommit ?? undefined;
+    if (reviewBaseCommit !== undefined && head !== expectedHead) {
+      throw new CodexSecurityError(
+        "The repository HEAD changed after independent review. Review the patch again before publishing.",
+      );
+    }
     await runWithTemporaryIndex(
       head === undefined ? ["read-tree", "--empty"] : ["read-tree", head],
     );
@@ -5202,12 +5211,27 @@ async function createPatchPullRequest(
       }
     }
     const intendedTree = await runWithTemporaryIndex(["write-tree"]);
+    if (reviewBaseCommit !== undefined && (await readHead()) !== expectedHead) {
+      throw new CodexSecurityError(
+        "The repository HEAD changed after independent review. Review the patch again before publishing.",
+      );
+    }
     await run("git", ["switch", "-c", branch]);
     await runWithTemporaryIndex(["commit", "-m", PATCH_PR_TITLE]);
     if ((await run("git", ["rev-parse", "HEAD^{tree}"])) !== intendedTree) {
       throw new CodexSecurityError(
         "The patch commit contains changes outside the independently reviewed tree.",
       );
+    }
+    if (reviewBaseCommit !== undefined) {
+      const parent = await run("git", ["rev-parse", "--verify", "HEAD^"]).catch(
+        () => undefined,
+      );
+      if (parent !== expectedHead) {
+        throw new CodexSecurityError(
+          "The repository HEAD changed while the reviewed patch was published. Review the resulting local commit before retrying.",
+        );
+      }
     }
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -5999,6 +6023,8 @@ async function snapshotPatchReviewWorktree(
   const baselineMaterializedTrackedPaths = new Set<string>();
   let baselineTrackedPaths: Buffer[] = [];
   let baselineTrackedPathSet = new Set<string>();
+  let baselineSnapshotPaths: Buffer[] = [];
+  let baselineSnapshotPathSet = new Set<string>();
   const baselineNestedRepositoryStates = new Map<
     string,
     { repository: NestedPatchReviewRepository; state: string }
@@ -6149,6 +6175,7 @@ async function snapshotPatchReviewWorktree(
     for (const path of [
       ...splitNulRecords(listed),
       ...baselineTrackedPaths,
+      ...baselineSnapshotPaths,
       ...ignoredPaths,
       ...ignoredInstructionPaths,
     ]) {
@@ -6158,6 +6185,18 @@ async function snapshotPatchReviewWorktree(
     const removed: Buffer[] = [];
     for (const pathBytes of paths.values()) {
       const key = patchReviewGitPathKey(pathBytes);
+      if (
+        baselineSnapshotPathSet.has(key) &&
+        !baselineTrackedPathSet.has(key)
+      ) {
+        try {
+          await lstat(patchReviewFilesystemPath(repository, pathBytes));
+        } catch (error) {
+          if (!missingPatchReviewPath(error)) throw error;
+          removed.push(pathBytes);
+          continue;
+        }
+      }
       if (baselineTrackedPathSet.has(key)) {
         try {
           await lstat(patchReviewFilesystemPath(repository, pathBytes));
@@ -6288,14 +6327,22 @@ async function snapshotPatchReviewWorktree(
     if (reviewerGit === null) {
       throw new CodexSecurityError("git is not available on a trusted PATH.");
     }
-    const headTree = await runPatchReviewGit(
+    const headCommit = await runPatchReviewGit(
       repository,
-      ["rev-parse", "HEAD^{tree}"],
+      ["rev-parse", "--verify", "HEAD"],
       { environment: objectEnvironment, signal },
     ).catch(() => {
       signal?.throwIfAborted();
       return undefined;
     });
+    const headTree =
+      headCommit === undefined
+        ? undefined
+        : await runPatchReviewGit(
+            repository,
+            ["rev-parse", `${headCommit}^{tree}`],
+            { environment: objectEnvironment, signal },
+          );
     const indexTree = await runPatchReviewGit(repository, ["write-tree"], {
       environment: objectEnvironment,
       signal,
@@ -6309,6 +6356,21 @@ async function snapshotPatchReviewWorktree(
       if (currentIndexTree !== indexTree) {
         throw new CodexSecurityError(
           "The Git index changed after patch review started. Preserve staged user changes and retry.",
+        );
+      }
+    };
+    const assertRepositoryHeadUnchanged = async (): Promise<void> => {
+      const currentHead = await runPatchReviewGit(
+        repository,
+        ["rev-parse", "--verify", "HEAD"],
+        { environment: objectEnvironment, signal },
+      ).catch(() => {
+        signal?.throwIfAborted();
+        return undefined;
+      });
+      if (currentHead !== headCommit) {
+        throw new CodexSecurityError(
+          "The repository HEAD changed after patch review started. Retry from the intended base commit.",
         );
       }
     };
@@ -6327,6 +6389,16 @@ async function snapshotPatchReviewWorktree(
       baselineTrackedPaths.map(patchReviewGitPathKey),
     );
     await stageWorktree();
+    baselineSnapshotPaths = splitNulRecords(
+      await runPatchReviewGitBytes(
+        repository,
+        ["ls-files", "--cached", "-z", "--", "."],
+        { environment, signal },
+      ),
+    );
+    baselineSnapshotPathSet = new Set(
+      baselineSnapshotPaths.map(patchReviewGitPathKey),
+    );
     const baselineTree = await runPatchReviewGit(repository, ["write-tree"], {
       environment,
       signal,
@@ -6339,6 +6411,7 @@ async function snapshotPatchReviewWorktree(
       { environment, signal },
     );
     await assertRepositoryIndexUnchanged();
+    await assertRepositoryHeadUnchanged();
     if (confirmedBaselineTree !== baselineTree) {
       throw new CodexSecurityError(
         "The patch worktree changed while its review baseline was captured. Retry from a stable worktree.",
@@ -6395,6 +6468,7 @@ async function snapshotPatchReviewWorktree(
         gitExecutable: reviewerGit.executable,
       },
       async assertBaselineUnchanged() {
+        await assertRepositoryHeadUnchanged();
         await assertRepositoryIndexUnchanged();
         await stageWorktree();
         const current = await runPatchReviewGit(repository, ["write-tree"], {
@@ -6402,6 +6476,7 @@ async function snapshotPatchReviewWorktree(
           signal,
         });
         await assertRepositoryIndexUnchanged();
+        await assertRepositoryHeadUnchanged();
         if (current !== baselineTree) {
           throw new CodexSecurityError(
             "The patch worktree changed after its review baseline was captured. Retry so pre-author changes remain outside the patch.",
@@ -6415,6 +6490,7 @@ async function snapshotPatchReviewWorktree(
             "The patch review snapshot is no longer available.",
           );
         }
+        await assertRepositoryHeadUnchanged();
         await assertRepositoryIndexUnchanged();
         await stageWorktree();
         const candidateTree = await runPatchReviewGit(
@@ -6484,11 +6560,13 @@ async function snapshotPatchReviewWorktree(
           ),
         );
         await assertRepositoryIndexUnchanged();
+        await assertRepositoryHeadUnchanged();
         signal?.throwIfAborted();
         return {
           paths,
           diff: diffBytes.toString("utf8"),
           diffBytes,
+          publicationBaseCommit: headCommit ?? null,
           publicationBaseEntries: selectedPatchReviewTreeEntries(
             paths,
             baselineEntries,
@@ -6526,6 +6604,7 @@ async function runFindingPatches(
   reviewRepository?: string;
   reviewUnsafePublicationPaths?: string[];
   reviewPublicationEntries?: PatchReviewTreeEntry[];
+  reviewBaseCommit?: string | null;
 }> {
   if (selected.findings.length === 0) {
     stderr.write("No matching open findings to patch.\n");
@@ -6539,6 +6618,7 @@ async function runFindingPatches(
   let reviewRepository: string | undefined;
   const reviewUnsafePublicationPaths = new Set<string>();
   const reviewPublicationEntries = new Map<string, PatchReviewTreeEntry>();
+  let reviewBaseCommit: string | null | undefined;
   for (const finding of selected.findings) {
     const interruptedBeforeFinding = interruptedPatchExitCode(options.signal);
     if (interruptedBeforeFinding !== undefined) {
@@ -6578,6 +6658,17 @@ async function runFindingPatches(
             reviewRepository = repository;
           },
           onReviewCandidate: (candidate) => {
+            if (candidate.publicationBaseCommit !== undefined) {
+              if (
+                reviewBaseCommit !== undefined &&
+                reviewBaseCommit !== candidate.publicationBaseCommit
+              ) {
+                throw new CodexSecurityError(
+                  "Patch reviews must use one base commit.",
+                );
+              }
+              reviewBaseCommit = candidate.publicationBaseCommit;
+            }
             const baseEntries = new Map(
               (candidate.publicationBaseEntries ?? []).map((entry) => [
                 entry.path,
@@ -6681,6 +6772,7 @@ async function runFindingPatches(
       : {
           reviewPublicationEntries: [...reviewPublicationEntries.values()],
         }),
+    ...(reviewBaseCommit === undefined ? {} : { reviewBaseCommit }),
   };
 }
 
@@ -8771,6 +8863,7 @@ async function executeScan(
           patchRun.reviewRepository,
           patchRun.reviewUnsafePublicationPaths,
           patchRun.reviewPublicationEntries,
+          patchRun.reviewBaseCommit,
         );
         if (pullRequest !== undefined) {
           scanData = { ...scanData, pullRequest };
