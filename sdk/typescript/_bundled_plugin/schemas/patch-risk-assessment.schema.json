@@ -151,13 +151,14 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "status", "protects"],
+        "required": ["name", "status", "protects", "requiredForMerge"],
         "properties": {
           "name": { "$ref": "#/$defs/nonBlankString" },
           "status": {
             "enum": ["passed", "failed", "skipped", "unavailable"]
           },
           "protects": { "$ref": "#/$defs/nonBlankString" },
+          "requiredForMerge": { "type": "boolean" },
           "failureAttribution": {
             "enum": ["patch_caused", "not_patch_caused", "unknown"]
           }
