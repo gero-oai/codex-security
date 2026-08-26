@@ -2775,6 +2775,69 @@ describe("scan and patch workflow", () => {
     }
   }, 30_000);
 
+  test.skipIf(process.platform === "win32" || process.platform === "darwin")(
+    "preserves raw dormant submodule metadata names",
+    async () => {
+      const repository = await realpath(
+        await mkdtemp(join(tmpdir(), "codex-security-raw-submodule-")),
+      );
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      try {
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        await writeFile(join(repository, "value.ts"), "unsafe\n");
+        git("add", "--", "value.ts");
+        git("commit", "-m", "Initial synthetic checkout");
+        const moduleDirectory = Buffer.concat([
+          Buffer.from(`${join(repository, ".git", "modules")}/`),
+          Buffer.from([0xff]),
+        ]);
+        await mkdir(Buffer.concat([moduleDirectory, Buffer.from("/objects")]), {
+          recursive: true,
+        });
+        await writeFile(
+          Buffer.concat([moduleDirectory, Buffer.from("/HEAD")]),
+          "ref: refs/heads/main\n",
+        );
+
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: async (_args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                output!.stdout.write(
+                  JSON.stringify({ status: "approved", findings: [] }),
+                );
+              } else {
+                await writeFile(join(repository, "value.ts"), "fixed\n");
+                output!.stdout.write("Verified synthetic patch.");
+              }
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode, outcome.stderr).toBe(0);
+      } finally {
+        await rm(repository, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
   test("fails closed when the author changes sibling linked-worktree metadata", async () => {
     const root = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-sibling-worktree-")),

@@ -6955,13 +6955,21 @@ const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
 async function patchReviewModuleGitDirectories(
   gitDirectory: string,
   signal?: AbortSignal,
-): Promise<string[]> {
-  const directories: string[] = [];
-  const visitNamespace = async (directory: string): Promise<void> => {
+): Promise<Buffer[]> {
+  const directories: Buffer[] = [];
+  const childPath = (directory: Buffer, name: Buffer | string): Buffer =>
+    Buffer.concat([
+      directory,
+      Buffer.from("/"),
+      typeof name === "string" ? Buffer.from(name) : name,
+    ]);
+  const visitNamespace = async (directory: Buffer): Promise<void> => {
     signal?.throwIfAborted();
     let metadata: Awaited<ReturnType<typeof lstat>>;
     try {
-      metadata = await lstat(directory);
+      metadata = await lstat(
+        patchReviewFilesystemPath(gitDirectory, directory),
+      );
     } catch (error) {
       if (missingPatchReviewPath(error)) return;
       throw error;
@@ -6971,11 +6979,19 @@ async function patchReviewModuleGitDirectories(
         "Git submodule metadata changed after patch review started.",
       );
     }
-    const entries = (await readdir(directory)).sort();
+    const entries = (
+      await readdir(patchReviewFilesystemPath(gitDirectory, directory), {
+        encoding: "buffer",
+      })
+    )
+      .map((name) => (Buffer.isBuffer(name) ? name : Buffer.from(name)))
+      .sort(Buffer.compare);
     for (const name of entries) {
       signal?.throwIfAborted();
-      const child = join(directory, name);
-      const childMetadata = await lstat(child);
+      const child = childPath(directory, name);
+      const childMetadata = await lstat(
+        patchReviewFilesystemPath(gitDirectory, child),
+      );
       if (!childMetadata.isDirectory()) {
         throw new CodexSecurityError(
           "Git submodule metadata changed after patch review started.",
@@ -6983,7 +6999,9 @@ async function patchReviewModuleGitDirectories(
       }
       const [head, config, objects] = await Promise.all(
         ["HEAD", "config", "objects"].map((entry) =>
-          lstat(join(child, entry)).catch((error: unknown) => {
+          lstat(
+            patchReviewFilesystemPath(gitDirectory, childPath(child, entry)),
+          ).catch((error: unknown) => {
             if (missingPatchReviewPath(error)) return undefined;
             throw error;
           }),
@@ -6995,13 +7013,13 @@ async function patchReviewModuleGitDirectories(
         objects?.isDirectory() === true
       ) {
         directories.push(child);
-        await visitNamespace(join(child, "modules"));
+        await visitNamespace(childPath(child, "modules"));
       } else {
         await visitNamespace(child);
       }
     }
   };
-  await visitNamespace(join(gitDirectory, "modules"));
+  await visitNamespace(Buffer.from("modules"));
   return directories;
 }
 
@@ -7226,26 +7244,28 @@ async function snapshotPatchReviewWorktree(
           signal,
         );
       }
-      for (const moduleGitDirectory of await patchReviewModuleGitDirectories(
+      for (const modulePath of await patchReviewModuleGitDirectories(
         gitDirectory,
         signal,
       )) {
-        const modulePath = Buffer.from(
-          relative(gitDirectory, moduleGitDirectory),
-        );
         updateNestedPatchReviewDigest(
           digest,
           modulePath,
           "module-git-directory",
           "",
         );
-        await hashNestedPatchReviewGitDirectory(
-          moduleGitDirectory,
-          modulePath,
-          digest,
-          hashContext,
-          signal,
-        );
+        for (const path of [
+          ...PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS,
+          "index",
+        ]) {
+          await hashNestedPatchReviewPath(
+            gitDirectory,
+            Buffer.concat([modulePath, Buffer.from(`/${path}`)]),
+            digest,
+            hashContext,
+            signal,
+          );
+        }
       }
     }
     return digest.digest("hex");
