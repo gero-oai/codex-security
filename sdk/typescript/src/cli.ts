@@ -8205,6 +8205,7 @@ async function runFindingPatches(
   const patches: FindingPatch[] = [];
   let reviewRepository: string | undefined;
   const reviewUnsafePublicationPaths = new Set<string>();
+  const reviewPublicationPaths = new Set<string>();
   const reviewPublicationBaseEntries = new Map<string, PatchReviewTreeEntry>();
   const reviewPublicationEntries = new Map<string, PatchReviewTreeEntry>();
   let reviewPublicationCandidate: PatchReviewPublicationCandidate | undefined;
@@ -8249,9 +8250,6 @@ async function runFindingPatches(
             reviewRepository = repository;
           },
           onReviewCandidate: (candidate) => {
-            const priorPublicationEntries = new Map(reviewPublicationEntries);
-            reviewPublicationBaseEntries.clear();
-            reviewPublicationEntries.clear();
             if (candidate.publicationBaseCommit !== undefined) {
               if (
                 reviewBaseCommit !== undefined &&
@@ -8269,21 +8267,42 @@ async function runFindingPatches(
                 entry,
               ]),
             );
-            for (const entry of baseEntries.values()) {
-              reviewPublicationBaseEntries.set(entry.path, entry);
-            }
+            const publicationEntries = new Map(
+              (candidate.publicationEntries ?? []).map((entry) => [
+                entry.path,
+                entry,
+              ]),
+            );
+            const candidatePaths = new Set([
+              ...candidate.paths,
+              ...baseEntries.keys(),
+              ...publicationEntries.keys(),
+            ]);
             for (const path of candidate.publicationUnsafePaths ?? []) {
               if (
+                !reviewPublicationPaths.has(path) ||
                 !samePatchReviewTreeEntry(
-                  priorPublicationEntries.get(path),
+                  reviewPublicationEntries.get(path),
                   baseEntries.get(path),
                 )
               ) {
                 reviewUnsafePublicationPaths.add(path);
               }
             }
-            for (const entry of candidate.publicationEntries ?? []) {
-              reviewPublicationEntries.set(entry.path, entry);
+            for (const path of candidatePaths) {
+              if (!reviewPublicationPaths.has(path)) {
+                const baseEntry = baseEntries.get(path);
+                if (baseEntry !== undefined) {
+                  reviewPublicationBaseEntries.set(path, baseEntry);
+                }
+                reviewPublicationPaths.add(path);
+              }
+              const publicationEntry = publicationEntries.get(path);
+              if (publicationEntry === undefined) {
+                reviewPublicationEntries.delete(path);
+              } else {
+                reviewPublicationEntries.set(path, publicationEntry);
+              }
             }
           },
           onReviewPublicationCandidate: (candidate) => {

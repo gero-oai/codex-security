@@ -674,7 +674,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                         errors.append(
                             f"evidencePlan.{index}: a merge outcome cannot retain unknown impact"
                         )
-                    if value["regressionLikelihood"]["rating"] == "unknown":
+                    if outcome_likelihood == "unknown":
                         errors.append(
                             f"evidencePlan.{index}: a merge outcome cannot retain unknown regression likelihood"
                         )
