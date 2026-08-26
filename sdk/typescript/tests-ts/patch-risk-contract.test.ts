@@ -539,6 +539,7 @@ describe("patch risk assessment contract", () => {
       payload.recommendation = recommendation;
       payload.workflowLabel = recommendation;
       payload.impact.rating = "unknown";
+      payload.confidence.rating = "moderate";
       if (recommendation === "revise") {
         payload.materialBoundaries[0]!.result = "contradicted";
       } else if (recommendation === "no_op") {
