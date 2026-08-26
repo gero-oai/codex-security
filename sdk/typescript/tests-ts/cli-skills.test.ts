@@ -560,9 +560,14 @@ describe("CLI skill commands", () => {
         verdict.report = [
           "## Patch risk",
           "",
+          "Authorization: unchanged",
+          "Token handling: unaffected",
+          "",
           "-----BEGIN PRIVATE KEY-----",
           "SYNTHETIC-MULTILINE-KEY-BODY",
           "-----END PRIVATE KEY-----",
+          "",
+          "Recoverability: easy",
         ].join("\n");
         output!.stdout.write(JSON.stringify(verdict));
         return 0;
@@ -578,9 +583,98 @@ describe("CLI skill commands", () => {
       ),
     ).toBe(0);
     expect(stderr.text()).toContain("[redacted]");
+    expect(stderr.text()).toContain("Authorization: unchanged");
+    expect(stderr.text()).toContain("Token handling: unaffected");
+    expect(stderr.text()).toContain("Recoverability: easy");
     expect(stderr.text()).not.toContain("SYNTHETIC-MULTILINE-KEY-BODY");
     expect(stderr.text()).not.toContain("-----END PRIVATE KEY-----");
   });
+
+  test("surfaces patch-risk validator setup failures", async () => {
+    const stderr = capture();
+    const current = dependencies({
+      onCodex: (_args, output) => {
+        const { prompt, sandbox } = output!.appServer!;
+        output!.stdout.write(
+          sandbox === "read-only"
+            ? JSON.stringify(patchRiskVerdict(prompt))
+            : "Verified synthetic patch.",
+        );
+        return 0;
+      },
+    });
+    current.validatePatchRiskAssessment = async () => {
+      throw new Error("synthetic validator setup failure");
+    };
+
+    expect(
+      await main(
+        ["patch", "Synthetic security issue", "--assess-patch-risk"],
+        capture().stream,
+        stderr.stream,
+        current,
+      ),
+    ).toBe(2);
+    expect(stderr.text()).toContain("synthetic validator setup failure");
+    expect(stderr.text()).not.toContain(
+      "patch-risk-assessment review returned an invalid assessment",
+    );
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "surfaces patch-risk validator launch failures",
+    async () => {
+      const root = await mkdtemp(
+        join(tmpdir(), "codex-security-patch-risk-python-"),
+      );
+      const python = join(root, "python3");
+      try {
+        await writeFile(
+          python,
+          [
+            "#!/bin/sh",
+            'if [ "$1" = "-I" ] && [ "$2" = "-c" ]; then',
+            '  /bin/rm -f -- "$0"',
+            "  printf '%s\\n' codex-security-python-ok",
+            "  exit 0",
+            "fi",
+            "exit 1",
+            "",
+          ].join("\n"),
+        );
+        await filesystem.chmod(python, 0o700);
+        const stderr = capture();
+        const current = dependencies({
+          environment: { ...process.env, PYTHON: python },
+          onCodex: (_args, output) => {
+            const { prompt, sandbox } = output!.appServer!;
+            output!.stdout.write(
+              sandbox === "read-only"
+                ? JSON.stringify(patchRiskVerdict(prompt))
+                : "Verified synthetic patch.",
+            );
+            return 0;
+          },
+        });
+        delete current.validatePatchRiskAssessment;
+
+        expect(
+          await main(
+            ["patch", "Synthetic security issue", "--assess-patch-risk"],
+            capture().stream,
+            stderr.stream,
+            current,
+          ),
+        ).toBe(2);
+        expect(stderr.text()).toContain("ENOENT");
+        expect(stderr.text()).not.toContain(
+          "patch-risk-assessment review returned an invalid assessment",
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("rejects duplicate keys in the raw patch-risk review envelope", async () => {
     const stderr = capture();

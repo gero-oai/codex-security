@@ -5293,8 +5293,8 @@ async function createPatchPullRequest(
   return publishPatchBranch(repository, branch, stderr, dependencies);
 }
 
-function safePatchText(value: string): string {
-  return stripVTControlCharacters(safeErrorMessage(value)).replaceAll(
+function stripPatchControlCharacters(value: string): string {
+  return stripVTControlCharacters(value).replaceAll(
     /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu,
     " ",
   );
@@ -5314,12 +5314,36 @@ function patchReviewGitProcessEnvironment(): NodeJS.ProcessEnv {
   };
 }
 
+function safePatchText(value: string): string {
+  return stripPatchControlCharacters(safeErrorMessage(value));
+}
+
+const SAFE_PATCH_REPORT_STATUS =
+  /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:authorization|token handling)\s*:\s*(?:unchanged|unaffected|preserved|not affected|not applicable|none|absent|unknown)(?:[.!])?\s*$/iu;
+const PRIVATE_KEY_BLOCK_START =
+  /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
+const PRIVATE_KEY_BLOCK_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
+
 function safePatchReport(value: string): string {
-  return safeErrorMessage(value)
-    .split(/\r?\n/u)
-    .map((line) => safePatchText(line))
-    .join("\n")
-    .trim();
+  const lines: string[] = [];
+  let insidePrivateKey = false;
+  for (const line of value.split(/\r?\n/u)) {
+    if (insidePrivateKey) {
+      if (PRIVATE_KEY_BLOCK_END.test(line)) insidePrivateKey = false;
+      continue;
+    }
+    if (PRIVATE_KEY_BLOCK_START.test(line)) {
+      lines.push("[redacted]");
+      insidePrivateKey = !PRIVATE_KEY_BLOCK_END.test(line);
+      continue;
+    }
+    lines.push(
+      SAFE_PATCH_REPORT_STATUS.test(line)
+        ? stripPatchControlCharacters(line)
+        : safePatchText(line),
+    );
+  }
+  return lines.join("\n").trim();
 }
 
 async function runPatchReviewGit(
@@ -6642,9 +6666,17 @@ async function validatePatchRiskAssessment(
       );
       signal?.throwIfAborted();
       return true;
-    } catch {
+    } catch (error) {
       signal?.throwIfAborted();
-      return false;
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        typeof error.code === "number"
+      ) {
+        return false;
+      }
+      throw error;
     }
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -7135,17 +7167,20 @@ async function runIndependentPatchReview(
   }
 
   if (stage === "patch-risk-assessment") {
-    const artifactUnchanged = await artifact!.verify().catch(() => false);
-    const assessmentValid = artifactUnchanged
-      ? await context
-          .validatePatchRiskAssessment(review.response, {
+    let artifactUnchanged = false;
+    let assessmentValid = false;
+    try {
+      artifactUnchanged = await artifact!.verify().catch(() => false);
+      assessmentValid = artifactUnchanged
+        ? await context.validatePatchRiskAssessment(review.response, {
             environment: context.options.environment ?? context.environment,
             pythonPath: context.options.pythonPath,
             signal: context.options.signal,
           })
-          .catch(() => false)
-      : false;
-    await artifact!.dispose().catch(() => {});
+        : false;
+    } finally {
+      await artifact!.dispose().catch(() => {});
+    }
     context.options.signal?.throwIfAborted();
     if (!artifactUnchanged || !assessmentValid) {
       const reason = artifactUnchanged
