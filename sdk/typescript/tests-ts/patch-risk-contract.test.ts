@@ -466,6 +466,10 @@ describe("patch risk assessment contract", () => {
     payload.impact.rating = "unknown";
     payload.regressionLikelihood.rating = "unknown";
     payload.confidence.rating = "low";
+    payload.applicability = {
+      status: "unknown",
+      rationale: "Runtime reachability remains unresolved.",
+    };
     payload.unknowns = [
       {
         id: "runtime-impact",
@@ -478,6 +482,7 @@ describe("patch risk assessment contract", () => {
         question: "Does the changed path reach a supported runtime?",
         action: "Inspect the checked-in runtime registry.",
         resolvesUnknowns: ["runtime-impact"],
+        resolvesApplicability: true,
         outcomes: {
           reachable: "merge",
           unreachable: "no_op",
@@ -587,6 +592,10 @@ describe("patch risk assessment contract", () => {
     payload.recommendation = "hold_for_evidence";
     payload.workflowLabel = "hold_for_evidence";
     payload.confidence.rating = "low";
+    payload.applicability = {
+      status: "unknown",
+      rationale: "Ownership of the rollout target remains unresolved.",
+    };
     payload.unknowns = [
       {
         id: "rollout-target",
@@ -605,6 +614,7 @@ describe("patch risk assessment contract", () => {
         question: "Does the changed configuration own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
         resolvesUnknowns: ["rollout-target"],
+        resolvesApplicability: true,
         outcomes: {
           supported: "merge",
           contradicted: "no_op",
@@ -639,6 +649,7 @@ describe("patch risk assessment contract", () => {
         question: "Does this repository own the affected runtime?",
         action: "Inspect the checked-in deployment registry.",
         resolvesUnknowns: ["runtime-owner"],
+        resolvesApplicability: true,
         outcomes: {
           owned: "revise",
           not_owned: "no_op",
