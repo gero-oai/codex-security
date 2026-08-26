@@ -1082,6 +1082,7 @@ interface SkillCommandOutput {
     readonly approvalPolicy?: "never" | "on-request";
     readonly sandbox?: "read-only" | "workspace-write";
     readonly isolateReviewerTools?: boolean;
+    readonly reviewRepository?: PatchReviewRepositoryView;
     readonly onEvent?: (event: Readonly<Record<string, unknown>>) => void;
   };
 }
@@ -1123,6 +1124,7 @@ interface SkillRunOptions extends PatchReviewOptions {
   reviewStage?: PatchReviewStage;
   reviewFindings?: readonly string[];
   reviewCandidate?: PatchReviewCandidateDelta;
+  reviewRepository?: PatchReviewRepositoryView;
   onReviewRepository?: (repository: string) => void;
   onReviewCandidate?: (candidate: PatchReviewCandidateDelta) => void;
 }
@@ -1142,8 +1144,17 @@ interface PatchReviewTreeEntry {
   object?: string;
 }
 
+interface PatchReviewRepositoryView {
+  directory: string;
+  repository: string;
+  tree: string;
+  objectDirectory: string;
+  alternateObjectDirectory: string;
+}
+
 interface PatchReviewWorktreeSnapshot {
   directory: string;
+  reviewRepository: PatchReviewRepositoryView;
   candidate(): Promise<PatchReviewCandidateDelta>;
   dispose(): Promise<void>;
 }
@@ -1464,6 +1475,7 @@ export async function runCodexSkillCommand(
                     approvalPolicy: output.appServer.approvalPolicy,
                     sandbox: output.appServer.sandbox,
                     isolateReviewerTools: output.appServer.isolateReviewerTools,
+                    reviewRepository: output.appServer.reviewRepository,
                     onEvent: output.appServer.onEvent,
                   },
             ),
@@ -5179,11 +5191,12 @@ async function runPatchReviewGit(
   args: readonly string[],
   options: {
     environment?: NodeJS.ProcessEnv;
+    input?: string;
     signal?: AbortSignal;
     trim?: boolean;
   } = {},
 ): Promise<string> {
-  const { environment, signal, trim = true } = options;
+  const { environment, input, signal, trim = true } = options;
   signal?.throwIfAborted();
   const isolatedEnvironment = {
     ...exportEnvironment(),
@@ -5198,7 +5211,7 @@ async function runPatchReviewGit(
     throw new CodexSecurityError("git is not available on a trusted PATH.");
   }
   signal?.throwIfAborted();
-  const { stdout } = await execFile(
+  const execution = execFile(
     executable.executable,
     ["-c", "core.fsmonitor=false", ...args],
     {
@@ -5210,6 +5223,11 @@ async function runPatchReviewGit(
       windowsHide: true,
     },
   );
+  if (input !== undefined) {
+    execution.child.stdin?.on("error", () => {});
+    execution.child.stdin?.end(input);
+  }
+  const { stdout } = await execution;
   signal?.throwIfAborted();
   const value = String(stdout);
   return trim ? value.replace(/\r?\n$/u, "") : value;
@@ -5430,6 +5448,7 @@ async function snapshotPatchReviewWorktree(
     join(temporaryRoot, "codex-security-patch-review-"),
   );
   const objectDirectory = join(temporaryDirectory, "objects");
+  const reviewDirectory = join(temporaryDirectory, "review");
   const pathspecFile = join(temporaryDirectory, "candidate-pathspecs");
   const objectEnvironment = {
     GIT_OBJECT_DIRECTORY: objectDirectory,
@@ -5439,6 +5458,8 @@ async function snapshotPatchReviewWorktree(
     ...objectEnvironment,
     GIT_INDEX_FILE: join(temporaryDirectory, "index"),
   };
+  const baselineMaterializedSkipWorktreePaths = new Set<string>();
+  let capturingBaseline = true;
   const stageWorktree = async (): Promise<void> => {
     const sparseEntries = await runPatchReviewGit(
       repository,
@@ -5467,6 +5488,7 @@ async function snapshotPatchReviewWorktree(
     const paths = listed.split("\0");
     if (paths.at(-1) === "") paths.pop();
     const included: string[] = [];
+    const removed: string[] = [];
     for (const path of paths) {
       if (ignoredPathSet.has(path)) continue;
       if (await isNestedPatchReviewRepository(repository, path)) continue;
@@ -5474,33 +5496,52 @@ async function snapshotPatchReviewWorktree(
         try {
           await lstat(join(repository, path));
         } catch (error) {
-          if (missingPatchReviewPath(error)) continue;
+          if (missingPatchReviewPath(error)) {
+            if (
+              !capturingBaseline &&
+              baselineMaterializedSkipWorktreePaths.has(path)
+            ) {
+              removed.push(path);
+            }
+            continue;
+          }
           throw error;
+        }
+        if (capturingBaseline) {
+          baselineMaterializedSkipWorktreePaths.add(path);
         }
       }
       included.push(path);
     }
-    if (included.length === 0) return;
-    await writeFile(
-      pathspecFile,
-      [...included.map((path) => `:(top,literal)${path}`), ""].join("\0"),
-      { mode: 0o600 },
-    );
-    await runPatchReviewGit(
-      repository,
-      [
-        "add",
-        "--all",
-        "--sparse",
-        `--pathspec-from-file=${pathspecFile}`,
-        "--pathspec-file-nul",
-      ],
-      { environment, signal },
-    );
+    if (included.length > 0) {
+      await writeFile(
+        pathspecFile,
+        [...included.map((path) => `:(top,literal)${path}`), ""].join("\0"),
+        { mode: 0o600 },
+      );
+      await runPatchReviewGit(
+        repository,
+        [
+          "add",
+          "--all",
+          "--sparse",
+          `--pathspec-from-file=${pathspecFile}`,
+          "--pathspec-file-nul",
+        ],
+        { environment, signal },
+      );
+    }
+    if (removed.length > 0) {
+      await runPatchReviewGit(
+        repository,
+        ["update-index", "--force-remove", "-z", "--stdin"],
+        { environment, input: `${removed.join("\0")}\0`, signal },
+      );
+    }
   };
   try {
     signal?.throwIfAborted();
-    await mkdir(objectDirectory);
+    await Promise.all([mkdir(objectDirectory), mkdir(reviewDirectory)]);
     const headTree = await runPatchReviewGit(
       repository,
       ["rev-parse", "HEAD^{tree}"],
@@ -5518,6 +5559,7 @@ async function snapshotPatchReviewWorktree(
       signal,
     });
     await stageWorktree();
+    capturingBaseline = false;
     const baselineTree = await runPatchReviewGit(repository, ["write-tree"], {
       environment,
       signal,
@@ -5562,6 +5604,13 @@ async function snapshotPatchReviewWorktree(
     let disposed = false;
     return {
       directory: repository,
+      reviewRepository: {
+        directory: reviewDirectory,
+        repository,
+        tree: baselineTree,
+        objectDirectory,
+        alternateObjectDirectory: repositoryObjectDirectory,
+      },
       async candidate() {
         signal?.throwIfAborted();
         if (disposed) {
@@ -5655,6 +5704,385 @@ async function snapshotPatchReviewWorktree(
     await rm(temporaryDirectory, { recursive: true, force: true });
     throw error;
   }
+}
+
+interface PatchReviewGitTreeEntry {
+  mode: string;
+  type: "blob" | "commit" | "tree";
+  object: string;
+  path: string;
+}
+
+function patchReviewTreePath(path: string, allowRoot = false): string {
+  const normalized =
+    process.platform === "win32" ? path.replaceAll("\\", "/") : path;
+  if (
+    (!allowRoot && normalized.length === 0) ||
+    isAbsolute(path) ||
+    (process.platform === "win32" &&
+      (win32.isAbsolute(path) || /^[A-Za-z]:/u.test(path))) ||
+    normalized.split("/").some((part) => part === "..")
+  ) {
+    throw new CodexSecurityError(
+      "Repository inspection requires a confined relative path.",
+    );
+  }
+  return normalized.replace(/^\.\//u, "").replace(/\/$/u, "");
+}
+
+function parsePatchReviewGitTreeEntries(
+  output: string,
+): PatchReviewGitTreeEntry[] {
+  const records = output.split("\0");
+  if (records.at(-1) === "") records.pop();
+  return records.map((record) => {
+    const separator = record.indexOf("\t");
+    const metadata = separator < 0 ? [] : record.slice(0, separator).split(" ");
+    const [mode, type, object] = metadata;
+    if (
+      separator < 0 ||
+      mode === undefined ||
+      !/^[0-7]{6}$/u.test(mode) ||
+      (type !== "blob" && type !== "commit" && type !== "tree") ||
+      object === undefined ||
+      !/^[0-9a-f]+$/u.test(object)
+    ) {
+      throw new CodexSecurityError(
+        "The baseline repository tree is unreadable.",
+      );
+    }
+    return { mode, type, object, path: record.slice(separator + 1) };
+  });
+}
+
+async function runPatchReviewRepositoryMcp(
+  args: readonly string[],
+): Promise<number> {
+  const [repository, tree, objectDirectory, alternateObjectDirectory] = args;
+  if (
+    repository === undefined ||
+    tree === undefined ||
+    objectDirectory === undefined ||
+    alternateObjectDirectory === undefined ||
+    args.length !== 4
+  ) {
+    return 2;
+  }
+  const canonicalRepository = await realpath(repository);
+  const environment = {
+    GIT_OBJECT_DIRECTORY: objectDirectory,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: JSON.stringify(alternateObjectDirectory),
+  };
+  await runPatchReviewGit(
+    canonicalRepository,
+    ["cat-file", "-e", `${tree}^{tree}`],
+    {
+      environment,
+    },
+  );
+
+  const treeEntries = async (
+    directory: string,
+  ): Promise<{ prefix: string; entries: PatchReviewGitTreeEntry[] }> => {
+    const path = patchReviewTreePath(directory, true);
+    if (path.length === 0) {
+      return {
+        prefix: "",
+        entries: parsePatchReviewGitTreeEntries(
+          await runPatchReviewGit(
+            canonicalRepository,
+            ["ls-tree", "-z", tree],
+            {
+              environment,
+              trim: false,
+            },
+          ),
+        ),
+      };
+    }
+    const entry = parsePatchReviewGitTreeEntries(
+      await runPatchReviewGit(
+        canonicalRepository,
+        ["ls-tree", "--full-tree", "-z", tree, "--", `:(top,literal)${path}`],
+        { environment, trim: false },
+      ),
+    ).find((candidate) => candidate.path === path);
+    if (entry?.type !== "tree") {
+      throw new CodexSecurityError(
+        "The requested baseline path is not a directory.",
+      );
+    }
+    return {
+      prefix: `${path}/`,
+      entries: parsePatchReviewGitTreeEntries(
+        await runPatchReviewGit(
+          canonicalRepository,
+          ["ls-tree", "-z", entry.object],
+          { environment, trim: false },
+        ),
+      ),
+    };
+  };
+
+  const send = (value: JsonObject): void => {
+    process.stdout.write(`${JSON.stringify(value)}\n`);
+  };
+  const result = (
+    id: JsonValue,
+    text: string,
+    isError = false,
+  ): JsonObject => ({
+    jsonrpc: "2.0",
+    id,
+    result: {
+      content: [{ type: "text", text }],
+      ...(isError ? { isError: true } : {}),
+    },
+  });
+  const tools: JsonObject[] = [
+    {
+      name: "read_file",
+      description:
+        "Read one text file from the immutable pre-author repository tree.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["path"],
+        properties: { path: { type: "string" } },
+      },
+      annotations: {
+        readOnlyHint: true,
+        idempotentHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    {
+      name: "list_directory",
+      description:
+        "List one directory from the immutable pre-author repository tree.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { path: { type: "string" } },
+      },
+      annotations: {
+        readOnlyHint: true,
+        idempotentHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    {
+      name: "search",
+      description:
+        "Search text in the immutable pre-author repository tree using a literal query.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["query"],
+        properties: {
+          query: { type: "string" },
+          path: { type: "string" },
+        },
+      },
+      annotations: {
+        readOnlyHint: true,
+        idempotentHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+  ];
+
+  for await (const line of createInterface({ input: process.stdin })) {
+    if (line.trim().length === 0) continue;
+    let request: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (typeof parsed !== "object" || parsed === null) throw new Error();
+      request = parsed as Record<string, unknown>;
+    } catch {
+      send({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32700, message: "Parse error" },
+      });
+      continue;
+    }
+    const id = (request["id"] ?? null) as JsonValue;
+    const method = request["method"];
+    if (method === "notifications/initialized") continue;
+    if (method === "initialize") {
+      send({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2025-11-25",
+          capabilities: { tools: {} },
+          serverInfo: { name: "codex-security-patch-review", version: VERSION },
+        },
+      });
+      continue;
+    }
+    if (method === "tools/list") {
+      send({ jsonrpc: "2.0", id, result: { tools } });
+      continue;
+    }
+    if (method !== "tools/call") {
+      if (request["id"] !== undefined) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: "Method not found" },
+        });
+      }
+      continue;
+    }
+
+    const params = request["params"];
+    const name =
+      typeof params === "object" && params !== null && "name" in params
+        ? params.name
+        : undefined;
+    const arguments_ =
+      typeof params === "object" && params !== null && "arguments" in params
+        ? params.arguments
+        : undefined;
+    const values =
+      typeof arguments_ === "object" && arguments_ !== null
+        ? (arguments_ as Record<string, unknown>)
+        : {};
+    try {
+      if (name === "read_file") {
+        if (typeof values["path"] !== "string") {
+          throw new CodexSecurityError("read_file requires a path.");
+        }
+        const path = patchReviewTreePath(values["path"]);
+        const entry = parsePatchReviewGitTreeEntries(
+          await runPatchReviewGit(
+            canonicalRepository,
+            [
+              "ls-tree",
+              "--full-tree",
+              "-z",
+              tree,
+              "--",
+              `:(top,literal)${path}`,
+            ],
+            { environment, trim: false },
+          ),
+        ).find((candidate) => candidate.path === path);
+        if (entry?.type !== "blob") {
+          throw new CodexSecurityError(
+            "The requested baseline path is not a file.",
+          );
+        }
+        const contents = await runPatchReviewGit(
+          canonicalRepository,
+          ["cat-file", "blob", entry.object],
+          { environment, trim: false },
+        );
+        send(
+          result(
+            id,
+            entry.mode === "120000"
+              ? `Symbolic link target (not followed):\n${contents}`
+              : contents,
+          ),
+        );
+        continue;
+      }
+      if (name === "list_directory") {
+        if (
+          values["path"] !== undefined &&
+          typeof values["path"] !== "string"
+        ) {
+          throw new CodexSecurityError("list_directory path must be a string.");
+        }
+        const { prefix, entries } = await treeEntries(
+          (values["path"] as string | undefined) ?? "",
+        );
+        send(
+          result(
+            id,
+            JSON.stringify(
+              entries.map((entry) => ({
+                path: `${prefix}${entry.path}`,
+                type:
+                  entry.type === "tree"
+                    ? "directory"
+                    : entry.type === "commit"
+                      ? "submodule"
+                      : entry.mode === "120000"
+                        ? "symlink"
+                        : "file",
+              })),
+            ),
+          ),
+        );
+        continue;
+      }
+      if (name === "search") {
+        if (
+          typeof values["query"] !== "string" ||
+          values["query"].length === 0 ||
+          (values["path"] !== undefined && typeof values["path"] !== "string")
+        ) {
+          throw new CodexSecurityError("search requires a non-empty query.");
+        }
+        const path = patchReviewTreePath(
+          (values["path"] as string | undefined) ?? "",
+          true,
+        );
+        let matches = "";
+        try {
+          matches = await runPatchReviewGit(
+            canonicalRepository,
+            [
+              "grep",
+              "--full-name",
+              "-n",
+              "-I",
+              "-F",
+              "-e",
+              values["query"],
+              tree,
+              ...(path.length === 0 ? [] : ["--", `:(top,literal)${path}`]),
+            ],
+            { environment, trim: false },
+          );
+        } catch (error) {
+          if (
+            typeof error !== "object" ||
+            error === null ||
+            !("code" in error) ||
+            error.code !== 1
+          ) {
+            throw error;
+          }
+        }
+        send(
+          result(
+            id,
+            matches
+              .split("\n")
+              .map((match) =>
+                match.startsWith(`${tree}:`)
+                  ? match.slice(tree.length + 1)
+                  : match,
+              )
+              .join("\n"),
+          ),
+        );
+        continue;
+      }
+      send(result(id, "Unknown repository inspection tool.", true));
+    } catch (error) {
+      send(result(id, safePatchText(errorMessage(error)), true));
+    }
+  }
+  return 0;
 }
 
 async function runFindingPatches(
@@ -6008,7 +6436,8 @@ async function runIndependentPatchReview(
   context.stderr.write(`Running independent ${stage} review...\n`);
   const review = await captureSkillStage(context.run, {
     ...context.options,
-    directory: context.snapshot.directory,
+    directory: context.snapshot.reviewRepository.directory,
+    reviewRepository: context.snapshot.reviewRepository,
     reviewCandidate:
       context.candidate === undefined
         ? undefined
@@ -6196,6 +6625,26 @@ async function runPatchReviewWorkflow(
         return PATCH_REVIEW_EXIT_CODE.failure;
       }
 
+      const revisionCandidate = await context.snapshot.candidate();
+      context.options.signal?.throwIfAborted();
+      if (!samePatchReviewCandidate(candidate, revisionCandidate)) {
+        const reason = `${stage} review candidate changed while revision was being prepared.`;
+        context.stderr.write(`${reason}\n`);
+        if (subject.response !== undefined) {
+          stdout.write(
+            renderTerminalReviewResponse(
+              subject.response,
+              revisionCandidate,
+              "failed",
+              reason,
+            ),
+          );
+          return PATCH_REVIEW_EXIT_CODE.success;
+        }
+        return PATCH_REVIEW_EXIT_CODE.failure;
+      }
+      candidate = revisionCandidate;
+      context.candidate = revisionCandidate;
       stageRevisions.set(stage, (stageRevisions.get(stage) ?? 0) + 1);
       totalRevisions += 1;
       context.options.signal?.throwIfAborted();
@@ -6467,7 +6916,7 @@ async function runSkillStage(
         ]
       : review
         ? [
-            `Independently perform only the ${reviewStage} review of the observed candidate delta. You are a read-only reviewer: do not edit, delegate, expand scope, rely on the patch author's rationale, read outside the selected repository, or follow repository links outside it.`,
+            `Independently perform only the ${reviewStage} review of the observed candidate delta. You are a read-only reviewer: do not edit, delegate, expand scope, rely on the patch author's rationale, read outside the selected repository, or follow repository links outside it. Use only the codex_security_review tools for repository inspection; they expose the pre-author baseline as data and cannot execute repository code.`,
             PATCH_REVIEW_ASSIGNMENTS[reviewStage],
             'Return exactly one JSON object: {"status":"approved|revise|blocked","findings":["concrete source-backed issue"]}. Use approved only when findings is empty; use revise only when findings is nonempty.',
           ]
@@ -6565,7 +7014,14 @@ async function runSkillStage(
               threadSource,
               approvalPolicy,
               ...(readOnly ? { sandbox: "read-only" as const } : {}),
-              ...(review ? { isolateReviewerTools: true } : {}),
+              ...(review
+                ? {
+                    isolateReviewerTools: true,
+                    ...(options.reviewRepository === undefined
+                      ? {}
+                      : { reviewRepository: options.reviewRepository }),
+                  }
+                : {}),
               ...(options.onEvent === undefined
                 ? {}
                 : { onEvent: options.onEvent }),
@@ -6588,6 +7044,7 @@ export async function readSkillCommandOutput(
     readonly approvalPolicy?: "never" | "on-request";
     readonly sandbox?: "read-only" | "workspace-write";
     readonly isolateReviewerTools?: boolean;
+    readonly reviewRepository?: PatchReviewRepositoryView;
     readonly onEvent?: (event: Readonly<Record<string, unknown>>) => void;
   },
 ): Promise<{
@@ -6699,6 +7156,15 @@ export async function readSkillCommandOutput(
             appServer.input.end();
             continue;
           }
+          if (
+            appServer.isolateReviewerTools &&
+            appServer.reviewRepository === undefined
+          ) {
+            error =
+              "Codex did not receive the baseline repository view required for independent review.";
+            appServer.input.end();
+            continue;
+          }
           const repositoryServers = new Set<string>();
           const configuredServers = new Set<string>();
           for (const layer of layers) {
@@ -6739,21 +7205,32 @@ export async function readSkillCommandOutput(
           const disabledServers = appServer.isolateReviewerTools
             ? new Set([...repositoryServers, ...configuredServers])
             : repositoryServers;
+          const disabledMcpServers = Object.fromEntries(
+            [...disabledServers].map((server) => [server, { enabled: false }]),
+          );
           const disabledMcpConfiguration: JsonObject =
             disabledServers.size === 0
               ? {}
-              : {
-                  mcp_servers: Object.fromEntries(
-                    [...disabledServers].map((server) => [
-                      server,
-                      { enabled: false },
-                    ]),
-                  ),
-                };
+              : { mcp_servers: disabledMcpServers };
+          const reviewRepository = appServer.reviewRepository;
           startThread(
             appServer.isolateReviewerTools
               ? {
-                  ...disabledMcpConfiguration,
+                  mcp_servers: {
+                    ...disabledMcpServers,
+                    codex_security_review: {
+                      command: process.execPath,
+                      args: [
+                        fileURLToPath(import.meta.url),
+                        "--patch-review-mcp",
+                        reviewRepository!.repository,
+                        reviewRepository!.tree,
+                        reviewRepository!.objectDirectory,
+                        reviewRepository!.alternateObjectDirectory,
+                      ],
+                      enabled: true,
+                    },
+                  },
                   allow_login_shell: false,
                   web_search: "disabled",
                   sandbox_workspace_write: { network_access: false },
@@ -8552,7 +9029,10 @@ function invokedAsMain(): boolean {
 }
 
 if (invokedAsMain()) {
-  void main().then(
+  const patchReviewMcp = process.argv[2] === "--patch-review-mcp";
+  void (
+    patchReviewMcp ? runPatchReviewRepositoryMcp(process.argv.slice(3)) : main()
+  ).then(
     (exitCode) => {
       process.exitCode = exitCode;
     },

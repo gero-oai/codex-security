@@ -23,6 +23,13 @@ function dependencies(options: Parameters<typeof fixtureDependencies>[0] = {}) {
   const current = fixtureDependencies(options);
   current.snapshotPatchReviewWorktree = async (directory) => ({
     directory,
+    reviewRepository: {
+      directory,
+      repository: directory,
+      tree: "synthetic-baseline-tree",
+      objectDirectory: resolve(directory, ".git", "objects"),
+      alternateObjectDirectory: resolve(directory, ".git", "objects"),
+    },
     candidate: async () => ({
       paths: ["src/finding-1.ts"],
       diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n",
@@ -1895,6 +1902,14 @@ lines.on("line", (line) => {
   });
 
   test("starts reviewer threads without inherited external tools", async () => {
+    const reviewRepository = {
+      directory: process.cwd(),
+      repository: "/synthetic/repository",
+      tree: "synthetic-baseline-tree",
+      objectDirectory: "/synthetic/review-objects",
+      alternateObjectDirectory: "/synthetic/repository-objects",
+    };
+    const reviewEntrypoint = join(import.meta.dir, "../src/cli.ts");
     const source = `
 const assert = require("node:assert/strict");
 const lines = require("node:readline").createInterface({ input: process.stdin });
@@ -1919,6 +1934,18 @@ lines.on("line", (line) => {
           repository: { enabled: false },
           trusted: { enabled: false },
           shared: { enabled: false },
+          codex_security_review: {
+            command: ${JSON.stringify(process.execPath)},
+            args: ${JSON.stringify([
+              reviewEntrypoint,
+              "--patch-review-mcp",
+              reviewRepository.repository,
+              reviewRepository.tree,
+              reviewRepository.objectDirectory,
+              reviewRepository.alternateObjectDirectory,
+            ])},
+            enabled: true,
+          },
         },
         allow_login_shell: false,
         web_search: "disabled",
@@ -1972,6 +1999,7 @@ lines.on("line", (line) => {
             approvalPolicy: "never",
             sandbox: "read-only",
             isolateReviewerTools: true,
+            reviewRepository,
           },
         },
         { command: process.execPath },
