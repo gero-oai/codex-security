@@ -670,6 +670,20 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: a terminal outcome requires a complete changed-file inventory"
                     )
+                if (
+                    outcome_recommendation == "no_op"
+                    and outcome_confidence == "low"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a no_op outcome cannot retain low confidence"
+                    )
+                if (
+                    outcome_recommendation == "hold_for_evidence"
+                    and outcome_confidence != "low"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a hold outcome requires low confidence"
+                    )
                 if outcome_recommendation == "merge":
                     if outcome_confidence == "low":
                         errors.append(
@@ -713,35 +727,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 remaining_decision_unknowns = (
                     decision_critical_unknowns - set(item["resolvesUnknowns"])
                 ) | outcome_remaining_unknowns
-                resolved_failed_validations = (
-                    set(item.get("resolvesFailedValidation", []))
-                    if branch_failed_validation_resolved
-                    else set()
-                )
-                remaining_failures = (
-                    unknown_failed_validations - resolved_failed_validations
-                )
-                remaining_boundary_ids = unresolved_boundaries - set(
-                    resolved_boundaries
-                )
-                if outcome_boundaries is not None:
-                    remaining_boundary_ids |= {
-                        boundary_id
-                        for boundary_id, result in outcome_boundaries.items()
-                        if result == "unresolved"
-                    }
-                remaining_applicability = (
-                    value["applicability"]["status"] == "unknown"
-                    and outcome_applicability not in {"confirmed", *NON_APPLICABLE}
-                )
-                if outcome_recommendation == "hold_for_evidence" and not (
-                    remaining_decision_unknowns
-                    or remaining_failures
-                    or remaining_boundary_ids
-                    or remaining_applicability
+                if (
+                    outcome_recommendation == "hold_for_evidence"
+                    and not outcome_remaining_unknowns
                 ):
                     errors.append(
-                        f"evidencePlan.{index}: a hold outcome must retain an explicit unresolved pivot"
+                        f"evidencePlan.{index}: a hold outcome must retain a decision-critical unknown in remainingUnknowns"
                     )
                 if (
                     outcome_recommendation != "hold_for_evidence"
