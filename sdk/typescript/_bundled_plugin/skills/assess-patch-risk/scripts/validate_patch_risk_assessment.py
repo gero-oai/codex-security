@@ -250,6 +250,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     decision_critical_unknowns = {
         item["id"] for item in unknowns if item["decisionCritical"]
     }
+    noncritical_unknowns = {
+        item["id"] for item in unknowns if not item["decisionCritical"]
+    }
     unresolved_boundaries = {
         item["id"] for item in boundaries if item["result"] == "unresolved"
     }
@@ -387,6 +390,8 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         planned_unknowns: set[str] = set()
         planned_boundaries: set[str] = set()
         planned_applicability = False
+        planned_impact = value["impact"]["rating"] != "unknown"
+        planned_likelihood = value["regressionLikelihood"]["rating"] != "unknown"
         planned_changed_files = bool(value["patch"]["changedFiles"])
         for index, item in enumerate(evidence_plan):
             applicability_outcomes = item.get("applicabilityOutcomes")
@@ -426,6 +431,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"evidencePlan.{index}: impactOutcomes must name exactly the evidence outcome keys"
                 )
+            if impact_outcomes is not None and any(
+                rating != "unknown" for rating in impact_outcomes.values()
+            ):
+                planned_impact = True
             if changed_files_outcomes is not None and set(
                 changed_files_outcomes
             ) != set(item["outcomes"]):
@@ -451,6 +460,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"evidencePlan.{index}: regressionLikelihoodOutcomes must name exactly the evidence outcome keys"
                 )
+            if likelihood_outcomes is not None and any(
+                rating != "unknown" for rating in likelihood_outcomes.values()
+            ):
+                planned_likelihood = True
             if safety_failure_outcomes is not None and set(
                 safety_failure_outcomes
             ) != set(item["outcomes"]):
@@ -698,6 +711,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: unknown regression protection cannot support high confidence"
                     )
+                if noncritical_unknowns and outcome_confidence == "high":
+                    errors.append(
+                        f"evidencePlan.{index}: high confidence cannot retain an explicit unknown"
+                    )
                 if outcome_recommendation == "merge":
                     if outcome_confidence == "low":
                         errors.append(
@@ -866,6 +883,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         ):
             errors.append(
                 "unknown applicability requires a matching applicability evidence plan"
+            )
+        if not planned_impact:
+            errors.append("unknown impact requires a matching impact evidence plan")
+        if not planned_likelihood:
+            errors.append(
+                "unknown regression likelihood requires a matching likelihood evidence plan"
             )
         if not planned_changed_files:
             errors.append(
