@@ -3029,6 +3029,9 @@ describe("scan and patch workflow", () => {
           return 0;
         },
         onRepositoryCommand: (command, args) => {
+          if (command === "git" && args[0] === "ls-files") {
+            return `100644 ${secondReviewed} 0\t${sharedPath}\0`;
+          }
           if (command === "git" && args[0] === "ls-tree") {
             return `100644 blob ${secondReviewed}\t${sharedPath}\0`;
           }
@@ -3810,7 +3813,7 @@ describe("scan and patch workflow", () => {
     const instruction = "Preserve the synthetic compatibility path.";
     let reviewerPrompt = "";
     const outcome = await runWorkflow(
-      ["scan", "--review-minimality"],
+      ["scan", "--patch", "--review-minimality"],
       {
         result: resultWithFindings(["high"]),
         onCodex: (args, output) => {
