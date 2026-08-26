@@ -5344,10 +5344,9 @@ async function createPatchPullRequest(
 }
 
 function safePatchText(value: string): string {
-  return stripVTControlCharacters(safeErrorMessage(value)).replaceAll(
-    /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu,
-    " ",
-  );
+  return stripVTControlCharacters(safeErrorMessage(value))
+    .replaceAll(/\u001B\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replaceAll(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu, " ");
 }
 
 function patchReviewGitProcessEnvironment(): NodeJS.ProcessEnv {

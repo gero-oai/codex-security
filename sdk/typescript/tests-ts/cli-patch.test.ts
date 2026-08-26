@@ -5350,7 +5350,6 @@ describe("scan and patch workflow", () => {
         git("init", "--bare", remote);
         git("remote", "add", "origin", remote);
         git("push", "--set-upstream", "origin", "main");
-        await writeFile(armed, "armed\n");
 
         const outcome = await runWorkflow(
           ["scan", "--patch", "--review-minimality", "--create-pr", "--json"],
@@ -5359,6 +5358,7 @@ describe("scan and patch workflow", () => {
             result,
             onCodex: async (args, output) => {
               if (output!.appServer!.sandbox === "read-only") {
+                await writeFile(armed, "armed\n");
                 output!.stdout.write(
                   JSON.stringify({ status: "approved", findings: [] }),
                 );
