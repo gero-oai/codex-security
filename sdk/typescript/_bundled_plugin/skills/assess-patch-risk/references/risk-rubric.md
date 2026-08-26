@@ -54,7 +54,7 @@ When a patch newly rejects inputs or narrows an existing contract and the govern
 
 When behavior derives a new target or reuses saved authority, independently classify the derived URL, callback, nested resource, cached principal, historical object, retry, replay, or re-execution at the consuming policy decision. Inherited trust is not evidence of safety.
 
-When an authentication or authorization patch claims complete or unconditional enforcement, trace saved, cached, historical, and versioned authority through every applicable refresh, reconnect, replay, retry, and re-execution. At each consuming decision, reclassify the current principal, resource, and policy; prove that an authoritative contract defines a recorded or versioned authority snapshot as the governing decision context and that source binds the operation to that snapshot; or prove from source that the binding cannot change.
+When an authentication or authorization patch claims complete or unconditional enforcement, trace saved, cached, historical, and versioned authority through every applicable refresh, reconnect, replay, retry, and re-execution. At each consuming decision, reclassify the current principal, resource, and policy; prove that an authoritative contract defines a recorded or versioned authority snapshot as the governing decision context, fixes every authorization-relevant input and resulting decision used at the sink, and is bound to the operation by source; or prove from source that every authorization-relevant principal attribute, resource attribute, policy input, entity binding, and resulting decision cannot change before consumption.
 
 Apply these challenges when the patch contains the corresponding structure:
 
