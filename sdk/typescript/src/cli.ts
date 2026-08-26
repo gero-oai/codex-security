@@ -5644,6 +5644,25 @@ function patchReviewGitPathKey(path: Buffer): string {
   return path.toString("base64");
 }
 
+function splitPatchReviewGitPath(path: Buffer): Buffer[] | undefined {
+  const parts: Buffer[] = [];
+  let start = 0;
+  for (let index = 0; index <= path.length; index += 1) {
+    if (index !== path.length && path[index] !== 0x2f) continue;
+    const part = path.subarray(start, index);
+    if (
+      part.length === 0 ||
+      part.equals(Buffer.from(".")) ||
+      part.equals(Buffer.from(".."))
+    ) {
+      return;
+    }
+    parts.push(part);
+    start = index + 1;
+  }
+  return parts;
+}
+
 function isPatchReviewInstructionPath(path: Buffer): boolean {
   const separator = path.lastIndexOf(0x2f);
   return path.subarray(separator + 1).equals(Buffer.from("AGENTS.md"));
@@ -5742,22 +5761,11 @@ async function validatePatchReviewGitPath(
     );
   }
 
-  const parts: Buffer[] = [];
-  let start = 0;
-  for (let index = 0; index <= path.length; index += 1) {
-    if (index !== path.length && path[index] !== 0x2f) continue;
-    const part = path.subarray(start, index);
-    if (
-      part.length === 0 ||
-      part.equals(Buffer.from(".")) ||
-      part.equals(Buffer.from(".."))
-    ) {
-      throw new CodexSecurityError(
-        "The observed patch contains an unsafe candidate path.",
-      );
-    }
-    parts.push(part);
-    start = index + 1;
+  const parts = splitPatchReviewGitPath(path);
+  if (parts === undefined) {
+    throw new CodexSecurityError(
+      "The observed patch contains an unsafe candidate path.",
+    );
   }
 
   let current = Buffer.from(canonicalRoot ?? (await realpath(directory)));
@@ -5776,6 +5784,56 @@ async function validatePatchReviewGitPath(
       );
     }
   }
+}
+
+async function actualPatchReviewPath(
+  worktree: string,
+  path: Buffer,
+  directoryEntries: Map<string, Buffer[]>,
+): Promise<Buffer> {
+  try {
+    await lstat(patchReviewFilesystemPath(worktree, path));
+  } catch (error) {
+    if (missingPatchReviewPath(error)) return path;
+    throw error;
+  }
+
+  const parts = splitPatchReviewGitPath(path);
+  if (parts === undefined) return path;
+  const actual: Buffer[] = [];
+  let current = Buffer.from(worktree);
+  for (const part of parts) {
+    const directoryKey = current.toString("base64");
+    let entries = directoryEntries.get(directoryKey);
+    if (entries === undefined) {
+      entries = (await readdir(current, { encoding: "buffer" })).map((name) =>
+        Buffer.isBuffer(name) ? name : Buffer.from(name),
+      );
+      directoryEntries.set(directoryKey, entries);
+    }
+    let selected = entries.find((entry) => entry.equals(part));
+    if (selected === undefined) {
+      const decoded = decodePatchReviewGitPath(part);
+      if (decoded === undefined) return path;
+      const folded = decoded.normalize("NFC").toLowerCase();
+      const matches = entries.filter((entry) => {
+        const candidate = decodePatchReviewGitPath(entry);
+        return (
+          candidate !== undefined &&
+          candidate.normalize("NFC").toLowerCase() === folded
+        );
+      });
+      if (matches.length !== 1) return path;
+      [selected] = matches;
+    }
+    actual.push(selected!);
+    current = Buffer.concat([current, Buffer.from(sep), selected!]);
+  }
+  return Buffer.concat(
+    actual.flatMap((part, index) =>
+      index === 0 ? [part] : [Buffer.from("/"), part],
+    ),
+  );
 }
 
 interface NestedPatchReviewRepository {
@@ -6365,6 +6423,7 @@ async function snapshotPatchReviewWorktree(
     { repository: NestedPatchReviewRepository; state: string }
   >();
   const baselineIgnoredPathStates = new Map<string, string>();
+  const baselineUnrepresentedFileModes = new Map<string, bigint>();
   let capturingBaseline = true;
   const nestedRepositoryState = async (
     nested: NestedPatchReviewRepository,
@@ -6489,11 +6548,37 @@ async function snapshotPatchReviewWorktree(
   };
   const stageWorktree = async (): Promise<void> => {
     if (!capturingBaseline) await assertNestedRepositoriesUnchanged();
-    const sparseEntries = await runPatchReviewGitBytes(
-      repository,
-      ["ls-files", "-v", "-z", "--", "."],
-      { signal },
-    );
+    const [sparseEntries, listed, currentIgnored] = await Promise.all([
+      runPatchReviewGitBytes(repository, ["ls-files", "-v", "-z", "--", "."], {
+        signal,
+      }),
+      runPatchReviewGitBytes(
+        repository,
+        [
+          "ls-files",
+          "--cached",
+          "--others",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { environment, signal },
+      ),
+      runPatchReviewGitBytes(
+        repository,
+        [
+          "ls-files",
+          "--others",
+          "--ignored",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { environment, signal },
+      ),
+    ]);
     const skipWorktreePaths = new Set(
       splitNulRecords(sparseEntries)
         .filter(
@@ -6504,19 +6589,16 @@ async function snapshotPatchReviewWorktree(
         )
         .map((entry) => patchReviewGitPathKey(entry.subarray(2))),
     );
-    const listed = await runPatchReviewGitBytes(
-      repository,
-      [
-        "ls-files",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        "--",
-        ".",
-      ],
-      { environment, signal },
-    );
+    if (!capturingBaseline) {
+      for (const path of splitNulRecords(currentIgnored)) {
+        const key = patchReviewGitPathKey(path);
+        if (!ignoredPathSet.has(key) && !baselineSnapshotPathSet.has(key)) {
+          throw new CodexSecurityError(
+            "Ignore rules or ignored files changed after patch review started. Preserve unrelated ignored files and retry.",
+          );
+        }
+      }
+    }
     const paths = new Map<string, Buffer>();
     for (const path of [
       ...splitNulRecords(listed),
@@ -6528,23 +6610,76 @@ async function snapshotPatchReviewWorktree(
       paths.set(patchReviewGitPathKey(path), path);
     }
     const included: Buffer[] = [];
+    const includedSet = new Set<string>();
     const removed: Buffer[] = [];
-    for (const pathBytes of paths.values()) {
-      await validatePatchReviewGitPath(repository, pathBytes, repository);
-      const key = patchReviewGitPathKey(pathBytes);
-      if (ignoredPathSet.has(key)) {
+    const removedSet = new Set<string>();
+    const actualPathDirectoryEntries = new Map<string, Buffer[]>();
+    for (const observedPathBytes of paths.values()) {
+      await validatePatchReviewGitPath(
+        repository,
+        observedPathBytes,
+        repository,
+      );
+      const observedKey = patchReviewGitPathKey(observedPathBytes);
+      const ignoredAtBaseline = ignoredPathSet.has(observedKey);
+      const ignoredInstructionAtBaseline =
+        ignoredInstructionPathSet.has(observedKey);
+      const actualPathBytes = await actualPatchReviewPath(
+        repository,
+        observedPathBytes,
+        actualPathDirectoryEntries,
+      );
+      if (ignoredAtBaseline) {
         const digest = createHash("sha256");
-        await hashNestedPatchReviewPath(repository, pathBytes, digest, signal);
+        digest.update(actualPathBytes);
+        await hashNestedPatchReviewPath(
+          repository,
+          observedPathBytes,
+          digest,
+          signal,
+        );
         const state = digest.digest("hex");
-        const baseline = baselineIgnoredPathStates.get(key);
+        const baseline = baselineIgnoredPathStates.get(observedKey);
         if (capturingBaseline && baseline === undefined) {
-          baselineIgnoredPathStates.set(key, state);
+          baselineIgnoredPathStates.set(observedKey, state);
         } else if (baseline !== state) {
           throw new CodexSecurityError(
             "An ignored path changed after patch review started. Preserve unrelated ignored files and retry.",
           );
         }
       }
+      try {
+        const metadata = await lstat(
+          patchReviewFilesystemPath(repository, observedPathBytes),
+          { bigint: true },
+        );
+        if (metadata.isFile()) {
+          const mode = metadata.mode & 0o7666n;
+          const baseline = baselineUnrepresentedFileModes.get(observedKey);
+          if (capturingBaseline && baseline === undefined) {
+            baselineUnrepresentedFileModes.set(observedKey, mode);
+          } else if (baseline !== undefined && baseline !== mode) {
+            throw new CodexSecurityError(
+              "A file permission changed outside Git's reviewed mode. Preserve unrelated permission bits and retry.",
+            );
+          }
+        }
+      } catch (error) {
+        if (!missingPatchReviewPath(error)) throw error;
+      }
+      if (!actualPathBytes.equals(observedPathBytes)) {
+        await validatePatchReviewGitPath(
+          repository,
+          actualPathBytes,
+          repository,
+        );
+        if (!removedSet.has(observedKey)) {
+          removedSet.add(observedKey);
+          removed.push(observedPathBytes);
+        }
+      }
+      const pathBytes = actualPathBytes;
+      const key = patchReviewGitPathKey(pathBytes);
       if (
         baselineSnapshotPathSet.has(key) &&
         !baselineTrackedPathSet.has(key)
@@ -6553,7 +6688,10 @@ async function snapshotPatchReviewWorktree(
           await lstat(patchReviewFilesystemPath(repository, pathBytes));
         } catch (error) {
           if (!missingPatchReviewPath(error)) throw error;
-          removed.push(pathBytes);
+          if (!removedSet.has(key)) {
+            removedSet.add(key);
+            removed.push(pathBytes);
+          }
           continue;
         }
       }
@@ -6568,13 +6706,19 @@ async function snapshotPatchReviewWorktree(
               !capturingBaseline &&
               baselineMaterializedSkipWorktreePaths.has(key)
             ) {
-              removed.push(pathBytes);
+              if (!removedSet.has(key)) {
+                removedSet.add(key);
+                removed.push(pathBytes);
+              }
             }
           } else if (
             capturingBaseline ||
             baselineMaterializedTrackedPaths.has(key)
           ) {
-            removed.push(pathBytes);
+            if (!removedSet.has(key)) {
+              removedSet.add(key);
+              removed.push(pathBytes);
+            }
           }
           continue;
         }
@@ -6603,7 +6747,7 @@ async function snapshotPatchReviewWorktree(
         }
         continue;
       }
-      if (ignoredPathSet.has(key) && !ignoredInstructionPathSet.has(key)) {
+      if (ignoredAtBaseline && !ignoredInstructionAtBaseline) {
         continue;
       }
       if (skipWorktreePaths.has(key)) {
@@ -6615,7 +6759,10 @@ async function snapshotPatchReviewWorktree(
               !capturingBaseline &&
               baselineMaterializedSkipWorktreePaths.has(key)
             ) {
-              removed.push(pathBytes);
+              if (!removedSet.has(key)) {
+                removedSet.add(key);
+                removed.push(pathBytes);
+              }
             }
             continue;
           }
@@ -6625,7 +6772,10 @@ async function snapshotPatchReviewWorktree(
           baselineMaterializedSkipWorktreePaths.add(key);
         }
       }
-      included.push(pathBytes);
+      if (!includedSet.has(key)) {
+        includedSet.add(key);
+        included.push(pathBytes);
+      }
     }
     if (included.length > 0) {
       const currentEntries = parseRawPatchReviewIndexEntries(
