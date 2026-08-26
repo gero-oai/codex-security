@@ -8567,7 +8567,9 @@ async function runFindingPatchesWithRiskSnapshot(
       `  ${patch.status.toUpperCase()}  ${title}${patch.reason === undefined ? "" : `: ${safePatchText(patch.reason)}`}\n`,
     );
     patches.push(patch);
-    if (patch.status !== "verified") patchRiskSnapshot = undefined;
+    if (patch.status !== "verified" && patch.status !== "no_change") {
+      patchRiskSnapshot = undefined;
+    }
   }
   const verifiedPatchIds = new Set(
     patches

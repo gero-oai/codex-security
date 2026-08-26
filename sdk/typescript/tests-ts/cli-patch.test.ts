@@ -489,6 +489,92 @@ describe("scan and patch workflow", () => {
     expect(assessedPaths).toEqual([[firstPath], [firstPath, secondPath]]);
   });
 
+  test("preserves cumulative risk assessment across a no-change finding", async () => {
+    const result = resultWithFindings(["high", "high", "high"]);
+    const firstPath = "src/finding-1.ts";
+    const thirdPath = "src/finding-3.ts";
+    const assessedPaths: string[][] = [];
+    let author = 0;
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--assess-patch-risk", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          { paths: [], diff: "" },
+          {
+            paths: [thirdPath],
+            diff: `diff --git a/${thirdPath} b/${thirdPath}\n`,
+          },
+          {
+            paths: [thirdPath],
+            diff: `diff --git a/${thirdPath} b/${thirdPath}\n`,
+          },
+        ],
+        cumulativePatchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath, thirdPath],
+            diff: [firstPath, thirdPath]
+              .map((path) => `diff --git a/${path} b/${path}\n`)
+              .join(""),
+          },
+        ],
+        onCodex: (_args, output) => {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_3"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
+            const prompt = output!.appServer!.prompt;
+            assessedPaths.push(patchRiskArtifact(prompt).patch.changedFiles);
+            output!.stdout.write(
+              JSON.stringify(approvedPatchRiskVerdict(prompt)),
+            );
+          } else {
+            const occurrenceId = `occ_${author + 1}`;
+            output!.stdout.write(
+              JSON.stringify({
+                patches: [
+                  author === 1
+                    ? { occurrenceId, status: "no_change", files: [] }
+                    : {
+                        occurrenceId,
+                        status: "verified",
+                        files: [`src/finding-${author + 1}.ts`],
+                        verification: "The synthetic issue is fixed.",
+                      },
+                ],
+              }),
+            );
+            author += 1;
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(assessedPaths).toEqual([[firstPath], [firstPath, thirdPath]]);
+  });
+
   test("reverifies all accepted findings after the final reviewed patch", async () => {
     const result = resultWithFindings(["high", "high"]);
     const stages: string[] = [];
