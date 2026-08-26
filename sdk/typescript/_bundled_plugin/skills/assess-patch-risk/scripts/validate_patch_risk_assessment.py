@@ -231,8 +231,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     boundaries = value["materialBoundaries"]
     errors: list[str] = []
 
-    if recommendation != "no_op" and not value["patch"]["changedFiles"]:
-        errors.append("patch.changedFiles must be non-empty unless recommendation is no_op")
+    if recommendation not in {"no_op", "hold_for_evidence"} and not value[
+        "patch"
+    ]["changedFiles"]:
+        errors.append(
+            "patch.changedFiles must be non-empty unless recommendation is no_op or hold_for_evidence"
+        )
 
     if recommendation != "hold_for_evidence":
         if value["impact"]["rating"] == "unknown":
@@ -281,8 +285,6 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("hold_for_evidence requires a bounded evidence plan")
         if value["regressionLikelihood"]["rating"] == "critical":
             errors.append("hold_for_evidence cannot have critical regression likelihood")
-        if any(item["status"] == "failed" for item in value["validation"]):
-            errors.append("hold_for_evidence cannot include failed validation")
         if any(item["result"] == "contradicted" for item in boundaries):
             errors.append("hold_for_evidence cannot retain a contradicted material boundary")
         for index, item in enumerate(evidence_plan):

@@ -331,17 +331,43 @@ describe("patch risk assessment contract", () => {
     );
   });
 
-  test("allows an empty changed-file identity only for no-op", async () => {
+  test("allows an empty changed-file identity only for no-op or an evidence hold", async () => {
     const payload = assessment();
     payload.patch.changedFiles = [];
     const merge = await validate(payload);
     expect(merge.status).not.toBe(0);
     expect(merge.stderr).toContain(
-      "patch.changedFiles must be non-empty unless recommendation is no_op",
+      "patch.changedFiles must be non-empty unless recommendation is no_op or hold_for_evidence",
     );
+
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        summary:
+          "The provider did not return a complete changed-file inventory.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Can the immutable final comparison be retrieved completely?",
+        action: "Retrieve the same final comparison again from the provider.",
+        outcomes: {
+          complete: "merge",
+          still_incomplete: "hold_for_evidence",
+        },
+      },
+    ];
+    const hold = await validate(payload);
+    expect(hold.status, hold.stderr).toBe(0);
 
     payload.recommendation = "no_op";
     payload.workflowLabel = "no_op";
+    payload.confidence.rating = "high";
+    payload.unknowns = [];
+    payload.evidencePlan = [];
     payload.applicability = {
       status: "no_live_effect",
       rationale: "The immutable comparison contains no changed files.",
@@ -416,7 +442,7 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
-  test("rejects established defects when holding for evidence", async () => {
+  test("rejects established defects but allows unattributed failures when holding", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
     payload.workflowLabel = "hold_for_evidence";
@@ -458,10 +484,7 @@ describe("patch risk assessment contract", () => {
     payload.regressionProtection.exactHeadChecksPassed = false;
     payload.validation[0]!.status = "failed";
     const failedValidation = await validate(payload);
-    expect(failedValidation.status).not.toBe(0);
-    expect(failedValidation.stderr).toContain(
-      "hold_for_evidence cannot include failed validation",
-    );
+    expect(failedValidation.status, failedValidation.stderr).toBe(0);
 
     payload.validation[0]!.status = "unavailable";
     const unresolved = await validate(payload);
