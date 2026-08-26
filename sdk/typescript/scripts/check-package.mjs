@@ -182,6 +182,7 @@ const distFiles = new Set(
     "linear",
     "models",
     "multiscan",
+    "patch-review-mcp",
     "patch-tui",
     "publication",
     "publication-events",

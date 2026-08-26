@@ -19,6 +19,12 @@ import {
 } from "./cli-fixtures.js";
 import { runTestInSubprocess } from "./support/test-subprocess.js";
 
+const PATCH_REVIEW_RUNTIME = join(
+  import.meta.dir,
+  "../src/patch-review-mcp.ts",
+);
+const GIT_EXECUTABLE = Bun.which("git") ?? process.execPath;
+
 function dependencies(options: Parameters<typeof fixtureDependencies>[0] = {}) {
   const current = fixtureDependencies(options);
   current.snapshotPatchReviewWorktree = async (directory) => ({
@@ -29,6 +35,8 @@ function dependencies(options: Parameters<typeof fixtureDependencies>[0] = {}) {
       tree: "synthetic-baseline-tree",
       objectDirectory: resolve(directory, ".git", "objects"),
       alternateObjectDirectory: resolve(directory, ".git", "objects"),
+      runtime: PATCH_REVIEW_RUNTIME,
+      gitExecutable: GIT_EXECUTABLE,
     },
     candidate: async () => ({
       paths: ["src/finding-1.ts"],
@@ -1908,8 +1916,9 @@ lines.on("line", (line) => {
       tree: "synthetic-baseline-tree",
       objectDirectory: "/synthetic/review-objects",
       alternateObjectDirectory: "/synthetic/repository-objects",
+      runtime: PATCH_REVIEW_RUNTIME,
+      gitExecutable: GIT_EXECUTABLE,
     };
-    const reviewEntrypoint = join(import.meta.dir, "../src/cli.ts");
     const source = `
 const assert = require("node:assert/strict");
 const lines = require("node:readline").createInterface({ input: process.stdin });
@@ -1937,8 +1946,8 @@ lines.on("line", (line) => {
           codex_security_review: {
             command: ${JSON.stringify(process.execPath)},
             args: ${JSON.stringify([
-              reviewEntrypoint,
-              "--patch-review-mcp",
+              reviewRepository.runtime,
+              reviewRepository.gitExecutable,
               reviewRepository.repository,
               reviewRepository.tree,
               reviewRepository.objectDirectory,
