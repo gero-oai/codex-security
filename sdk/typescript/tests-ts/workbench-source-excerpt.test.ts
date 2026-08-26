@@ -189,14 +189,14 @@ function ordinaryRepository(root: string): {
 }
 
 async function upgradedPlugin(root: string) {
-  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.47");
+  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.74");
   const previous = join(root, "previous-plugin");
   cpSync(PLUGIN_ROOT, previous, { recursive: true });
   const manifestPath = join(previous, ".codex-plugin", "plugin.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
     version: string;
   };
-  manifest.version = "0.1.46";
+  manifest.version = "0.1.73";
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
 
   const home = join(root, "codex-home");
@@ -232,8 +232,8 @@ async function upgradedPlugin(root: string) {
   const installedMcp = JSON.parse(
     readFileSync(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
   ) as { mcpServers: Record<string, { env_vars?: string[] }> };
-  expect(predecessor.version).toBe("0.1.46");
-  expect(upgraded.version).toBe("0.1.47");
+  expect(predecessor.version).toBe("0.1.73");
+  expect(upgraded.version).toBe("0.1.74");
   expect(upgraded.installedRoot).not.toBe(predecessor.installedRoot);
   expect(
     installedMcp.mcpServers["codex-security"]?.env_vars?.find(
