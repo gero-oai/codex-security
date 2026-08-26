@@ -1686,6 +1686,119 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("fails closed when the author changes only Git index flags", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-index-flags-")),
+    );
+    const hidden = join(repository, "hidden.ts");
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviews = 0;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      await writeFile(hidden, "preserve\n");
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              git("update-index", "--skip-worktree", "hidden.ts");
+              await rm(hidden);
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain(
+        "Git index changed after patch review started",
+      );
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects object alternates outside the selected repository", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-object-alternate-")),
+    );
+    const repository = join(root, "repository");
+    const external = join(root, "external");
+    const git = (directory: string, ...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: directory,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let authorStarted = false;
+    try {
+      await Promise.all([mkdir(repository), mkdir(external)]);
+      git(repository, "init", "--initial-branch=main");
+      git(repository, "config", "user.name", "Synthetic User");
+      git(repository, "config", "user.email", "synthetic@example.test");
+      git(repository, "config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git(repository, "add", "--", "value.ts");
+      git(repository, "commit", "-m", "Initial synthetic checkout");
+      git(external, "init", "--initial-branch=main");
+      await mkdir(join(repository, ".git", "objects", "info"), {
+        recursive: true,
+      });
+      await writeFile(
+        join(repository, ".git", "objects", "info", "alternates"),
+        `${join(external, ".git", "objects")}\n`,
+      );
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: () => {
+            authorStarted = true;
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(authorStarted).toBe(false);
+      expect(outcome.stderr).toContain(
+        "Git object alternates must remain inside",
+      );
+      expect(outcome.stderr).not.toContain(external);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("ignores untracked nested Git repositories in the candidate", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-nested-repository-")),
