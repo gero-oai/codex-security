@@ -2130,6 +2130,58 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("rejects repository-local Git config includes before authoring", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-config-include-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let authorStarted = false;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+      await writeFile(
+        join(repository, ".git", "review-config"),
+        "[core]\n\thooksPath = synthetic-hooks\n",
+      );
+      git("config", "--local", "include.path", "review-config");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: () => {
+            authorStarted = true;
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(authorStarted).toBe(false);
+      expect(outcome.stderr).toContain(
+        "Git metadata must not include external configuration",
+      );
+      expect(outcome.stderr).not.toContain("review-config");
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
   test("ignores untracked nested Git repositories in the candidate", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-nested-repository-")),
