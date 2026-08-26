@@ -7039,7 +7039,19 @@ async function snapshotPatchReviewWorktree(
       }
       if (baselineTrackedPathSet.has(key)) {
         try {
-          await lstat(patchReviewFilesystemPath(repository, pathBytes));
+          const metadata = await lstat(
+            patchReviewFilesystemPath(repository, pathBytes),
+          );
+          if (
+            metadata.isDirectory() &&
+            currentEntries.get(key)?.mode !== "160000"
+          ) {
+            if (!removedSet.has(key)) {
+              removedSet.add(key);
+              removed.push(pathBytes);
+            }
+            continue;
+          }
           if (capturingBaseline) baselineMaterializedTrackedPaths.add(key);
         } catch (error) {
           if (!missingPatchReviewPath(error)) throw error;
