@@ -752,6 +752,7 @@ describe("patch risk assessment contract", () => {
     payload.regressionLikelihood.rating = "high";
     payload.validation[0]!.status = "failed";
     payload.validation[0]!.failureAttribution = "patch_caused";
+    payload.regressionProtection.exactHeadChecksPassed = false;
     const failed = await validate(payload);
     expect(failed.status, failed.stderr).toBe(0);
   });
@@ -1600,6 +1601,7 @@ describe("patch risk assessment contract", () => {
     payload.workflowLabel = "block";
     payload.regressionProtection.rating = "partial";
     payload.validation[0]!.status = "unavailable";
+    payload.regressionProtection.exactHeadChecksPassed = false;
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toBe(
@@ -1821,6 +1823,7 @@ describe("patch risk assessment contract", () => {
     payload.regressionLikelihood.rating = "moderate";
     payload.validation[0]!.status = "failed";
     payload.validation[0]!.failureAttribution = "not_patch_caused";
+    payload.regressionProtection.exactHeadChecksPassed = false;
 
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
@@ -1849,6 +1852,7 @@ describe("patch risk assessment contract", () => {
     payload.workflowLabel = "revise";
     payload.validation[0]!.status = "failed";
     payload.validation[0]!.failureAttribution = "patch_caused";
+    payload.regressionProtection.exactHeadChecksPassed = false;
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
   });
@@ -1910,6 +1914,7 @@ describe("patch risk assessment contract", () => {
     failed.workflowLabel = "revise";
     failed.validation[0]!.status = "failed";
     failed.validation[0]!.failureAttribution = "patch_caused";
+    failed.regressionProtection.exactHeadChecksPassed = false;
     const failedResult = await validate(failed);
     expect(failedResult.status, failedResult.stderr).toBe(0);
   });
@@ -2032,6 +2037,7 @@ describe("patch risk assessment contract", () => {
     payload.workflowLabel = "revise";
     payload.validation[0]!.status = "failed";
     payload.validation[0]!.failureAttribution = "patch_caused";
+    payload.regressionProtection.exactHeadChecksPassed = false;
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
   });
