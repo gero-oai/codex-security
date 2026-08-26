@@ -295,12 +295,7 @@ export async function runComponentScans(
     documentType: "codex-security.component-findings",
     schemaVersion: "1.0",
     findings,
-    deduplication: {
-      ...deduplication,
-      matches,
-      uncertain,
-      ...(related === undefined ? {} : { related }),
-    },
+    deduplication: { ...deduplication, matches, uncertain, related },
   });
   await writeJson(summary.summaryPath, {
     ...summary,

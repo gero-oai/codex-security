@@ -32,8 +32,17 @@ import {
   runCodexCommand,
   type CodexCommand,
 } from "./runtime.js";
+import {
+  CODEX_SECURITY_THREAD_SOURCES,
+  type CodexSecurityThreadSource,
+} from "./thread-source.js";
 
 type Finding = ComparisonFinding;
+type ReadOnlyCodexThreadSource = Extract<
+  CodexSecurityThreadSource,
+  | typeof CODEX_SECURITY_THREAD_SOURCES.scan
+  | typeof CODEX_SECURITY_THREAD_SOURCES.scanComparison
+>;
 
 export interface ScanComparisonInput {
   before: readonly Finding[];
@@ -285,7 +294,10 @@ export async function matchScanFindingsInternal(
       }
     }
   }
-  const thread = await startReadOnlyCodexThread(options, runtimeOptions);
+  const thread = await startReadOnlyCodexThread(options, {
+    ...runtimeOptions,
+    threadSource: CODEX_SECURITY_THREAD_SOURCES.scanComparison,
+  });
   const remainingPages = new Set(pages.keys());
   remainingPages.delete(0);
   const evidenceCursors = new Map<string, EvidenceCursor>();
@@ -491,7 +503,10 @@ export async function matchScanFindingsInternal(
 
 async function startReadOnlyCodexThread(
   options: ReadOnlyCodexOptions,
-  runtimeOptions: { surface: CodexSecuritySurface },
+  runtimeOptions: {
+    surface: CodexSecuritySurface;
+    threadSource: ReadOnlyCodexThreadSource;
+  },
 ): Promise<ReturnType<ReadOnlyCodex["startThread"]>> {
   const config =
     options.config === undefined
@@ -551,6 +566,7 @@ async function startReadOnlyCodexThread(
       } as NonNullable<CodexOptions["config"]>,
     });
   return codex.startThread({
+    threadSource: runtimeOptions.threadSource,
     ...(model === undefined ? {} : { model }),
     modelReasoningEffort: reasoningEffort as ModelReasoningEffort,
     sandboxMode: "read-only",
@@ -566,7 +582,10 @@ export async function runReadOnlyCodex(
   prompt: string,
   outputSchema: unknown,
   options: ReadOnlyCodexOptions,
-  runtimeOptions: { surface: CodexSecuritySurface },
+  runtimeOptions: {
+    surface: CodexSecuritySurface;
+    threadSource: ReadOnlyCodexThreadSource;
+  },
 ): Promise<string> {
   const thread = await startReadOnlyCodexThread(options, runtimeOptions);
   const turn = await thread.run(prompt, {
@@ -672,9 +691,12 @@ export async function matchCompletedScan(
     workingDirectory: options.repository,
   });
 
-  for (const { scanId, findings } of beforeScans) {
+  const comparisons = beforeScans.map(({ scanId, findings }) => ({
+    scanId,
+    projected: comparisonForScan(comparison, findings),
+  }));
+  for (const { scanId, projected } of comparisons) {
     options.signal?.throwIfAborted();
-    const projected = comparisonForScan(comparison, findings);
     await options.workbench(
       [
         "save-scan-comparison",
