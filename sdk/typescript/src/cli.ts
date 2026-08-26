@@ -1182,6 +1182,8 @@ interface SkillRunOptions extends PatchReviewOptions {
   ) => void;
   patchRiskArtifact?: PatchRiskReviewArtifactDescription;
   patchRiskContract?: PatchRiskReviewContract;
+  patchRiskFindings?: readonly Finding[];
+  patchRiskFindingInstructions?: Readonly<Record<string, string>>;
 }
 
 interface PatchReviewCandidateDelta {
@@ -5462,6 +5464,9 @@ const PATCH_REPORT_EMPTY_SENSITIVE_FIELD =
 const PATCH_REPORT_MARKDOWN_FENCE = /^\s*(?<fence>`{3,}|~{3,}).*$/u;
 const PATCH_REPORT_MARKDOWN_FENCE_CLOSE = /^\s*(?<fence>`{3,}|~{3,})\s*$/u;
 const PATCH_REPORT_ENCODED_TOKEN = /[A-Za-z0-9+/_-]{12,}={0,2}/gu;
+const PATCH_REPORT_HEADING = /^\s{0,3}#{1,6}\s+\S/u;
+const PATCH_REPORT_FIELD =
+  /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:schema version|patch(?: identity)?|analyzed base|recommendation|workflow label|impact|(?:regression )?likelihood|material safety failure|regression protection|recoverability|confidence|applicability|status[- ]quo risk|auto[- ]merge exclusions|affected (?:production|runtime) roots|important callers|risk drivers|protective factors|material boundaries|validation|tests(?: and checks)?|unknowns|evidence plan)\s*:/iu;
 
 function containsEncodedPatchCredential(value: string): boolean {
   for (const match of value.matchAll(PATCH_REPORT_ENCODED_TOKEN)) {
@@ -5484,7 +5489,10 @@ function containsEncodedPatchCredential(value: string): boolean {
       decoded.length >= 6 &&
       decoded.toString("base64").replace(/=+$/u, "") === normalized &&
       (decoded.every((byte) => byte >= 0x20 && byte <= 0x7e) ||
-        /[+/_-]/u.test(candidate))
+        (/[A-Z]/u.test(candidate) &&
+          /[a-z]/u.test(candidate) &&
+          /\d/u.test(candidate) &&
+          /[-_]/u.test(candidate)))
     ) {
       return true;
     }
@@ -5502,6 +5510,17 @@ function safePatchBoundaryClassification(value: string): string | undefined {
       ? " [redacted]"
       : safeDetails
   }`;
+}
+
+function isPatchReportStructuralBoundary(line: string): boolean {
+  if (PATCH_REPORT_HEADING.test(line) || PATCH_REPORT_FIELD.test(line)) {
+    return true;
+  }
+  const boundary = PATCH_REPORT_BOUNDARY_LINE.exec(line);
+  return (
+    boundary?.groups?.["evidence"] !== undefined &&
+    safePatchBoundaryClassification(boundary.groups["evidence"]) !== undefined
+  );
 }
 
 function safePatchReport(value: string): string {
@@ -5567,9 +5586,13 @@ function safePatchReport(value: string): string {
         boundaryContinuationPrefix = undefined;
         continue;
       }
-      lines.push("[redacted]");
+      if (!isPatchReportStructuralBoundary(line)) {
+        lines.push("[redacted]");
+        boundaryContinuationPrefix = undefined;
+        continue;
+      }
+      redactCredentialContinuation = false;
       boundaryContinuationPrefix = undefined;
-      continue;
     }
     if (PATCH_REPORT_EMPTY_SENSITIVE_FIELD.test(line)) {
       const boundary = PATCH_REPORT_BOUNDARY_LINE.exec(line);
@@ -5973,6 +5996,12 @@ interface NestedPatchReviewRepository {
   gitDirectory: string;
 }
 
+function nestedPatchReviewRepositoryKey(
+  nested: NestedPatchReviewRepository,
+): string {
+  return JSON.stringify([nested.worktree, nested.gitDirectory]);
+}
+
 const NESTED_PATCH_REVIEW_GIT_METADATA_PATHS = [
   "HEAD",
   "config",
@@ -6038,6 +6067,48 @@ async function hashNestedPatchReviewGitMetadata(
       signal,
     );
   }
+}
+
+async function hashNestedPatchReviewGitMarker(
+  worktree: string,
+  digest: ReturnType<typeof createHash>,
+  signal?: AbortSignal,
+): Promise<void> {
+  const markerPath = Buffer.from(".git");
+  const metadata = await lstat(join(worktree, ".git"), { bigint: true });
+  if (metadata.isDirectory()) {
+    updateNestedPatchReviewDigest(
+      digest,
+      markerPath,
+      `directory:${metadata.mode.toString(8)}`,
+      "",
+    );
+    return;
+  }
+  await hashNestedPatchReviewPath(worktree, markerPath, digest, signal);
+}
+
+async function hashNestedPatchReviewDirectoryMode(
+  worktree: string,
+  path: Buffer,
+  digest: ReturnType<typeof createHash>,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  const metadata = await lstat(patchReviewFilesystemPath(worktree, path), {
+    bigint: true,
+  });
+  if (!metadata.isDirectory()) {
+    throw new CodexSecurityError(
+      "A nested Git worktree path ancestor is no longer a directory.",
+    );
+  }
+  updateNestedPatchReviewDigest(
+    digest,
+    path,
+    `directory:${metadata.mode.toString(8)}`,
+    "",
+  );
 }
 
 async function hashNestedPatchReviewPath(
@@ -6846,6 +6917,19 @@ async function snapshotPatchReviewWorktree(
         ),
       ]);
     const digest = createHash("sha256").update(status);
+    updateNestedPatchReviewDigest(
+      digest,
+      Buffer.from("worktree"),
+      "identity",
+      Buffer.from(nested.worktree),
+    );
+    updateNestedPatchReviewDigest(
+      digest,
+      Buffer.from("git-directory"),
+      "identity",
+      Buffer.from(nested.gitDirectory),
+    );
+    await hashNestedPatchReviewGitMarker(nested.worktree, digest, signal);
     const paths = new Map<string, Buffer>();
     for (const output of [changed, untracked, ignoredPaths]) {
       for (const path of splitNulRecords(output)) {
@@ -6854,6 +6938,33 @@ async function snapshotPatchReviewWorktree(
     }
     for (const path of parseRawPatchReviewIndexPaths(indexEntries)) {
       paths.set(patchReviewGitPathKey(path), path);
+    }
+    const directories = new Map<string, Buffer>([
+      [patchReviewGitPathKey(Buffer.alloc(0)), Buffer.alloc(0)],
+    ]);
+    for (const path of paths.values()) {
+      const parts = splitPatchReviewGitPath(path);
+      if (parts === undefined) {
+        throw new CodexSecurityError(
+          "A nested Git worktree contains an unsafe path.",
+        );
+      }
+      let directory = Buffer.alloc(0);
+      for (const part of parts.slice(0, -1)) {
+        directory =
+          directory.length === 0
+            ? Buffer.from(part)
+            : Buffer.concat([directory, Buffer.from("/"), part]);
+        directories.set(patchReviewGitPathKey(directory), directory);
+      }
+    }
+    for (const directory of [...directories.values()].sort(Buffer.compare)) {
+      await hashNestedPatchReviewDirectoryMode(
+        nested.worktree,
+        directory,
+        digest,
+        signal,
+      );
     }
     for (const path of [...paths.values()].sort(Buffer.compare)) {
       await hashNestedPatchReviewPath(nested.worktree, path, digest, signal);
@@ -6878,10 +6989,20 @@ async function snapshotPatchReviewWorktree(
       repository: nested,
       state: baseline,
     } of baselineNestedRepositoryStates.values()) {
-      const current = await nestedRepositoryState(nested).catch(
-        () => undefined,
-      );
-      if (current !== undefined) currentStates.set(nested.worktree, current);
+      const rediscovered = await nestedPatchReviewRepository(
+        repository,
+        relative(repository, nested.worktree),
+        allowedNestedGitDirectories,
+      ).catch(() => undefined);
+      const current =
+        rediscovered !== undefined &&
+        nestedPatchReviewRepositoryKey(rediscovered) ===
+          nestedPatchReviewRepositoryKey(nested)
+          ? await nestedRepositoryState(rediscovered).catch(() => undefined)
+          : undefined;
+      if (current !== undefined) {
+        currentStates.set(nestedPatchReviewRepositoryKey(nested), current);
+      }
       if (current !== baseline) {
         throw new CodexSecurityError(
           "A nested Git worktree changed after patch review started. Review it as a separate patch target.",
@@ -7299,10 +7420,11 @@ async function snapshotPatchReviewWorktree(
               allowedNestedGitDirectories,
             );
       if (nested !== undefined) {
-        let state = currentNestedRepositoryStates.get(nested.worktree);
+        const repositoryKey = nestedPatchReviewRepositoryKey(nested);
+        let state = currentNestedRepositoryStates.get(repositoryKey);
         if (state === undefined) {
           state = await nestedRepositoryState(nested);
-          currentNestedRepositoryStates.set(nested.worktree, state);
+          currentNestedRepositoryStates.set(repositoryKey, state);
         }
         const baseline = baselineNestedRepositoryStates.get(nested.worktree);
         if (capturingBaseline && baseline === undefined) {
@@ -7310,7 +7432,12 @@ async function snapshotPatchReviewWorktree(
             repository: nested,
             state,
           });
-        } else if (baseline?.state !== state) {
+        } else if (
+          baseline === undefined ||
+          nestedPatchReviewRepositoryKey(baseline.repository) !==
+            repositoryKey ||
+          baseline.state !== state
+        ) {
           throw new CodexSecurityError(
             "A nested Git worktree changed after patch review started. Review it as a separate patch target.",
           );
@@ -8392,6 +8519,8 @@ async function runFindingPatchesWithRiskSnapshot(
     `\nPatching ${selected.findings.length} confirmed finding${selected.findings.length === 1 ? "" : "s"}...\n`,
   );
   const patches: FindingPatch[] = [];
+  const acceptedPatchRiskFindings: Finding[] = [];
+  const acceptedPatchRiskInstructions: Record<string, string> = {};
   let reviewRepository: string | undefined;
   const reviewUnsafePublicationPaths = new Set<string>();
   const reviewPublicationPaths = new Set<string>();
@@ -8412,6 +8541,10 @@ async function runFindingPatchesWithRiskSnapshot(
       },
     };
     const instruction = options.findingInstructions?.[finding.occurrenceId];
+    const patchRiskFindingInstructions = {
+      ...acceptedPatchRiskInstructions,
+      ...(instruction?.trim() ? { [finding.occurrenceId]: instruction } : {}),
+    };
     let status: number;
     try {
       status = await runSkill(
@@ -8426,6 +8559,14 @@ async function runFindingPatchesWithRiskSnapshot(
           ...options,
           reviewPublicationCandidate,
           ...(patchRiskSnapshot === undefined ? {} : { patchRiskSnapshot }),
+          ...(options.assessPatchRisk === true
+            ? {
+                patchRiskFindings: [...acceptedPatchRiskFindings, finding],
+                ...(Object.keys(patchRiskFindingInstructions).length === 0
+                  ? {}
+                  : { patchRiskFindingInstructions }),
+              }
+            : {}),
           directory: selected.repository,
           findings: [finding],
           onReviewRepository: (repository) => {
@@ -8567,6 +8708,12 @@ async function runFindingPatchesWithRiskSnapshot(
       `  ${patch.status.toUpperCase()}  ${title}${patch.reason === undefined ? "" : `: ${safePatchText(patch.reason)}`}\n`,
     );
     patches.push(patch);
+    if (patch.status === "verified") {
+      acceptedPatchRiskFindings.push(finding);
+      if (instruction?.trim()) {
+        acceptedPatchRiskInstructions[finding.occurrenceId] = instruction;
+      }
+    }
     if (patch.status !== "verified" && patch.status !== "no_change") {
       patchRiskSnapshot = undefined;
     }
@@ -8974,6 +9121,11 @@ async function runIndependentPatchReview(
   try {
     review = await captureSkillStage(context.run, {
       ...context.options,
+      findingInstructions:
+        stage === "patch-risk-assessment" &&
+        context.options.patchRiskFindingInstructions !== undefined
+          ? context.options.patchRiskFindingInstructions
+          : context.options.findingInstructions,
       directory: reviewRepository.directory,
       reviewRepository,
       reviewCandidate:
@@ -9419,6 +9571,15 @@ async function runSkill(
     directory,
     options.signal,
   );
+  const patchRiskContents =
+    options.patchRiskFindings === undefined
+      ? contents
+      : await prepareSkillContents(
+          inputs,
+          options.patchRiskFindings,
+          directory,
+          options.signal,
+        );
   const stages: PatchReviewStage[] =
     skill === "fix-finding"
       ? [
@@ -9432,7 +9593,9 @@ async function runSkill(
   const run = (output: Writable, configuration: SkillRunOptions = options) =>
     runSkillStage(
       skill,
-      contents,
+      configuration.reviewStage === "patch-risk-assessment"
+        ? patchRiskContents
+        : contents,
       codexOverrides,
       effort,
       output,

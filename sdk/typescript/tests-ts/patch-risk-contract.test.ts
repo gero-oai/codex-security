@@ -683,6 +683,10 @@ describe("patch risk assessment contract", () => {
       reachable: "unknown",
       unreachable: "low",
     };
+    payload.evidencePlan[0]!.confidenceOutcomes = {
+      reachable: "low",
+      unreachable: "moderate",
+    };
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
   });
@@ -902,10 +906,29 @@ describe("patch risk assessment contract", () => {
           contradicted: "moderate",
           unavailable: "low",
         },
+        remainingUnknowns: {
+          supported: [],
+          contradicted: [],
+          unavailable: ["rollout-target"],
+        },
       },
     ];
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
+
+    payload.evidencePlan[0]!.confidenceOutcomes!["contradicted"] = "low";
+    const lowNoOpConfidence = await validate(payload);
+    expect(lowNoOpConfidence.status).not.toBe(0);
+    expect(lowNoOpConfidence.stderr).toContain(
+      "a no_op outcome cannot retain low confidence",
+    );
+    payload.evidencePlan[0]!.confidenceOutcomes!["contradicted"] = "moderate";
+    payload.evidencePlan[0]!.confidenceOutcomes!["unavailable"] = "moderate";
+    const elevatedHoldConfidence = await validate(payload);
+    expect(elevatedHoldConfidence.status).not.toBe(0);
+    expect(elevatedHoldConfidence.stderr).toContain(
+      "a hold outcome requires low confidence",
+    );
   });
 
   test("preserves known defect evidence while applicability remains unknown", async () => {
@@ -939,6 +962,10 @@ describe("patch risk assessment contract", () => {
           owned: "confirmed",
           not_owned: "wrong_owner",
         },
+        confidenceOutcomes: {
+          owned: "moderate",
+          not_owned: "moderate",
+        },
       },
     ];
 
@@ -969,15 +996,24 @@ describe("patch risk assessment contract", () => {
       summary: `Decision-critical unknown ${index + 1}.`,
       decisionCritical: true,
     }));
-    payload.evidencePlan = Array.from({ length: 4 }, (_, index) => ({
-      question: `Question ${index + 1}?`,
-      action: `Resolve unknown ${index + 1}.`,
-      resolvesUnknowns: [`unknown-${index + 1}`],
-      outcomes: {
-        supported: "hold_for_evidence",
-        contradicted: "hold_for_evidence",
-      },
-    }));
+    payload.evidencePlan = Array.from({ length: 4 }, (_, index) => {
+      const remainingUnknowns = payload.unknowns
+        .map((unknown) => unknown.id)
+        .filter((unknownId) => unknownId !== `unknown-${index + 1}`);
+      return {
+        question: `Question ${index + 1}?`,
+        action: `Resolve unknown ${index + 1}.`,
+        resolvesUnknowns: [`unknown-${index + 1}`],
+        outcomes: {
+          supported: "hold_for_evidence" as const,
+          contradicted: "hold_for_evidence" as const,
+        },
+        remainingUnknowns: {
+          supported: remainingUnknowns,
+          contradicted: remainingUnknowns,
+        },
+      };
+    });
 
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
@@ -1168,6 +1204,54 @@ describe("patch risk assessment contract", () => {
     expect(unsafeMerge.stderr).toContain(
       "a merge outcome requires every resolved material boundary to be supported",
     );
+  });
+
+  test("retains a decision-critical ID for an unresolved boundary branch", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "request-contract-evidence",
+        summary: "The request contract evidence is incomplete.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the request contract remain supported?",
+        action: "Exercise the contract through its production caller.",
+        resolvesUnknowns: ["request-contract-evidence"],
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          supported: { "request-contract": "supported" },
+          inconclusive: { "request-contract": "unresolved" },
+        },
+        outcomes: {
+          supported: "merge",
+          inconclusive: "hold_for_evidence",
+        },
+        confidenceOutcomes: {
+          supported: "moderate",
+          inconclusive: "low",
+        },
+      },
+    ];
+
+    const unnamed = await validate(payload);
+    expect(unnamed.status).not.toBe(0);
+    expect(unnamed.stderr).toContain(
+      "a hold outcome must retain a decision-critical unknown in remainingUnknowns",
+    );
+
+    payload.evidencePlan[0]!.remainingUnknowns = {
+      supported: [],
+      inconclusive: ["request-contract-evidence"],
+    };
+    const named = await validate(payload);
+    expect(named.status, named.stderr).toBe(0);
   });
 
   test("requires unique unknown identifiers", async () => {
@@ -1560,6 +1644,10 @@ describe("patch risk assessment contract", () => {
         outcomes: {
           known: "hold_for_evidence",
           unavailable: "hold_for_evidence",
+        },
+        remainingUnknowns: {
+          known: ["failure-attribution"],
+          unavailable: ["failure-attribution"],
         },
       },
     ];
@@ -1968,6 +2056,14 @@ describe("patch risk assessment contract", () => {
           owned: "hold_for_evidence",
           not_owned: "no_op",
         },
+        remainingUnknowns: {
+          owned: ["boundary-result"],
+          not_owned: [],
+        },
+        confidenceOutcomes: {
+          owned: "low",
+          not_owned: "moderate",
+        },
       },
     ];
 
@@ -2058,6 +2154,10 @@ describe("patch risk assessment contract", () => {
         outcomes: {
           owned: "hold_for_evidence",
           not_owned: "no_op",
+        },
+        confidenceOutcomes: {
+          owned: "low",
+          not_owned: "moderate",
         },
       },
       {
@@ -2250,7 +2350,7 @@ describe("patch risk assessment contract", () => {
     const missing = await validate(payload);
     expect(missing.status).not.toBe(0);
     expect(missing.stderr).toContain(
-      "a hold outcome must retain an explicit unresolved pivot",
+      "a hold outcome must retain a decision-critical unknown in remainingUnknowns",
     );
 
     payload.evidencePlan[0]!.remainingUnknowns = {

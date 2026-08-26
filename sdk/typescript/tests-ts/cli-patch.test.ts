@@ -425,6 +425,8 @@ describe("scan and patch workflow", () => {
     const firstPath = "src/finding-1.ts";
     const secondPath = "src/finding-2.ts";
     const assessedPaths: string[][] = [];
+    const assessedFindingIds: string[][] = [];
+    const authorFindingIds: string[][] = [];
     const outcome = await runWorkflow(
       ["patch", "--scan", "scan-1", "--assess-patch-risk", "--json"],
       {
@@ -474,10 +476,22 @@ describe("scan and patch workflow", () => {
           } else if (output!.appServer!.sandbox === "read-only") {
             const prompt = output!.appServer!.prompt;
             assessedPaths.push(patchRiskArtifact(prompt).patch.changedFiles);
+            assessedFindingIds.push(
+              (JSON.parse(prompt.split("\n").at(-1)!) as Finding[]).map(
+                ({ occurrenceId }) => occurrenceId,
+              ),
+            );
             output!.stdout.write(
               JSON.stringify(approvedPatchRiskVerdict(prompt)),
             );
           } else {
+            authorFindingIds.push(
+              (
+                JSON.parse(
+                  output!.appServer!.prompt.split("\n").at(-1)!,
+                ) as Finding[]
+              ).map(({ occurrenceId }) => occurrenceId),
+            );
             completePatches(args, output);
           }
           return 0;
@@ -487,6 +501,109 @@ describe("scan and patch workflow", () => {
 
     expect(outcome.exitCode, outcome.stderr).toBe(0);
     expect(assessedPaths).toEqual([[firstPath], [firstPath, secondPath]]);
+    expect(authorFindingIds).toEqual([["occ_1"], ["occ_2"]]);
+    expect(assessedFindingIds).toEqual([["occ_1"], ["occ_1", "occ_2"]]);
+  });
+
+  test("keeps authors finding-scoped while cumulative risk review receives prior constraints", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const firstPath = "src/finding-1.ts";
+    const secondPath = "src/finding-2.ts";
+    const instructions = {
+      occ_1: "Preserve the first synthetic compatibility path.",
+      occ_2: "Preserve the second synthetic compatibility path.",
+    };
+    const authorInstructions: Array<Record<string, string>> = [];
+    const riskInstructions: Array<Record<string, string>> = [];
+    const outcome = await runWorkflow(
+      ["scan", "--patch", "--assess-patch-risk"],
+      {
+        result,
+        patchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [secondPath],
+            diff: `diff --git a/${secondPath} b/${secondPath}\n`,
+          },
+          {
+            paths: [secondPath],
+            diff: `diff --git a/${secondPath} b/${secondPath}\n`,
+          },
+        ],
+        cumulativePatchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath, secondPath],
+            diff: [firstPath, secondPath]
+              .map((path) => `diff --git a/${path} b/${path}\n`)
+              .join(""),
+          },
+        ],
+        onCodex: (args, output) => {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_2"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+            return 0;
+          }
+          const prompt = output!.appServer!.prompt;
+          const lines = prompt.split("\n");
+          const instructionLine = lines.findIndex((line) =>
+            line.includes("user-provided"),
+          );
+          const observed = JSON.parse(lines[instructionLine + 1]!) as Record<
+            string,
+            string
+          >;
+          if (output!.appServer!.sandbox === "read-only") {
+            riskInstructions.push(observed);
+            output!.stdout.write(
+              JSON.stringify(approvedPatchRiskVerdict(prompt)),
+            );
+          } else {
+            authorInstructions.push(observed);
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+      {
+        interactive: true,
+        configure: (current) => {
+          current.patchEditor = async () => ({
+            severity: "high",
+            occurrenceIds: ["occ_1", "occ_2"],
+            instructions,
+          });
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(authorInstructions).toEqual([
+      { occ_1: instructions.occ_1 },
+      { occ_2: instructions.occ_2 },
+    ]);
+    expect(riskInstructions).toEqual([
+      { occ_1: instructions.occ_1 },
+      instructions,
+    ]);
   });
 
   test("preserves cumulative risk assessment across a no-change finding", async () => {
@@ -2716,6 +2833,154 @@ describe("scan and patch workflow", () => {
       expect(await readFile(join(nested, "value.ts"), "utf8")).toBe(
         "nested changed\n",
       );
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  for (const changedDirectory of ["root", "ancestor"] as const) {
+    test.skipIf(process.platform === "win32")(
+      `fails closed when the author changes a nested Git ${changedDirectory} directory mode`,
+      async () => {
+        const repository = await realpath(
+          await mkdtemp(join(tmpdir(), "codex-security-nested-mode-")),
+        );
+        const nested = join(repository, "nested");
+        const ancestor = join(nested, "src");
+        const git = (directory: string, ...args: string[]) =>
+          execFileSync("git", args, {
+            cwd: directory,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }).trim();
+        let reviews = 0;
+        try {
+          git(repository, "init", "--initial-branch=main");
+          git(repository, "config", "user.name", "Synthetic User");
+          git(repository, "config", "user.email", "synthetic@example.test");
+          git(repository, "config", "commit.gpgsign", "false");
+          await writeFile(join(repository, "value.ts"), "unsafe\n");
+          git(repository, "add", "--", "value.ts");
+          git(repository, "commit", "-m", "Initial synthetic checkout");
+
+          await mkdir(ancestor, { recursive: true });
+          git(nested, "init", "--initial-branch=main");
+          git(nested, "config", "user.name", "Synthetic User");
+          git(nested, "config", "user.email", "synthetic@example.test");
+          git(nested, "config", "commit.gpgsign", "false");
+          await writeFile(join(ancestor, "tracked.ts"), "nested baseline\n");
+          await chmod(nested, 0o755);
+          await chmod(ancestor, 0o755);
+          git(nested, "add", "--", "src/tracked.ts");
+          git(nested, "commit", "-m", "Initial nested checkout");
+
+          const outcome = await runWorkflow(
+            ["patch", "Synthetic security issue", "--review-minimality"],
+            {
+              currentDirectory: repository,
+              onCodex: async (_args, output) => {
+                if (output!.appServer!.sandbox === "read-only") {
+                  reviews += 1;
+                } else {
+                  await writeFile(join(repository, "value.ts"), "fixed\n");
+                  await chmod(
+                    changedDirectory === "root" ? nested : ancestor,
+                    0o777,
+                  );
+                  output!.stdout.write("Verified synthetic patch.");
+                }
+                return 0;
+              },
+            },
+            {
+              configure: (current) => {
+                delete current.snapshotPatchReviewWorktree;
+              },
+            },
+          );
+
+          expect(outcome.exitCode).toBe(2);
+          expect(reviews).toBe(0);
+          expect(outcome.stderr).toContain("nested Git worktree changed");
+        } finally {
+          await rm(repository, { recursive: true, force: true });
+        }
+      },
+    );
+  }
+
+  test("fails closed when the author repoints nested Git metadata", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-nested-gitdir-")),
+    );
+    const nested = join(repository, "nested");
+    const alternate = join(repository, "alternate");
+    const primaryGitDirectory = join(nested, ".nested-git-a");
+    const alternateGitDirectory = join(nested, ".nested-git-b");
+    const git = (directory: string, ...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: directory,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviews = 0;
+    try {
+      git(repository, "init", "--initial-branch=main");
+      git(repository, "config", "user.name", "Synthetic User");
+      git(repository, "config", "user.email", "synthetic@example.test");
+      git(repository, "config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git(repository, "add", "--", "value.ts");
+      git(repository, "commit", "-m", "Initial synthetic checkout");
+
+      await mkdir(nested);
+      git(nested, "init", "--initial-branch=main");
+      git(nested, "config", "user.name", "Synthetic User");
+      git(nested, "config", "user.email", "synthetic@example.test");
+      git(nested, "config", "commit.gpgsign", "false");
+      await writeFile(join(nested, ".gitignore"), ".nested-git-*/\n");
+      await writeFile(join(nested, "tracked.ts"), "nested baseline\n");
+      git(nested, "add", "--", ".gitignore", "tracked.ts");
+      git(nested, "commit", "-m", "Initial nested checkout");
+      await rename(join(nested, ".git"), primaryGitDirectory);
+      await writeFile(join(nested, ".git"), "gitdir: .nested-git-a\n");
+
+      await mkdir(alternate);
+      git(alternate, "init", "--initial-branch=main");
+      git(alternate, "config", "user.name", "Synthetic User");
+      git(alternate, "config", "user.email", "synthetic@example.test");
+      git(alternate, "config", "commit.gpgsign", "false");
+      await writeFile(join(alternate, "tracked.ts"), "alternate baseline\n");
+      git(alternate, "add", "--", "tracked.ts");
+      git(alternate, "commit", "-m", "Alternate synthetic checkout");
+      await rename(join(alternate, ".git"), alternateGitDirectory);
+      await rm(alternate, { recursive: true, force: true });
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              await writeFile(join(nested, ".git"), "gitdir: .nested-git-b\n");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain("nested Git worktree changed");
     } finally {
       await rm(repository, { recursive: true, force: true });
     }
