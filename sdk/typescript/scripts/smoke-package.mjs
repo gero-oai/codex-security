@@ -250,6 +250,7 @@ async function smokeNestedDeepScanWorker(installedRoot, consumer) {
     });
     const { events } = await codex
       .startThread({
+        threadSource: "security_scan",
         workingDirectory: workerHome,
         skipGitRepoCheck: true,
         sandboxMode: "read-only",
@@ -358,7 +359,7 @@ try {
       "--eval",
       [
         `const sdk = await import(${JSON.stringify(packageManifest.name)});`,
-        `for (const name of ${JSON.stringify(["CodexSecurity", "publishScan", "applySecurityPolicy", "loadSecurityPolicyDraft", "securityPolicyDiff", "SecurityPolicyRecoveryError", "SecurityPolicyVerificationError"])}) {`,
+        `for (const name of ${JSON.stringify(["CodexSecurity", "publishScan", "checkScanPublication", "applySecurityPolicy", "loadSecurityPolicyDraft", "securityPolicyDiff", "SecurityPolicyRecoveryError", "SecurityPolicyVerificationError"])}) {`,
         '  if (typeof sdk[name] !== "function") throw new Error(`The installed package does not export ${name}.`);',
         "}",
         'if (typeof sdk.CodexSecurity.prototype.generatePolicy !== "function") throw new Error("The installed package does not export generatePolicy.");',
@@ -707,6 +708,43 @@ try {
   assert.equal(publication.counts.findings, 1);
   assert.equal(publication.counts.created, 0);
   assert.match(publication.issues[0].title, /^\[Codex Security\]\[HIGH\] /u);
+  assert.match(
+    run(process.execPath, [launcher, "publish", "scan", "--help"], {
+      cwd: consumer,
+      capture: true,
+    }),
+    /--skip-existing/u,
+  );
+  const missingHistory = spawnSync(
+    process.execPath,
+    [
+      launcher,
+      "publish",
+      "check",
+      publicationScan,
+      "--to",
+      "linear",
+      "--linear-team",
+      "team-example",
+      "--json",
+    ],
+    {
+      cwd: consumer,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODEX_SECURITY_LINEAR_API_KEY: "",
+        CODEX_SECURITY_STATE_DIR: join(consumer, "publication-state"),
+      },
+      timeout: PACKAGE_SMOKE_TIMEOUT_MS,
+      windowsHide: true,
+    },
+  );
+  assert.equal(missingHistory.status, 2, missingHistory.stderr);
+  assert.match(missingHistory.stderr, /scan-history database does not exist/u);
+  await assert.rejects(stat(join(consumer, "publication-state")), {
+    code: "ENOENT",
+  });
 
   const networkGuard = join(consumer, "reject-publication-network.cjs");
   await writeFile(
@@ -755,10 +793,20 @@ try {
     /lin_api_|security@example\.test/u,
   );
 
+  run(
+    process.execPath,
+    [
+      join(packageRoot, "scripts", "fixtures", "credential-lock.mjs"),
+      pathToFileURL(join(installedRoot, "dist", "runtime.js")).href,
+      join(consumer, "credential-lock-state"),
+    ],
+    { cwd: consumer },
+  );
+
   await smokeNestedDeepScanWorker(installedRoot, consumer);
 
   console.log(
-    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, NodeNext types, CLI, ${expectedPluginFiles.length} bundled plugin files, bundled Codex version, and a nested worker without global codex.`,
+    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, NodeNext types, CLI, credential locking, ${expectedPluginFiles.length} bundled plugin files, bundled Codex version, and a nested worker without global codex.`,
   );
 } finally {
   await rm(consumer, {
