@@ -42,7 +42,8 @@ function treePath(path: string, allowRoot = false): string {
   ) {
     throw new Error("Repository inspection requires a confined relative path.");
   }
-  return normalized.replace(/^\.\//u, "").replace(/\/$/u, "");
+  const confined = normalized.replace(/^\.\//u, "").replace(/\/$/u, "");
+  return allowRoot && confined === "." ? "" : confined;
 }
 
 function parseTreeEntries(output: string): GitTreeEntry[] {
