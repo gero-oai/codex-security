@@ -17,6 +17,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { deflateSync } from "node:zlib";
 import type { Finding, JsonObject, SeverityLevel } from "../src/index.js";
 import { main } from "../src/cli.js";
 import {
@@ -2601,6 +2602,178 @@ describe("scan and patch workflow", () => {
       }
     },
   );
+
+  test("fails closed when the author substitutes a snapshot object", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-object-collision-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    const reviewDirectories = async () =>
+      (await readdir(tmpdir()))
+        .filter((name) => name.startsWith("codex-security-patch-review-"))
+        .sort();
+    const before = new Set(await reviewDirectories());
+    const stableContents = Buffer.from("stable baseline\n");
+    let reviews = 0;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "stable.ts"), stableContents);
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "stable.ts", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+      const objectFormat = git("rev-parse", "--show-object-format");
+      const objectContents = Buffer.concat([
+        Buffer.from(`blob ${stableContents.length}\0`),
+        stableContents,
+      ]);
+      const object = createHash(objectFormat)
+        .update(objectContents)
+        .digest("hex");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              const temporaryDirectory = (await reviewDirectories()).find(
+                (name) => !before.has(name),
+              );
+              if (temporaryDirectory === undefined) {
+                throw new Error("Synthetic patch review storage was missing.");
+              }
+              const forgedContents = Buffer.from("forged contents\n");
+              await writeFile(
+                join(
+                  tmpdir(),
+                  temporaryDirectory,
+                  "objects",
+                  object.slice(0, 2),
+                  object.slice(2),
+                ),
+                deflateSync(
+                  Buffer.concat([
+                    Buffer.from(`blob ${forgedContents.length}\0`),
+                    forgedContents,
+                  ]),
+                ),
+              );
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain(
+        "Patch review object storage changed after patch review started",
+      );
+      expect(outcome.stderr).not.toContain("forged contents");
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when the author changes dormant submodule metadata", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-dormant-submodule-")),
+    );
+    const repository = join(root, "repository");
+    const dependency = join(root, "dependency");
+    const git = (directory: string, ...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: directory,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviews = 0;
+    try {
+      await Promise.all([mkdir(repository), mkdir(dependency)]);
+      git(dependency, "init", "--initial-branch=main");
+      git(dependency, "config", "user.name", "Synthetic User");
+      git(dependency, "config", "user.email", "synthetic@example.test");
+      git(dependency, "config", "commit.gpgsign", "false");
+      await writeFile(join(dependency, "dependency.ts"), "dependency\n");
+      git(dependency, "add", "--", "dependency.ts");
+      git(dependency, "commit", "-m", "Initial synthetic dependency");
+
+      git(repository, "init", "--initial-branch=main");
+      git(repository, "config", "user.name", "Synthetic User");
+      git(repository, "config", "user.email", "synthetic@example.test");
+      git(repository, "config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git(repository, "add", "--", "value.ts");
+      git(repository, "commit", "-m", "Initial synthetic checkout");
+      git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        dependency,
+        "dependency",
+      );
+      git(repository, "commit", "-m", "Add synthetic dependency");
+      git(repository, "submodule", "deinit", "-f", "--", "dependency");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              await writeFile(
+                join(repository, ".git", "modules", "dependency", "HEAD"),
+                "ref: refs/heads/synthetic-mutated\n",
+              );
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain(
+        "Git metadata changed after patch review started",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("fails closed when the author changes sibling linked-worktree metadata", async () => {
     const root = await realpath(
