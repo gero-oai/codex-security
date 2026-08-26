@@ -387,19 +387,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         planned_unknowns: set[str] = set()
         planned_boundaries: set[str] = set()
         planned_applicability = False
-        established_defect = (
-            value["regressionLikelihood"]["rating"] == "critical"
-            or value["materialSafetyFailure"]["established"]
-            or any(item["result"] == "contradicted" for item in boundaries)
-            or any(
-                item["status"] == "failed"
-                and item.get("failureAttribution") == "patch_caused"
-                for item in validations
-            )
-        )
+        planned_changed_files = bool(value["patch"]["changedFiles"])
         for index, item in enumerate(evidence_plan):
             applicability_outcomes = item.get("applicabilityOutcomes")
+            changed_files_outcomes = item.get("changedFilesOutcomes")
             impact_outcomes = item.get("impactOutcomes")
+            confidence_outcomes = item.get("confidenceOutcomes")
             likelihood_outcomes = item.get("regressionLikelihoodOutcomes")
             safety_failure_outcomes = item.get("materialSafetyFailureOutcomes")
             resolved_boundaries = item.get("resolvesBoundaries", [])
@@ -432,6 +425,25 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             ):
                 errors.append(
                     f"evidencePlan.{index}: impactOutcomes must name exactly the evidence outcome keys"
+                )
+            if changed_files_outcomes is not None and set(
+                changed_files_outcomes
+            ) != set(item["outcomes"]):
+                errors.append(
+                    f"evidencePlan.{index}: changedFilesOutcomes must name exactly the evidence outcome keys"
+                )
+            if changed_files_outcomes is not None:
+                if any(changed_files_outcomes.values()):
+                    planned_changed_files = True
+                else:
+                    errors.append(
+                        f"evidencePlan.{index}: changedFilesOutcomes must complete the inventory in at least one outcome"
+                    )
+            if confidence_outcomes is not None and set(confidence_outcomes) != set(
+                item["outcomes"]
+            ):
+                errors.append(
+                    f"evidencePlan.{index}: confidenceOutcomes must name exactly the evidence outcome keys"
                 )
             if likelihood_outcomes is not None and set(likelihood_outcomes) != set(
                 item["outcomes"]
@@ -490,6 +502,16 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     impact_outcomes.get(outcome)
                     if impact_outcomes is not None
                     else value["impact"]["rating"]
+                )
+                outcome_changed_files = (
+                    changed_files_outcomes.get(outcome)
+                    if changed_files_outcomes is not None
+                    else value["patch"]["changedFiles"]
+                )
+                outcome_confidence = (
+                    confidence_outcomes.get(outcome)
+                    if confidence_outcomes is not None
+                    else value["confidence"]["rating"]
                 )
                 outcome_safety_failure = (
                     safety_failure_outcomes.get(outcome)
@@ -567,26 +589,41 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: a terminal outcome cannot retain unknown regression likelihood"
                     )
+                branch_contradiction = any(
+                    boundary["result"] == "contradicted" for boundary in boundaries
+                ) or (
+                    outcome_boundaries is not None
+                    and any(
+                        result == "contradicted"
+                        for result in outcome_boundaries.values()
+                    )
+                )
+                branch_patch_failure = any(
+                    validation["status"] == "failed"
+                    and validation.get("failureAttribution") == "patch_caused"
+                    for validation in validations
+                ) or (
+                    outcome == "patch_caused"
+                    and bool(item.get("resolvesFailedValidation", []))
+                )
+                branch_defect = (
+                    outcome_likelihood == "critical"
+                    or outcome_safety_failure is True
+                    or branch_contradiction
+                    or branch_patch_failure
+                )
                 if (
-                    established_defect
-                    and outcome_applicability == "confirmed"
+                    branch_defect
+                    and effective_applicability == "confirmed"
                     and outcome_recommendation not in {"revise", "block"}
                 ):
                     errors.append(
                         f"evidencePlan.{index}: confirmed applicability with an established defect requires revise or block"
                     )
-                if established_defect and outcome_recommendation == "merge":
+                if branch_defect and outcome_recommendation == "merge":
                     errors.append(
                         f"evidencePlan.{index}: a merge outcome cannot retain an established defect"
                     )
-                branch_contradiction = outcome_boundaries is not None and any(
-                    result == "contradicted"
-                    for result in outcome_boundaries.values()
-                )
-                branch_patch_failure = (
-                    outcome == "patch_caused"
-                    and bool(item.get("resolvesFailedValidation", []))
-                )
                 branch_failed_validation_resolved = outcome in {
                     "patch_caused",
                     "not_patch_caused",
@@ -599,13 +636,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: an inconclusive failed-validation outcome must remain on hold"
                     )
-                if outcome_recommendation == "revise" and not (
-                    established_defect
-                    or branch_contradiction
-                    or branch_patch_failure
-                    or outcome_likelihood == "critical"
-                    or outcome_safety_failure is True
-                ):
+                if outcome_recommendation == "revise" and not branch_defect:
                     errors.append(
                         f"evidencePlan.{index}: a revise outcome requires branch evidence of a defect"
                     )
@@ -632,7 +663,18 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: a block outcome requires critical regression likelihood and an established material safety failure"
                     )
+                if (
+                    outcome_recommendation not in {"no_op", "hold_for_evidence"}
+                    and not outcome_changed_files
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a terminal outcome requires a complete changed-file inventory"
+                    )
                 if outcome_recommendation == "merge":
+                    if outcome_confidence == "low":
+                        errors.append(
+                            f"evidencePlan.{index}: a merge outcome cannot retain low confidence"
+                        )
                     if outcome_likelihood == "critical":
                         errors.append(
                             f"evidencePlan.{index}: a merge outcome cannot establish critical regression likelihood"
@@ -640,6 +682,17 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     if outcome_safety_failure is True:
                         errors.append(
                             f"evidencePlan.{index}: a merge outcome cannot establish a material safety failure"
+                        )
+                    if outcome_likelihood == "low" and (
+                        value["regressionProtection"]["rating"]
+                        in {"none", "unknown"}
+                        or not any(
+                            validation["status"] == "passed"
+                            for validation in validations
+                        )
+                    ):
+                        errors.append(
+                            f"evidencePlan.{index}: a low-likelihood merge outcome requires passing protection"
                         )
                 if (
                     outcome_recommendation == "hold_for_evidence"
@@ -808,6 +861,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         ):
             errors.append(
                 "unknown applicability requires a matching applicability evidence plan"
+            )
+        if not planned_changed_files:
+            errors.append(
+                "empty patch.changedFiles requires a matching changedFilesOutcomes evidence plan"
             )
     elif evidence_plan:
         errors.append("only hold_for_evidence may include an evidence plan")
