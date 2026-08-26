@@ -62,10 +62,12 @@ interface Assessment {
     action: string;
     resolvesUnknowns: string[];
     remainingUnknowns?: Record<string, string[]>;
+    changedFilesOutcomes?: Record<string, string[]>;
     resolvesBoundaries?: string[];
     boundaryOutcomes?: Record<string, Record<string, string>>;
     applicabilityOutcomes?: Record<string, string>;
     impactOutcomes?: Record<string, string>;
+    confidenceOutcomes?: Record<string, string>;
     regressionLikelihoodOutcomes?: Record<string, string>;
     materialSafetyFailureOutcomes?: Record<string, boolean>;
     resolvesFailedValidation?: string[];
@@ -707,12 +709,25 @@ describe("patch risk assessment contract", () => {
           local: "low",
           bounded: "moderate",
         },
+        confidenceOutcomes: {
+          local: "moderate",
+          bounded: "moderate",
+        },
         outcomes: {
           local: "merge",
           bounded: "merge",
         },
       },
     ];
+
+    const confidenceOutcomes = payload.evidencePlan[0]!.confidenceOutcomes!;
+    delete payload.evidencePlan[0]!.confidenceOutcomes;
+    const lowConfidence = await validate(payload);
+    expect(lowConfidence.status).not.toBe(0);
+    expect(lowConfidence.stderr).toContain(
+      "a merge outcome cannot retain low confidence",
+    );
+    payload.evidencePlan[0]!.confidenceOutcomes = confidenceOutcomes;
 
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
@@ -795,12 +810,28 @@ describe("patch risk assessment contract", () => {
           complete: [],
           still_incomplete: ["changed-file-inventory"],
         },
+        changedFilesOutcomes: {
+          complete: ["src/request.ts"],
+          still_incomplete: [],
+        },
+        confidenceOutcomes: {
+          complete: "moderate",
+          still_incomplete: "low",
+        },
         outcomes: {
           complete: "merge",
           still_incomplete: "hold_for_evidence",
         },
       },
     ];
+    const changedFilesOutcomes = payload.evidencePlan[0]!.changedFilesOutcomes!;
+    delete payload.evidencePlan[0]!.changedFilesOutcomes;
+    const incompleteIdentity = await validate(payload);
+    expect(incompleteIdentity.status).not.toBe(0);
+    expect(incompleteIdentity.stderr).toContain(
+      "empty patch.changedFiles requires a matching changedFilesOutcomes evidence plan",
+    );
+    payload.evidencePlan[0]!.changedFilesOutcomes = changedFilesOutcomes;
     const hold = await validate(payload);
     expect(hold.status, hold.stderr).toBe(0);
 
@@ -865,6 +896,11 @@ describe("patch risk assessment contract", () => {
           supported: "confirmed",
           contradicted: "wrong_owner",
           unavailable: "unknown",
+        },
+        confidenceOutcomes: {
+          supported: "moderate",
+          contradicted: "moderate",
+          unavailable: "low",
         },
       },
     ];
@@ -1051,6 +1087,10 @@ describe("patch risk assessment contract", () => {
         action: "Exercise the request contract through its production caller.",
         resolvesUnknowns: ["request-contract-evidence"],
         outcomes: { supported: "merge", contradicted: "revise" },
+        confidenceOutcomes: {
+          supported: "moderate",
+          contradicted: "moderate",
+        },
       },
     ];
 
@@ -1100,6 +1140,10 @@ describe("patch risk assessment contract", () => {
         resolvesUnknowns: ["request-contract-evidence"],
         resolvesBoundaries: ["request-contract"],
         outcomes: { supported: "merge", contradicted: "revise" },
+        confidenceOutcomes: {
+          supported: "moderate",
+          contradicted: "moderate",
+        },
       },
     ];
 
@@ -1264,6 +1308,10 @@ describe("patch risk assessment contract", () => {
       patch_caused: "no_live_effect",
       not_patch_caused: "confirmed",
     };
+    payload.evidencePlan[0]!.confidenceOutcomes = {
+      patch_caused: "moderate",
+      not_patch_caused: "moderate",
+    };
     payload.evidencePlan[0]!.outcomes = {
       patch_caused: "merge",
       not_patch_caused: "revise",
@@ -1294,6 +1342,10 @@ describe("patch risk assessment contract", () => {
       applicable: "confirmed",
       not_applicable: "no_live_effect",
     };
+    payload.evidencePlan[0]!.confidenceOutcomes = {
+      applicable: "moderate",
+      not_applicable: "moderate",
+    };
     const establishedDefectMerge = await validate(payload);
     expect(establishedDefectMerge.status).not.toBe(0);
     expect(establishedDefectMerge.stderr).toContain(
@@ -1319,6 +1371,10 @@ describe("patch risk assessment contract", () => {
       patch_caused: "confirmed",
       not_patch_caused: "confirmed",
     };
+    payload.evidencePlan[0]!.confidenceOutcomes = {
+      patch_caused: "moderate",
+      not_patch_caused: "moderate",
+    };
     const unattributedFailure = await validate(payload);
     expect(unattributedFailure.status, unattributedFailure.stderr).toBe(0);
 
@@ -1331,6 +1387,10 @@ describe("patch risk assessment contract", () => {
     payload.evidencePlan[0]!.applicabilityOutcomes = {
       supported: "confirmed",
       alternate: "confirmed",
+    };
+    payload.evidencePlan[0]!.confidenceOutcomes = {
+      supported: "moderate",
+      alternate: "moderate",
     };
     const attributedFailure = await validate(payload);
     expect(attributedFailure.status, attributedFailure.stderr).toBe(0);
@@ -1361,6 +1421,10 @@ describe("patch risk assessment contract", () => {
         outcomes: {
           supported: "merge",
           contradicted: "merge",
+        },
+        confidenceOutcomes: {
+          supported: "moderate",
+          contradicted: "moderate",
         },
       },
     ];
@@ -1649,11 +1713,73 @@ describe("patch risk assessment contract", () => {
           patch_caused: true,
           not_patch_caused: false,
         },
+        confidenceOutcomes: {
+          patch_caused: "moderate",
+          not_patch_caused: "moderate",
+        },
+      },
+    ];
+
+    const unprotectedMerge = await validate(payload);
+    expect(unprotectedMerge.status).not.toBe(0);
+    expect(unprotectedMerge.stderr).toContain(
+      "a low-likelihood merge outcome requires passing protection",
+    );
+
+    payload.validation.push({
+      name: "independent request contract test",
+      status: "passed",
+      protects: "The unchanged supported request path.",
+      requiredForMerge: false,
+    });
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("validates revise against the resulting evidence branch state", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionLikelihood.rating = "critical";
+    payload.applicability = {
+      status: "unknown",
+      rationale: "Runtime ownership remains unresolved.",
+    };
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which runtime owns the changed path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: { owned: "revise", retired: "no_op" },
+        applicabilityOutcomes: {
+          owned: "confirmed",
+          retired: "no_live_effect",
+        },
+        regressionLikelihoodOutcomes: {
+          owned: "low",
+          retired: "low",
+        },
+        confidenceOutcomes: {
+          owned: "moderate",
+          retired: "moderate",
+        },
       },
     ];
 
     const result = await validate(payload);
-    expect(result.status, result.stderr).toBe(0);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "a revise outcome requires branch evidence of a defect",
+    );
   });
 
   test("routes established critical safety failures to block", async () => {
@@ -2117,6 +2243,7 @@ describe("patch risk assessment contract", () => {
         action: "Inspect the checked-in runtime registry.",
         resolvesUnknowns: ["runtime-owner"],
         outcomes: { owned: "merge", unavailable: "hold_for_evidence" },
+        confidenceOutcomes: { owned: "moderate", unavailable: "low" },
       },
     ];
 
@@ -2158,6 +2285,10 @@ describe("patch risk assessment contract", () => {
         outcomes: {
           supported: "merge",
           defective: "merge",
+        },
+        confidenceOutcomes: {
+          supported: "moderate",
+          defective: "moderate",
         },
       },
     ];
