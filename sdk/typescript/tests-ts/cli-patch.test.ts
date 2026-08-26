@@ -72,6 +72,7 @@ interface PatchReviewDeltaFixture {
     mode?: string;
     object?: string;
   }>;
+  publicationDiffBytes?: Buffer;
   base?: string;
   head?: string;
 }
@@ -133,6 +134,13 @@ function dependencies(
           publicationUnsafePaths: [...(selected.publicationUnsafePaths ?? [])],
           publicationBaseEntries: [...(selected.publicationBaseEntries ?? [])],
           publicationEntries: [...(selected.publicationEntries ?? [])],
+          ...(selected.publicationDiffBytes === undefined
+            ? {}
+            : {
+                publicationDiffBytes: Buffer.from(
+                  selected.publicationDiffBytes,
+                ),
+              }),
           base: selected.base ?? "a".repeat(40),
           head: selected.head ?? "b".repeat(40),
         };
@@ -1024,6 +1032,136 @@ describe("scan and patch workflow", () => {
     expect(outcome.exitCode, outcome.stderr).toBe(0);
     expect(assessedPaths).toEqual([[firstPath], [firstPath, secondPath]]);
     expect(assessedPaths.flat()).not.toContain(unrelatedPath);
+  });
+
+  test("applies same-file accepted deltas without a blocked intervening edit", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-cumulative-same-file-")),
+    );
+    const path = "shared.ts";
+    const file = join(repository, path);
+    const result = resultWithFindings(["high", "high", "high"]);
+    for (const finding of result.findings.findings) {
+      finding.locations[0]!.path = path;
+    }
+    const baseline = [
+      "first = 'unsafe';",
+      ...Array.from({ length: 8 }, (_, index) => `before_${index} = true;`),
+      "blocked = 'original';",
+      ...Array.from({ length: 8 }, (_, index) => `after_${index} = true;`),
+      "third = 'unsafe';",
+      "",
+    ].join("\n");
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    const assessedDiffs: string[] = [];
+    let author = 0;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(file, baseline);
+      git("add", "--", path);
+      git("commit", "-m", "Initial synthetic checkout");
+
+      const outcome = await runWorkflow(
+        ["patch", "--scan", "scan-1", "--assess-patch-risk", "--json"],
+        {
+          currentDirectory: repository,
+          result,
+          onWorkbench: () => {
+            const saved = savedScan(result);
+            (saved["scan"] as JsonObject)["targetPath"] = repository;
+            return saved;
+          },
+          onCodex: async (_args, output) => {
+            if (output!.command === "verify-fix") {
+              output!.stdout.write(
+                JSON.stringify({
+                  results: ["occ_1", "occ_3"].map((id) => ({
+                    id,
+                    status: "fixed",
+                    evidence: "The complete synthetic patch preserves the fix.",
+                  })),
+                }),
+              );
+              return 0;
+            }
+            if (output!.appServer!.sandbox === "read-only") {
+              const prompt = output!.appServer!.prompt;
+              assessedDiffs.push(
+                await readFile(patchRiskArtifact(prompt).path, "utf8"),
+              );
+              output!.stdout.write(
+                JSON.stringify(approvedPatchRiskVerdict(prompt)),
+              );
+              return 0;
+            }
+
+            const occurrenceId = `occ_${author + 1}`;
+            const contents = await readFile(file, "utf8");
+            if (author === 0) {
+              await writeFile(
+                file,
+                contents.replace("first = 'unsafe';", "first = 'fixed';"),
+              );
+            } else if (author === 1) {
+              await writeFile(
+                file,
+                contents.replace(
+                  "blocked = 'original';",
+                  "blocked = 'changed';",
+                ),
+              );
+            } else {
+              await writeFile(
+                file,
+                contents.replace("third = 'unsafe';", "third = 'fixed';"),
+              );
+            }
+            output!.stdout.write(
+              JSON.stringify({
+                patches: [
+                  author === 1
+                    ? {
+                        occurrenceId,
+                        status: "blocked",
+                        files: [],
+                        reason: "The synthetic dependency is unavailable.",
+                      }
+                    : {
+                        occurrenceId,
+                        status: "verified",
+                        files: [path],
+                        verification: "The synthetic issue is fixed.",
+                      },
+                ],
+              }),
+            );
+            author += 1;
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(1);
+      expect(assessedDiffs).toHaveLength(2);
+      expect(assessedDiffs[1]).toContain("first = 'fixed';");
+      expect(assessedDiffs[1]).toContain("third = 'fixed';");
+      expect(assessedDiffs[1]).not.toContain("blocked = 'changed';");
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
   });
 
   test("reverifies all accepted findings after the final reviewed patch", async () => {
@@ -8613,21 +8751,43 @@ describe("scan and patch workflow", () => {
     });
   });
 
-  test("uses the configured Python interpreter to load saved findings", async () => {
+  test("binds the configured Python interpreter after loading the saved target", async () => {
     const result = resultWithFindings(["high"]);
     const pythonPaths: Array<string | undefined> = [];
+    const protectedRoots: string[] = [];
     const outcome = await runWorkflow(
       ["patch", "--scan", "scan-1", "--python", "/managed/python"],
       {
-        onWorkbench: (_args, _input, pythonPath): JsonObject => {
+        onWorkbench: (args, _input, pythonPath): JsonObject => {
           pythonPaths.push(pythonPath);
-          return savedScan(result);
+          if (args[0] === "list-findings") {
+            return {
+              findings: result.findings.findings as unknown as JsonObject[],
+            };
+          }
+          const saved = savedScan(result);
+          const scan = saved["scan"] as JsonObject;
+          scan["findings"] = [];
+          scan["findingsTruncated"] = true;
+          return saved;
+        },
+      },
+      {
+        configure: (current) => {
+          current.resolvePluginPython = async (options) => {
+            if (options?.protectedRoot === undefined) {
+              throw new Error("Expected a protected synthetic target root.");
+            }
+            protectedRoots.push(options.protectedRoot);
+            return "/managed/python";
+          };
         },
       },
     );
 
     expect(outcome.exitCode).toBe(0);
-    expect(pythonPaths).toEqual(["/managed/python"]);
+    expect(pythonPaths).toEqual([undefined, "/managed/python"]);
+    expect(protectedRoots).toEqual([SAVED_REPOSITORY]);
   });
 
   test("creates a draft pull request for verified saved-finding patches", async () => {
