@@ -5608,6 +5608,19 @@ interface NestedPatchReviewRepository {
   gitDirectory: string;
 }
 
+const NESTED_PATCH_REVIEW_GIT_METADATA_PATHS = [
+  "HEAD",
+  "config",
+  "config.worktree",
+  "hooks",
+  "info/attributes",
+  "info/exclude",
+  "info/sparse-checkout",
+  "objects/info/alternates",
+  "packed-refs",
+  "refs",
+] as const;
+
 function updateNestedPatchReviewDigest(
   digest: ReturnType<typeof createHash>,
   path: Buffer,
@@ -5623,6 +5636,43 @@ function updateNestedPatchReviewDigest(
       .update(payload)
       .digest(),
   );
+}
+
+async function hashNestedPatchReviewGitMetadata(
+  worktree: string,
+  markerPath: Buffer,
+  digest: ReturnType<typeof createHash>,
+  signal?: AbortSignal,
+): Promise<void> {
+  const marker = patchReviewFilesystemPath(worktree, markerPath);
+  let metadata: BigIntStats;
+  try {
+    metadata = await lstat(marker, { bigint: true });
+  } catch (error) {
+    if (missingPatchReviewPath(error)) {
+      updateNestedPatchReviewDigest(digest, markerPath, "missing", "");
+      return;
+    }
+    throw error;
+  }
+  if (!metadata.isDirectory()) {
+    await hashNestedPatchReviewPath(worktree, markerPath, digest, signal);
+    return;
+  }
+  updateNestedPatchReviewDigest(
+    digest,
+    markerPath,
+    `directory:${metadata.mode.toString(8)}`,
+    "",
+  );
+  for (const relativePath of NESTED_PATCH_REVIEW_GIT_METADATA_PATHS) {
+    await hashNestedPatchReviewPath(
+      worktree,
+      Buffer.concat([markerPath, Buffer.from("/"), Buffer.from(relativePath)]),
+      digest,
+      signal,
+    );
+  }
 }
 
 async function hashNestedPatchReviewPath(
@@ -5666,7 +5716,15 @@ async function hashNestedPatchReviewPath(
     );
     entries.sort(Buffer.compare);
     for (const name of entries) {
-      if (name.equals(Buffer.from(".git"))) continue;
+      if (name.equals(Buffer.from(".git"))) {
+        await hashNestedPatchReviewGitMetadata(
+          worktree,
+          Buffer.concat([path, Buffer.from("/"), name]),
+          digest,
+          signal,
+        );
+        continue;
+      }
       await hashNestedPatchReviewPath(
         worktree,
         Buffer.concat([path, Buffer.from("/"), name]),
@@ -5840,13 +5898,14 @@ async function readPatchReviewBlob(
         "The patch worktree changed while its review boundary was captured.",
       );
     }
-    const preserveWindowsMode =
-      process.platform === "win32" &&
-      (existingMode === "100644" || existingMode === "100755");
+    const preserveMaterializedMode =
+      existingMode === "120000" ||
+      (process.platform === "win32" &&
+        (existingMode === "100644" || existingMode === "100755"));
     const executable = (opened.mode & 0o111n) !== 0n;
     return {
       contents,
-      mode: preserveWindowsMode
+      mode: preserveMaterializedMode
         ? existingMode
         : executable
           ? "100755"
@@ -6653,6 +6712,18 @@ async function snapshotPatchReviewWorktree(
               removedSet.add(key);
               removed.push(pathBytes);
             }
+          }
+          continue;
+        }
+      }
+      if (currentEntries.has(key)) {
+        try {
+          await lstat(patchReviewFilesystemPath(repository, pathBytes));
+        } catch (error) {
+          if (!missingPatchReviewPath(error)) throw error;
+          if (!removedSet.has(key)) {
+            removedSet.add(key);
+            removed.push(pathBytes);
           }
           continue;
         }
