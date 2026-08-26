@@ -589,14 +589,14 @@ def merge_saved_results(
         if (relative != "parent" or not parent_manifest) and not superseded:
             source_coverage = draft["coverage"]
             source_completeness = source_coverage.get("completeness")
+            source_complete = draft.get("complete", True) is True
             if (
-                draft.get("complete") is False
-                or ("complete" in draft and not isinstance(draft["complete"], bool))
-                or source_completeness not in ("complete", "partial")
+                not source_complete
                 or (
                     source_completeness != "complete"
                     and (
                         worker_id is not None
+                        or source_completeness != "partial"
                         or coverage.get("completeness") == "unknown"
                     )
                 )
@@ -604,11 +604,10 @@ def merge_saved_results(
                     not isinstance(source_coverage.get(field), list)
                     for field in ("surfaces", "explicitExclusions", "deferred")
                 )
-            ):
-                if _UNVERIFIED_COVERAGE_WARNING not in warnings:
-                    warnings.append(_UNVERIFIED_COVERAGE_WARNING)
+            ) and _UNVERIFIED_COVERAGE_WARNING not in warnings:
+                warnings.append(_UNVERIFIED_COVERAGE_WARNING)
             if (
-                draft.get("complete") is False or source_completeness != "complete"
+                not source_complete or source_completeness != "complete"
             ) and coverage.get("completeness") in {"complete", "unknown"}:
                 coverage["completeness"] = "partial"
         if superseded and not stopped:

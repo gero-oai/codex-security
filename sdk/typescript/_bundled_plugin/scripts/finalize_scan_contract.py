@@ -1049,10 +1049,6 @@ def _recover_unsealed_coverage(
             )
             for warning in warnings
         )
-        and not any(
-            surface["disposition"] == "needs_follow_up"
-            for surface in coverage["surfaces"]
-        )
     ):
         coverage["completeness"] = "complete"
         warnings.append(

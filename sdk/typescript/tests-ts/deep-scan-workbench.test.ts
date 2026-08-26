@@ -66,7 +66,14 @@ interface OwnershipProbe {
   mutation?: "rotate" | "withdraw";
 }
 
-function runOwnershipProbe(probe: OwnershipProbe): Record<string, unknown> {
+interface CoverageProbeResult {
+  expected: string;
+  completeness: string;
+  warnings: string[];
+  openQuestions?: Array<{ question: string }>;
+}
+
+function runPythonProbe<T>(script: string, root: string, probe: unknown): T {
   const python = Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
   expect(python).not.toBeNull();
   if (python === null) {
@@ -74,23 +81,20 @@ function runOwnershipProbe(probe: OwnershipProbe): Record<string, unknown> {
   }
 
   const result = Bun.spawnSync(
-    [
-      python,
-      "-I",
-      "-B",
-      "-c",
-      deepScanOwnershipProbe,
-      join(PLUGIN_ROOT, "scripts"),
-      JSON.stringify(probe),
-    ],
+    [python, "-I", "-B", "-c", script, root, JSON.stringify(probe)],
     { stdout: "pipe", stderr: "pipe" },
   );
   expect(new TextDecoder().decode(result.stderr)).toBe("");
   expect(result.exitCode).toBe(0);
-  return JSON.parse(new TextDecoder().decode(result.stdout)) as Record<
-    string,
-    unknown
-  >;
+  return JSON.parse(new TextDecoder().decode(result.stdout)) as T;
+}
+
+function runOwnershipProbe(probe: OwnershipProbe): Record<string, unknown> {
+  return runPythonProbe(
+    deepScanOwnershipProbe,
+    join(PLUGIN_ROOT, "scripts"),
+    probe,
+  );
 }
 
 test("copies a Deep Scan publication when the filesystem rejects hardlinks", async () => {
@@ -284,30 +288,6 @@ test.each([
 );
 
 describe("deep scan workbench ownership", () => {
-  function runCoverageProbe(script: string[], cases: readonly unknown[]) {
-    const python = Bun.which("python3") ?? Bun.which("python");
-    expect(python).not.toBeNull();
-    const result = Bun.spawnSync(
-      [
-        python!,
-        "-I",
-        "-B",
-        "-c",
-        script.join("\n"),
-        PLUGIN_ROOT,
-        JSON.stringify(cases),
-      ],
-      { stdout: "pipe", stderr: "pipe" },
-    );
-    expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
-    return JSON.parse(new TextDecoder().decode(result.stdout)) as Array<{
-      expected: string;
-      completeness: string;
-      warnings: string[];
-      openQuestions?: Array<{ question: string }>;
-    }>;
-  }
-
   test("restores complete deep coverage only without pending or lost work", () => {
     const cases = [
       { expected: "complete" },
@@ -373,7 +353,7 @@ describe("deep scan workbench ownership", () => {
       { expected: "partial", coverage: { mode: "repository" } },
       { expected: "unknown", coverage: { completeness: "unknown" } },
     ] as const;
-    const recovered = runCoverageProbe(
+    const recovered = runPythonProbe<CoverageProbeResult[]>(
       [
         "import copy, json, pathlib, runpy, sys",
         "plugin = pathlib.Path(sys.argv[1])",
@@ -389,7 +369,8 @@ describe("deep scan workbench ownership", () => {
         "    recover(coverage, plugin / 'schemas', examples, warnings, case.get('discarded', []))",
         "    results.append({'expected': case['expected'], 'completeness': coverage['completeness'], 'warnings': warnings, 'openQuestions': coverage['openQuestions']})",
         "print(json.dumps(results))",
-      ],
+      ].join("\n"),
+      PLUGIN_ROOT,
       cases,
     );
     for (const result of recovered) {
@@ -402,84 +383,35 @@ describe("deep scan workbench ownership", () => {
 
   test("preserves worker and parent coverage provenance during recovery", () => {
     const cases = [
-      ["complete", false, "complete", null, "partial"],
-      ["partial", false, "complete", null, "partial"],
-      ["partial", null, "complete", null, "partial"],
-      ["partial", 0, "complete", null, "partial"],
-      ["partial", "false", "complete", null, "partial"],
-      ["complete", null, "complete", null, "partial", { priorWarning: true }],
-      ["complete", 0, "complete", null, "partial", { priorWarning: true }],
-      [
-        "complete",
-        "false",
-        "complete",
-        null,
-        "partial",
-        { priorWarning: true },
-      ],
-      ["partial", true, "complete", null, "complete"],
-      ["complete", "omitted", "unknown", null, "partial"],
-      ["partial", "omitted", "unknown", null, "partial"],
-      ["partial", "omitted", null, null, "partial"],
-      ["partial", "omitted", "invalid", null, "partial"],
-      ["partial", "omitted", [], null, "partial"],
-      ["partial", "omitted", "partial", "deferred", "partial"],
-      ["complete", "omitted", "complete", "surfaces", "partial"],
-      ["complete", "omitted", "partial", null, "partial"],
-      ["partial", "omitted", "partial", null, "partial"],
-      ["unknown", "omitted", "partial", null, "partial"],
-      ["unknown", "omitted", "complete", null, "unknown"],
-      ["partial", "omitted", "complete", null, "complete"],
-      [
-        "partial",
-        "omitted",
-        "complete",
-        null,
-        "partial",
-        { kind: "discovery", missing: true },
-      ],
-      [
-        "partial",
-        "omitted",
-        "complete",
-        null,
-        "partial",
-        { kind: "dedup", missing: true },
-      ],
-      [
-        "complete",
-        "omitted",
-        "complete",
-        null,
-        "partial",
-        { kind: "discovery", missing: true, priorWarning: true },
-      ],
-      [
-        "complete",
-        "omitted",
-        "complete",
-        null,
-        "partial",
-        { kind: "dedup", missing: true, priorWarning: true },
-      ],
-      [
-        "partial",
-        "omitted",
-        "complete",
-        null,
-        "complete",
-        { kind: "discovery", status: "failed", missing: true },
-      ],
-      [
-        "partial",
-        "omitted",
-        "complete",
-        null,
-        "complete",
-        { kind: "discovery", status: "canceled", missing: true },
-      ],
+      { parent: "complete", complete: false },
+      { complete: false },
+      { complete: null },
+      { complete: 0 },
+      { complete: "false" },
+      { parent: "complete", complete: null, retry: true },
+      { parent: "complete", complete: 0, retry: true },
+      { parent: "complete", complete: "false", retry: true },
+      { complete: true, expected: "complete" },
+      { parent: "complete", worker: "unknown" },
+      { worker: "unknown" },
+      { worker: null },
+      { worker: "invalid" },
+      { worker: [] },
+      { worker: "partial", malformed: "deferred" },
+      { parent: "complete", malformed: "surfaces" },
+      { parent: "complete", worker: "partial" },
+      { worker: "partial" },
+      { parent: "unknown", worker: "partial" },
+      { parent: "unknown", expected: "unknown" },
+      { expected: "complete" },
+      { missing: true },
+      { kind: "dedup", missing: true },
+      { parent: "complete", missing: true, retry: true },
+      { parent: "complete", kind: "dedup", missing: true, retry: true },
+      { status: "failed", missing: true, expected: "complete" },
+      { status: "canceled", missing: true, expected: "complete" },
     ] as const;
-    const recovered = runCoverageProbe(
+    const recovered = runPythonProbe<CoverageProbeResult[]>(
       [
         "import copy, json, pathlib, sys",
         "plugin = pathlib.Path(sys.argv[1])",
@@ -496,13 +428,16 @@ describe("deep scan workbench ownership", () => {
         "saved.write_scan_local_bytes = lambda *_args, **_kwargs: None",
         "results = []",
         "for case in json.loads(sys.argv[2]):",
-        "    parent_status, worker_complete, worker_status, malformed, expected = case[:5]",
-        "    options = case[5] if len(case) > 5 else {}",
+        "    parent_status = case.get('parent', 'partial')",
+        "    worker_complete = case.get('complete', 'omitted')",
+        "    worker_status = case.get('worker', 'complete')",
+        "    malformed = case.get('malformed')",
+        "    expected = case.get('expected', 'partial')",
         "    workers = []",
         "    for index in range(2):",
         "        name = f'synthetic-worker-{index}'",
-        "        workers.append(dict(id=name, kind=options.get('kind', 'discovery'),",
-        "            status=options.get('status', 'succeeded'), artifact_dir=str(examples / name),",
+        "        workers.append(dict(id=name, kind=case.get('kind', 'discovery'),",
+        "            status=case.get('status', 'succeeded'), artifact_dir=str(examples / name),",
         "            result_manifest_path=str(examples / name / 'result.json'), completed_at='now', attempt=1))",
         "    parent_coverage = copy.deepcopy(example)",
         "    parent_coverage.update(scanId='synthetic-scan', mode='deep_repository', completeness=parent_status)",
@@ -515,18 +450,19 @@ describe("deep scan workbench ownership", () => {
         "        'findings.json': {'findings': []}, 'coverage.json': parent_coverage}",
         "    worker_draft = {'scanId': 'synthetic-scan', 'findings': [], 'coverage': worker_coverage}",
         "    if worker_complete != 'omitted': worker_draft['complete'] = worker_complete",
-        "    if not options.get('missing'):",
+        "    if not case.get('missing'):",
         "        for worker in workers: drafts[f\"{worker['id']}/result.json\"] = worker_draft",
         "    def read_draft(_root, relative, _label):",
         "        if relative not in drafts: raise FileNotFoundError(relative)",
         "        return copy.deepcopy(drafts[relative])",
         "    saved._read_scan_local_json = read_draft",
-        "    warnings = [saved._UNVERIFIED_COVERAGE_WARNING] if options.get('priorWarning') else []",
+        "    warnings = [saved._UNVERIFIED_COVERAGE_WARNING] if case.get('retry') else []",
         "    coverage = saved.merge_saved_results(examples, 'synthetic-scan', binding, workers, warnings, stopped=False, reason='')[2]",
         "    finalizer._recover_unsealed_coverage(coverage, plugin / 'schemas', examples, warnings, [])",
         "    results.append({'expected': expected, 'completeness': coverage['completeness'], 'warnings': warnings})",
         "print(json.dumps(results))",
-      ],
+      ].join("\n"),
+      PLUGIN_ROOT,
       cases,
     );
     for (const result of recovered) {
