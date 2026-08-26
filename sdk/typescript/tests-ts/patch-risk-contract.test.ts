@@ -44,6 +44,7 @@ interface Assessment {
     name: string;
     status: string;
     protects: string;
+    requiredForMerge: boolean;
     failureAttribution?: string;
   }>;
   unknowns: Array<{
@@ -138,6 +139,7 @@ function assessment(): Assessment {
         name: "focused request tests",
         status: "passed",
         protects: "Changed behavior through the production caller.",
+        requiredForMerge: true,
       },
     ],
     unknowns: [],
@@ -454,6 +456,21 @@ describe("patch risk assessment contract", () => {
     expect(result.stderr).toContain(
       "auto_merge_candidate gate failed: autoMergeExclusions",
     );
+  });
+
+  test("allows skipped non-required validation evidence for auto-merge", async () => {
+    const payload = assessment();
+    payload.workflowLabel = "auto_merge_candidate";
+    payload.impact.rating = "low";
+    payload.validation.push({
+      name: "optional platform benchmark",
+      status: "skipped",
+      protects: "An unaffected platform-specific performance boundary.",
+      requiredForMerge: false,
+    });
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
   });
 
   test("rejects a merge with a decision-critical unknown", async () => {
@@ -1840,14 +1857,33 @@ describe("patch risk assessment contract", () => {
     );
   });
 
-  test("requires a passed validation for an exact-head pass claim", async () => {
+  test("requires required validation to pass for an exact-head pass claim", async () => {
     const payload = assessment();
     payload.regressionProtection.rating = "partial";
     payload.validation[0]!.status = "skipped";
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
-      "exact-head checks passed requires a passed validation",
+      "exact-head checks passed requires every required validation to pass",
+    );
+  });
+
+  test("rejects an exact-head pass claim when another required validation failed", async () => {
+    const payload = assessment();
+    payload.workflowLabel = "human_review_required";
+    payload.regressionLikelihood.rating = "moderate";
+    payload.validation.push({
+      name: "required integration tests",
+      status: "failed",
+      protects: "The changed behavior through its integration boundary.",
+      requiredForMerge: true,
+      failureAttribution: "not_patch_caused",
+    });
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "exact-head checks passed requires every required validation to pass",
     );
   });
 

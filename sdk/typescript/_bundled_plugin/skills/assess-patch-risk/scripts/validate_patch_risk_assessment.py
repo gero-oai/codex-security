@@ -743,10 +743,14 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("strong regression protection requires exact-head checks to pass")
         if not any(item["status"] in {"passed", "failed"} for item in validations):
             errors.append("strong regression protection requires an executed validation")
-    if value["regressionProtection"]["exactHeadChecksPassed"] and not any(
-        item["status"] == "passed" for item in validations
+    required_validations = [item for item in validations if item["requiredForMerge"]]
+    if value["regressionProtection"]["exactHeadChecksPassed"] and (
+        not required_validations
+        or not all(item["status"] == "passed" for item in required_validations)
     ):
-        errors.append("exact-head checks passed requires a passed validation")
+        errors.append(
+            "exact-head checks passed requires every required validation to pass"
+        )
 
     if workflow_label == "auto_merge_candidate":
         auto_merge_requirements = {
@@ -765,7 +769,11 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             "statusQuoRisk.rating": value["statusQuoRisk"]["rating"] != "unknown",
             "autoMergeExclusions": not value["autoMergeExclusions"],
             "unknowns": not unknowns,
-            "validation": all(item["status"] == "passed" for item in value["validation"]),
+            "validation": all(
+                not item["requiredForMerge"] or item["status"] == "passed"
+                for item in validations
+            )
+            and not any(item["status"] == "failed" for item in validations),
         }
         for field, passed in auto_merge_requirements.items():
             if not passed:

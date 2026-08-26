@@ -56,7 +56,7 @@ Return both a concise Markdown report and a JSON object conforming to [`../../sc
 3. impact, likelihood, regression protection, recoverability, and confidence ratings with evidence, plus any strict auto-merge exclusions;
 4. affected production roots, important callers, contracts, and state;
 5. strongest counterexample and legitimate control for each material boundary;
-6. relevant tests and checks, including whether they ran and what they actually protect;
+6. relevant tests and checks, including whether they ran, what they actually protect, and whether each is required for merge;
 7. top risk drivers, protective factors, and status-quo risk; and
 8. unknowns plus the bounded evidence plan when held.
 
