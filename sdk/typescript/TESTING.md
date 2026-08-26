@@ -29,6 +29,11 @@ JavaScript and TypeScript, not the Python helpers or child processes. It is
 diagnostic for now. Use several successful CI runs to establish a baseline
 before proposing a coverage floor.
 
+The scan-history Python fixtures use direct interpreter lookup and a 30-second
+child deadline, raised from 10 seconds after repeated hosted Windows timeouts.
+They still run real Python processes and fail if Python is unavailable.
+Production interpreter discovery and its deadlines are unchanged.
+
 ## Writing tests
 
 - Test observable results, failures, cancellation, and cleanup. Prefer a

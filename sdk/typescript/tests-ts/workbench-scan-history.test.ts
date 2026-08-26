@@ -1,11 +1,16 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { resolvePluginPython, runCodexCommand } from "../src/runtime.js";
+import { runCodexCommand } from "../src/runtime.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 test("loads each scan's matching findings once across historical batches", async () => {
-  const python = await resolvePluginPython();
+  const python =
+    process.env["PYTHON"] ??
+    Bun.which("python3") ??
+    Bun.which("python") ??
+    Bun.which("py");
+  if (python === null) throw new Error("A Python interpreter is required.");
 
   const probe = [
     "import argparse, json, sqlite3, sys",
@@ -43,7 +48,7 @@ test("loads each scan's matching findings once across historical batches", async
     ],
     process.env,
     probe,
-    AbortSignal.timeout(10_000),
+    AbortSignal.timeout(30_000),
   );
 
   expect(result.exitCode, result.stderr).toBe(0);
@@ -65,7 +70,12 @@ test("loads each scan's matching findings once across historical batches", async
 });
 
 test("loads oversized comparison matches from stdin", async () => {
-  const python = await resolvePluginPython();
+  const python =
+    process.env["PYTHON"] ??
+    Bun.which("python3") ??
+    Bun.which("python") ??
+    Bun.which("py");
+  if (python === null) throw new Error("A Python interpreter is required.");
 
   const probe = [
     "import argparse, io, json, sqlite3, sys",
@@ -102,7 +112,7 @@ test("loads oversized comparison matches from stdin", async () => {
     ["-I", "-B", "-c", probe, join(PLUGIN_ROOT, "scripts")],
     process.env,
     payload,
-    AbortSignal.timeout(10_000),
+    AbortSignal.timeout(30_000),
   );
 
   expect(result.exitCode, result.stderr).toBe(0);

@@ -4,13 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, test } from "bun:test";
-import { resolvePluginPython } from "../src/runtime.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 test.skipIf(process.platform !== "win32")(
   "matches scan-root filters across Windows path aliases",
   async () => {
-    const python = await resolvePluginPython();
+    const python =
+      process.env["PYTHON"] ??
+      Bun.which("python3") ??
+      Bun.which("python") ??
+      Bun.which("py");
+    if (python === null) throw new Error("A Python interpreter is required.");
 
     const root = realpathSync(
       mkdtempSync(join(tmpdir(), "codex-security-scan-root-case-")),
@@ -38,7 +42,7 @@ test.skipIf(process.platform !== "win32")(
       const result = await promisify(execFile)(
         python,
         ["-I", "-B", "-c", probe, join(PLUGIN_ROOT, "scripts"), scanRoot],
-        { encoding: "utf8", timeout: 10_000, windowsHide: true },
+        { encoding: "utf8", timeout: 30_000, windowsHide: true },
       );
 
       expect(result.stderr).toBe("");
