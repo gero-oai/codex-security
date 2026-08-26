@@ -5539,6 +5539,97 @@ describe("scan and patch workflow", () => {
     },
   );
 
+  test.skipIf(process.platform === "win32")(
+    "does not invoke repository clean filters while publishing reviewed paths",
+    async () => {
+      const root = await mkdtemp(
+        join(tmpdir(), "codex-security-publish-git-environment-"),
+      );
+      const repository = join(root, "repository");
+      const remote = join(root, "remote.git");
+      const filter = join(root, "filter.mjs");
+      const invoked = join(root, "invoked.txt");
+      const armed = join(root, "armed");
+      const result = resultWithFindings(["high"]);
+      result.findings.findings[0]!.locations[0]!.path = "value.ts";
+      try {
+        await mkdir(repository);
+        const git = (...args: string[]) => runRepositoryGit(repository, args);
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        await writeFile(
+          filter,
+          [
+            'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
+            `if (existsSync(${JSON.stringify(armed)})) writeFileSync(${JSON.stringify(invoked)}, "invoked");`,
+            "process.stdout.write(readFileSync(0));",
+          ].join("\n"),
+        );
+        git(
+          "config",
+          "filter.capture.clean",
+          `${JSON.stringify(process.execPath)} ${JSON.stringify(filter)}`,
+        );
+        await writeFile(
+          join(repository, ".gitattributes"),
+          "value.ts filter=capture\n",
+        );
+        await writeFile(join(repository, "value.ts"), "unsafe\n");
+        git("add", "--", ".");
+        git("commit", "-m", "Initial synthetic checkout");
+        git("init", "--bare", remote);
+        git("remote", "add", "origin", remote);
+        git("push", "--set-upstream", "origin", "main");
+        await writeFile(armed, "armed\n");
+
+        const outcome = await runWorkflow(
+          ["scan", "--patch", "--review-minimality", "--create-pr", "--json"],
+          {
+            currentDirectory: repository,
+            result,
+            onCodex: async (args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                output!.stdout.write(
+                  JSON.stringify({ status: "approved", findings: [] }),
+                );
+              } else {
+                await writeFile(join(repository, "value.ts"), "fixed\n");
+                completePatches(args, output);
+              }
+              return 0;
+            },
+            onRepositoryCommand: (command, args, _repository, options) => {
+              if (command === "git")
+                return runRepositoryGit(repository, args, options);
+              return args[1] === "list"
+                ? ""
+                : "https://github.example.test/example/repository/pull/22";
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode, outcome.stderr).toBe(0);
+        expect(
+          await readFile(invoked, "utf8").catch(
+            (error: NodeJS.ErrnoException) => {
+              if (error.code === "ENOENT") return undefined;
+              throw error;
+            },
+          ),
+        ).toBeUndefined();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("captures broad review candidates without per-path Git fan-out", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-broad-review-")),
