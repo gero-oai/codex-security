@@ -544,6 +544,68 @@ describe("scan and patch workflow", () => {
     ]);
   });
 
+  test("removes a stale temporary-index entry after an author revision", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-revision-removal-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let authors = 0;
+    let reviews = 0;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+              output!.stdout.write(
+                JSON.stringify(
+                  reviews === 1
+                    ? { status: "revise", findings: ["Remove extra.ts."] }
+                    : { status: "approved", findings: [] },
+                ),
+              );
+            } else {
+              authors += 1;
+              if (authors === 1) {
+                await writeFile(join(repository, "value.ts"), "fixed\n");
+                await writeFile(join(repository, "extra.ts"), "extra\n");
+              } else {
+                await rm(join(repository, "extra.ts"));
+              }
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect({ authors, reviews }).toEqual({ authors: 2, reviews: 2 });
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
   test("restages a restored tracked file even when ignore rules match", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-restored-ignored-")),
@@ -2198,6 +2260,122 @@ describe("scan and patch workflow", () => {
       expect(await readFile(join(nested, "value.ts"), "utf8")).toBe(
         "nested changed\n",
       );
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when the author changes descendant embedded Git metadata", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-descendant-metadata-")),
+    );
+    const nested = join(repository, "nested");
+    const embedded = join(nested, "embedded");
+    const git = (directory: string, ...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: directory,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviews = 0;
+    try {
+      git(repository, "init", "--initial-branch=main");
+      git(repository, "config", "user.name", "Synthetic User");
+      git(repository, "config", "user.email", "synthetic@example.test");
+      git(repository, "config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git(repository, "add", "--", "value.ts");
+      git(repository, "commit", "-m", "Initial synthetic checkout");
+
+      await mkdir(nested);
+      git(nested, "init", "--initial-branch=main");
+      git(nested, "config", "user.name", "Synthetic User");
+      git(nested, "config", "user.email", "synthetic@example.test");
+      git(nested, "config", "commit.gpgsign", "false");
+      await writeFile(join(nested, "tracked.ts"), "nested baseline\n");
+      git(nested, "add", "--", "tracked.ts");
+      git(nested, "commit", "-m", "Initial nested checkout");
+
+      await mkdir(embedded);
+      git(embedded, "init", "--initial-branch=main");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              git(embedded, "config", "review.synthetic", "changed");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain("nested Git worktree changed");
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves materialized symlink modes in review snapshots", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-materialized-link-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "target.ts"), "unsafe\n");
+      await symlink("target.ts", join(repository, "linked.ts"));
+      git("add", "--", "target.ts", "linked.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+      git("config", "core.symlinks", "false");
+      await rm(join(repository, "linked.ts"));
+      git("checkout", "--", "linked.ts");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "linked.ts"), "fixed.ts");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
     } finally {
       await rm(repository, { recursive: true, force: true });
     }
