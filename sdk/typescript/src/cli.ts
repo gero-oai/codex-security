@@ -1212,6 +1212,7 @@ interface PatchReviewCandidateDelta {
   publicationUnsafePaths?: string[];
   publicationBaseEntries?: PatchReviewTreeEntry[];
   publicationEntries?: PatchReviewTreeEntry[];
+  publicationDiffBytes?: Buffer;
   base?: string;
   head?: string;
 }
@@ -5113,11 +5114,13 @@ async function selectSavedFindings(
   let scanId = requestedScanId;
   if (scanId === "latest") {
     const repository = resolve(dependencies.currentDirectory());
-    const history = await dependencies.runWorkbench(
-      ["list-scans", "--repository", repository, "--status", "complete"],
-      undefined,
-      pythonPath,
-    );
+    const history = await dependencies.runWorkbench([
+      "list-scans",
+      "--repository",
+      repository,
+      "--status",
+      "complete",
+    ]);
     const latest = (history["scans"] as { scanId?: string }[] | undefined)?.[0]
       ?.scanId;
     if (typeof latest !== "string") {
@@ -5134,7 +5137,6 @@ async function selectSavedFindings(
     for await (const finding of workbenchFindings(
       ["list-global-findings", "--status", "open"],
       dependencies,
-      pythonPath,
     )) {
       for (const identifier of [finding.occurrenceId, finding.findingId]) {
         if (remaining.delete(identifier)) scanIds.add(finding.scanId);
@@ -5152,18 +5154,14 @@ async function selectSavedFindings(
     }
   }
 
-  const context = await dependencies.runWorkbench(
-    [
-      "get-scan",
-      "--scan-id",
-      scanId,
-      ...(identifiers.length === 1 && identifiers[0]?.startsWith("occ_")
-        ? ["--occurrence-id", identifiers[0]]
-        : []),
-    ],
-    undefined,
-    pythonPath,
-  );
+  const context = await dependencies.runWorkbench([
+    "get-scan",
+    "--scan-id",
+    scanId,
+    ...(identifiers.length === 1 && identifiers[0]?.startsWith("occ_")
+      ? ["--occurrence-id", identifiers[0]]
+      : []),
+  ]);
   const scan = context["scan"] as
     | {
         scanId: string;
@@ -5184,11 +5182,19 @@ async function selectSavedFindings(
 
   let findings = scan.findings ?? [];
   if (scan.findingsTruncated) {
+    const selectedPythonPath =
+      pythonPath === undefined
+        ? undefined
+        : await (dependencies.resolvePluginPython ?? resolvePluginPython)({
+            configuredPath: pythonPath,
+            environment: exportEnvironment(dependencies.environment),
+            protectedRoot: scan.targetPath,
+          });
     findings = [];
     for await (const finding of workbenchFindings(
       ["list-findings", "--scan-id", scan.scanId, "--status", "open"],
       dependencies,
-      pythonPath,
+      selectedPythonPath,
     )) {
       findings.push(finding);
     }
@@ -8835,6 +8841,107 @@ async function snapshotPatchReviewWorktree(
         head: projectedHead,
       };
     };
+    const applyCandidateDiff = async (
+      baseTree: string,
+      compositionEnvironment: NodeJS.ProcessEnv,
+      previousHead: string | undefined,
+      candidateDiff: Uint8Array,
+    ): Promise<{
+      paths: string[];
+      diff: string;
+      diffBytes: Buffer;
+      entries: PatchReviewTreeEntry[];
+      head: string;
+    }> => {
+      await runPatchReviewGit(
+        repository,
+        ["read-tree", previousHead ?? baseTree],
+        { environment: compositionEnvironment, signal },
+      );
+      if (candidateDiff.length > 0) {
+        await runPatchReviewGit(
+          repository,
+          ["apply", "--cached", "--binary", "--whitespace=nowarn", "-"],
+          {
+            environment: compositionEnvironment,
+            input: candidateDiff,
+            signal,
+          },
+        );
+      }
+      const projectedHead = await runPatchReviewGit(
+        repository,
+        ["write-tree"],
+        { environment: compositionEnvironment, signal },
+      );
+      const names = await runPatchReviewGitBytes(
+        repository,
+        [
+          "--no-pager",
+          "diff",
+          "--no-color",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--no-renames",
+          "--name-only",
+          "-z",
+          "--relative",
+          baseTree,
+          projectedHead,
+          "--",
+          ".",
+        ],
+        { environment: compositionEnvironment, signal },
+      );
+      const paths = [
+        ...new Set(
+          splitNulRecords(names).map((path) => {
+            const decoded = decodePatchReviewGitPath(path);
+            if (decoded === undefined) {
+              throw new CodexSecurityError(
+                "Patch reviews cannot represent a changed path that is not UTF-8.",
+              );
+            }
+            return decoded;
+          }),
+        ),
+      ];
+      const diffBytes =
+        paths.length === 0
+          ? Buffer.alloc(0)
+          : await runPatchReviewGitBytes(
+              repository,
+              [
+                "--no-pager",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--binary",
+                "--relative",
+                baseTree,
+                projectedHead,
+                "--",
+                ".",
+              ],
+              { environment: compositionEnvironment, signal },
+            );
+      const entries = parsePatchReviewIndexEntries(
+        await runPatchReviewGitBytes(
+          repository,
+          ["ls-files", "--stage", "-z", "--", "."],
+          { environment: compositionEnvironment, signal },
+        ),
+      );
+      return {
+        paths,
+        diff: diffBytes.toString("utf8"),
+        diffBytes,
+        entries: selectedPatchReviewTreeEntries(paths, entries),
+        head: projectedHead,
+      };
+    };
     let disposed = false;
     return {
       directory: repository,
@@ -8938,6 +9045,51 @@ async function snapshotPatchReviewWorktree(
                 { environment, signal },
               );
         const normalizedCandidate = await normalizedPublicationTree(paths);
+        const publicationBaseEntries = selectedPatchReviewTreeEntries(
+          paths,
+          normalizedBaseline.entries,
+        );
+        const publicationEntries = selectedPatchReviewTreeEntries(
+          paths,
+          normalizedCandidate.entries,
+        );
+        const publicationDeltaBase = await composeCandidateTree(
+          publicationBaseTree,
+          publicationEnvironment,
+          paths,
+          [],
+          [],
+          publicationBaseEntries,
+        );
+        const publicationDeltaCandidate = await composeCandidateTree(
+          publicationBaseTree,
+          publicationEnvironment,
+          paths,
+          [],
+          [],
+          publicationEntries,
+        );
+        const publicationDiffBytes =
+          paths.length === 0
+            ? Buffer.alloc(0)
+            : await runPatchReviewGitBytes(
+                repository,
+                [
+                  "--no-pager",
+                  "diff",
+                  "--no-color",
+                  "--no-ext-diff",
+                  "--no-textconv",
+                  "--no-renames",
+                  "--binary",
+                  "--relative",
+                  publicationDeltaBase.head,
+                  publicationDeltaCandidate.head,
+                  "--",
+                  ".",
+                ],
+                { environment: publicationEnvironment, signal },
+              );
         await assertRepositoryGitMetadataUnchanged();
         await assertRepositoryIndexUnchanged();
         await assertRepositoryHeadUnchanged();
@@ -8946,15 +9098,10 @@ async function snapshotPatchReviewWorktree(
           paths,
           diff: diffBytes.toString("utf8"),
           diffBytes,
+          publicationDiffBytes,
           publicationBaseCommit: headCommit ?? null,
-          publicationBaseEntries: selectedPatchReviewTreeEntries(
-            paths,
-            normalizedBaseline.entries,
-          ),
-          publicationEntries: selectedPatchReviewTreeEntries(
-            paths,
-            normalizedCandidate.entries,
-          ),
+          publicationBaseEntries,
+          publicationEntries,
           publicationUnsafePaths: paths.filter((path) =>
             preexistingPathSet.has(path),
           ),
@@ -8979,28 +9126,14 @@ async function snapshotPatchReviewWorktree(
             "The reviewed patch has no candidate tree for cumulative assessment.",
           );
         }
-        await runPatchReviewGit(repository, ["read-tree", candidate.head], {
-          environment: cumulativeEnvironment,
-          signal,
-        });
-        const candidateEntries = parsePatchReviewIndexEntries(
-          await runPatchReviewGitBytes(
-            repository,
-            ["ls-files", "--stage", "-z", "--", "."],
-            { environment: cumulativeEnvironment, signal },
-          ),
-        );
-        const projected = await composeCandidateTree(
+        const projected = await applyCandidateDiff(
           baselineTree,
           cumulativeEnvironment,
-          candidate.paths,
-          previous?.paths ?? [],
-          previous?.entries ?? [],
-          selectedPatchReviewTreeEntries(candidate.paths, candidateEntries),
+          previous?.head,
+          candidate.diffBytes ?? Buffer.from(candidate.diff, "utf8"),
         );
         return {
           ...projected,
-          entries: projected.entries,
           base: baselineTree,
         };
       },
@@ -9021,18 +9154,16 @@ async function snapshotPatchReviewWorktree(
             "The reviewed patch has no candidate tree for publication.",
           );
         }
-        if (candidate.publicationEntries === undefined) {
+        if (candidate.publicationDiffBytes === undefined) {
           throw new CodexSecurityError(
-            "The reviewed patch has no normalized entries for publication.",
+            "The reviewed patch has no normalized delta for publication.",
           );
         }
-        const projected = await composeCandidateTree(
+        const projected = await applyCandidateDiff(
           publicationBaseTree,
           publicationEnvironment,
-          candidate.paths,
-          previous?.paths ?? [],
-          previous?.publicationEntries ?? [],
-          candidate.publicationEntries,
+          previous?.head,
+          candidate.publicationDiffBytes,
         );
         return {
           paths: projected.paths,
