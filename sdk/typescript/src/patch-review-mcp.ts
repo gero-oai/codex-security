@@ -425,7 +425,7 @@ export async function runPatchReviewRepositoryMcp(
               "grep",
               "--full-name",
               "-n",
-              "-I",
+              "--text",
               "-F",
               "-e",
               values["query"],
