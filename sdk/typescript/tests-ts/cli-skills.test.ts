@@ -131,7 +131,12 @@ function patchRiskAssessment(
         status: "passed",
         protects: "The changed behavior through its production caller.",
       },
-    ],
+    ] as Array<{
+      name: string;
+      status: string;
+      failureAttribution?: "patch_caused";
+      protects: string;
+    }>,
     unknowns: [] as Array<{
       summary: string;
       decisionCritical: boolean;
@@ -146,6 +151,7 @@ function patchRiskAssessment(
     assessment.regressionLikelihood.rating = "high";
     assessment.materialBoundaries[0]!.result = "contradicted";
     assessment.validation[0]!.status = "failed";
+    assessment.validation[0]!.failureAttribution = "patch_caused";
   } else if (recommendation === "no_op") {
     assessment.applicability = {
       status: "superseded",
@@ -155,6 +161,7 @@ function patchRiskAssessment(
     assessment.regressionLikelihood.rating = "critical";
     assessment.materialBoundaries[0]!.result = "contradicted";
     assessment.validation[0]!.status = "failed";
+    assessment.validation[0]!.failureAttribution = "patch_caused";
   } else if (recommendation === "hold_for_evidence") {
     assessment.impact.rating = "unknown";
     assessment.regressionLikelihood.rating = "unknown";
