@@ -2696,6 +2696,66 @@ describe("scan and patch workflow", () => {
     },
   );
 
+  test("reviews a tracked directory replaced by a file", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-directory-to-file-")),
+    );
+    const target = join(repository, "shape");
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviewedPaths: string[] = [];
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await mkdir(target);
+      await writeFile(join(target, "value.ts"), "unsafe\n");
+      git("add", "--", "shape/value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              const lines = output!.appServer!.prompt.split("\n");
+              const marker = lines.findIndex((line) =>
+                line.startsWith("Review scope is exactly"),
+              );
+              reviewedPaths = (
+                JSON.parse(lines[marker + 1]!) as { paths: string[] }
+              ).paths;
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await rm(target, { recursive: true, force: true });
+              await writeFile(target, "fixed\n");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(reviewedPaths).toEqual(["shape", "shape/value.ts"]);
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
   test("reviews case-only renames using the worktree spelling", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-case-rename-")),
