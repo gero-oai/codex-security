@@ -1,4 +1,4 @@
-// Rounded file timings [Unix, Windows] in seconds from node-ci on 2026-08-25.
+// Rounded file timings [Unix, Windows] in seconds from CI and local runs.
 // These affect only scheduling: new files automatically get a small default.
 const timings = {
   "api-credentials.test.ts": [1, 48],
@@ -15,7 +15,8 @@ const timings = {
   "publication-integration.test.ts": [9, 19],
   "publication-store.test.ts": [17, 30],
   "release-automation.test.ts": [7, 50],
-  "runtime.test.ts": [20, 121],
+  "runtime-credentials.test.ts": [12, 87],
+  "runtime.test.ts": [18, 60],
   "scan-comparison.test.ts": [1, 11],
   "scan-recovery.test.ts": [24, 83],
   "stopped-scan-results.test.ts": [7, 17],
