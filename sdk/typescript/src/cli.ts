@@ -6887,9 +6887,13 @@ async function snapshotPatchReviewWorktree(
         }
       }
     }
+    const listedPaths = splitNulRecords(listed);
+    const listedPathSet = new Set(
+      listedPaths.map((path) => patchReviewGitPathKey(path)),
+    );
     const paths = new Map<string, Buffer>();
     for (const path of [
-      ...splitNulRecords(listed),
+      ...listedPaths,
       ...baselineTrackedPaths,
       ...baselineSnapshotPaths,
       ...ignoredPaths,
@@ -6943,6 +6947,13 @@ async function snapshotPatchReviewWorktree(
               throw error;
             }
             if (!metadata.isDirectory()) {
+              if (
+                !capturingBaseline &&
+                metadata.isFile() &&
+                listedPathSet.has(directoryKey)
+              ) {
+                break;
+              }
               throw new CodexSecurityError(
                 "A patch path ancestor is no longer a directory. Preserve unrelated filesystem state and retry.",
               );
@@ -7028,7 +7039,19 @@ async function snapshotPatchReviewWorktree(
       }
       if (baselineTrackedPathSet.has(key)) {
         try {
-          await lstat(patchReviewFilesystemPath(repository, pathBytes));
+          const metadata = await lstat(
+            patchReviewFilesystemPath(repository, pathBytes),
+          );
+          if (
+            metadata.isDirectory() &&
+            currentEntries.get(key)?.mode !== "160000"
+          ) {
+            if (!removedSet.has(key)) {
+              removedSet.add(key);
+              removed.push(pathBytes);
+            }
+            continue;
+          }
           if (capturingBaseline) baselineMaterializedTrackedPaths.add(key);
         } catch (error) {
           if (!missingPatchReviewPath(error)) throw error;

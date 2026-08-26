@@ -31,6 +31,8 @@ const PATCH_REVIEW_RUNTIME = join(
   "../src/patch-review-mcp.ts",
 );
 const GIT_EXECUTABLE = Bun.which("git") ?? process.execPath;
+const TEST_PYTHON_EXECUTABLE =
+  Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
 
 function runRepositoryGit(
   repository: string,
@@ -126,6 +128,12 @@ function dependencies(
       dispose: async () => {},
     }));
   current.validatePatchRiskAssessment = async () => true;
+  current.resolvePluginPython = async () => {
+    if (TEST_PYTHON_EXECUTABLE === null) {
+      throw new Error("The patch-risk test fixture requires Python.");
+    }
+    return TEST_PYTHON_EXECUTABLE;
+  };
   return current;
 }
 
@@ -2688,6 +2696,78 @@ describe("scan and patch workflow", () => {
     },
   );
 
+  test.each(["directory-to-file", "file-to-directory"] as const)(
+    "reviews a tracked %s replacement",
+    async (transition) => {
+      const repository = await realpath(
+        await mkdtemp(join(tmpdir(), `codex-security-${transition}-`)),
+      );
+      const target = join(repository, "shape");
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      let reviewedPaths: string[] = [];
+      try {
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        if (transition === "directory-to-file") {
+          await mkdir(target);
+          await writeFile(join(target, "value.ts"), "unsafe\n");
+        } else {
+          await writeFile(target, "unsafe\n");
+        }
+        git("add", "--", ".");
+        git("commit", "-m", "Initial synthetic checkout");
+
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: async (_args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                const lines = output!.appServer!.prompt.split("\n");
+                const marker = lines.findIndex((line) =>
+                  line.startsWith("Review scope is exactly"),
+                );
+                reviewedPaths = (
+                  JSON.parse(lines[marker + 1]!) as { paths: string[] }
+                ).paths;
+                output!.stdout.write(
+                  JSON.stringify({ status: "approved", findings: [] }),
+                );
+              } else {
+                await rm(target, { recursive: true, force: true });
+                if (transition === "directory-to-file") {
+                  await writeFile(target, "fixed\n");
+                } else {
+                  await mkdir(target);
+                  await writeFile(join(target, "value.ts"), "fixed\n");
+                }
+                output!.stdout.write("Verified synthetic patch.");
+              }
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode, outcome.stderr).toBe(0);
+        expect(reviewedPaths).toEqual(["shape", "shape/value.ts"]);
+      } finally {
+        await rm(repository, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("reviews case-only renames using the worktree spelling", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-case-rename-")),
@@ -4093,6 +4173,18 @@ describe("scan and patch workflow", () => {
           currentDirectory: repository,
           result,
           onCodex: async (args, output) => {
+            if (output!.command === "verify-fix") {
+              output!.stdout.write(
+                JSON.stringify({
+                  results: ["occ_1", "occ_2"].map((id) => ({
+                    id,
+                    status: "fixed",
+                    evidence: "The complete synthetic patch preserves the fix.",
+                  })),
+                }),
+              );
+              return 0;
+            }
             if (output!.appServer!.sandbox === "read-only") {
               const artifact = patchRiskArtifact(output!.appServer!.prompt);
               expect(output!.appServer!.reviewRepository?.tree).toBe(
@@ -4452,6 +4544,20 @@ describe("scan and patch workflow", () => {
             result,
             onCodex: async (args, output) => {
               const server = output!.appServer!;
+              if (output!.command === "verify-fix") {
+                output!.stdout.write(
+                  JSON.stringify({
+                    results: [
+                      {
+                        id: "occ_1",
+                        status: "fixed",
+                        evidence: "The complete synthetic patch preserves the fix.",
+                      },
+                    ],
+                  }),
+                );
+                return 0;
+              }
               if (server.sandbox === "read-only") {
                 const artifact = patchRiskArtifact(server.prompt);
                 assessedHead = artifact.patch.head;
