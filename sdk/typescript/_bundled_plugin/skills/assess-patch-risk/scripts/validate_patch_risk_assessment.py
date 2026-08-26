@@ -321,6 +321,8 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("merge requires every material boundary to be supported")
         if value["regressionLikelihood"]["rating"] == "critical":
             errors.append("merge cannot have critical regression likelihood")
+        if value["materialSafetyFailure"]["established"]:
+            errors.append("merge cannot retain an established material safety failure")
         if value["confidence"]["rating"] == "low":
             errors.append("merge cannot have low confidence")
         if any(
@@ -369,12 +371,20 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             and value["applicability"]["status"] != "unknown"
         ):
             errors.append("hold_for_evidence cannot retain a contradicted material boundary")
+        if (
+            value["materialSafetyFailure"]["established"]
+            and value["applicability"]["status"] != "unknown"
+        ):
+            errors.append(
+                "hold_for_evidence cannot retain an established material safety failure"
+            )
         planned_failed_validations: set[str] = set()
         planned_unknowns: set[str] = set()
         planned_boundaries: set[str] = set()
         planned_applicability = False
         established_defect = (
             value["regressionLikelihood"]["rating"] == "critical"
+            or value["materialSafetyFailure"]["established"]
             or any(item["result"] == "contradicted" for item in boundaries)
             or any(
                 item["status"] == "failed"
@@ -382,11 +392,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 for item in validations
             )
         )
-        established_block_reason = (
-            value["regressionLikelihood"]["rating"] == "critical"
-        )
         for index, item in enumerate(evidence_plan):
             applicability_outcomes = item.get("applicabilityOutcomes")
+            likelihood_outcomes = item.get("regressionLikelihoodOutcomes")
+            safety_failure_outcomes = item.get("materialSafetyFailureOutcomes")
             resolved_boundaries = item.get("resolvesBoundaries", [])
             boundary_outcomes = item.get("boundaryOutcomes")
             remaining_unknown_outcomes = item.get("remainingUnknowns")
@@ -411,6 +420,18 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             ) != set(item["outcomes"]):
                 errors.append(
                     f"evidencePlan.{index}: applicabilityOutcomes must name exactly the evidence outcome keys"
+                )
+            if likelihood_outcomes is not None and set(likelihood_outcomes) != set(
+                item["outcomes"]
+            ):
+                errors.append(
+                    f"evidencePlan.{index}: regressionLikelihoodOutcomes must name exactly the evidence outcome keys"
+                )
+            if safety_failure_outcomes is not None and set(
+                safety_failure_outcomes
+            ) != set(item["outcomes"]):
+                errors.append(
+                    f"evidencePlan.{index}: materialSafetyFailureOutcomes must name exactly the evidence outcome keys"
                 )
             if resolved_boundaries and boundary_outcomes is None:
                 errors.append(
@@ -447,6 +468,16 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     remaining_unknown_outcomes.get(outcome, [])
                     if remaining_unknown_outcomes is not None
                     else []
+                )
+                outcome_likelihood = (
+                    likelihood_outcomes.get(outcome)
+                    if likelihood_outcomes is not None
+                    else value["regressionLikelihood"]["rating"]
+                )
+                outcome_safety_failure = (
+                    safety_failure_outcomes.get(outcome)
+                    if safety_failure_outcomes is not None
+                    else value["materialSafetyFailure"]["established"]
                 )
                 for unknown_id in outcome_remaining_unknowns:
                     if unknown_id not in decision_critical_unknowns:
@@ -543,13 +574,25 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     established_defect
                     or branch_contradiction
                     or branch_patch_failure
+                    or outcome_likelihood == "critical"
+                    or outcome_safety_failure is True
                 ):
                     errors.append(
                         f"evidencePlan.{index}: a revise outcome requires branch evidence of a defect"
                     )
-                if outcome_recommendation == "block" and not established_block_reason:
+                if branch_contradiction and outcome_recommendation not in {
+                    "revise",
+                    "block",
+                }:
                     errors.append(
-                        f"evidencePlan.{index}: a block outcome requires critical regression likelihood"
+                        f"evidencePlan.{index}: a contradicted boundary outcome requires revise or block"
+                    )
+                if outcome_recommendation == "block" and not (
+                    outcome_likelihood == "critical"
+                    and outcome_safety_failure is True
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a block outcome requires critical regression likelihood and an established material safety failure"
                     )
                 remaining_decision_unknowns = (
                     decision_critical_unknowns - set(item["resolvesUnknowns"])
@@ -714,6 +757,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     if (
         recommendation == "revise"
         and value["regressionLikelihood"]["rating"] != "critical"
+        and not value["materialSafetyFailure"]["established"]
         and not any(item["result"] == "contradicted" for item in boundaries)
         and not any(
             item["status"] == "failed"
@@ -722,14 +766,16 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         )
     ):
         errors.append(
-            "revise requires critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure"
+            "revise requires critical regression likelihood, an established material safety failure, a contradicted material boundary, or a patch-caused validation failure"
         )
 
-    if (
-        recommendation == "block"
-        and value["regressionLikelihood"]["rating"] != "critical"
+    if recommendation == "block" and not (
+        value["regressionLikelihood"]["rating"] == "critical"
+        and value["materialSafetyFailure"]["established"]
     ):
-        errors.append("block requires critical regression likelihood")
+        errors.append(
+            "block requires critical regression likelihood and an established material safety failure"
+        )
 
     if value["regressionProtection"]["rating"] == "strong":
         if not value["regressionProtection"]["exactHeadChecksPassed"]:
@@ -738,7 +784,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("strong regression protection requires an executed validation")
     required_validations = [item for item in validations if item["requiredForMerge"]]
     if value["regressionProtection"]["exactHeadChecksPassed"] and (
-        not required_validations
+        not any(item["status"] == "passed" for item in validations)
         or not all(item["status"] == "passed" for item in required_validations)
     ):
         errors.append(

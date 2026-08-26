@@ -21,6 +21,7 @@ interface Assessment {
   workflowLabel: string;
   impact: { rating: string; rationale: string };
   regressionLikelihood: { rating: string; rationale: string };
+  materialSafetyFailure: { established: boolean; evidence: string };
   regressionProtection: {
     rating: string;
     rationale: string;
@@ -37,7 +38,9 @@ interface Assessment {
     invariant: string;
     runtimeRoot: string;
     counterexample: string;
+    counterexamplePath: string;
     legitimateControl: string;
+    legitimateControlPath: string;
     result: string;
   }>;
   validation: Array<{
@@ -60,6 +63,8 @@ interface Assessment {
     resolvesBoundaries?: string[];
     boundaryOutcomes?: Record<string, Record<string, string>>;
     applicabilityOutcomes?: Record<string, string>;
+    regressionLikelihoodOutcomes?: Record<string, string>;
+    materialSafetyFailureOutcomes?: Record<string, boolean>;
     resolvesFailedValidation?: string[];
     outcomes: Record<string, string>;
   }>;
@@ -106,6 +111,10 @@ function assessment(): Assessment {
       rating: "low",
       rationale: "The changed path and its caller are covered.",
     },
+    materialSafetyFailure: {
+      established: false,
+      evidence: "No material safety failure was established.",
+    },
     regressionProtection: {
       rating: "strong",
       rationale: "Focused and integration checks passed at the exact head.",
@@ -130,7 +139,9 @@ function assessment(): Assessment {
           "Supported requests retain their existing response contract.",
         runtimeRoot: "service.request",
         counterexample: "A supported request takes the changed branch.",
+        counterexamplePath: "src/request.ts",
         legitimateControl: "A supported request takes the unchanged branch.",
+        legitimateControlPath: "src/request.ts",
         result: "supported",
       },
     ],
@@ -284,6 +295,24 @@ describe("patch risk assessment contract", () => {
     const result = await validate(assessment());
     expect(result.status, result.stderr).toBe(0);
   });
+
+  test.each(["counterexamplePath", "legitimateControlPath"] as const)(
+    "requires a patched source trace in %s",
+    async (field) => {
+      const payload = assessment();
+      delete (
+        payload.materialBoundaries[0] as Partial<
+          Assessment["materialBoundaries"][number]
+        >
+      )[field];
+
+      const result = await validate(payload);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        `required property '${field}' is missing`,
+      );
+    },
+  );
 
   test("accepts omitted and empty optional evidence lists", async () => {
     const omitted = await validate(assessment());
@@ -622,6 +651,10 @@ describe("patch risk assessment contract", () => {
         };
       } else {
         payload.regressionLikelihood.rating = "critical";
+        payload.materialSafetyFailure = {
+          established: true,
+          evidence: "The affected boundary permits a cross-subject decision.",
+        };
       }
 
       const result = await validate(payload);
@@ -1325,6 +1358,103 @@ describe("patch risk assessment contract", () => {
     );
   });
 
+  test("allows an evidence branch to establish a material critical block", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionLikelihood.rating = "moderate";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "unknown";
+    payload.unknowns = [
+      {
+        id: "failure-attribution",
+        summary: "The failed safety check attribution is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Did the patch cause the material safety failure?",
+        action: "Run the safety check against the immutable base.",
+        resolvesUnknowns: ["failure-attribution"],
+        resolvesFailedValidation: ["focused request tests"],
+        outcomes: {
+          patch_caused: "block",
+          not_patch_caused: "merge",
+        },
+        regressionLikelihoodOutcomes: {
+          patch_caused: "critical",
+          not_patch_caused: "low",
+        },
+        materialSafetyFailureOutcomes: {
+          patch_caused: true,
+          not_patch_caused: false,
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("rejects a hold branch that establishes a contradicted boundary", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "boundary-result",
+        summary: "The boundary result is unknown.",
+        decisionCritical: true,
+      },
+      {
+        id: "rollout-target",
+        summary: "The rollout target is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the boundary preserve the required control?",
+        action: "Trace both cases through the patched source.",
+        resolvesUnknowns: ["boundary-result"],
+        remainingUnknowns: {
+          supported: ["rollout-target"],
+          contradicted: ["rollout-target"],
+        },
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          supported: { "request-contract": "supported" },
+          contradicted: { "request-contract": "contradicted" },
+        },
+        outcomes: {
+          supported: "hold_for_evidence",
+          contradicted: "hold_for_evidence",
+        },
+      },
+      {
+        question: "Which runtime receives the patch?",
+        action: "Inspect the checked-in rollout mapping.",
+        resolvesUnknowns: ["rollout-target"],
+        outcomes: {
+          known: "hold_for_evidence",
+          unavailable: "hold_for_evidence",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "a contradicted boundary outcome requires revise or block",
+    );
+  });
+
   test("keeps terminal evidence branches on hold while another pivot remains", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
@@ -1743,7 +1873,7 @@ describe("patch risk assessment contract", () => {
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toBe(
-      "block requires critical regression likelihood\n",
+      "block requires critical regression likelihood and an established material safety failure\n",
     );
 
     payload.validation[0]!.status = "failed";
@@ -1755,11 +1885,20 @@ describe("patch risk assessment contract", () => {
     );
   });
 
-  test("requires critical regression likelihood for block", async () => {
+  test("requires critical likelihood and a material safety failure for block", async () => {
     const critical = assessment();
     critical.recommendation = "block";
     critical.workflowLabel = "block";
     critical.regressionLikelihood.rating = "critical";
+    const nonSafetyCritical = await validate(critical);
+    expect(nonSafetyCritical.status).not.toBe(0);
+    expect(nonSafetyCritical.stderr).toContain(
+      "an established material safety failure",
+    );
+    critical.materialSafetyFailure = {
+      established: true,
+      evidence: "The affected boundary permits a cross-subject decision.",
+    };
     const criticalResult = await validate(critical);
     expect(criticalResult.status, criticalResult.stderr).toBe(0);
 
@@ -1872,6 +2011,16 @@ describe("patch risk assessment contract", () => {
     expect(result.stderr).toContain(
       "exact-head checks passed requires every required validation to pass",
     );
+  });
+
+  test("allows an exact-head pass claim with only optional passing validation", async () => {
+    const payload = assessment();
+    payload.workflowLabel = "human_review_required";
+    payload.regressionLikelihood.rating = "moderate";
+    payload.validation[0]!.requiredForMerge = false;
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
   });
 
   test("rejects an exact-head pass claim when another required validation failed", async () => {
@@ -2066,7 +2215,7 @@ describe("patch risk assessment contract", () => {
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toBe(
-      "revise requires critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure\n",
+      "revise requires critical regression likelihood, an established material safety failure, a contradicted material boundary, or a patch-caused validation failure\n",
     );
   });
 
