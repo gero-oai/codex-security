@@ -85,8 +85,9 @@ failures do not suppress installation failures. Unix keeps its pinned pnpm
 setup action. Windows package inspection enables npm's native phase timings to
 diagnose installation delays without changing its failure or timeout behavior.
 It also logs npm cache/fetch activity and uses a 16-thread libuv pool for
-filesystem-heavy package extraction. Its `TEMP` and `TMP` point to the runner's
-job temporary directory, keeping the fresh npm consumer outside the checkout.
+filesystem-heavy package extraction. Its `TEMP` and `TMP` use the same private
+Windows root as the tests, keeping the fresh npm consumer outside the checkout
+while satisfying the installed credential fixture's ancestor ACL checks.
 These settings apply only to Windows package inspection; the install arguments,
 assertions, and timeouts are unchanged.
 

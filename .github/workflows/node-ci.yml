@@ -352,12 +352,17 @@ jobs:
         working-directory: sdk/typescript
         run: pnpm pack --pack-destination ../../dist
 
+      - name: Prepare private Windows test root
+        id: windows-temp
+        shell: pwsh
+        run: ./sdk/typescript/scripts/prepare-windows-test-root.ps1
+
       - name: Inspect package
         working-directory: sdk/typescript
         shell: bash
         env:
-          TEMP: ${{ runner.temp }}
-          TMP: ${{ runner.temp }}
+          TEMP: ${{ steps.windows-temp.outputs.path }}
+          TMP: ${{ steps.windows-temp.outputs.path }}
           npm_config_timing: "true"
           npm_config_loglevel: http
           UV_THREADPOOL_SIZE: "16"

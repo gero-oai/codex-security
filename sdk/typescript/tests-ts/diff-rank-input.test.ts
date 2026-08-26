@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
@@ -10,10 +10,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, expect, test } from "bun:test";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryRoots: string[] = [];
+const executeFile = promisify(execFile);
 
 function pythonExecutable(): string | null {
   return (
@@ -30,8 +32,8 @@ afterEach(() => {
   }
 });
 
-function git(repository: string, ...args: string[]): string {
-  return execFileSync(
+async function git(repository: string, ...args: string[]): Promise<string> {
+  const { stdout } = await executeFile(
     "git",
     [
       "-c",
@@ -41,10 +43,11 @@ function git(repository: string, ...args: string[]): string {
       ...args,
     ],
     { cwd: repository, encoding: "utf8" },
-  ).trim();
+  );
+  return stdout.trim();
 }
 
-test("diff previews stay inside the selected repository", () => {
+test("diff previews stay inside the selected repository", async () => {
   const root = realpathSync(
     mkdtempSync(join(tmpdir(), "codex-security-diff-rank-")),
   );
@@ -52,36 +55,36 @@ test("diff previews stay inside the selected repository", () => {
   const repository = join(root, "repository");
   const nested = join(repository, "src", "nested");
   mkdirSync(nested, { recursive: true });
-  git(repository, "init", "-q");
+  await git(repository, "init", "-q");
   writeFileSync(join(repository, "src", "handler.py"), "value = 1\n");
   writeFileSync(join(repository, "src", "deleted.py"), "removed = True\n");
   writeFileSync(join(repository, "src", "entry.py"), "handler.py");
   writeFileSync(join(nested, "linked.py"), "value = 1\n");
-  git(repository, "add", ".");
-  const originalLink = git(repository, "hash-object", "src/entry.py");
-  git(
+  await git(repository, "add", ".");
+  const originalLink = await git(repository, "hash-object", "src/entry.py");
+  await git(
     repository,
     "update-index",
     "--cacheinfo",
     `120000,${originalLink},src/entry.py`,
   );
-  git(repository, "commit", "-qm", "base");
-  const base = git(repository, "rev-parse", "HEAD");
+  await git(repository, "commit", "-qm", "base");
+  const base = await git(repository, "rev-parse", "HEAD");
 
   writeFileSync(join(repository, "src", "handler.py"), "value = 2\n");
   writeFileSync(join(repository, "src", "entry.py"), "nested/linked.py");
   writeFileSync(join(nested, "linked.py"), "value = 2\n");
   rmSync(join(repository, "src", "deleted.py"));
-  git(repository, "add", ".");
-  const updatedLink = git(repository, "hash-object", "src/entry.py");
-  git(
+  await git(repository, "add", ".");
+  const updatedLink = await git(repository, "hash-object", "src/entry.py");
+  await git(
     repository,
     "update-index",
     "--cacheinfo",
     `120000,${updatedLink},src/entry.py`,
   );
-  git(repository, "commit", "-qm", "selected changes");
-  const head = git(repository, "rev-parse", "HEAD");
+  await git(repository, "commit", "-qm", "selected changes");
+  const head = await git(repository, "rev-parse", "HEAD");
 
   const externalFixture = join(root, "synthetic-fixture");
   mkdirSync(externalFixture);
@@ -131,7 +134,7 @@ test("diff previews stay inside the selected repository", () => {
   );
 });
 
-test("preserves Unicode Git paths and legacy-encoded commit metadata", () => {
+test("preserves Unicode Git paths and legacy-encoded commit metadata", async () => {
   const root = realpathSync(
     mkdtempSync(join(tmpdir(), "codex-security-diff-rank-unicode-")),
   );
@@ -139,18 +142,18 @@ test("preserves Unicode Git paths and legacy-encoded commit metadata", () => {
   const repository = join(root, "repository-漢字");
   const source = join(repository, "src", "変更.py");
   mkdirSync(join(repository, "src"), { recursive: true });
-  git(repository, "init", "-q");
+  await git(repository, "init", "-q");
   writeFileSync(source, "value = 1\n");
-  git(repository, "add", ".");
-  git(repository, "commit", "-qm", "base");
-  const base = git(repository, "rev-parse", "HEAD");
+  await git(repository, "add", ".");
+  await git(repository, "commit", "-qm", "base");
+  const base = await git(repository, "rev-parse", "HEAD");
   writeFileSync(source, "value = 2\n");
-  git(repository, "add", ".");
-  git(repository, "commit", "-qm", "変更");
-  const head = git(repository, "rev-parse", "HEAD");
+  await git(repository, "add", ".");
+  await git(repository, "commit", "-qm", "変更");
+  const head = await git(repository, "rev-parse", "HEAD");
   const legacyMessage = join(root, "legacy-message");
   writeFileSync(legacyMessage, Buffer.from("café\n", "latin1"));
-  git(
+  await git(
     repository,
     "-c",
     "i18n.commitEncoding=ISO-8859-1",
@@ -160,7 +163,7 @@ test("preserves Unicode Git paths and legacy-encoded commit metadata", () => {
     "-F",
     legacyMessage,
   );
-  const legacyHead = git(repository, "rev-parse", "HEAD");
+  const legacyHead = await git(repository, "rev-parse", "HEAD");
 
   const python = pythonExecutable();
   expect(python).not.toBeNull();
