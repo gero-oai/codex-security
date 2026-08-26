@@ -1626,6 +1626,18 @@ describe("scan and patch workflow", () => {
             expect(createHash("sha256").update(actual).digest("hex")).toBe(
               artifact.patch.sha256,
             );
+            const scope = lines.findIndex((line) =>
+              line.startsWith("Review scope is exactly"),
+            );
+            const reviewCandidate = JSON.parse(lines[scope + 1]!) as {
+              canonicalDiff?: { encoding: string; data: string };
+            };
+            expect(reviewCandidate.canonicalDiff?.encoding).toBe("base64");
+            expect(
+              Buffer.from(reviewCandidate.canonicalDiff!.data, "base64").equals(
+                actual,
+              ),
+            ).toBe(true);
             artifactMatched = true;
             output!.stdout.write(
               JSON.stringify(approvedPatchRiskVerdict(server.prompt)),
@@ -2489,6 +2501,9 @@ describe("scan and patch workflow", () => {
           onCodex: async (args, output) => {
             if (output!.appServer!.sandbox === "read-only") {
               const artifact = patchRiskArtifact(output!.appServer!.prompt);
+              expect(output!.appServer!.reviewRepository?.tree).toBe(
+                artifact.patch.base,
+              );
               assessedPatches.push(artifact.patch);
               assessedDiffs.push(await readFile(artifact.path, "utf8"));
               output!.stdout.write(
