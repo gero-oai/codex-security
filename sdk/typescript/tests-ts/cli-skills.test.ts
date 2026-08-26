@@ -92,6 +92,10 @@ function patchRiskAssessment(
       rating: "low",
       rationale: "The changed path and its caller are covered.",
     },
+    materialSafetyFailure: {
+      established: false,
+      evidence: "No material safety failure was established.",
+    },
     regressionProtection: {
       rating: "strong",
       rationale: "Focused checks exercise the changed behavior.",
@@ -121,7 +125,9 @@ function patchRiskAssessment(
         invariant: "Supported requests retain their contract.",
         runtimeRoot: "service.request",
         counterexample: "A supported request takes the changed branch.",
+        counterexamplePath: "src/request.ts",
         legitimateControl: "The same request succeeds at the base tree.",
+        legitimateControlPath: "src/request.ts",
         result: "supported",
       },
     ],
@@ -164,6 +170,10 @@ function patchRiskAssessment(
     };
   } else if (recommendation === "block") {
     assessment.regressionLikelihood.rating = "critical";
+    assessment.materialSafetyFailure = {
+      established: true,
+      evidence: "The affected boundary permits a cross-subject decision.",
+    };
     assessment.materialBoundaries[0]!.result = "contradicted";
     assessment.validation[0]!.status = "failed";
     assessment.validation[0]!.failureAttribution = "patch_caused";
