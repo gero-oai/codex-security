@@ -684,6 +684,20 @@ MIGRATIONS = (
         """,
     ),
     (
+        31,
+        "freeze stopped scan source digests",
+        """
+        ALTER TABLE scans ADD COLUMN retained_source_digests_json TEXT;
+        """,
+    ),
+    (
+        32,
+        "separate deep scan publication failures",
+        """
+        ALTER TABLE deep_scan_runs ADD COLUMN publication_error_message TEXT;
+        """,
+    ),
+    (
         34,
         "persist authorized source excerpt scopes",
         """
@@ -750,6 +764,20 @@ def apply_migrations(
                         "deep_scan_runs",
                         "max_time_hours",
                         "REAL NOT NULL DEFAULT 96",
+                    )
+                elif version == 31:
+                    add_column_if_missing(
+                        connection,
+                        "scans",
+                        "retained_source_digests_json",
+                        "TEXT",
+                    )
+                elif version == 32:
+                    add_column_if_missing(
+                        connection,
+                        "deep_scan_runs",
+                        "publication_error_message",
+                        "TEXT",
                     )
                 elif version == 34:
                     add_column_if_missing(connection, "scans", "source_scopes_json", "TEXT")
