@@ -55,6 +55,7 @@ interface Assessment {
     question: string;
     action: string;
     resolvesUnknowns: string[];
+    resolvesBoundaries?: string[];
     applicabilityOutcomes?: Record<string, string>;
     resolvesFailedValidation?: string[];
     outcomes: Record<string, string>;
@@ -201,6 +202,10 @@ describe("patch risk assessment contract", () => {
     identifierWithTrailingNewline.materialBoundaries[0]!.id =
       "request-contract\n";
     expect(validateSchema(identifierWithTrailingNewline)).toBe(false);
+
+    const byteOrderMarkOnly = assessment();
+    byteOrderMarkOnly.patch.repository = "\uFEFF";
+    expect(validateSchema(byteOrderMarkOnly)).toBe(false);
   });
 
   test("documents the configured validator command over stdin", async () => {
@@ -697,7 +702,7 @@ describe("patch risk assessment contract", () => {
       action: `Resolve unknown ${index + 1}.`,
       resolvesUnknowns: [`unknown-${index + 1}`],
       outcomes: {
-        supported: "merge",
+        supported: "hold_for_evidence",
         contradicted: "revise",
       },
     }));
@@ -750,6 +755,78 @@ describe("patch risk assessment contract", () => {
     expect(mismatched.stderr).toContain(
       "'missing-unknown' is not a decision-critical unknown",
     );
+  });
+
+  test("keeps a favorable evidence outcome on hold while another pivot remains", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+      {
+        id: "rollout-target",
+        summary: "The rollout target is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Who owns the runtime?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: { owned: "merge", not_owned: "revise" },
+      },
+      {
+        question: "Which target receives the rollout?",
+        action: "Inspect the checked-in rollout registry.",
+        resolvesUnknowns: ["rollout-target"],
+        outcomes: { targeted: "hold_for_evidence", absent: "revise" },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "a merge outcome must resolve every decision-critical unknown",
+    );
+  });
+
+  test("binds every unresolved boundary to a matching evidence action", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "request-contract-evidence",
+        summary: "The request contract evidence is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the request contract remain supported?",
+        action: "Exercise the request contract through its production caller.",
+        resolvesUnknowns: ["request-contract-evidence"],
+        outcomes: { supported: "merge", contradicted: "revise" },
+      },
+    ];
+
+    const missing = await validate(payload);
+    expect(missing.status).not.toBe(0);
+    expect(missing.stderr).toContain(
+      "unresolved material boundary 'request-contract' requires a matching evidence plan",
+    );
+
+    payload.evidencePlan[0]!.resolvesBoundaries = ["request-contract"];
+    const covered = await validate(payload);
+    expect(covered.status, covered.stderr).toBe(0);
   });
 
   test("requires unique unknown identifiers", async () => {
@@ -826,6 +903,7 @@ describe("patch risk assessment contract", () => {
     );
 
     payload.materialBoundaries[0]!.result = "unresolved";
+    payload.evidencePlan[0]!.resolvesBoundaries = ["request-contract"];
     payload.regressionProtection.rating = "partial";
     payload.regressionProtection.exactHeadChecksPassed = false;
     payload.validation[0]!.status = "failed";
@@ -924,6 +1002,13 @@ describe("patch risk assessment contract", () => {
     expect(establishedDefectMerge.status).not.toBe(0);
     expect(establishedDefectMerge.stderr).toContain(
       "a merge outcome cannot retain an established defect",
+    );
+
+    payload.evidencePlan[0]!.outcomes["applicable"] = "hold_for_evidence";
+    const establishedDefectHold = await validate(payload);
+    expect(establishedDefectHold.status).not.toBe(0);
+    expect(establishedDefectHold.stderr).toContain(
+      "confirmed applicability with an established defect requires revise or block",
     );
 
     payload.validation[0]!.failureAttribution = "unknown";
@@ -1182,6 +1267,16 @@ describe("patch risk assessment contract", () => {
     payload.validation[0]!.status = "passed";
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("requires an executed passing validation for strong protection", async () => {
+    const payload = assessment();
+    payload.validation[0]!.status = "skipped";
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "strong regression protection requires an executed passing validation",
+    );
   });
 
   test("rejects high confidence when regression protection is unknown", async () => {
@@ -1490,6 +1585,13 @@ describe("patch risk assessment contract", () => {
         payload.materialBoundaries[0]!.id = "request-contract\n";
       },
       "materialBoundaries.0.id: string does not match the required pattern",
+    ],
+    [
+      "byte-order-mark-only strings",
+      (payload: Assessment) => {
+        payload.patch.repository = "\uFEFF";
+      },
+      "patch.repository: string does not match the required pattern",
     ],
     [
       "empty validation evidence",
