@@ -5095,13 +5095,13 @@ async function createPatchPullRequest(
       ),
     ),
   ].map((file) => {
-    const path = relative(repository, resolve(repository, file));
-    if (path === "" || isOutsidePath(path)) {
+    const nativePath = relative(repository, resolve(repository, file));
+    if (nativePath === "" || isOutsidePath(nativePath)) {
       throw new CodexSecurityError(
         "Patch files must remain inside the scanned repository.",
       );
     }
-    return path;
+    return nativePath.split(sep).join("/");
   });
   if (files.length === 0) {
     stderr.write("No verified patch changes to publish.\n");
