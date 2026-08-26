@@ -137,6 +137,9 @@ function patchRiskAssessment(
     },
     autoMergeExclusions: ["public_contract"],
     affectedRuntimeRoots: ["service.request"],
+    importantCallers: ["src/request.ts"],
+    riskDrivers: ["The changed branch handles a supported request."],
+    protectiveFactors: ["Focused exact-head validation passed."],
     materialBoundaries: [
       {
         id: "request-contract",
