@@ -272,7 +272,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 )
             ):
                 errors.append(
-                    "a patch-caused validation failure requires revise, block, or an established no-op disposition"
+                    "a patch-caused validation failure requires revise, a separately justified block, or an established no-op disposition"
                 )
         elif attribution is not None:
             errors.append(
@@ -551,10 +551,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 if outcome_recommendation == "block" and not (
                     established_block_reason
                     or branch_contradiction
-                    or branch_patch_failure
                 ):
                     errors.append(
-                        f"evidencePlan.{index}: a block outcome requires branch evidence of critical likelihood, a contradicted boundary, or a patch-caused validation failure"
+                        f"evidencePlan.{index}: a block outcome requires branch evidence of critical likelihood or a contradicted boundary"
                     )
                 remaining_decision_unknowns = (
                     decision_critical_unknowns - set(item["resolvesUnknowns"])
@@ -592,11 +591,23 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 if (
                     outcome_recommendation != "hold_for_evidence"
                     and remaining_decision_unknowns
+                    and not (
+                        outcome_recommendation == "no_op"
+                        and outcome_applicability in NON_APPLICABLE
+                    )
                 ):
                     errors.append(
                         f"evidencePlan.{index}: a terminal outcome cannot retain a decision-critical unknown"
                     )
                 if outcome_recommendation == "merge":
+                    if value["impact"]["rating"] == "unknown":
+                        errors.append(
+                            f"evidencePlan.{index}: a merge outcome cannot retain unknown impact"
+                        )
+                    if value["regressionLikelihood"]["rating"] == "unknown":
+                        errors.append(
+                            f"evidencePlan.{index}: a merge outcome cannot retain unknown regression likelihood"
+                        )
                     unresolved_unknowns = decision_critical_unknowns - set(
                         item["resolvesUnknowns"]
                     )
@@ -632,7 +643,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     )
                     continue
                 if remaining_unknown_outcomes is not None and all(
-                    unknown_id in remaining_unknown_outcomes[outcome]
+                    unknown_id in remaining_unknown_outcomes.get(outcome, [])
                     for outcome in item["outcomes"]
                 ):
                     errors.append(
@@ -722,14 +733,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         recommendation == "block"
         and value["regressionLikelihood"]["rating"] != "critical"
         and not any(item["result"] == "contradicted" for item in boundaries)
-        and not any(
-            item["status"] == "failed"
-            and item.get("failureAttribution") == "patch_caused"
-            for item in value["validation"]
-        )
     ):
         errors.append(
-            "block requires critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure"
+            "block requires critical regression likelihood or a contradicted material boundary"
         )
 
     if value["regressionProtection"]["rating"] == "strong":
