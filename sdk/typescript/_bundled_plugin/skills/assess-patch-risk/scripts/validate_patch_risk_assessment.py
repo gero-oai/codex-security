@@ -354,10 +354,38 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("hold_for_evidence cannot retain a contradicted material boundary")
         planned_failed_validations: set[str] = set()
         planned_unknowns: set[str] = set()
+        established_defect = (
+            value["regressionLikelihood"]["rating"] == "critical"
+            or any(item["result"] == "contradicted" for item in boundaries)
+            or any(
+                item["status"] == "failed"
+                and item.get("failureAttribution") == "patch_caused"
+                for item in validations
+            )
+        )
         for index, item in enumerate(evidence_plan):
             if len(set(item["outcomes"].values())) < 2:
                 errors.append(
                     f"evidencePlan.{index}: requires at least two distinct outcome recommendations"
+                )
+            if established_defect and "merge" in item["outcomes"].values():
+                errors.append(
+                    f"evidencePlan.{index}: a merge outcome cannot retain an established defect"
+                )
+            resolves_applicability = item.get("resolvesApplicability") is True
+            if (
+                resolves_applicability
+                and value["applicability"]["status"] != "unknown"
+            ):
+                errors.append(
+                    f"evidencePlan.{index}: resolvesApplicability requires unknown applicability"
+                )
+            if "no_op" in item["outcomes"].values() and not (
+                resolves_applicability
+                and value["applicability"]["status"] == "unknown"
+            ):
+                errors.append(
+                    f"evidencePlan.{index}: a no_op outcome requires the same action to resolve unknown applicability"
                 )
             for unknown_id in item["resolvesUnknowns"]:
                 if unknown_id not in decision_critical_unknowns:
