@@ -537,6 +537,74 @@ describe("CLI skill commands", () => {
     await expect(filesystem.access(artifactPath)).rejects.toThrow();
   });
 
+  test("seals the patch-risk contract before the author turn", async () => {
+    const events: string[] = [];
+    const root = resolve("/synthetic-sealed-patch-risk-contract");
+    const validatorPath = join(
+      root,
+      "skills",
+      "assess-patch-risk",
+      "scripts",
+      "validate_patch_risk_assessment.py",
+    );
+    let reviewerPrompt = "";
+    const current = dependencies({
+      onCodex: (_args, output) => {
+        const { prompt, sandbox } = output!.appServer!;
+        if (sandbox !== "read-only") {
+          events.push("author");
+          output!.stdout.write("Verified synthetic patch.");
+          return 0;
+        }
+        events.push("reviewer");
+        reviewerPrompt = prompt;
+        output!.stdout.write(JSON.stringify(patchRiskVerdict(prompt)));
+        return 0;
+      },
+    });
+    current.sealPatchRiskReviewContract = async (repository) => {
+      expect(repository).toBe("/current/repository");
+      events.push("seal");
+      return {
+        root,
+        skill: "SYNTHETIC SEALED SKILL",
+        rubric: "SYNTHETIC SEALED RUBRIC",
+        schema: "SYNTHETIC SEALED SCHEMA",
+        validatorSource: "SYNTHETIC SEALED VALIDATOR",
+        validatorPath,
+        dispose: async () => {
+          events.push("dispose");
+        },
+      };
+    };
+    current.validatePatchRiskAssessment = async (_response, options) => {
+      events.push("validate");
+      expect(options.pluginRoot).toBe(root);
+      expect(options.validatorPath).toBe(validatorPath);
+      return true;
+    };
+
+    expect(
+      await main(
+        ["patch", "Synthetic security issue", "--assess-patch-risk"],
+        capture().stream,
+        capture().stream,
+        current,
+      ),
+    ).toBe(0);
+    expect(events).toEqual([
+      "seal",
+      "author",
+      "reviewer",
+      "validate",
+      "dispose",
+    ]);
+    expect(reviewerPrompt).toContain("SYNTHETIC SEALED SKILL");
+    expect(reviewerPrompt).toContain("SYNTHETIC SEALED RUBRIC");
+    expect(reviewerPrompt).toContain("SYNTHETIC SEALED SCHEMA");
+    expect(reviewerPrompt).toContain("SYNTHETIC SEALED VALIDATOR");
+  });
+
   test("validates patch-risk output with the bundled contract validator", async () => {
     const current = dependencies({
       environment: process.env,

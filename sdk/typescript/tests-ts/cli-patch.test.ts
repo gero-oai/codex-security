@@ -2740,6 +2740,144 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("creates a patch pull request from an unborn repository", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "codex-security-unborn-pr-"),
+    );
+    const repository = join(directory, "repository");
+    const remote = join(directory, "remote.git");
+    const result = resultWithFindings(["high"]);
+    await mkdir(join(repository, "src"), { recursive: true });
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      git("init", "--bare", remote);
+      git("remote", "add", "origin", remote);
+
+      const outcome = await runWorkflow(
+        ["scan", "--patch", "--create-pr", "--json"],
+        {
+          currentDirectory: repository,
+          result,
+          onCodex: async (args, output) => {
+            await writeFile(join(repository, "src", "finding-1.ts"), "fixed\n");
+            completePatches(args, output);
+            return 0;
+          },
+          onRepositoryCommand: (command, args, _repository, options) => {
+            if (command === "git") {
+              return runRepositoryGit(repository, args, options);
+            }
+            return args[1] === "list"
+              ? ""
+              : "https://github.example.test/example/repository/pull/22";
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(git("branch", "--show-current")).toBe("codex-security/patch-scan");
+      expect(git("show", "HEAD:src/finding-1.ts")).toBe("fixed");
+      expect(git("status", "--short")).toBe("");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "does not publish files staged by a commit hook",
+    async () => {
+      const directory = await mkdtemp(
+        join(tmpdir(), "codex-security-hook-publication-"),
+      );
+      const repository = join(directory, "repository");
+      const remote = join(directory, "remote.git");
+      const result = resultWithFindings(["high"]);
+      let githubInvoked = false;
+      await mkdir(join(repository, "src"), { recursive: true });
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+
+      try {
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        await writeFile(join(repository, "src", "finding-1.ts"), "unsafe\n");
+        await writeFile(join(repository, "unrelated.ts"), "original\n");
+        git("add", "--", ".");
+        git("commit", "-m", "Initial synthetic checkout");
+        git("init", "--bare", remote);
+        git("remote", "add", "origin", remote);
+        git("push", "--set-upstream", "origin", "main");
+        await writeFile(join(repository, "unrelated.ts"), "hook staged\n");
+        await writeFile(
+          join(repository, ".git", "hooks", "pre-commit"),
+          "#!/bin/sh\ngit add -- unrelated.ts\n",
+          { mode: 0o700 },
+        );
+
+        const outcome = await runWorkflow(
+          ["scan", "--patch", "--review-minimality", "--create-pr", "--json"],
+          {
+            currentDirectory: repository,
+            result,
+            onCodex: async (args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                output!.stdout.write(
+                  JSON.stringify({ status: "approved", findings: [] }),
+                );
+              } else {
+                await writeFile(
+                  join(repository, "src", "finding-1.ts"),
+                  "fixed\n",
+                );
+                completePatches(args, output);
+              }
+              return 0;
+            },
+            onRepositoryCommand: (command, args, _repository, options) => {
+              if (command === "git") {
+                return runRepositoryGit(repository, args, options);
+              }
+              githubInvoked = true;
+              return "";
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode).toBe(2);
+        expect(outcome.stderr).toContain(
+          "contains changes outside the independently reviewed tree",
+        );
+        expect(githubInvoked).toBe(false);
+        expect(
+          git("ls-remote", "--heads", "origin", "codex-security/patch-scan"),
+        ).toBe("");
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("preserves global Git normalization while reviewing publication paths", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "codex-security-git-config-"),
@@ -2907,6 +3045,7 @@ describe("scan and patch workflow", () => {
         expect(git("ls-tree", "-r", "--name-only", "HEAD", "--", "shape")).toBe(
           transition === "directory-to-file" ? "shape" : "shape/value.ts",
         );
+        expect(git("status", "--short")).toBe("");
       } finally {
         await rm(directory, { recursive: true, force: true });
       }
