@@ -68,6 +68,7 @@ import {
   validateCommandResultOptions,
 } from "./cli-manifest.js";
 import {
+  publishFindingsCsvToCloud,
   publishScanToCloud,
   type CloudPublicationResult,
 } from "./cloud-publish.js";
@@ -103,6 +104,10 @@ import {
   ScanInterruptedError,
 } from "./errors.js";
 import {
+  GITHUB_ALERT_STATES,
+  importGitHubCodeScanningAlerts,
+} from "./github.js";
+import {
   importLinearIssues,
   resolveLinearApiKey,
   type ImportedIssue,
@@ -114,6 +119,7 @@ import { componentPlanSchema, planComponents } from "./component-plan.js";
 import { runComponentScans } from "./component-scan.js";
 import {
   checkScanPublication,
+  forceTerminatePublicationProcesses as terminatePublishers,
   publishScan,
   type CheckScanPublicationOptions,
   type PublishScanProgress,
@@ -140,6 +146,10 @@ import {
   type ScanComparisonInput,
 } from "./scan-comparison.js";
 import { scanActivitiesFromEvent } from "./scan-activity.js";
+import {
+  CODEX_SECURITY_THREAD_SOURCES,
+  type CodexSecurityThreadSource,
+} from "./thread-source.js";
 import { readScanLogs } from "./scan-logs.js";
 import {
   renderScanHistory,
@@ -252,6 +262,9 @@ const COMMAND_VALUE_OPTIONS = new Set([
   "--linear-issue",
   "--linear-project",
   "--linear-filter",
+  "--github-alert",
+  "--github-ref",
+  "--github-state",
   "--fail-on-severity",
   "--patch-severity",
   "--resume-pr",
@@ -266,6 +279,7 @@ const COMMAND_VALUE_OPTIONS = new Set([
   "--max-time-hours",
   "--max-attempts",
   "--export-format",
+  "--csv",
   "--output",
   "--source-root",
   "--scan-root",
@@ -1020,6 +1034,12 @@ type MatchingPlan = JsonObject & {
   batches: (JsonObject & MatchingBatch)[];
 };
 
+type SkillThreadSource = Extract<
+  CodexSecurityThreadSource,
+  | typeof CODEX_SECURITY_THREAD_SOURCES.remediation
+  | typeof CODEX_SECURITY_THREAD_SOURCES.validation
+>;
+
 interface SkillCommandOutput {
   readonly command: "validate" | "patch" | "verify-fix";
   readonly stdout: Writable;
@@ -1027,6 +1047,7 @@ interface SkillCommandOutput {
   readonly appServer?: {
     readonly directory: string;
     readonly prompt: string;
+    readonly threadSource: SkillThreadSource;
     readonly sandbox?: "read-only" | "workspace-write";
     readonly onEvent?: (event: Readonly<Record<string, unknown>>) => void;
   };
@@ -1082,6 +1103,7 @@ interface CliDependencies {
     Partial<Pick<BulkScanPrompt, "checkbox">>;
   checkScanPublication?: typeof checkScanPublication;
   publishScan?: typeof publishScan;
+  publishFindingsCsvToCloud?: typeof publishFindingsCsvToCloud;
   publishScanToCloud?: typeof publishScanToCloud;
   confirmPatchReview?: (question: string) => Promise<boolean>;
   patchEditor?: (
@@ -1095,6 +1117,7 @@ interface CliDependencies {
   addSignalListener(signal: SignalName, listener: () => void): void;
   removeSignalListener(signal: SignalName, listener: () => void): void;
   writeSynchronously(stream: Writable, value: string): void;
+  terminatePublishers?(): void;
   forceExit(signal: SignalName): void;
   exportFindings(
     arguments_: ExportArguments,
@@ -1114,6 +1137,7 @@ interface CliDependencies {
   bulkScan?: BulkScanDiscoveryDependencies;
   planComponents?: typeof planComponents;
   linearClient?: LinearClientFactory;
+  importGitHubAlerts?: typeof importGitHubCodeScanningAlerts;
   runWorkbench(args: readonly string[], input?: string): Promise<JsonObject>;
   matchFindings: typeof matchScanFindings;
   checkForUpdate(signal: AbortSignal): Promise<UpdateNotice | undefined>;
@@ -1365,6 +1389,7 @@ export async function runCodexSkillCommand(
                 : {
                     directory: output.appServer.directory,
                     prompt: output.appServer.prompt,
+                    threadSource: output.appServer.threadSource,
                     input: invocation.stdin!,
                     sandbox: output.appServer.sandbox,
                     onEvent: output.appServer.onEvent,
@@ -2032,9 +2057,9 @@ export async function main(
     }
   };
   const publication = Cli.create("publish", {
-    description: "Publish completed Codex Security scan findings.",
+    description: "Publish Codex Security findings.",
   }).command("scan", {
-    description: "Publish every finding from a completed scan to Linear.",
+    description: "Publish findings from a completed scan or CSV.",
     destructive: true,
     mcp: false,
     args: z.object({
@@ -2066,7 +2091,10 @@ export async function main(
       dryRun: z
         .boolean()
         .default(false)
-        .describe("Preview the findings without creating Linear issues."),
+        .describe("Preview the findings without publishing them."),
+      csv: optionValue("--csv")
+        .optional()
+        .describe("Findings CSV to publish instead of a completed scan."),
       skipExisting: z
         .boolean()
         .default(false)
@@ -2082,7 +2110,6 @@ export async function main(
     async run({ args, format, formatExplicit, options }) {
       const controller = new AbortController();
       let presentation: PublicationProgressPresenter | undefined;
-      let directApiPublication = false;
       let firstSignalAt = 0;
       let observingSignals = false;
       let cloudBatch:
@@ -2096,7 +2123,8 @@ export async function main(
         presentation?.stop();
         if (controller.signal.aborted) {
           if (
-            !directApiPublication ||
+            options.to !== "linear" ||
+            options.dryRun ||
             (controller.signal.reason === signal &&
               dependencies.now() - firstSignalAt < 500)
           ) {
@@ -2108,6 +2136,7 @@ export async function main(
               "codex-security: Publication force-stopped; reconcile retained Linear publication evidence before retrying.\n",
             );
           } catch {}
+          (dependencies.terminatePublishers ?? terminatePublishers)();
           removeSignalListeners();
           dependencies.forceExit(signal);
           return;
@@ -2140,6 +2169,10 @@ export async function main(
       };
       try {
         const currentDirectory = dependencies.currentDirectory();
+        const csvPath =
+          options.csv === undefined
+            ? undefined
+            : resolveCliPath(currentDirectory, options.csv);
         const directories = [
           ...new Set(
             [
@@ -2156,6 +2189,21 @@ export async function main(
         if (options.scan.length > 0 && directories.length > 0) {
           throw new CodexSecurityError(
             "Use --scan or scan directory inputs, not both.",
+          );
+        }
+        if (
+          csvPath !== undefined &&
+          (args.scanDir !== undefined ||
+            options.scan.length > 0 ||
+            options.scanDir.length > 0)
+        ) {
+          throw new CodexSecurityError(
+            "Use --csv or scan directory and ID inputs, not both.",
+          );
+        }
+        if (csvPath !== undefined && options.to !== "cloud") {
+          throw new CodexSecurityError(
+            "--csv is only supported with --to cloud.",
           );
         }
         if (new Set(options.scan).size > 1 && options.to !== "cloud") {
@@ -2185,13 +2233,20 @@ export async function main(
                 dependencies.environment,
               )
             : undefined;
-        directApiPublication =
-          !options.dryRun && destination?.linearApiKey !== undefined;
-
         if (options.to === "cloud") {
           dependencies.addSignalListener("SIGINT", onInterrupt);
           dependencies.addSignalListener("SIGTERM", onTerminate);
           observingSignals = true;
+        }
+        if (csvPath !== undefined) {
+          const result = await (
+            dependencies.publishFindingsCsvToCloud ?? publishFindingsCsvToCloud
+          )(csvPath, {
+            environment: dependencies.environment,
+            dryRun: options.dryRun,
+            signal: controller.signal,
+          });
+          return { ...result };
         }
         const selectedScans: { scanDir: string; scanId?: string }[] =
           directories.map((scanDir) => ({ scanDir }));
@@ -2572,9 +2627,94 @@ export async function main(
       }
     },
   });
+  const imports = Cli.create("import", {
+    description: "Read upstream findings for local validation or triage.",
+  }).command("github", {
+    description: "Import GitHub code scanning alerts without changing GitHub.",
+    destructive: false,
+    mcp: false,
+    args: z.object({
+      repository: z
+        .string()
+        .min(1)
+        .describe("GitHub repository in OWNER/REPO form."),
+    }),
+    options: z.object({
+      githubAlert: z
+        .array(
+          optionValue("--github-alert").regex(
+            /^[1-9]\d*$/u,
+            "GitHub alert numbers must be positive integers.",
+          ),
+        )
+        .default([])
+        .describe(
+          "Exact alert number, regardless of state; repeat to select a subset.",
+        ),
+      githubRef: optionValue("--github-ref")
+        .optional()
+        .describe("Git reference to inspect (default: default branch)."),
+      githubState: z
+        .enum(GITHUB_ALERT_STATES)
+        .default("open")
+        .describe(
+          "State to list; all includes dismissed and fixed alerts. Not used with exact alert numbers.",
+        ),
+    }),
+    output: z
+      .array(
+        z.object({
+          source: z.literal("github-code-scanning"),
+          repository: z.string(),
+          number: z.number().int().positive(),
+          url: z.string(),
+          alert: z.record(z.string(), z.unknown()),
+        }),
+      )
+      .optional(),
+    async run({ args, options }) {
+      const controller = new AbortController();
+      const onInterrupt = () => controller.abort("SIGINT");
+      const onTerminate = () => controller.abort("SIGTERM");
+      dependencies.addSignalListener("SIGINT", onInterrupt);
+      dependencies.addSignalListener("SIGTERM", onTerminate);
+      try {
+        return await (
+          dependencies.importGitHubAlerts ?? importGitHubCodeScanningAlerts
+        )(
+          {
+            repository: args.repository,
+            alertNumbers: options.githubAlert.map(Number),
+            ref: options.githubRef,
+            state: options.githubState,
+            signal: controller.signal,
+          },
+          {
+            environment: dependencies.environment,
+            currentDirectory: dependencies.currentDirectory(),
+          },
+        );
+      } catch (error) {
+        const signal = controller.signal.reason;
+        if (signal === "SIGINT" || signal === "SIGTERM") {
+          exitCode = signal === "SIGINT" ? 130 : 143;
+          errorOutput.write(
+            `codex-security: GitHub import ${signal === "SIGINT" ? "canceled" : "terminated"}.\n`,
+          );
+        } else {
+          exitCode = 2;
+          errorOutput.write(`codex-security: ${errorMessage(error)}\n`);
+        }
+        return undefined;
+      } finally {
+        dependencies.removeSignalListener("SIGINT", onInterrupt);
+        dependencies.removeSignalListener("SIGTERM", onTerminate);
+      }
+    },
+  });
   const cli = Cli.create("codex-security", {
     description:
-      "Run, validate, patch, verify fixes, export, and publish Codex Security findings.",
+      "Run, import, validate, patch, verify fixes, export, and publish Codex Security findings.",
     version: VERSION,
     mcp: {
       command: "npx --yes @openai/codex-security --mcp",
@@ -2921,6 +3061,7 @@ export async function main(
     .command(scanHistory)
     .command(findingFeedback)
     .command(publication)
+    .command(imports)
     .command("scan-components", {
       description:
         "Run standard scans for project components and combine the results.",
@@ -4311,6 +4452,7 @@ function validateCliArguments(
       "findings",
       "export",
       "publish",
+      "import",
       "validate",
       "verify-fix",
       "patch",
@@ -4324,8 +4466,43 @@ function validateCliArguments(
   const resultOptionError = validateCommandResultOptions(command, argv);
   if (resultOptionError !== undefined) return resultOptionError;
   const nestedCommand =
-    command === "scans" || command === "findings" || command === "publish";
+    command === "scans" ||
+    command === "findings" ||
+    command === "publish" ||
+    command === "import";
   const subcommand = nestedCommand ? commandArguments[1] : undefined;
+  if (command === "info") {
+    const metadataFields = new Set([
+      "sdkVersion",
+      "bundledPluginVersion",
+      "scanMcp",
+      "cancellationNote",
+      "cliVersion",
+      "codexVersion",
+      "codexSdkVersion",
+      "model",
+      "reasoningEffort",
+      "nextStep",
+    ]);
+    for (let index = 0; index < argv.length; index += 1) {
+      const argument = argv[index]!;
+      if (
+        argument !== "--filter-output" &&
+        !argument.startsWith("--filter-output=")
+      ) {
+        continue;
+      }
+      const selector = argument.includes("=")
+        ? argument.slice(argument.indexOf("=") + 1)
+        : argv[index + 1];
+      if (
+        selector !== undefined &&
+        !selector.split(",").every((field) => metadataFields.has(field))
+      ) {
+        return "--filter-output must select an info metadata field.";
+      }
+    }
+  }
   for (
     let index = nestedCommand ? 2 : 1;
     index < commandArguments.length;
@@ -5066,9 +5243,14 @@ async function runSkill(
   ].join("\n");
   const patch = skill === "fix-finding";
   const appServer = patch || verify;
+  const threadSource = patch
+    ? CODEX_SECURITY_THREAD_SOURCES.remediation
+    : CODEX_SECURITY_THREAD_SOURCES.validation;
   return dependencies.runCodex(
     [
-      ...(appServer ? ["app-server"] : ["exec", "--ignore-user-config"]),
+      ...(appServer
+        ? ["app-server"]
+        : ["exec", "--ignore-user-config", "--thread-source", threadSource]),
       "--disable",
       "plugins",
       ...(appServer ? [] : ["--ephemeral", "--color", "never", "--json"]),
@@ -5116,6 +5298,7 @@ async function runSkill(
             appServer: {
               directory,
               prompt,
+              threadSource,
               ...(verify ? { sandbox: "read-only" as const } : {}),
               ...(options.onEvent === undefined
                 ? {}
@@ -5134,6 +5317,7 @@ export async function readSkillCommandOutput(
   appServer?: {
     readonly directory?: string;
     readonly prompt: string;
+    readonly threadSource: SkillThreadSource;
     readonly input: NodeJS.WritableStream;
     readonly sandbox?: "read-only" | "workspace-write";
     readonly onEvent?: (event: Readonly<Record<string, unknown>>) => void;
@@ -5154,12 +5338,14 @@ export async function readSkillCommandOutput(
     appServer?.input.write(`${JSON.stringify(request)}\n`);
   };
   const startThread = (config?: JsonObject): void => {
+    if (appServer === undefined) return;
     send({
       id: 2,
       method: "thread/start",
       // An explicit cwd makes Codex persist trust for a new project.
       // Inherit the child process cwd and preserve the user's decision.
       params: {
+        threadSource: appServer.threadSource,
         approvalPolicy:
           appServer?.sandbox === "read-only" ? "on-request" : "never",
         sandbox: appServer?.sandbox ?? "workspace-write",
@@ -6452,6 +6638,23 @@ function scanFailureMessage(
   // errors can name the organization or project, which must not reach stderr or
   // the JSON error field.
   if (isLocalScanFailure(error)) return diagnosticValue(error);
+  const message = errorMessage(error);
+  const nativeRefreshRecovery = message.match(
+    /\b(?:your access token could not be refreshed because you have since logged out or signed in to another account\. Please sign in again\.|your authentication session could not be refreshed automatically\. Please log out and sign in again\.)/iu,
+  )?.[0];
+  if (nativeRefreshRecovery !== undefined) return nativeRefreshRecovery;
+  if (
+    /\byour access token could not be refreshed(?: because your refresh token (?:has expired|was already used|was revoked))?\. Please log out and sign in again\./iu.test(
+      message,
+    )
+  ) {
+    return (
+      "Codex Security's stored ChatGPT sign-in could not be refreshed. " +
+      "Codex may still need it to load workspace-managed policies when an API key is selected for model authentication. " +
+      "If the sign-in recently changed, check 'npx @openai/codex-security login status' and retry. " +
+      "Otherwise run 'npx @openai/codex-security logout', then 'npx @openai/codex-security login'."
+    );
+  }
   switch (classifyConnectionFailure(error)) {
     case "unauthorized":
       if (authentication?.method === "aws_credentials") {
@@ -6462,7 +6665,6 @@ function scanFailureMessage(
       }
       return authentication?.method === "api_key"
         ? `Authentication failed using ${authentication.source}. ` +
-            "Your ChatGPT sign-in was not used. " +
             "Retry with '--auth chatgpt' or provide a valid API key."
         : "Authentication failed using stored ChatGPT credentials. " +
             "Sign in again with 'codex-security login' or provide a valid API key.";

@@ -105,6 +105,52 @@ to the Codex Security state directory's `validations/` folder. Pass `auth` to
 select authentication or `signal` to cancel. Failed, incomplete, or malformed
 responses reject the promise.
 
+### Import GitHub code scanning alerts
+
+Use `importGitHubCodeScanningAlerts()` to read GitHub code scanning findings,
+including third-party SARIF uploads, before independent validation:
+
+```ts
+import {
+  CodexSecurity,
+  importGitHubCodeScanningAlerts,
+} from "@openai/codex-security";
+
+const findings = await importGitHubCodeScanningAlerts({
+  repository: "example/repository",
+  alertNumbers: [12, 18], // Omit to list all open alerts on the default branch.
+  githubToken: process.env["GH_TOKEN"],
+});
+
+const security = new CodexSecurity();
+try {
+  for (const finding of findings) {
+    const result = await security.validate({
+      repositoryPath: "/path/to/repository",
+      finding,
+    });
+    console.log(finding.url, result.disposition, result.outputDir);
+  }
+} finally {
+  await security.close();
+}
+```
+
+Each result contains `source`, `repository`, `number`, `url`, and the full
+upstream `alert`, including rule/help text, locations, commit/ref, and dismissal
+context. Import does not start Codex, register a scan, or change GitHub state.
+Validate against the intended local checkout; import does not check out code.
+
+Without `alertNumbers`, `state` defaults to `"open"`; `"closed"`, `"dismissed"`,
+`"fixed"`, and `"all"` are also accepted. Exact alert numbers ignore state and
+cannot be combined with a nondefault `state`. `ref` selects another branch or
+pull-request reference and preserves that reference's alert instance.
+
+Authentication reuses `gh auth token` (including GitHub CLI token environment
+variables) unless `githubToken` is supplied. `githubHost` defaults to `GH_HOST`
+or `github.com`; `signal` cancels requests. The token needs read access to code
+scanning alerts. Access failures reject the import.
+
 ### SDK configuration and scan options
 
 Pass runtime configuration to the `CodexSecurity` constructor:
@@ -193,9 +239,8 @@ $env:OPENAI_API_KEY = "<your-api-key>"
 npx @openai/codex-security scan C:\code\repository
 ```
 
-Check or remove the stored sign-in with `npx @openai/codex-security login status`
-and `npx @openai/codex-security logout`. Codex Security keeps its sign-in in a
-private, stable Codex home at `$CODEX_SECURITY_STATE_DIR/codex-home`, or at
+Codex Security keeps its sign-in in a private, stable Codex home at
+`$CODEX_SECURITY_STATE_DIR/codex-home`, or at
 `$CODEX_HOME/state/plugins/codex-security/codex-home` when no state directory is
 configured. On managed Windows devices, inherited access for `SYSTEM` and local
 `Administrators` is preserved while protecting the home against future changes
@@ -208,7 +253,24 @@ when the dedicated home does not already contain stored credentials. Logging
 out prevents later scans from automatically reimporting that ambient sign-in
 until you explicitly log in again.
 
-An environment API key takes precedence over a stored sign-in by default.
+Scan runtime preparation locks this home even if the process pauses; exiting or
+crashing releases the lock. A compatibility heartbeat prevents released
+heartbeat-only clients from replacing an active newer owner's lock, but those
+clients can still replace a paused newer owner's lock. Finish operations using
+older versions before upgrading. Keep `.codex-security-scan.sqlite3` between
+operations and never remove it while an operation is running. PID reuse can make
+older PID-only locks look live and block recovery. Stop all operations using
+this home before manually removing an old `.codex-security-scan.lock` directory.
+
+If a scan says the stored ChatGPT sign-in could not be refreshed, check it with
+`npx @openai/codex-security login status` and retry if it recently changed.
+Otherwise replace it with `npx @openai/codex-security logout`, then
+`npx @openai/codex-security login`. Codex Security does not automatically clear
+the sign-in or change managed login restrictions.
+
+An environment API key takes precedence for model authentication by default,
+but Codex may still need a valid ChatGPT sign-in to load workspace-managed
+policies.
 When both a stored ChatGPT sign-in and an environment API key are available, an
 interactive scan asks which credential to use. JSON output, dry runs, CI, and
 other noninteractive scans never prompt and retain automatic API-key
@@ -295,8 +357,10 @@ npx @openai/codex-security export /path/outside/repository/results --export-form
 npx @openai/codex-security export /path/outside/repository/results --export-format json --output /path/outside/repository/findings.json
 npx @openai/codex-security publish scan /path/outside/repository/results --to linear --linear-team TEAM_ID
 npx @openai/codex-security publish scan --to linear --linear-team TEAM_ID
+npx @openai/codex-security publish scan --to cloud --csv /path/outside/repository/findings.csv
 npx @openai/codex-security validate /path/outside/repository/findings.json "Possible SQL injection in src/query.ts:42"
 npx @openai/codex-security validate "Possible SQL injection" --effort high
+npx @openai/codex-security import github example/repository --format json
 npx @openai/codex-security verify-fix --linear-issue SEC-123 --json
 npx @openai/codex-security verify-fix --linear-project "Security backlog" --linear-filter '{"state":{"type":{"eq":"completed"}}}' --json
 npx @openai/codex-security verify-fix --scan SCAN_ID --severity high --json
@@ -631,6 +695,9 @@ The CLI and SDK recognize the following user-configurable environment:
 | `CI`                                                                        | Disable interactive update notices in automated environments.                                 |
 | `NO_COLOR`, `TERM`                                                          | Disable colored scan-history output when `NO_COLOR` is defined or `TERM=dumb`.                |
 
+Custom Codex executables must support thread source attribution for both `exec`
+and `app-server` requests (Codex 0.149.1 or later).
+
 On Windows, `CODEX_CLI_PATH` must name a native `.exe` or `.com`. Command
 shims such as `codex.cmd` automatically use the bundled Codex executable
 instead.
@@ -731,7 +798,7 @@ and scans stopped at their configured cost limit do not start another turn.
 invocation and defaults to `1`. Results remain under `--output-dir`; rerun the
 same command to resume.
 
-### Publish multiple completed scans to Cloud
+### Publish findings to Cloud
 
 Choose completed scans from your local history:
 
@@ -772,6 +839,27 @@ Automatic and keyring credential storage are not accepted for Cloud
 publication, even when an `auth.json` file exists, because that file may be
 stale and belong to a different account. The CLI sends one scan at a time,
 with each scan's findings and metadata in a separate request.
+
+To publish findings from a CSV instead of a completed scan, pass the CSV
+created by `codex-security export --export-format csv`:
+
+```bash
+npx @openai/codex-security publish scan --to cloud \
+  --csv /path/outside/repository/findings.csv
+```
+
+The repository includes a header-only
+[findings CSV template](https://github.com/openai/codex-security/blob/main/examples/findings.csv)
+that you can copy and fill in before publishing.
+
+The CSV must have the export columns `occurrence_id`, `finding_id`, `title`,
+`summary`, `severity`, `confidence`, `status`, `close_reason`, `note`,
+`remediation`, `path`, `start_line`, and `end_line`. Deep-scan exports may also
+include `candidate_id`. Use `--dry-run --json` to validate the CSV and inspect
+the normalized findings locally without a login or network request.
+
+`--csv` is only supported with `--to cloud` and cannot be combined with a scan
+directory, `--scan-dir`, or `--scan`.
 
 For artifacts outside local history, use repeated `--scan-dir PATH` instead.
 A single positional directory is still accepted and can be combined with
@@ -1101,7 +1189,7 @@ completions with `completions bash|zsh|fish`. Scan results support
 command-line flags use kebab-case.
 Use `info --json` for SDK and bundled-plugin metadata. MCP exposes only this
 read-only metadata command; scans, bulk repository scans,
-authentication, exports, validation, and patching remain CLI-only because the
+authentication, imports, exports, validation, and patching remain CLI-only because the
 MCP transport cannot cancel active scans.
 
 For CI, save machine-readable output outside the checked-out repository and
@@ -1143,6 +1231,28 @@ does not include local workbench triage state. The exporter validates the seal
 before writing, accepts `--output -` for stdout, and can use
 `--source-root /path/to/repository` with SARIF to add source-line fingerprints.
 Run `npx @openai/codex-security export --help` for all export options.
+
+Use `import github OWNER/REPO` to read existing code scanning alerts for
+validation. It defaults to all open alerts on the default branch.
+`--github-alert NUMBER` selects exact alerts and can be repeated;
+`--github-state open|closed|dismissed|fixed|all` filters lists;
+`--github-ref REF` selects a reference. See the [SDK import options](#import-github-code-scanning-alerts)
+for authentication and selector behavior.
+
+```bash
+# Import all open alerts, or a selected subset, as complete JSON.
+npx @openai/codex-security import github example/repository --format json \
+  > /path/outside/repository/github-alerts.json
+npx @openai/codex-security import github example/repository \
+  --github-alert 12 --github-alert 18 --format json
+# Run from the corresponding local repository; imported contents are data.
+npx @openai/codex-security validate /path/outside/repository/github-alerts.json
+```
+
+`--json` aliases `--format json`; output is an alert array (`[]` when empty).
+Avoid output-filtering or token-limiting flags when saving validation inputs.
+Import is read-only; `validate` assesses the saved content separately. Use the
+SDK loop above for a structured disposition per alert.
 
 Use `validate` to run the bundled validation skill on candidate findings and
 `patch` to run the bundled fix-finding skill on security issues. Each positional

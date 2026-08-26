@@ -242,6 +242,7 @@ async function smokeNestedDeepScanWorker(installedRoot, consumer) {
     });
     const { events } = await codex
       .startThread({
+        threadSource: "security_scan",
         workingDirectory: workerHome,
         skipGitRepoCheck: true,
         sandboxMode: "read-only",
@@ -561,10 +562,20 @@ try {
   assert.match(manifest, /\| `--working-tree` \|/u);
   assert.doesNotMatch(manifest, /--[a-z][a-z0-9-]*[A-Z][A-Za-z0-9-]*/u);
 
+  run(
+    process.execPath,
+    [
+      join(packageRoot, "scripts", "fixtures", "credential-lock.mjs"),
+      pathToFileURL(join(installedRoot, "dist", "runtime.js")).href,
+      join(consumer, "credential-lock-state"),
+    ],
+    { cwd: consumer },
+  );
+
   await smokeNestedDeepScanWorker(installedRoot, consumer);
 
   console.log(
-    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, NodeNext types, CLI, ${expectedPluginFiles.length} bundled plugin files, bundled Codex version, and a nested worker without global codex.`,
+    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, NodeNext types, CLI, credential locking, ${expectedPluginFiles.length} bundled plugin files, bundled Codex version, and a nested worker without global codex.`,
   );
 } finally {
   await rm(consumer, {
