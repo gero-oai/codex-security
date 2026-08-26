@@ -45,7 +45,10 @@ import { Readable, Writable as NodeWritable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify, stripVTControlCharacters } from "node:util";
-import { deflate as deflateCallback } from "node:zlib";
+import {
+  deflate as deflateCallback,
+  inflate as inflateCallback,
+} from "node:zlib";
 import { Cli, z } from "incur";
 import { parse as parseToml } from "smol-toml";
 import {
@@ -184,6 +187,7 @@ import {
 const PROGRESS_REFRESH_MILLISECONDS = 1_000;
 const execFile = promisify(execFileCallback);
 const deflate = promisify(deflateCallback);
+const inflate = promisify(inflateCallback);
 const WINDOWS_NETWORK_PATH = /^[\\/]{2}/u;
 const WINDOWS_LOCAL_DEVICE_ROOT =
   /^[\\/]{2}[?.][\\/](?:[A-Za-z]:|Volume\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\}|GLOBALROOT[\\/]Device[\\/]HarddiskVolume[0-9]+)(?=[\\/]|$)/iu;
@@ -6248,14 +6252,28 @@ async function writePatchReviewBlob(
   const object = createHash(objectFormat).update(objectContents).digest("hex");
   const directory = join(objectDirectory, object.slice(0, 2));
   const path = join(directory, object.slice(2));
+  const compressed = await deflate(objectContents);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   try {
-    await writeFile(path, await deflate(objectContents), {
+    await writeFile(path, compressed, {
       flag: "wx",
       mode: 0o600,
     });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  let stored: Buffer;
+  try {
+    stored = await inflate(await readFile(path));
+  } catch {
+    throw new CodexSecurityError(
+      "Patch review object storage changed after patch review started.",
+    );
+  }
+  if (!stored.equals(objectContents)) {
+    throw new CodexSecurityError(
+      "Patch review object storage changed after patch review started.",
+    );
   }
   return object;
 }
@@ -6582,6 +6600,59 @@ const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
   "worktrees",
 ] as const;
 
+async function patchReviewModuleGitDirectories(
+  gitDirectory: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const directories: string[] = [];
+  const visitNamespace = async (directory: string): Promise<void> => {
+    signal?.throwIfAborted();
+    let metadata: Awaited<ReturnType<typeof lstat>>;
+    try {
+      metadata = await lstat(directory);
+    } catch (error) {
+      if (missingPatchReviewPath(error)) return;
+      throw error;
+    }
+    if (!metadata.isDirectory()) {
+      throw new CodexSecurityError(
+        "Git submodule metadata changed after patch review started.",
+      );
+    }
+    const entries = (await readdir(directory)).sort();
+    for (const name of entries) {
+      signal?.throwIfAborted();
+      const child = join(directory, name);
+      const childMetadata = await lstat(child);
+      if (!childMetadata.isDirectory()) {
+        throw new CodexSecurityError(
+          "Git submodule metadata changed after patch review started.",
+        );
+      }
+      const [head, config, objects] = await Promise.all(
+        ["HEAD", "config", "objects"].map((entry) =>
+          lstat(join(child, entry)).catch((error: unknown) => {
+            if (missingPatchReviewPath(error)) return undefined;
+            throw error;
+          }),
+        ),
+      );
+      if (
+        head?.isFile() === true ||
+        config?.isFile() === true ||
+        objects?.isDirectory() === true
+      ) {
+        directories.push(child);
+        await visitNamespace(join(child, "modules"));
+      } else {
+        await visitNamespace(child);
+      }
+    }
+  };
+  await visitNamespace(join(gitDirectory, "modules"));
+  return directories;
+}
+
 async function readPatchReviewAncestorInstructions(
   repository: string,
   signal?: AbortSignal,
@@ -6798,6 +6869,27 @@ async function snapshotPatchReviewWorktree(
         await hashNestedPatchReviewPath(
           gitDirectory,
           Buffer.from(path),
+          digest,
+          hashContext,
+          signal,
+        );
+      }
+      for (const moduleGitDirectory of await patchReviewModuleGitDirectories(
+        gitDirectory,
+        signal,
+      )) {
+        const modulePath = Buffer.from(
+          relative(gitDirectory, moduleGitDirectory),
+        );
+        updateNestedPatchReviewDigest(
+          digest,
+          modulePath,
+          "module-git-directory",
+          "",
+        );
+        await hashNestedPatchReviewGitDirectory(
+          moduleGitDirectory,
+          modulePath,
           digest,
           hashContext,
           signal,
