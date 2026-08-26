@@ -6943,7 +6943,9 @@ async function snapshotPatchReviewWorktree(
       [patchReviewGitPathKey(Buffer.alloc(0)), Buffer.alloc(0)],
     ]);
     for (const path of paths.values()) {
-      const parts = splitPatchReviewGitPath(path);
+      const pathWithoutTrailingSeparator =
+        path.at(-1) === 0x2f ? path.subarray(0, -1) : path;
+      const parts = splitPatchReviewGitPath(pathWithoutTrailingSeparator);
       if (parts === undefined) {
         throw new CodexSecurityError(
           "A nested Git worktree contains an unsafe path.",
