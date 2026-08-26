@@ -1269,13 +1269,13 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
-  test("requires an executed passing validation for strong protection", async () => {
+  test("requires an executed validation for strong protection", async () => {
     const payload = assessment();
     payload.validation[0]!.status = "skipped";
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
-      "strong regression protection requires an executed passing validation",
+      "strong regression protection requires an executed validation",
     );
   });
 
