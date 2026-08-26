@@ -400,7 +400,7 @@ describe("scan and patch workflow", () => {
       },
     );
 
-    expect(outcome.exitCode).toBe(0);
+    expect(outcome.exitCode).toBe(2);
     expect(stages).toEqual([
       "author",
       "review",
@@ -2302,7 +2302,9 @@ describe("scan and patch workflow", () => {
 
       expect(outcome.exitCode).toBe(2);
       expect(reviews).toBe(0);
-      expect(outcome.stderr).toContain("Ignore rules or ignored files changed");
+      expect(outcome.stderr).toContain(
+        "Git metadata changed after patch review started",
+      );
       expect(outcome.stderr).not.toContain("SYNTHETIC_PRIVATE");
     } finally {
       await rm(repository, { recursive: true, force: true });
@@ -4472,7 +4474,17 @@ describe("scan and patch workflow", () => {
           delta(interleaved, secondReviewed, [sharedPath]),
         ],
         onCodex: (args, output) => {
-          if (output!.appServer!.sandbox === "read-only") {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_2"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
             output!.stdout.write(
               JSON.stringify({ status: "approved", findings: [] }),
             );
@@ -4535,7 +4547,17 @@ describe("scan and patch workflow", () => {
           delta(firstReviewed, secondReviewed, [sharedPath]),
         ],
         onCodex: (args, output) => {
-          if (output!.appServer!.sandbox === "read-only") {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_2"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
             output!.stdout.write(
               JSON.stringify({ status: "approved", findings: [] }),
             );
