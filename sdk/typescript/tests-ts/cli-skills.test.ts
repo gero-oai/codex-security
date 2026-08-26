@@ -130,12 +130,14 @@ function patchRiskAssessment(
         name: "focused request tests",
         status: "passed",
         protects: "The changed behavior through its production caller.",
+        requiredForMerge: true,
       },
     ] as Array<{
       name: string;
       status: string;
       failureAttribution?: "patch_caused";
       protects: string;
+      requiredForMerge: boolean;
     }>,
     unknowns: [] as Array<{
       id: string;
