@@ -6490,7 +6490,13 @@ if ([basename(process.argv[1]), ...process.argv.slice(2)].join(" ") !== "login s
     await mkdir(codexHome, { mode: 0o700 });
     await writeFile(
       fakeCodex,
-      'console.error("Open https://auth.example.test/device");\nconsole.error("User code: ABCD-EFGH");\nprocess.on("SIGTERM", () => {});\nsetInterval(() => {}, 1000);\n',
+      [
+        'process.on("SIGTERM", () => console.error("ignored SIGTERM"));',
+        'console.error("Open https://auth.example.test/device");',
+        'console.error("User code: ABCD-EFGH");',
+        "setInterval(() => {}, 1000);",
+        "await new Promise(() => {});",
+      ].join("\n"),
     );
     const fakeCommand = nodeCodex(fakeCodex);
     const client = new TestClient(
@@ -6523,8 +6529,8 @@ if ([basename(process.argv[1]), ...process.argv.slice(2)].join(" ") !== "login s
     expect(login.verificationUrl).toBe("https://auth.example.test/device");
     expect(login.userCode).toBe("ABCD-EFGH");
     const timeout = AbortSignal.timeout(5_000);
-    await expect(
-      Promise.race([
+    expect(
+      await Promise.race([
         client.close(),
         new Promise<never>((_, reject) => {
           timeout.addEventListener(
@@ -6534,8 +6540,12 @@ if ([basename(process.argv[1]), ...process.argv.slice(2)].join(" ") !== "login s
           );
         }),
       ]),
-    ).resolves.toBeUndefined();
-    await expect(login.wait()).resolves.toMatchObject({ success: false });
+    ).toBeUndefined();
+    const result = await login.wait();
+    expect(result).toMatchObject({ success: false });
+    if (process.platform !== "win32") {
+      expect(result.stderr).toContain("ignored SIGTERM");
+    }
   });
 
   test("keeps ambient credentials available to scans", async () => {
@@ -6620,6 +6630,7 @@ process.on("SIGTERM", () => {
 writeFileSync(${JSON.stringify(ready)}, "ready");
 for await (const _chunk of process.stdin) {}
 setInterval(() => {}, 1000);
+await new Promise(() => {});
 `,
     );
     const fakeCommand = nodeCodex(fakeCodex);
@@ -6660,6 +6671,11 @@ setInterval(() => {}, 1000);
       await client.close();
       await expect(login).rejects.toThrow();
       await expect(stat(codexHome)).resolves.toBeDefined();
+      if (process.platform !== "win32") {
+        expect(await readFile(join(codexHome, "auth.json"), "utf8")).toBe(
+          "late write",
+        );
+      }
     } finally {
       await client.close();
     }
