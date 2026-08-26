@@ -1205,6 +1205,8 @@ export class CodexSecurity {
           }
         },
         onFinalize: async (usage) => {
+          // Validation threads are accounted separately from the discovery turn.
+          const discoveryUsage = usage;
           if (options.validationPrompt !== undefined) {
             await runCustomValidation({
               repository: repo,
@@ -1251,6 +1253,7 @@ export class CodexSecurity {
                     turn.lastStreamError ??
                       "The custom validation turn did not complete.",
                   );
+                tracker.recordCompletedThreadUsage(turn.threadId, turn.usage);
                 usage = sumTokenUsage(usage, turn.usage);
                 return turn.finalResponse;
               },
@@ -1258,12 +1261,12 @@ export class CodexSecurity {
             customValidationComplete = true;
           }
           const snapshot = await tracker
-            .stop(usage)
+            .stop(discoveryUsage)
             .catch(async (error: unknown) => {
               if (options.maxCostUsd !== undefined) {
                 throwIfAborted(signal, scanDir);
                 try {
-                  return await tracker.stop(usage);
+                  return await tracker.stop(discoveryUsage);
                 } catch {
                   runPostScan = null;
                   throwIfAborted(signal, scanDir);

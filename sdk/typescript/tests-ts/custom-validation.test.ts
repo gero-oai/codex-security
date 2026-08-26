@@ -141,7 +141,9 @@ async function* responseEvents(
   activity?: string,
 ): AsyncGenerator<ThreadEvent> {
   for await (const event of completedEvents()) {
-    if (
+    if (event.type === "thread.started") {
+      yield { ...event, thread_id: "validation-thread" };
+    } else if (
       event.type === "item.completed" &&
       event.item.type === "agent_message"
     ) {
@@ -402,7 +404,10 @@ describe("custom validation", () => {
                 expect(threadOptions.threadSource).toBe("security_scan");
                 workingDirectories.push(threadOptions.workingDirectory);
                 return {
-                  id: "thread-1",
+                  id:
+                    threadOptions.workingDirectory === scanDir
+                      ? "thread-1"
+                      : "validation-thread",
                   async runStreamed(prompt, turnOptions) {
                     turns += 1;
                     if (turns === 1) {

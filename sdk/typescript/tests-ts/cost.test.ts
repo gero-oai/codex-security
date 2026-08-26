@@ -605,6 +605,56 @@ describe("scan cost", () => {
 });
 
 describe("live scan cost tracking", () => {
+  test.each([null, 40, 80])(
+    "counts SDK-completed validation and its workers once with rollout usage %s",
+    async (validationInput) => {
+      const home = await codexHome();
+      const rootUsage = { input_tokens: 100, output_tokens: 10 };
+      await writeSession(
+        home,
+        "scan-thread",
+        rootUsage,
+        undefined,
+        undefined,
+        undefined,
+        true,
+      );
+      if (validationInput !== null)
+        await writeSession(home, "validation-thread", {
+          input_tokens: validationInput,
+          output_tokens: validationInput / 10,
+        });
+      await writeSession(
+        home,
+        "worker-thread",
+        { input_tokens: 20, output_tokens: 2 },
+        "validation-thread",
+        undefined,
+        undefined,
+        true,
+      );
+      const tracker = new ScanCostTracker({
+        codexHome: home,
+        model: "gpt-5.6-sol",
+        maxCostUsd: 1,
+      });
+      tracker.start("scan-thread");
+      tracker.recordCompletedThreadUsage("validation-thread", {
+        input_tokens: 40,
+        output_tokens: 4,
+      });
+
+      const snapshot = await tracker.stop(rootUsage);
+
+      expect(snapshot.cost?.inputTokens).toBe(
+        120 + Math.max(40, validationInput ?? 0),
+      );
+      expect(snapshot.cost?.outputTokens).toBe(
+        12 + Math.max(4, (validationInput ?? 0) / 10),
+      );
+    },
+  );
+
   test("coalesces overlapping polling ticks and bounds final work", async () => {
     const home = await codexHome();
     await writeSession(home, "scan-thread", {

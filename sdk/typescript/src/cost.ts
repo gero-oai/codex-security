@@ -137,6 +137,7 @@ export class ScanCostTracker {
   #pending: Promise<void> = Promise.resolve();
   #snapshot: ScanCostSnapshot = { usage: null, cost: null };
   #finalSnapshot: ScanCostSnapshot | null = null;
+  #completedThreadUsage = new Map<string | null, ScanTokenUsage | null>();
   #observedUsage: ObservedSessionUsage = {
     root: null,
     workers: null,
@@ -159,6 +160,13 @@ export class ScanCostTracker {
 
   public setExpectedFilesTotal(filesTotal: number): void {
     this.#expectedFilesTotal = filesTotal;
+  }
+
+  public recordCompletedThreadUsage(
+    threadId: string | null,
+    usage: unknown,
+  ): void {
+    this.#completedThreadUsage.set(threadId, tokenUsage(usage));
   }
 
   public start(threadId: string): void {
@@ -371,7 +379,12 @@ export class ScanCostTracker {
       return rootThreadId;
     };
 
-    const included = new Set([rootThreadId]);
+    const included = new Set([
+      rootThreadId,
+      ...[...this.#completedThreadUsage.keys()].filter(
+        (threadId): threadId is string => threadId !== null,
+      ),
+    ]);
     const ambiguousWorkers = new Set<string>();
     if (this.#options.scanDirectory !== undefined) {
       const scanStartedAt =
@@ -476,6 +489,7 @@ export class ScanCostTracker {
       unidentifiedSessions: new Set(),
       accountedSessions: new Set(),
     };
+    const accountedThreads = new Set<string | null>();
     for (const [path, session] of this.#sessions) {
       if (
         this.#options.maxCostUsd !== undefined &&
@@ -485,6 +499,7 @@ export class ScanCostTracker {
         observed.unidentifiedSessions.add(path);
       }
       if (session.threadId !== null && included.has(session.threadId)) {
+        accountedThreads.add(session.threadId);
         if (presentSessions.has(path)) observed.accountedSessions.add(path);
         await this.#reportSessionEvents(path, session);
         if (
@@ -498,9 +513,15 @@ export class ScanCostTracker {
           });
         }
         if (session.pendingLineBytes > 0) observed.unverified = true;
-        const usage = session.accounting?.usage ?? null;
+        const usage = higherCostUsage(
+          this.#options.model,
+          session.accounting?.usage ?? null,
+          this.#completedThreadUsage.get(session.threadId) ?? null,
+        );
         if (session.threadId === this.#threadId) {
-          observed.rootCompleted = session.taskCompleted;
+          observed.rootCompleted =
+            session.taskCompleted ||
+            this.#completedThreadUsage.has(session.threadId);
           if (usage !== null) {
             observed.root = addTokenUsage(observed.root, usage);
           }
@@ -510,8 +531,23 @@ export class ScanCostTracker {
           } else {
             observed.workers = addTokenUsage(observed.workers, usage);
           }
-          if (!session.taskCompleted) observed.unfinishedWorkers = true;
+          if (
+            !session.taskCompleted &&
+            !this.#completedThreadUsage.has(session.threadId)
+          )
+            observed.unfinishedWorkers = true;
         }
+      }
+    }
+    for (const [threadId, usage] of this.#completedThreadUsage) {
+      if (accountedThreads.has(threadId)) continue;
+      if (usage === null) {
+        observed.unverified = true;
+      } else if (threadId === rootThreadId) {
+        observed.root = addTokenUsage(observed.root, usage);
+        observed.rootCompleted = true;
+      } else {
+        observed.workers = addTokenUsage(observed.workers, usage);
       }
     }
     this.#observedUsage = observed;
