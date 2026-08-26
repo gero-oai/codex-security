@@ -6353,18 +6353,11 @@ async function assertOpenedPatchReviewFileConfined(
 ): Promise<void> {
   await validatePatchReviewGitPath(worktree, path, worktree);
   const filesystemPath = patchReviewFilesystemPath(worktree, path);
-  let canonicalPath: string;
   let current: BigIntStats;
   try {
-    canonicalPath = await realpath(filesystemPath);
-    current = await lstat(canonicalPath, { bigint: true });
+    current = await lstat(filesystemPath, { bigint: true });
   } catch {
     throw new CodexSecurityError(changedMessage);
-  }
-  if (isOutsidePath(relative(worktree, canonicalPath))) {
-    throw new CodexSecurityError(
-      "The observed patch contains a path through a link outside the selected repository.",
-    );
   }
   if (
     !current.isFile() ||
@@ -7012,35 +7005,6 @@ function parseRawPatchReviewIndexEntries(
   return entries;
 }
 
-function parseRawPatchReviewIndexPaths(output: Buffer): Buffer[] {
-  const entries = new Set<string>();
-  const paths = new Map<string, Buffer>();
-  for (const record of splitNulRecords(output)) {
-    const separator = record.indexOf(0x09);
-    const metadata =
-      separator < 0
-        ? undefined
-        : record.subarray(0, separator).toString("ascii");
-    const match = /^([0-7]{6}) ([0-9a-f]+) ([0-3])$/u.exec(metadata ?? "");
-    const path = separator < 0 ? undefined : record.subarray(separator + 1);
-    if (path === undefined || match === null) {
-      throw new CodexSecurityError(
-        "The reviewed patch contains an unreadable Git index entry.",
-      );
-    }
-    const pathKey = patchReviewGitPathKey(path);
-    const entryKey = `${pathKey}:${match[3]}`;
-    if (entries.has(entryKey)) {
-      throw new CodexSecurityError(
-        "The reviewed patch contains an unreadable Git index entry.",
-      );
-    }
-    entries.add(entryKey);
-    paths.set(pathKey, path);
-  }
-  return [...paths.values()];
-}
-
 function parsePatchReviewIndexEntries(
   output: Buffer,
 ): Map<string, PatchReviewTreeEntry> {
@@ -7219,6 +7183,7 @@ const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
   "MERGE_HEAD",
   "MERGE_MODE",
   "MERGE_MSG",
+  "MERGE_RR",
   "ORIG_HEAD",
   "REBASE_HEAD",
   "REVERT_HEAD",
@@ -7237,6 +7202,7 @@ const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
   "packed-refs",
   "packed-refs.lock",
   "refs",
+  "rr-cache",
   "rebase-apply",
   "rebase-merge",
   "sequencer",
@@ -7834,14 +7800,36 @@ async function snapshotPatchReviewWorktree(
       hashContext,
       signal,
     );
+    const rawIndexEntries = parseRawPatchReviewIndexEntries(indexEntries);
+    const gitlinks = [...rawIndexEntries.values()].filter(
+      ({ mode }) => mode === "160000",
+    );
+    const isInsideGitlink = (path: Buffer): boolean =>
+      gitlinks.some(
+        (gitlink) =>
+          path.equals(gitlink.path) ||
+          (path.length > gitlink.path.length &&
+            path.subarray(0, gitlink.path.length).equals(gitlink.path) &&
+            path[gitlink.path.length] === 0x2f),
+      );
+    for (const gitlink of gitlinks) {
+      updateNestedPatchReviewDigest(
+        digest,
+        gitlink.path,
+        "gitlink",
+        `${gitlink.mode}:${gitlink.object}`,
+      );
+    }
     const paths = new Map<string, Buffer>();
     for (const output of [changed, untracked, ignoredPaths]) {
       for (const path of splitNulRecords(output)) {
+        if (isInsideGitlink(path)) continue;
         paths.set(patchReviewGitPathKey(path), path);
       }
     }
-    for (const path of parseRawPatchReviewIndexPaths(indexEntries)) {
-      paths.set(patchReviewGitPathKey(path), path);
+    for (const entry of rawIndexEntries.values()) {
+      if (entry.mode === "160000") continue;
+      paths.set(patchReviewGitPathKey(entry.path), entry.path);
     }
     const directories = new Map<string, Buffer>([
       [patchReviewGitPathKey(Buffer.alloc(0)), Buffer.alloc(0)],
@@ -7860,6 +7848,7 @@ async function snapshotPatchReviewWorktree(
       for (const listedPath of splitNulRecords(output)) {
         const path =
           listedPath.at(-1) === 0x2f ? listedPath.subarray(0, -1) : listedPath;
+        if (isInsideGitlink(path)) continue;
         const key = patchReviewGitPathKey(path);
         if (nonemptyDirectoryKeys.has(key)) continue;
         await validatePatchReviewGitPath(
