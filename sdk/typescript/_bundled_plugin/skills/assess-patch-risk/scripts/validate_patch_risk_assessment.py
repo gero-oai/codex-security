@@ -909,6 +909,14 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             "critical regression likelihood with an established material safety failure requires block"
         )
 
+    if (
+        value["materialSafetyFailure"]["established"]
+        and value["regressionLikelihood"]["rating"] != "critical"
+    ):
+        errors.append(
+            "an established material safety failure requires critical regression likelihood"
+        )
+
     if recommendation == "block" and not (
         value["regressionLikelihood"]["rating"] == "critical"
         and value["materialSafetyFailure"]["established"]
