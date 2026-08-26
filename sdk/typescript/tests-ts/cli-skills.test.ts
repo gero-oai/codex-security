@@ -746,6 +746,8 @@ describe("CLI skill commands", () => {
           "Token handling: changed",
           "Authorization: contradicted because Bearer SYNTHETIC_ADVERSE_CREDENTIAL",
           "Authorization: changed because dXNlcjpwYXNz",
+          "Authorization: changed because YWJjZGVmZ2hpag",
+          "Token handling: changed via __79_Pv6-fj39vX0",
           "Authorization: Bearer SYNTHETIC_REPORT_CREDENTIAL",
           "Authorization: dXNlcjpwYXNz",
           "Authorization:",
@@ -812,6 +814,8 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).not.toContain("SYNTHETIC-MULTILINE-KEY-BODY");
     expect(stderr.text()).not.toContain("SYNTHETIC_REPORT_CREDENTIAL");
     expect(stderr.text()).not.toContain("dXNlcjpwYXNz");
+    expect(stderr.text()).not.toContain("YWJjZGVmZ2hpag");
+    expect(stderr.text()).not.toContain("__79_Pv6-fj39vX0");
     expect(stderr.text()).not.toContain("SYNTHETIC_ADVERSE_CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-BULLETED-CREDENTIAL");
