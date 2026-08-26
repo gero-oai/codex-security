@@ -48,7 +48,7 @@
         "changedFiles": { "$ref": "#/$defs/stringList" },
         "sha256": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
         }
       }
     },
@@ -230,7 +230,7 @@
     },
     "identifier": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9_-]*$"
+      "pattern": "^[a-z0-9][a-z0-9_-]*(?![\\s\\S])"
     },
     "stringList": {
       "type": "array",
