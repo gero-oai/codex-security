@@ -745,6 +745,7 @@ test("plans from a Git inventory without tools or ignored files", async () => {
     codex: {
       startThread(options) {
         expect(options).toMatchObject({
+          threadSource: "security_scan",
           sandboxMode: "read-only",
           approvalPolicy: "never",
           networkAccessEnabled: false,
