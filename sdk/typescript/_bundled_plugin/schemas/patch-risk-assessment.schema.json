@@ -200,6 +200,11 @@
             "$ref": "#/$defs/stringList",
             "minItems": 1
           },
+          "remainingUnknowns": {
+            "type": "object",
+            "additionalProperties": { "$ref": "#/$defs/stringList" },
+            "minProperties": 1
+          },
           "resolvesBoundaries": { "$ref": "#/$defs/stringList" },
           "boundaryOutcomes": {
             "type": "object",
