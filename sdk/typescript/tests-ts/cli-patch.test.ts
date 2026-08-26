@@ -4753,6 +4753,120 @@ describe("scan and patch workflow", () => {
     });
   });
 
+  test("publishes reviewed files from disjoint findings", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    result.findings.findings[0]!.locations[0]!.path = "first.ts";
+    result.findings.findings[1]!.locations[0]!.path = "second.ts";
+    const baseCommit = "a".repeat(40);
+    const firstBase = "b".repeat(40);
+    const firstReviewed = "c".repeat(40);
+    const secondBase = "d".repeat(40);
+    const secondReviewed = "e".repeat(40);
+    const delta = (path: string, baseObject: string, object: string) => ({
+      paths: [path],
+      diff: `diff --git a/${path} b/${path}\n`,
+      publicationBaseCommit: baseCommit,
+      publicationBaseEntries: [{ path, mode: "100644", object: baseObject }],
+      publicationEntries: [{ path, mode: "100644", object }],
+    });
+    const stagedPaths: string[][] = [];
+    const url = "https://github.example.test/example/repository/pull/20";
+    const outcome = await runWorkflow(
+      [
+        "patch",
+        "--scan",
+        "scan-1",
+        "--review-minimality",
+        "--create-pr",
+        "--json",
+      ],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          delta("first.ts", firstBase, firstReviewed),
+          delta("first.ts", firstBase, firstReviewed),
+          delta("second.ts", secondBase, secondReviewed),
+          delta("second.ts", secondBase, secondReviewed),
+        ],
+        onCodex: (args, output) => {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_2"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+        onRepositoryCommand: (command, args) => {
+          if (command === "git" && args.includes("add")) {
+            stagedPaths.push(args.slice(args.indexOf("--") + 1));
+          }
+          if (
+            command === "git" &&
+            args[0] === "rev-parse" &&
+            args[1] === "--verify" &&
+            args[2] === "HEAD"
+          ) {
+            return baseCommit;
+          }
+          if (command === "git" && args[0] === "ls-files") {
+            return (
+              `100644 ${firstReviewed} 0\tfirst.ts\0` +
+              `100644 ${secondReviewed} 0\tsecond.ts\0`
+            );
+          }
+          if (command === "git" && args[0] === "ls-tree") {
+            const path = args.at(-1)!.replace(":(top,literal)", "");
+            const object = path === "first.ts" ? firstReviewed : secondReviewed;
+            return `100644 blob ${object}\t${path}\0`;
+          }
+          if (command === "git" && args[0] === "write-tree") {
+            return "verified-tree";
+          }
+          if (
+            command === "git" &&
+            args[0] === "rev-parse" &&
+            args[1] === "HEAD^{tree}"
+          ) {
+            return "verified-tree";
+          }
+          if (
+            command === "git" &&
+            args[0] === "rev-parse" &&
+            args[1] === "--verify" &&
+            args[2] === "HEAD^"
+          ) {
+            return baseCommit;
+          }
+          if (command === "git" && args[0] === "rev-parse") {
+            return "verified-commit";
+          }
+          if (command === "gh" && args[1] === "list") return "";
+          if (command === "gh" && args[1] === "create") return url;
+          return "";
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(stagedPaths).toEqual([["first.ts", "second.ts"]]);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      pullRequest: { url },
+    });
+  });
+
   test("omits a path created and removed across reviewed findings", async () => {
     const result = resultWithFindings(["high", "high"]);
     result.findings.findings[0]!.locations[0]!.path = "transient.ts";
@@ -4771,15 +4885,23 @@ describe("scan and patch workflow", () => {
       ],
     };
     const final = {
-      paths: ["kept.ts"],
-      diff: "diff --git a/kept.ts b/kept.ts\n",
+      paths: ["transient.ts", "kept.ts"],
+      diff:
+        "diff --git a/transient.ts b/transient.ts\n" +
+        "diff --git a/kept.ts b/kept.ts\n",
       publicationBaseCommit: baseCommit,
       publicationBaseEntries: [
+        {
+          path: "transient.ts",
+          mode: "100644",
+          object: transientObject,
+        },
         { path: "kept.ts", mode: "100644", object: baseObject },
       ],
       publicationEntries: [
         { path: "kept.ts", mode: "100644", object: keptObject },
       ],
+      publicationUnsafePaths: ["transient.ts"],
     };
     const stagedPaths: string[][] = [];
     const url = "https://github.example.test/example/repository/pull/20";
