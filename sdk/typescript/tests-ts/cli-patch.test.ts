@@ -5324,7 +5324,7 @@ describe("scan and patch workflow", () => {
           changedFiles: ["src/finding-1.ts", "src/finding-2.ts"],
         },
       ]);
-      expect(assessmentBase).not.toBe(baseTree);
+      expect(assessmentBase).toBe(baseTree);
       expect(assessedPatches.at(-1)?.head).not.toBe(assessmentBase);
       expect(assessedDiffs.at(-1)).toContain("src/finding-1.ts");
       expect(assessedDiffs.at(-1)).toContain("src/finding-2.ts");
