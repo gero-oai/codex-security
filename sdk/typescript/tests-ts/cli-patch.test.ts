@@ -2341,6 +2341,7 @@ describe("scan and patch workflow", () => {
     "common directory",
     "configuration",
     "hook",
+    "index lock",
     "sparse checkout",
   ] as const)(
     "fails closed when the author changes top-level Git %s",
@@ -2388,10 +2389,15 @@ describe("scan and patch workflow", () => {
                     join(repository, ".git", "hooks", "pre-commit"),
                     "#!/bin/sh\nexit 0\n",
                   );
-                } else {
+                } else if (kind === "sparse checkout") {
                   await writeFile(
                     join(repository, ".git", "info", "sparse-checkout"),
                     "/src/\n",
+                  );
+                } else {
+                  await writeFile(
+                    join(repository, ".git", "index.lock"),
+                    "synthetic lock\n",
                   );
                 }
                 output!.stdout.write("Verified synthetic patch.");

@@ -6733,16 +6733,23 @@ async function sealPatchReviewMcpRuntime(
 
 const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
   "HEAD",
+  "HEAD.lock",
   "commondir",
   "config",
+  "config.lock",
   "config.worktree",
   "hooks",
+  "index.lock",
   "info/attributes",
   "info/exclude",
   "info/sparse-checkout",
+  "logs",
   "objects/info/alternates",
   "packed-refs",
+  "packed-refs.lock",
   "refs",
+  "shallow",
+  "shallow.lock",
 ] as const;
 
 async function snapshotPatchReviewWorktree(
