@@ -5524,15 +5524,9 @@ async function hashNestedPatchReviewPath(
       `directory:${metadata.mode.toString(8)}`,
       "",
     );
-    const entries = await readdir(filesystemPath, {
-      encoding: "buffer",
-      withFileTypes: true,
-    });
-    entries.sort((left, right) =>
-      Buffer.compare(Buffer.from(left.name), Buffer.from(right.name)),
-    );
-    for (const entry of entries) {
-      const name = Buffer.from(entry.name);
+    const entries = await readdir(filesystemPath, { encoding: "buffer" });
+    entries.sort(Buffer.compare);
+    for (const name of entries) {
       if (name.equals(Buffer.from(".git"))) continue;
       await hashNestedPatchReviewPath(
         worktree,
@@ -6170,7 +6164,17 @@ async function snapshotPatchReviewWorktree(
           if (capturingBaseline) baselineMaterializedTrackedPaths.add(key);
         } catch (error) {
           if (!missingPatchReviewPath(error)) throw error;
-          if (capturingBaseline || baselineMaterializedTrackedPaths.has(key)) {
+          if (skipWorktreePaths.has(key)) {
+            if (
+              !capturingBaseline &&
+              baselineMaterializedSkipWorktreePaths.has(key)
+            ) {
+              removed.push(pathBytes);
+            }
+          } else if (
+            capturingBaseline ||
+            baselineMaterializedTrackedPaths.has(key)
+          ) {
             removed.push(pathBytes);
           }
           continue;
