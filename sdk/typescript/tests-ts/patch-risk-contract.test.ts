@@ -66,16 +66,12 @@ const validatorPath = join(
   "scripts",
   "validate_patch_risk_assessment.py",
 );
+const skillPath = join(PLUGIN_ROOT, "skills", "assess-patch-risk", "SKILL.md");
 const python =
   process.env["PYTHON"] ??
   Bun.which("python3") ??
   Bun.which("python") ??
   Bun.which("py");
-const hasJsonSchema =
-  python !== null &&
-  python !== undefined &&
-  spawnSync(python, ["-c", "import jsonschema"]).status === 0;
-const validatorTest = hasJsonSchema ? test : test.skip;
 
 function assessment(): Assessment {
   return {
@@ -137,7 +133,7 @@ function assessment(): Assessment {
 function validate(payload: Assessment) {
   expect(python).toBeDefined();
   expect(python).not.toBeNull();
-  return spawnSync(python!, [validatorPath, "-"], {
+  return spawnSync(python!, ["-I", "-S", validatorPath, "-"], {
     cwd: PLUGIN_ROOT,
     encoding: "utf8",
     input: JSON.stringify(payload),
@@ -145,6 +141,20 @@ function validate(payload: Assessment) {
 }
 
 describe("patch risk assessment contract", () => {
+  test("resolves the validator from the installed skill", async () => {
+    const skill = await readFile(skillPath, "utf8");
+
+    expect(skill).toContain(
+      "This skill lives at `<plugin-root>/skills/assess-patch-risk/SKILL.md`",
+    );
+    expect(skill).toContain(
+      "<python_command> <plugin-root>/skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py <assessment.json>",
+    );
+    expect(skill).not.toContain(
+      "python skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py",
+    );
+  });
+
   test("publishes a valid draft 2020-12 schema", async () => {
     const schema = JSON.parse(await readFile(schemaPath, "utf8"));
     const validateSchema = new Ajv2020({
@@ -163,12 +173,50 @@ describe("patch risk assessment contract", () => {
     expect(validateSchema(rawWorktree)).toBe(false);
   });
 
-  validatorTest("accepts a supported human-review merge", () => {
+  test("enforces the published schema without site packages", async () => {
+    const schema = JSON.parse(await readFile(schemaPath, "utf8"));
+    const validateSchema = new Ajv2020({
+      strict: false,
+      validateFormats: false,
+    }).compile(schema);
+    const invalidAssessments: Assessment[] = [];
+
+    const missingRequired = assessment();
+    delete (missingRequired as Record<string, unknown>)["patch"];
+    invalidAssessments.push(missingRequired);
+
+    const additionalProperty = assessment();
+    additionalProperty["unexpected"] = true;
+    invalidAssessments.push(additionalProperty);
+
+    const invalidPattern = assessment();
+    invalidPattern.patch.sha256 = "g".repeat(64);
+    invalidAssessments.push(invalidPattern);
+
+    const emptyValidation = assessment();
+    emptyValidation.validation = [];
+    invalidAssessments.push(emptyValidation);
+
+    const duplicateItems = assessment();
+    duplicateItems["autoMergeExclusions"] = ["migration", "migration"];
+    invalidAssessments.push(duplicateItems);
+
+    const emptyString = assessment();
+    emptyString.impact.rationale = "";
+    invalidAssessments.push(emptyString);
+
+    for (const payload of invalidAssessments) {
+      expect(validateSchema(payload)).toBe(false);
+      expect(validate(payload).status).not.toBe(0);
+    }
+  });
+
+  test("accepts a supported human-review merge without site packages", () => {
     const result = validate(assessment());
     expect(result.status, result.stderr).toBe(0);
   });
 
-  validatorTest("enforces strict auto-merge gates", () => {
+  test("enforces strict auto-merge gates", () => {
     const payload = assessment();
     payload.workflowLabel = "auto_merge_candidate";
 
@@ -180,7 +228,7 @@ describe("patch risk assessment contract", () => {
     expect(accepted.status, accepted.stderr).toBe(0);
   });
 
-  validatorTest("requires a bounded evidence plan for an evidence hold", () => {
+  test("requires a bounded evidence plan for an evidence hold", () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
     payload.workflowLabel = "hold_for_evidence";
@@ -208,7 +256,7 @@ describe("patch risk assessment contract", () => {
     expect(accepted.status, accepted.stderr).toBe(0);
   });
 
-  validatorTest("requires an established non-applicable no-op", () => {
+  test("requires an established non-applicable no-op", () => {
     const payload = assessment();
     payload.recommendation = "no_op";
     payload.workflowLabel = "no_op";
