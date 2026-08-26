@@ -1133,7 +1133,7 @@ describe("database-backed Linear publication integration", () => {
     const publisherPidFile = join(root, "publisher.pid");
     const descendantPidFile = join(root, "descendant.pid");
     const descendant =
-      'const fs = require("node:fs");process.on("SIGINT", () => {});process.on("SIGTERM", () => {});fs.writeFileSync(process.env.CODEX_PUBLICATION_DESCENDANT_PID, String(process.pid));setInterval(() => {}, 1000);';
+      'const fs = require("node:fs");process.on("SIGINT", () => {});process.on("SIGTERM", () => {});const pidFile = process.env.CODEX_PUBLICATION_DESCENDANT_PID;fs.writeFileSync(pidFile + ".tmp", String(process.pid));fs.renameSync(pidFile + ".tmp", pidFile);setInterval(() => {}, 1000);';
     await writeFile(
       preload,
       `const fs = require("node:fs"); const { spawn } = require("node:child_process");
