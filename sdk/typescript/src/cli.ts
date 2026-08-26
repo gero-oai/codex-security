@@ -5662,6 +5662,8 @@ function patchReviewFilesystemPath(
 async function validatePatchReviewPath(
   directory: string,
   path: string,
+  canonicalRoot?: string,
+  inspectFinalPath = true,
 ): Promise<void> {
   const normalized =
     process.platform === "win32" ? path.replaceAll("\\", "/") : path;
@@ -5684,7 +5686,7 @@ async function validatePatchReviewPath(
     );
   }
 
-  const root = await realpath(directory);
+  const root = canonicalRoot ?? (await realpath(directory));
   const rejectEscape = (): never => {
     throw new CodexSecurityError(
       "The observed patch contains a path through a link outside the selected repository.",
@@ -5721,7 +5723,59 @@ async function validatePatchReviewPath(
       return;
     }
   };
-  await inspect(absolute, new Set());
+  await inspect(inspectFinalPath ? absolute : dirname(absolute), new Set());
+}
+
+async function validatePatchReviewGitPath(
+  directory: string,
+  path: Buffer,
+  canonicalRoot?: string,
+): Promise<void> {
+  const decoded = decodePatchReviewGitPath(path);
+  if (decoded !== undefined) {
+    await validatePatchReviewPath(directory, decoded, canonicalRoot, false);
+    return;
+  }
+  if (process.platform === "win32") {
+    throw new CodexSecurityError(
+      "The observed patch contains an unsafe candidate path.",
+    );
+  }
+
+  const parts: Buffer[] = [];
+  let start = 0;
+  for (let index = 0; index <= path.length; index += 1) {
+    if (index !== path.length && path[index] !== 0x2f) continue;
+    const part = path.subarray(start, index);
+    if (
+      part.length === 0 ||
+      part.equals(Buffer.from(".")) ||
+      part.equals(Buffer.from(".."))
+    ) {
+      throw new CodexSecurityError(
+        "The observed patch contains an unsafe candidate path.",
+      );
+    }
+    parts.push(part);
+    start = index + 1;
+  }
+
+  let current = Buffer.from(canonicalRoot ?? (await realpath(directory)));
+  for (const part of parts.slice(0, -1)) {
+    current = Buffer.concat([current, Buffer.from(sep), part]);
+    let metadata: Awaited<ReturnType<typeof lstat>>;
+    try {
+      metadata = await lstat(current);
+    } catch (error) {
+      if (missingPatchReviewPath(error)) return;
+      throw error;
+    }
+    if (metadata.isSymbolicLink()) {
+      throw new CodexSecurityError(
+        "The observed patch contains a path through a link outside the selected repository.",
+      );
+    }
+  }
 }
 
 interface NestedPatchReviewRepository {
@@ -5753,6 +5807,7 @@ async function hashNestedPatchReviewPath(
   signal?: AbortSignal,
 ): Promise<void> {
   signal?.throwIfAborted();
+  await validatePatchReviewGitPath(worktree, path, worktree);
   const filesystemPath = patchReviewFilesystemPath(worktree, path);
   let metadata: BigIntStats;
   try {
@@ -6309,6 +6364,7 @@ async function snapshotPatchReviewWorktree(
     string,
     { repository: NestedPatchReviewRepository; state: string }
   >();
+  const baselineIgnoredPathStates = new Map<string, string>();
   let capturingBaseline = true;
   const nestedRepositoryState = async (
     nested: NestedPatchReviewRepository,
@@ -6397,12 +6453,18 @@ async function snapshotPatchReviewWorktree(
     for (const entry of parseRawPatchReviewIndexEntries(
       indexEntries,
     ).values()) {
-      if (entry.mode === "160000") {
-        paths.set(patchReviewGitPathKey(entry.path), entry.path);
-      }
+      paths.set(patchReviewGitPathKey(entry.path), entry.path);
     }
     for (const path of [...paths.values()].sort(Buffer.compare)) {
       await hashNestedPatchReviewPath(nested.worktree, path, digest, signal);
+    }
+    for (const path of ["HEAD", "config", "index", "packed-refs", "refs"]) {
+      await hashNestedPatchReviewPath(
+        nested.gitDirectory,
+        Buffer.from(path),
+        digest,
+        signal,
+      );
     }
     return digest.digest("hex");
   };
@@ -6468,7 +6530,21 @@ async function snapshotPatchReviewWorktree(
     const included: Buffer[] = [];
     const removed: Buffer[] = [];
     for (const pathBytes of paths.values()) {
+      await validatePatchReviewGitPath(repository, pathBytes, repository);
       const key = patchReviewGitPathKey(pathBytes);
+      if (ignoredPathSet.has(key)) {
+        const digest = createHash("sha256");
+        await hashNestedPatchReviewPath(repository, pathBytes, digest, signal);
+        const state = digest.digest("hex");
+        const baseline = baselineIgnoredPathStates.get(key);
+        if (capturingBaseline && baseline === undefined) {
+          baselineIgnoredPathStates.set(key, state);
+        } else if (baseline !== state) {
+          throw new CodexSecurityError(
+            "An ignored path changed after patch review started. Preserve unrelated ignored files and retry.",
+          );
+        }
+      }
       if (
         baselineSnapshotPathSet.has(key) &&
         !baselineTrackedPathSet.has(key)

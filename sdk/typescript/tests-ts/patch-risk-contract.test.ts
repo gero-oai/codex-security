@@ -55,6 +55,7 @@ interface Assessment {
     question: string;
     action: string;
     resolvesUnknowns: string[];
+    remainingUnknowns?: Record<string, string[]>;
     resolvesBoundaries?: string[];
     boundaryOutcomes?: Record<string, Record<string, string>>;
     applicabilityOutcomes?: Record<string, string>;
@@ -579,6 +580,10 @@ describe("patch risk assessment contract", () => {
         question: "Can the immutable final comparison be retrieved completely?",
         action: "Retrieve the same final comparison again from the provider.",
         resolvesUnknowns: ["changed-file-inventory"],
+        remainingUnknowns: {
+          complete: [],
+          still_incomplete: ["changed-file-inventory"],
+        },
         outcomes: {
           complete: "merge",
           still_incomplete: "hold_for_evidence",
@@ -721,7 +726,7 @@ describe("patch risk assessment contract", () => {
       resolvesUnknowns: [`unknown-${index + 1}`],
       outcomes: {
         supported: "hold_for_evidence",
-        contradicted: "revise",
+        contradicted: "hold_for_evidence",
       },
     }));
 
@@ -1106,6 +1111,14 @@ describe("patch risk assessment contract", () => {
 
     payload.validation[0]!.failureAttribution = "not_patch_caused";
     delete payload.evidencePlan[0]!.resolvesFailedValidation;
+    payload.evidencePlan[0]!.outcomes = {
+      supported: "merge",
+      alternate: "merge",
+    };
+    payload.evidencePlan[0]!.applicabilityOutcomes = {
+      supported: "confirmed",
+      alternate: "confirmed",
+    };
     const attributedFailure = await validate(payload);
     expect(attributedFailure.status, attributedFailure.stderr).toBe(0);
 
@@ -1115,7 +1128,7 @@ describe("patch risk assessment contract", () => {
     expect(unresolved.status, unresolved.stderr).toBe(0);
   });
 
-  test("requires every evidence-plan item to have distinct recommendations", async () => {
+  test("allows evidence outcomes with the same terminal recommendation", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
     payload.workflowLabel = "hold_for_evidence";
@@ -1139,13 +1152,80 @@ describe("patch risk assessment contract", () => {
       },
     ];
 
-    const first = await validate(payload);
-    const second = await validate(payload);
-    expect(first.status).not.toBe(0);
-    expect(first.stderr).toBe(
-      "evidencePlan.0: requires at least two distinct outcome recommendations\n",
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("requires terminal evidence branches to justify revise or block", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionLikelihood.rating = "moderate";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "unknown";
+    payload.unknowns = [
+      {
+        id: "failure-attribution",
+        summary: "The failed check attribution is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Did the patch cause the failed check?",
+        action: "Run the same check against the immutable base.",
+        resolvesUnknowns: ["failure-attribution"],
+        resolvesFailedValidation: ["focused request tests"],
+        outcomes: {
+          patch_caused: "revise",
+          not_patch_caused: "block",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "a block outcome requires branch evidence of critical likelihood or a contradicted boundary",
     );
-    expect(second.stderr).toBe(first.stderr);
+  });
+
+  test("requires a hold outcome to retain an explicit pivot", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which runtime owns this path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: { owned: "merge", unavailable: "hold_for_evidence" },
+      },
+    ];
+
+    const missing = await validate(payload);
+    expect(missing.status).not.toBe(0);
+    expect(missing.stderr).toContain(
+      "a hold outcome must retain an explicit unresolved pivot",
+    );
+
+    payload.evidencePlan[0]!.remainingUnknowns = {
+      owned: [],
+      unavailable: ["runtime-owner"],
+    };
+    const valid = await validate(payload);
+    expect(valid.status, valid.stderr).toBe(0);
   });
 
   test("requires structured evidence for unknown applicability", async () => {
@@ -1171,7 +1251,7 @@ describe("patch risk assessment contract", () => {
         resolvesUnknowns: ["runtime-owner"],
         outcomes: {
           supported: "merge",
-          defective: "revise",
+          defective: "merge",
         },
       },
     ];
@@ -1420,6 +1500,27 @@ describe("patch risk assessment contract", () => {
       "high confidence cannot retain an explicit unknown",
     );
   });
+
+  test.each(["impact", "boundary"] as const)(
+    "rejects high confidence with unresolved %s evidence",
+    async (kind) => {
+      const payload = assessment();
+      payload.recommendation = "revise";
+      payload.workflowLabel = "revise";
+      payload.validation[0]!.status = "failed";
+      payload.validation[0]!.failureAttribution = "patch_caused";
+      if (kind === "impact") payload.impact.rating = "unknown";
+      else payload.materialBoundaries[0]!.result = "unresolved";
+
+      const result = await validate(payload);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        kind === "impact"
+          ? "unknown impact cannot support high confidence"
+          : "an unresolved material boundary cannot support high confidence",
+      );
+    },
+  );
 
   test.each(["none", "unknown"])(
     "requires passing protection for a low-likelihood merge with %s protection",
