@@ -17,7 +17,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { deflateSync } from "node:zlib";
+import { deflateSync, inflateSync } from "node:zlib";
 import type { Finding, JsonObject, SeverityLevel } from "../src/index.js";
 import { main } from "../src/cli.js";
 import {
@@ -107,7 +107,6 @@ function dependencies(
         repository: directory,
         tree: "synthetic-baseline-tree",
         objectDirectory: resolve(directory, ".git", "objects"),
-        alternateObjectDirectory: resolve(directory, ".git", "objects"),
         runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
         gitExecutable: GIT_EXECUTABLE,
       },
@@ -172,7 +171,6 @@ function dependencies(
         repository: directory,
         tree: "synthetic-cumulative-baseline-tree",
         objectDirectory: resolve(directory, ".git", "objects"),
-        alternateObjectDirectory: resolve(directory, ".git", "objects"),
         runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
         gitExecutable: GIT_EXECUTABLE,
       },
@@ -1180,6 +1178,40 @@ describe("scan and patch workflow", () => {
       {
         result,
         onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          {
+            paths: ["src/finding-1.ts"],
+            diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n+first\n",
+          },
+          {
+            paths: ["src/finding-1.ts"],
+            diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n+first\n",
+          },
+          {
+            paths: ["src/finding-2.ts"],
+            diff: "diff --git a/src/finding-2.ts b/src/finding-2.ts\n+second\n",
+          },
+          {
+            paths: ["src/finding-2.ts"],
+            diff: "diff --git a/src/finding-2.ts b/src/finding-2.ts\n+second\n",
+          },
+        ],
+        cumulativePatchReviewDeltas: [
+          {
+            paths: ["src/finding-1.ts", "src/finding-2.ts"],
+            diff: "synthetic cumulative patch",
+          },
+        ],
+        cumulativePatchReviewComposedDeltas: [
+          {
+            paths: ["src/finding-1.ts"],
+            diff: "synthetic first patch",
+          },
+          {
+            paths: ["src/finding-1.ts", "src/finding-2.ts"],
+            diff: "synthetic cumulative patch",
+          },
+        ],
         onCodex: (args, output) => {
           const server = output!.appServer!;
           if (output!.command === "verify-fix") {
@@ -1226,6 +1258,7 @@ describe("scan and patch workflow", () => {
       "review",
       "author",
       "review",
+      "review",
       "combined-verification",
     ]);
     expect(JSON.parse(outcome.stdout)).toMatchObject({
@@ -1237,6 +1270,91 @@ describe("scan and patch workflow", () => {
             "Final combined verification found that a later patch reintroduced this finding.",
         },
         { occurrenceId: "occ_2", status: "verified" },
+      ],
+    });
+  });
+
+  test("reviews the final cumulative patch before combined verification", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const first = {
+      paths: ["src/finding-1.ts"],
+      diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n+first\n",
+      base: "a".repeat(40),
+      head: "b".repeat(40),
+    };
+    const second = {
+      paths: ["src/finding-2.ts"],
+      diff: "diff --git a/src/finding-2.ts b/src/finding-2.ts\n+second\n",
+      base: "b".repeat(40),
+      head: "c".repeat(40),
+    };
+    const combined = {
+      paths: ["src/finding-1.ts", "src/finding-2.ts"],
+      diff: `${first.diff}${second.diff}`,
+      base: "a".repeat(40),
+      head: "c".repeat(40),
+    };
+    const stages: string[] = [];
+    let reviews = 0;
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--review-minimality", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [first, first, second, second],
+        cumulativePatchReviewDeltas: [combined],
+        cumulativePatchReviewComposedDeltas: [first, combined],
+        onCodex: (args, output) => {
+          const server = output!.appServer!;
+          if (server.sandbox === "read-only") {
+            reviews += 1;
+            if (reviews === 3) {
+              stages.push("combined-review");
+              expect(server.prompt).toContain("src/finding-1.ts");
+              expect(server.prompt).toContain("src/finding-2.ts");
+              output!.stdout.write(
+                JSON.stringify({
+                  status: "revise",
+                  findings: ["The combined synthetic patch is not minimal."],
+                }),
+              );
+            } else {
+              stages.push("review");
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            }
+          } else {
+            stages.push("author");
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(2);
+    expect(stages).toEqual([
+      "author",
+      "review",
+      "author",
+      "review",
+      "combined-review",
+    ]);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      patches: [
+        {
+          occurrenceId: "occ_1",
+          status: "failed",
+          reason:
+            "Final combined minimality review did not approve the cumulative patch.",
+        },
+        {
+          occurrenceId: "occ_2",
+          status: "failed",
+          reason:
+            "Final combined minimality review did not approve the cumulative patch.",
+        },
       ],
     });
   });
@@ -1729,11 +1847,6 @@ describe("scan and patch workflow", () => {
                       repository: directory,
                       tree: "synthetic-baseline-tree",
                       objectDirectory: resolve(directory, ".git", "objects"),
-                      alternateObjectDirectory: resolve(
-                        directory,
-                        ".git",
-                        "objects",
-                      ),
                       runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
                       gitExecutable: GIT_EXECUTABLE,
                     },
@@ -2285,7 +2398,6 @@ describe("scan and patch workflow", () => {
                 view.repository,
                 view.tree,
                 view.objectDirectory,
-                view.alternateObjectDirectory,
               ],
               {
                 encoding: "utf8",
@@ -2539,6 +2651,102 @@ describe("scan and patch workflow", () => {
       expect(observed?.diff).toContain("+materialized");
       expect(observed?.diff).not.toContain("\u001B[");
       expect(git("show", "HEAD:omit/value.ts")).toBe("preserved");
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("seals unmaterialized sparse baseline objects before authoring", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-sparse-object-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    const preserved = Buffer.from("preserved baseline\n");
+    let reviewedSealedObject = false;
+    try {
+      await mkdir(join(repository, "keep"), { recursive: true });
+      await mkdir(join(repository, "omit"), { recursive: true });
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "keep", "value.ts"), "unsafe\n");
+      await writeFile(join(repository, "omit", "value.ts"), preserved);
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+      const object = git("rev-parse", "HEAD:omit/value.ts");
+      const objectFormat = git("rev-parse", "--show-object-format");
+      const originalObject = Buffer.concat([
+        Buffer.from(`blob ${preserved.length}\0`),
+        preserved,
+      ]);
+      expect(
+        createHash(objectFormat).update(originalObject).digest("hex"),
+      ).toBe(object);
+      git("sparse-checkout", "init", "--cone");
+      git("sparse-checkout", "set", "keep");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              const view = output!.appServer!.reviewRepository!;
+              expect(
+                inflateSync(
+                  await readFile(
+                    join(
+                      view.objectDirectory,
+                      object.slice(0, 2),
+                      object.slice(2),
+                    ),
+                  ),
+                ),
+              ).toEqual(originalObject);
+              reviewedSealedObject = true;
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              const forged = Buffer.from("forged baseline\n");
+              const liveObject = join(
+                repository,
+                ".git",
+                "objects",
+                object.slice(0, 2),
+                object.slice(2),
+              );
+              await chmod(liveObject, 0o600);
+              await writeFile(
+                liveObject,
+                deflateSync(
+                  Buffer.concat([
+                    Buffer.from(`blob ${forged.length}\0`),
+                    forged,
+                  ]),
+                ),
+              );
+              await writeFile(join(repository, "keep", "value.ts"), "fixed\n");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(reviewedSealedObject).toBe(true);
     } finally {
       await rm(repository, { recursive: true, force: true });
     }
@@ -3601,6 +3809,127 @@ describe("scan and patch workflow", () => {
       });
       await writeFile(
         join(repository, ".git", "objects", "info", "alternates"),
+        `${join(external, ".git", "objects")}\n`,
+      );
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: () => {
+            authorStarted = true;
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(authorStarted).toBe(false);
+      expect(outcome.stderr).toContain(
+        "Git object alternates must remain inside",
+      );
+      expect(outcome.stderr).not.toContain(external);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "rejects Git metadata symlinks before authoring",
+    async () => {
+      const root = await realpath(
+        await mkdtemp(join(tmpdir(), "codex-security-metadata-link-")),
+      );
+      const repository = join(root, "repository");
+      const external = join(root, "external-hooks");
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      let authorStarted = false;
+      try {
+        await Promise.all([mkdir(repository), mkdir(external)]);
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        await writeFile(join(repository, "value.ts"), "unsafe\n");
+        git("add", "--", "value.ts");
+        git("commit", "-m", "Initial synthetic checkout");
+        await rm(join(repository, ".git", "hooks"), {
+          recursive: true,
+          force: true,
+        });
+        await symlink(external, join(repository, ".git", "hooks"), "dir");
+
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: () => {
+              authorStarted = true;
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode).toBe(2);
+        expect(authorStarted).toBe(false);
+        expect(outcome.stderr).toContain(
+          "Git metadata must not contain symbolic links",
+        );
+        expect(outcome.stderr).not.toContain(external);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("rejects nested object alternates outside the selected repository", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-nested-alternate-")),
+    );
+    const repository = join(root, "repository");
+    const nested = join(repository, "nested");
+    const external = join(root, "external");
+    const git = (directory: string, ...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: directory,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let authorStarted = false;
+    try {
+      await Promise.all([mkdir(repository), mkdir(external)]);
+      git(repository, "init", "--initial-branch=main");
+      git(repository, "config", "user.name", "Synthetic User");
+      git(repository, "config", "user.email", "synthetic@example.test");
+      git(repository, "config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git(repository, "add", "--", "value.ts");
+      git(repository, "commit", "-m", "Initial synthetic checkout");
+
+      await mkdir(nested);
+      git(nested, "init", "--initial-branch=main");
+      await writeFile(join(nested, "nested.ts"), "nested\n");
+      git(external, "init", "--initial-branch=main");
+      await mkdir(join(nested, ".git", "objects", "info"), {
+        recursive: true,
+      });
+      await writeFile(
+        join(nested, ".git", "objects", "info", "alternates"),
         `${join(external, ".git", "objects")}\n`,
       );
 
@@ -6511,6 +6840,52 @@ describe("scan and patch workflow", () => {
     );
   });
 
+  test("revalidates the candidate before returning a blocked review", async () => {
+    const result = resultWithFindings(["high"]);
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--review-minimality", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          {
+            paths: ["src/finding-1.ts"],
+            diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n+fixed\n",
+          },
+          {
+            paths: ["src/finding-1.ts"],
+            diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n+late change\n",
+          },
+        ],
+        onCodex: (args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({
+                status: "blocked",
+                findings: ["The synthetic patch needs more work."],
+              }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(2);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      patches: [
+        {
+          occurrenceId: "occ_1",
+          status: "failed",
+          reason:
+            "minimality review candidate changed while the terminal outcome was being processed.",
+        },
+      ],
+    });
+  });
+
   test("continues with separate patch tasks when one finding fails", async () => {
     const result = resultWithFindings(["critical", "high", "medium"]);
     const tasks: string[] = [];
@@ -7264,7 +7639,6 @@ describe("scan and patch workflow", () => {
               repository: root,
               tree: "synthetic-baseline-tree",
               objectDirectory: resolve(root, ".git", "objects"),
-              alternateObjectDirectory: resolve(root, ".git", "objects"),
               runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
               gitExecutable: GIT_EXECUTABLE,
             },
