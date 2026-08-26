@@ -1758,6 +1758,191 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test.each(["tracked file marked assume-unchanged", "Git metadata"] as const)(
+    "fails closed when the author changes a nested %s",
+    async (kind) => {
+      const repository = await realpath(
+        await mkdtemp(join(tmpdir(), "codex-security-nested-boundary-")),
+      );
+      const nested = join(repository, "nested");
+      const git = (directory: string, ...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: directory,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      let reviews = 0;
+      try {
+        git(repository, "init", "--initial-branch=main");
+        git(repository, "config", "user.name", "Synthetic User");
+        git(repository, "config", "user.email", "synthetic@example.test");
+        git(repository, "config", "commit.gpgsign", "false");
+        await writeFile(join(repository, "value.ts"), "unsafe\n");
+        git(repository, "add", "--", "value.ts");
+        git(repository, "commit", "-m", "Initial synthetic checkout");
+
+        await mkdir(nested);
+        git(nested, "init", "--initial-branch=main");
+        git(nested, "config", "user.name", "Synthetic User");
+        git(nested, "config", "user.email", "synthetic@example.test");
+        git(nested, "config", "commit.gpgsign", "false");
+        await writeFile(join(nested, "tracked.ts"), "nested baseline\n");
+        git(nested, "add", "--", "tracked.ts");
+        git(nested, "commit", "-m", "Initial nested checkout");
+        if (kind === "tracked file marked assume-unchanged") {
+          git(nested, "update-index", "--assume-unchanged", "tracked.ts");
+        }
+
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: async (_args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                reviews += 1;
+              } else {
+                await writeFile(join(repository, "value.ts"), "fixed\n");
+                if (kind === "tracked file marked assume-unchanged") {
+                  await writeFile(join(nested, "tracked.ts"), "changed\n");
+                } else {
+                  git(nested, "config", "review.synthetic", "changed");
+                }
+                output!.stdout.write("Verified synthetic patch.");
+              }
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode).toBe(2);
+        expect(reviews).toBe(0);
+        expect(outcome.stderr).toContain("nested Git worktree changed");
+      } finally {
+        await rm(repository, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.each(["overwrites", "deletes"] as const)(
+    "fails closed when the author %s a pre-existing ignored file",
+    async (operation) => {
+      const repository = await realpath(
+        await mkdtemp(join(tmpdir(), "codex-security-ignored-boundary-")),
+      );
+      const ignored = join(repository, "private.txt");
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      let reviews = 0;
+      try {
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        await writeFile(join(repository, ".gitignore"), "private.txt\n");
+        await writeFile(join(repository, "value.ts"), "unsafe\n");
+        git("add", "--", ".gitignore", "value.ts");
+        git("commit", "-m", "Initial synthetic checkout");
+        await writeFile(ignored, "SYNTHETIC_PRIVATE_BASELINE\n");
+
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: async (_args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                reviews += 1;
+              } else {
+                await writeFile(join(repository, "value.ts"), "fixed\n");
+                if (operation === "overwrites") {
+                  await writeFile(ignored, "SYNTHETIC_PRIVATE_CHANGED\n");
+                } else {
+                  await rm(ignored);
+                }
+                output!.stdout.write("Verified synthetic patch.");
+              }
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode).toBe(2);
+        expect(reviews).toBe(0);
+        expect(outcome.stderr).toContain("ignored path changed");
+        expect(outcome.stderr).not.toContain("SYNTHETIC_PRIVATE");
+      } finally {
+        await rm(repository, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("rejects a tracked path through an external ancestor link before authoring", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-baseline-link-")),
+    );
+    const repository = join(root, "repository");
+    const linked = join(repository, "linked");
+    const outside = join(root, "outside");
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let authorStarted = false;
+    try {
+      await mkdir(linked, { recursive: true });
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(linked, "value.ts"), "inside\n");
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+
+      await rm(linked, { recursive: true });
+      await mkdir(outside);
+      await writeFile(join(outside, "value.ts"), "SYNTHETIC_PRIVATE\n");
+      await symlink(outside, linked);
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: () => {
+            authorStarted = true;
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(authorStarted).toBe(false);
+      expect(outcome.stderr).toContain("path through a link outside");
+      expect(outcome.stderr).not.toContain("SYNTHETIC_PRIVATE");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test.each(["untracked", "ignored"] as const)(
     "fails closed when the author overwrites a pre-existing %s nested file",
     async (kind) => {
