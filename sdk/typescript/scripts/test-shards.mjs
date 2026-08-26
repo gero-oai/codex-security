@@ -20,6 +20,7 @@ const timings = {
   "scan-comparison.test.ts": [1, 11],
   "scan-recovery.test.ts": [55, 83],
   "stopped-scan-results.test.ts": [15, 17],
+  "targets-large-output.test.ts": [2, 11],
 };
 
 export function partitionTestFiles(files, count, platform = process.platform) {
