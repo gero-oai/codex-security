@@ -146,6 +146,7 @@ function patchRiskAssessment(
       question: string;
       action: string;
       resolvesUnknowns: string[];
+      applicabilityOutcomes?: Record<string, string>;
       outcomes: Record<string, string>;
     }>,
   };
@@ -189,6 +190,10 @@ function patchRiskAssessment(
         action: "Inspect the checked-in deployment mapping.",
         resolvesUnknowns: ["rollout-target"],
         outcomes: { supported: "merge", contradicted: "no_op" },
+        applicabilityOutcomes: {
+          supported: "confirmed",
+          contradicted: "wrong_owner",
+        },
       },
     ];
   }
@@ -481,6 +486,7 @@ describe("CLI skill commands", () => {
     expect(help.text()).toContain("--review-minimality");
     expect(help.text()).toContain("--review-style");
     expect(help.text()).toContain("--assess-patch-risk");
+    expect(help.text()).toContain("--python <string>");
     expect(help.text()).toContain("--max-review-revisions <number>");
   });
 
@@ -535,6 +541,42 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).toContain('"recommendation":"merge"');
     expect(stderr.text()).toContain("## Patch risk");
     await expect(filesystem.access(artifactPath)).rejects.toThrow();
+  });
+
+  test("forwards the patch Python interpreter to assessment validation", async () => {
+    const pythonPath = resolve("/synthetic/python");
+    let configuredPython: string | undefined;
+    const current = dependencies({
+      onCodex: (_args, output) => {
+        const { prompt, sandbox } = output!.appServer!;
+        output!.stdout.write(
+          sandbox === "read-only"
+            ? JSON.stringify(patchRiskVerdict(prompt))
+            : "Verified synthetic patch.",
+        );
+        return 0;
+      },
+    });
+    current.validatePatchRiskAssessment = async (_response, options) => {
+      configuredPython = options.pythonPath;
+      return true;
+    };
+
+    expect(
+      await main(
+        [
+          "patch",
+          "Synthetic security issue",
+          "--assess-patch-risk",
+          "--python",
+          pythonPath,
+        ],
+        capture().stream,
+        capture().stream,
+        current,
+      ),
+    ).toBe(0);
+    expect(configuredPython).toBe(pythonPath);
   });
 
   test("seals the patch-risk contract before the author turn", async () => {
@@ -646,6 +688,9 @@ describe("CLI skill commands", () => {
           "Authorization: unchanged",
           "Authorization: preserved by the existing route check",
           "Token handling: unaffected",
+          "Authorization: contradicted",
+          "Token handling: changed",
+          "Authorization: contradicted because Bearer SYNTHETIC_ADVERSE_CREDENTIAL",
           "Authorization: Bearer SYNTHETIC_REPORT_CREDENTIAL",
           "",
           "-----BEGIN PRIVATE KEY-----",
@@ -673,9 +718,13 @@ describe("CLI skill commands", () => {
       "Authorization: preserved by the existing route check",
     );
     expect(stderr.text()).toContain("Token handling: unaffected");
+    expect(stderr.text()).toContain("Authorization: contradicted");
+    expect(stderr.text()).toContain("Token handling: changed");
+    expect(stderr.text()).toContain("Authorization: contradicted [redacted]");
     expect(stderr.text()).toContain("Recoverability: easy");
     expect(stderr.text()).not.toContain("SYNTHETIC-MULTILINE-KEY-BODY");
     expect(stderr.text()).not.toContain("SYNTHETIC_REPORT_CREDENTIAL");
+    expect(stderr.text()).not.toContain("SYNTHETIC_ADVERSE_CREDENTIAL");
     expect(stderr.text()).not.toContain("-----END PRIVATE KEY-----");
   });
 

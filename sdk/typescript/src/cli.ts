@@ -4041,6 +4041,9 @@ export async function main(
       }),
       options: z.object({
         effort: effortOption(),
+        python: optionValue("--python")
+          .optional()
+          .describe(PYTHON_PATH_DESCRIPTION),
         scan: optionValue("--scan")
           .optional()
           .describe("Patch open findings from a saved scan."),
@@ -4111,6 +4114,7 @@ export async function main(
               options.assessPatchRisk ||
               options.maxReviewRevisions !== undefined ||
               options.effort !== undefined ||
+              options.python !== undefined ||
               options.codex.length > 0
             ) {
               throw new CodexSecurityError(
@@ -4182,6 +4186,7 @@ export async function main(
                 reviewMinimality: options.reviewMinimality,
                 reviewStyle: options.reviewStyle,
                 assessPatchRisk: options.assessPatchRisk,
+                pythonPath: options.python,
                 publicationRequested: options.createPr,
                 maxReviewRevisions: options.maxReviewRevisions,
               },
@@ -4273,6 +4278,7 @@ export async function main(
               reviewMinimality: options.reviewMinimality,
               reviewStyle: options.reviewStyle,
               assessPatchRisk: options.assessPatchRisk,
+              pythonPath: options.python,
               maxReviewRevisions: options.maxReviewRevisions,
             },
           );
@@ -5394,8 +5400,10 @@ function safePatchText(value: string): string {
   return stripPatchControlCharacters(safeErrorMessage(value));
 }
 
-const SAFE_PATCH_REPORT_BOUNDARY_EVIDENCE =
-  /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:authorization|token handling)\s*:\s*(?<evidence>(?:unchanged|unaffected|preserved|not affected|not applicable|none|absent|unknown)(?:\s+(?:because|by|through|via)\b.+)?)(?:[.!])?\s*$/iu;
+const PATCH_REPORT_BOUNDARY_LINE =
+  /^(?<prefix>\s*(?:(?:[-*+]|\d+[.)])\s+)?)(?<label>authorization|token handling)(?<separator>\s*:\s*)(?<evidence>.*)$/iu;
+const PATCH_REPORT_BOUNDARY_CLASSIFICATION =
+  /^(?<result>unchanged|unaffected|preserved|not affected|not applicable|none|absent|unknown|changed|contradicted|failed|unsupported|violated|affected|regressed)(?<details>(?:\s+(?:because|by|through|via)\b.*)?(?:[.!])?)$/iu;
 const PRIVATE_KEY_BLOCK_START =
   /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PRIVATE_KEY_BLOCK_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
@@ -5413,13 +5421,31 @@ function safePatchReport(value: string): string {
       insidePrivateKey = !PRIVATE_KEY_BLOCK_END.test(line);
       continue;
     }
-    const boundaryEvidence = SAFE_PATCH_REPORT_BOUNDARY_EVIDENCE.exec(line);
-    lines.push(
-      boundaryEvidence?.groups?.["evidence"] !== undefined &&
-        safeErrorMessage(boundaryEvidence.groups["evidence"]) !== "[redacted]"
-        ? stripPatchControlCharacters(line)
-        : safePatchText(line),
-    );
+    const boundary = PATCH_REPORT_BOUNDARY_LINE.exec(line);
+    if (
+      boundary?.groups?.["evidence"] !== undefined &&
+      boundary.groups["prefix"] !== undefined &&
+      boundary.groups["label"] !== undefined &&
+      boundary.groups["separator"] !== undefined
+    ) {
+      const evidence = boundary.groups["evidence"];
+      const classification =
+        PATCH_REPORT_BOUNDARY_CLASSIFICATION.exec(evidence);
+      let safeEvidence = safePatchText(evidence);
+      if (classification?.groups?.["result"] !== undefined) {
+        const safeDetails = safePatchText(
+          classification.groups["details"] ?? "",
+        );
+        safeEvidence = `${classification.groups["result"]}${safeDetails === "[redacted]" ? " [redacted]" : safeDetails}`;
+      }
+      lines.push(
+        stripPatchControlCharacters(
+          `${boundary.groups["prefix"]}${boundary.groups["label"]}${boundary.groups["separator"]}${safeEvidence}`,
+        ),
+      );
+      continue;
+    }
+    lines.push(safePatchText(line));
   }
   return lines.join("\n").trim();
 }

@@ -3894,6 +3894,7 @@ describe("scan and patch workflow", () => {
       ["--review-minimality"],
       ["--review-style"],
       ["--assess-patch-risk"],
+      ["--python", "/synthetic/python"],
       ["--max-review-revisions", "5"],
       ["occ_1"],
     ]) {
