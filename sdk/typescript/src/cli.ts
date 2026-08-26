@@ -1176,6 +1176,7 @@ interface SkillRunOptions extends PatchReviewOptions {
   onReviewRepository?: (repository: string) => void;
   onReviewCandidate?: (candidate: PatchReviewCandidateDelta) => void;
   reviewPublicationCandidate?: PatchReviewPublicationCandidate;
+  patchRiskSnapshot?: PatchReviewWorktreeSnapshot;
   onReviewPublicationCandidate?: (
     candidate: PatchReviewPublicationCandidate,
   ) => void;
@@ -1318,6 +1319,10 @@ interface CliDependencies {
     directory: string,
     signal?: AbortSignal,
   ) => Promise<PatchReviewWorktreeSnapshot>;
+  snapshotCumulativePatchReviewWorktree?: (
+    directory: string,
+    signal?: AbortSignal,
+  ) => Promise<PatchReviewWorktreeSnapshot>;
   sealPatchRiskReviewContract?: (
     repository: string,
     signal?: AbortSignal,
@@ -1429,6 +1434,7 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
     return stdout.trim();
   },
   snapshotPatchReviewWorktree,
+  snapshotCumulativePatchReviewWorktree: snapshotPatchReviewWorktree,
   exportFindings: async (arguments_, output) => {
     const environment = exportEnvironment();
     const python = await resolvePluginPython({
@@ -5476,7 +5482,9 @@ function containsEncodedPatchCredential(value: string): boolean {
     );
     if (
       decoded.length >= 6 &&
-      decoded.toString("base64").replace(/=+$/u, "") === normalized
+      decoded.toString("base64").replace(/=+$/u, "") === normalized &&
+      (decoded.every((byte) => byte >= 0x20 && byte <= 0x7e) ||
+        /[+/_-]/u.test(candidate))
     ) {
       return true;
     }
@@ -5560,7 +5568,6 @@ function safePatchReport(value: string): string {
         continue;
       }
       lines.push("[redacted]");
-      redactCredentialContinuation = false;
       boundaryContinuationPrefix = undefined;
       continue;
     }
@@ -6389,53 +6396,47 @@ function parsePatchReviewTreeEntry(
     : { path, mode: match[1], object: match[3] };
 }
 
-function parsePatchReviewTreeEntries(
-  output: string,
-): Array<PatchReviewTreeEntry & { mode: string; object: string }> {
-  const entries = new Map<
-    string,
-    PatchReviewTreeEntry & { mode: string; object: string }
-  >();
-  const records = output.split("\0");
-  if (records.at(-1) === "") records.pop();
-  for (const record of records) {
-    const match = /^([0-7]{6}) (?:blob|commit) ([0-9a-f]+)\t([\s\S]+)$/u.exec(
-      record,
-    );
-    if (match === null) {
-      throw new CodexSecurityError(
-        "The reviewed patch contains an unreadable Git tree entry.",
-      );
-    }
-    const mode = match[1]!;
-    const object = match[2]!;
-    const path = match[3]!;
-    const existing = entries.get(path);
-    if (
-      existing !== undefined &&
-      (existing.mode !== mode || existing.object !== object)
-    ) {
-      throw new CodexSecurityError(
-        "The reviewed patch contains an unreadable Git tree entry.",
-      );
-    }
-    if (existing !== undefined) continue;
-    entries.set(path, { path, mode, object });
-  }
-  return [...entries.values()];
-}
-
 interface RawPatchReviewIndexEntry {
   path: Buffer;
   mode: string;
   object: string;
 }
 
+function stageZeroPatchReviewIndexEntries(output: Buffer): Buffer {
+  const retained: Buffer[] = [];
+  const entries = new Set<string>();
+  for (const record of splitNulRecords(output)) {
+    const separator = record.indexOf(0x09);
+    const metadata =
+      separator < 0
+        ? undefined
+        : record.subarray(0, separator).toString("ascii");
+    const match = /^([0-7]{6}) ([0-9a-f]+) ([0-3])$/u.exec(metadata ?? "");
+    const path = separator < 0 ? undefined : record.subarray(separator + 1);
+    if (path === undefined || match === null) {
+      throw new CodexSecurityError(
+        "The reviewed patch contains an unreadable Git index entry.",
+      );
+    }
+    const entry = `${patchReviewGitPathKey(path)}:${match[3]}`;
+    if (entries.has(entry)) {
+      throw new CodexSecurityError(
+        "The reviewed patch contains an unreadable Git index entry.",
+      );
+    }
+    entries.add(entry);
+    if (match[3] === "0") retained.push(record, Buffer.from([0]));
+  }
+  return Buffer.concat(retained);
+}
+
 function parseRawPatchReviewIndexEntries(
   output: Buffer,
 ): Map<string, RawPatchReviewIndexEntry> {
   const entries = new Map<string, RawPatchReviewIndexEntry>();
-  for (const record of splitNulRecords(output)) {
+  for (const record of splitNulRecords(
+    stageZeroPatchReviewIndexEntries(output),
+  )) {
     const separator = record.indexOf(0x09);
     const metadata =
       separator < 0
@@ -7478,16 +7479,22 @@ async function snapshotPatchReviewWorktree(
           const tag = String.fromCharCode(record[0]!);
           const path = record.subarray(2);
           const key = patchReviewGitPathKey(path);
-          if (entries.has(key)) {
+          const parsed = {
+            path,
+            status: tag.toUpperCase(),
+            special: tag !== tag.toUpperCase(),
+          };
+          const existing = entries.get(key);
+          if (
+            existing !== undefined &&
+            (existing.status !== parsed.status ||
+              existing.special !== parsed.special)
+          ) {
             throw new CodexSecurityError(
               "The selected repository contains an unreadable Git index entry.",
             );
           }
-          entries.set(key, {
-            path,
-            status: tag.toUpperCase(),
-            special: tag !== tag.toUpperCase(),
-          });
+          entries.set(key, parsed);
         }
         return entries;
       };
@@ -7527,7 +7534,10 @@ async function snapshotPatchReviewWorktree(
       return entries;
     };
     let repositoryIndexSnapshot = 0;
-    const repositoryIndexTree = async (): Promise<string> => {
+    const repositoryIndexTree = async (): Promise<{
+      entries: Buffer;
+      tree: string;
+    }> => {
       repositoryIndexSnapshot += 1;
       const indexEnvironment = {
         ...objectEnvironment,
@@ -7546,29 +7556,35 @@ async function snapshotPatchReviewWorktree(
         environment: indexEnvironment,
         signal,
       });
-      if (entries.length > 0) {
+      const stageZeroEntries = stageZeroPatchReviewIndexEntries(entries);
+      if (stageZeroEntries.length > 0) {
         await runPatchReviewGit(
           repository,
           ["update-index", "-z", "--index-info"],
-          { environment: indexEnvironment, input: entries, signal },
+          { environment: indexEnvironment, input: stageZeroEntries, signal },
         );
       }
-      return runPatchReviewGit(repository, ["write-tree"], {
-        environment: indexEnvironment,
-        signal,
-      });
+      return {
+        entries,
+        tree: await runPatchReviewGit(repository, ["write-tree"], {
+          environment: indexEnvironment,
+          signal,
+        }),
+      };
     };
-    const [indexTree, indexState] = await Promise.all([
+    const [indexSnapshot, indexState] = await Promise.all([
       repositoryIndexTree(),
       repositoryIndexState(),
     ]);
+    const indexTree = indexSnapshot.tree;
     const assertRepositoryIndexUnchanged = async (): Promise<void> => {
-      const [currentIndexTree, currentIndexState] = await Promise.all([
+      const [currentIndexSnapshot, currentIndexState] = await Promise.all([
         repositoryIndexTree(),
         repositoryIndexState(),
       ]);
       let unchanged =
-        currentIndexTree === indexTree &&
+        currentIndexSnapshot.tree === indexTree &&
+        currentIndexSnapshot.entries.equals(indexSnapshot.entries) &&
         currentIndexState.size === indexState.size;
       if (unchanged) {
         for (const [key, baseline] of indexState) {
@@ -7738,9 +7754,7 @@ async function snapshotPatchReviewWorktree(
       );
       const trackedPathspecs = Buffer.concat(
         pathsToAdd
-          .filter((path) =>
-            indexState.has(patchReviewGitPathKey(Buffer.from(path))),
-          )
+          .filter((path) => indexEntries.has(path))
           .flatMap((path) => [Buffer.from(path), Buffer.from([0])]),
       );
       const filterArguments = await disabledPatchReviewFilterArguments(
@@ -7968,6 +7982,8 @@ async function snapshotPatchReviewWorktree(
           await validatePatchReviewPath(repository, path);
         }
         if (cumulativePaths.length > 0) {
+          const normalizedCandidate =
+            await normalizedPublicationTree(cumulativePaths);
           await runPatchReviewGit(
             repository,
             ["update-index", "--force-remove", "-z", "--stdin"],
@@ -7977,23 +7993,15 @@ async function snapshotPatchReviewWorktree(
               signal,
             },
           );
-          const entries = parsePatchReviewTreeEntries(
-            await runPatchReviewGit(
-              repository,
-              [
-                "ls-tree",
-                "-r",
-                "--full-tree",
-                "-z",
-                candidate.head,
-                "--",
-                ...cumulativePaths.map((path) => `:(top,literal)${path}`),
-              ],
-              { environment, signal, trim: false },
-            ),
+          const entries = selectedPatchReviewTreeEntries(
+            cumulativePaths,
+            normalizedCandidate.entries,
           );
           for (const entry of entries) {
             await validatePatchReviewPath(repository, entry.path);
+            if (entry.mode === undefined || entry.object === undefined) {
+              continue;
+            }
             await runPatchReviewGit(
               repository,
               [
@@ -8320,14 +8328,7 @@ async function validatePatchRiskAssessment(
   }
 }
 
-async function runFindingPatches(
-  selected: SelectedFindings,
-  codexOverrides: readonly string[],
-  effort: ScanReasoningEffort | undefined,
-  stderr: Writable,
-  dependencies: CliDependencies,
-  options: Omit<SkillRunOptions, "directory" | "findings"> = {},
-): Promise<{
+interface FindingPatchesResult {
   patches: FindingPatch[];
   interruptedExitCode?: 130 | 143;
   reviewRepository?: string;
@@ -8336,7 +8337,52 @@ async function runFindingPatches(
   reviewPublicationEntries?: PatchReviewTreeEntry[];
   reviewPublicationHead?: string;
   reviewBaseCommit?: string | null;
-}> {
+}
+
+async function runFindingPatches(
+  selected: SelectedFindings,
+  codexOverrides: readonly string[],
+  effort: ScanReasoningEffort | undefined,
+  stderr: Writable,
+  dependencies: CliDependencies,
+  options: Omit<SkillRunOptions, "directory" | "findings"> = {},
+): Promise<FindingPatchesResult> {
+  const snapshotCumulativePatchReviewWorktree =
+    dependencies.snapshotCumulativePatchReviewWorktree ??
+    (dependencies.snapshotPatchReviewWorktree === undefined
+      ? snapshotPatchReviewWorktree
+      : undefined);
+  const patchRiskSnapshot =
+    options.assessPatchRisk === true && selected.findings.length > 1
+      ? await snapshotCumulativePatchReviewWorktree?.(
+          selected.repository,
+          options.signal,
+        )
+      : undefined;
+  try {
+    return await runFindingPatchesWithRiskSnapshot(
+      selected,
+      codexOverrides,
+      effort,
+      stderr,
+      dependencies,
+      options,
+      patchRiskSnapshot,
+    );
+  } finally {
+    await patchRiskSnapshot?.dispose().catch(() => {});
+  }
+}
+
+async function runFindingPatchesWithRiskSnapshot(
+  selected: SelectedFindings,
+  codexOverrides: readonly string[],
+  effort: ScanReasoningEffort | undefined,
+  stderr: Writable,
+  dependencies: CliDependencies,
+  options: Omit<SkillRunOptions, "directory" | "findings">,
+  patchRiskSnapshot: PatchReviewWorktreeSnapshot | undefined,
+): Promise<FindingPatchesResult> {
   if (selected.findings.length === 0) {
     stderr.write("No matching open findings to patch.\n");
     return { patches: [] };
@@ -8379,6 +8425,7 @@ async function runFindingPatches(
         {
           ...options,
           reviewPublicationCandidate,
+          ...(patchRiskSnapshot === undefined ? {} : { patchRiskSnapshot }),
           directory: selected.repository,
           findings: [finding],
           onReviewRepository: (repository) => {
@@ -8520,6 +8567,7 @@ async function runFindingPatches(
       `  ${patch.status.toUpperCase()}  ${title}${patch.reason === undefined ? "" : `: ${safePatchText(patch.reason)}`}\n`,
     );
     patches.push(patch);
+    if (patch.status !== "verified") patchRiskSnapshot = undefined;
   }
   const verifiedPatchIds = new Set(
     patches
@@ -8682,6 +8730,7 @@ interface PatchReviewWorkflowContext {
   validatePatchRiskAssessment: NonNullable<
     CliDependencies["validatePatchRiskAssessment"]
   >;
+  patchRiskSnapshot?: PatchReviewWorktreeSnapshot;
   candidate?: PatchReviewCandidateDelta;
   publicationCandidate?: PatchReviewPublicationCandidate;
 }
@@ -8862,6 +8911,8 @@ async function runIndependentPatchReview(
   context.stderr.write(`Running independent ${stage} review...\n`);
   const candidate = context.candidate;
   let artifact: PatchRiskReviewArtifact | undefined;
+  let riskCandidate: PatchReviewCandidateDelta | undefined;
+  let riskSnapshot: PatchReviewWorktreeSnapshot | undefined;
   let publicationCandidate: PatchReviewPublicationCandidate | undefined;
   if (stage === "patch-risk-assessment") {
     if (context.options.patchRiskContract === undefined) {
@@ -8890,19 +8941,32 @@ async function runIndependentPatchReview(
       candidate,
       context.options.reviewPublicationCandidate,
     );
+    riskSnapshot = context.patchRiskSnapshot ?? context.snapshot;
+    riskCandidate =
+      riskSnapshot === context.snapshot
+        ? candidate
+        : await riskSnapshot.candidate();
+    if (!candidate.paths.every((path) => riskCandidate!.paths.includes(path))) {
+      return {
+        status: "failed",
+        exitCode: PATCH_REVIEW_EXIT_CODE.failure,
+        reason:
+          "patch-risk-assessment review cannot bind the current patch into the cumulative candidate.",
+      };
+    }
     artifact = await createPatchRiskReviewArtifact(
-      context.snapshot,
-      publicationCandidate ?? candidate,
+      riskSnapshot,
+      riskCandidate,
       context.options.signal,
     );
   }
-  const reviewCandidate = publicationCandidate ?? candidate;
+  const reviewCandidate = riskCandidate ?? candidate;
   const reviewRepository =
-    publicationCandidate === undefined
+    riskCandidate === undefined || riskSnapshot === undefined
       ? context.snapshot.reviewRepository
       : {
-          ...context.snapshot.reviewRepository,
-          tree: publicationCandidate.base,
+          ...riskSnapshot.reviewRepository,
+          tree: riskCandidate.base!,
         };
   let review: Awaited<ReturnType<typeof captureSkillStage>>;
   try {
@@ -9130,7 +9194,13 @@ async function runPatchReviewWorkflow(
           context.options,
         )
       ) {
-        const details = verdict.findings.join("; ");
+        const details = verdict.findings
+          .map((finding) =>
+            stage === "patch-risk-assessment"
+              ? safePatchReport(finding)
+              : finding,
+          )
+          .join("; ");
         const blocked = verdict.status === "blocked";
         const reason = `${stage} review ${
           blocked ? "blocked the patch" : "exhausted the revision budget"
@@ -9408,6 +9478,7 @@ async function runSkill(
       options: workflowOptions,
       stderr,
       snapshot,
+      patchRiskSnapshot: options.patchRiskSnapshot,
       environment: dependencies.environment,
       validatePatchRiskAssessment:
         dependencies.validatePatchRiskAssessment ?? validatePatchRiskAssessment,

@@ -758,6 +758,7 @@ describe("CLI skill commands", () => {
           "Authorization: contradicted",
           "Token handling: changed",
           "Authorization: contradicted because Bearer SYNTHETIC_ADVERSE_CREDENTIAL",
+          "Authorization: changed because FeatureFlagName1",
           "Authorization: changed because dXNlcjpwYXNz",
           "Authorization: changed because YWJjZGVmZ2hpag",
           "Token handling: changed via __79_Pv6-fj39vX0",
@@ -771,6 +772,8 @@ describe("CLI skill commands", () => {
           "SYNTHETIC-CONTINUED-AUTHORIZATION",
           "API key:",
           "SYNTHETIC-CONTINUED-CREDENTIAL",
+          "SYNTHETIC-WRAPPED-CREDENTIAL",
+          "",
           "- Token:",
           "SYNTHETIC-BULLETED-CREDENTIAL",
           "1. API key:",
@@ -818,6 +821,9 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).toContain("Token handling: changed");
     expect(stderr.text()).toContain("Authorization: contradicted [redacted]");
     expect(stderr.text()).toContain(
+      "Authorization: changed because FeatureFlagName1",
+    );
+    expect(stderr.text()).toContain(
       "Authorization: contradicted because the existing route omits the check",
     );
     expect(stderr.text()).toContain(
@@ -831,6 +837,7 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).not.toContain("__79_Pv6-fj39vX0");
     expect(stderr.text()).not.toContain("SYNTHETIC_ADVERSE_CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-CREDENTIAL");
+    expect(stderr.text()).not.toContain("SYNTHETIC-WRAPPED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-BULLETED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-NUMBERED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-FENCED-CREDENTIAL");

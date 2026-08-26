@@ -343,6 +343,12 @@ describe("patch risk assessment contract", () => {
     expect(result.stdout).toBe("");
   });
 
+  test("accepts a UTF-8 BOM in an assessment artifact", async () => {
+    const result = await validateRaw(`\uFEFF${JSON.stringify(assessment())}`);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe("");
+  });
+
   test("emits UTF-8 validation errors under a legacy console encoding", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
@@ -1403,6 +1409,8 @@ describe("patch risk assessment contract", () => {
     payload.confidence.rating = "low";
     payload.regressionProtection.rating = "partial";
     payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.applicability.status = "unknown";
+    payload.applicability.rationale = "The runtime owner is unknown.";
     payload.validation[0]!.status = "failed";
     payload.validation[0]!.failureAttribution = "unknown";
     payload.unknowns = [
@@ -1436,6 +1444,10 @@ describe("patch risk assessment contract", () => {
         question: "Which runtime owns the changed path?",
         action: "Inspect the checked-in runtime registry.",
         resolvesUnknowns: ["runtime-owner"],
+        applicabilityOutcomes: {
+          known: "confirmed",
+          unavailable: "unknown",
+        },
         outcomes: {
           known: "hold_for_evidence",
           unavailable: "hold_for_evidence",
@@ -1445,6 +1457,60 @@ describe("patch risk assessment contract", () => {
 
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("terminates applicable patch-caused failure branches", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "unknown";
+    payload.unknowns = [
+      {
+        id: "failure-attribution",
+        summary: "The failed check attribution is unknown.",
+        decisionCritical: true,
+      },
+      {
+        id: "separate-pivot",
+        summary: "A separate decision pivot remains.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Did the patch cause the failed check?",
+        action: "Run the same check against the immutable base.",
+        resolvesUnknowns: ["failure-attribution"],
+        remainingUnknowns: {
+          patch_caused: ["separate-pivot"],
+          not_patch_caused: ["separate-pivot"],
+        },
+        resolvesFailedValidation: ["focused request tests"],
+        outcomes: {
+          patch_caused: "hold_for_evidence",
+          not_patch_caused: "hold_for_evidence",
+        },
+      },
+      {
+        question: "What resolves the separate pivot?",
+        action: "Inspect the authoritative synthetic contract.",
+        resolvesUnknowns: ["separate-pivot"],
+        outcomes: {
+          resolved: "hold_for_evidence",
+          unresolved: "hold_for_evidence",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "an applicable patch-caused failure requires revise or block",
+    );
   });
 
   test("requires critical likelihood for a patch-caused block", async () => {
@@ -2715,6 +2781,13 @@ describe("patch risk assessment contract", () => {
         payload.patch.changedFiles.push("src/request.ts");
       },
       "patch.changedFiles: array items must be unique",
+    ],
+    [
+      "blank changed files",
+      (payload: Assessment) => {
+        payload.patch.changedFiles = ["   "];
+      },
+      "patch.changedFiles.0: string does not match the required pattern",
     ],
   ] as const)(
     "rejects structurally invalid assessments with %s",
