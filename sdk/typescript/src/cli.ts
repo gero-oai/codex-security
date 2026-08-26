@@ -5457,17 +5457,25 @@ const PATCH_REPORT_EMPTY_SENSITIVE_FIELD =
   /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:(?:api|access|private)[ _-]?key|authorization|auth|token(?:[ _-]?handling)?|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
 const PATCH_REPORT_MARKDOWN_FENCE = /^\s*(?<fence>`{3,}|~{3,}).*$/u;
 const PATCH_REPORT_MARKDOWN_FENCE_CLOSE = /^\s*(?<fence>`{3,}|~{3,})\s*$/u;
-const PATCH_REPORT_ENCODED_TOKEN = /[A-Za-z0-9+/]{12,}={0,2}/gu;
+const PATCH_REPORT_ENCODED_TOKEN = /[A-Za-z0-9+/_-]{12,}={0,2}/gu;
 
 function containsEncodedPatchCredential(value: string): boolean {
   for (const match of value.matchAll(PATCH_REPORT_ENCODED_TOKEN)) {
     const candidate = match[0];
-    const characterClasses = [/[a-z]/u, /[A-Z]/u, /[0-9+/]/u].filter(
+    const characterClasses = [/[a-z]/u, /[A-Z]/u, /[0-9+/_-]/u].filter(
       (pattern) => pattern.test(candidate),
     ).length;
-    if (characterClasses < 2 || candidate.length % 4 !== 0) continue;
-    const normalized = candidate.replace(/=+$/u, "");
-    const decoded = Buffer.from(candidate, "base64");
+    if (characterClasses < 2) continue;
+    const normalized = candidate
+      .replace(/=+$/u, "")
+      .replaceAll("-", "+")
+      .replaceAll("_", "/");
+    const remainder = normalized.length % 4;
+    if (remainder === 1) continue;
+    const decoded = Buffer.from(
+      normalized.padEnd(normalized.length + ((4 - remainder) % 4), "="),
+      "base64",
+    );
     if (
       decoded.length >= 6 &&
       decoded.toString("base64").replace(/=+$/u, "") === normalized
