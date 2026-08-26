@@ -692,6 +692,7 @@ describe("CLI skill commands", () => {
           "Token handling: changed",
           "Authorization: contradicted because Bearer SYNTHETIC_ADVERSE_CREDENTIAL",
           "Authorization: Bearer SYNTHETIC_REPORT_CREDENTIAL",
+          "Authorization: dXNlcjpwYXNz",
           "Authorization:",
           "contradicted because the existing route omits the check",
           "Token handling:",
@@ -738,6 +739,7 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).toContain("Recoverability: easy");
     expect(stderr.text()).not.toContain("SYNTHETIC-MULTILINE-KEY-BODY");
     expect(stderr.text()).not.toContain("SYNTHETIC_REPORT_CREDENTIAL");
+    expect(stderr.text()).not.toContain("dXNlcjpwYXNz");
     expect(stderr.text()).not.toContain("SYNTHETIC_ADVERSE_CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-AUTHORIZATION");
