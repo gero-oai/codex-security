@@ -63,6 +63,7 @@ interface Assessment {
     resolvesBoundaries?: string[];
     boundaryOutcomes?: Record<string, Record<string, string>>;
     applicabilityOutcomes?: Record<string, string>;
+    impactOutcomes?: Record<string, string>;
     regressionLikelihoodOutcomes?: Record<string, string>;
     materialSafetyFailureOutcomes?: Record<string, boolean>;
     resolvesFailedValidation?: string[];
@@ -625,8 +626,53 @@ describe("patch risk assessment contract", () => {
       reachable: ["runtime-impact"],
       unreachable: [],
     };
+    payload.evidencePlan[0]!.regressionLikelihoodOutcomes = {
+      reachable: "unknown",
+      unreachable: "low",
+    };
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("allows evidence outcomes to establish impact before merge", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.impact.rating = "unknown";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "runtime-impact",
+        summary: "The runtime impact is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "What is the bounded runtime impact?",
+        action: "Exercise the immutable patch through its supported caller.",
+        resolvesUnknowns: ["runtime-impact"],
+        impactOutcomes: {
+          local: "low",
+          bounded: "moderate",
+        },
+        outcomes: {
+          local: "merge",
+          bounded: "merge",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+
+    delete payload.evidencePlan[0]!.impactOutcomes!["bounded"];
+    payload.evidencePlan[0]!.impactOutcomes!["unexpected"] = "moderate";
+    const mismatched = await validate(payload);
+    expect(mismatched.status).not.toBe(0);
+    expect(mismatched.stderr).toContain(
+      "impactOutcomes must name exactly the evidence outcome keys",
+    );
   });
 
   test("rejects unknown risk ratings for merge", async () => {
@@ -1309,6 +1355,98 @@ describe("patch risk assessment contract", () => {
     );
   });
 
+  test("requires terminal evidence branches to establish likelihood", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionLikelihood.rating = "unknown";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "unknown";
+    payload.unknowns = [
+      {
+        id: "failure-attribution",
+        summary: "The failed check attribution is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Did the patch cause the failed check?",
+        action: "Run the same check against the immutable base.",
+        resolvesUnknowns: ["failure-attribution"],
+        resolvesFailedValidation: ["focused request tests"],
+        regressionLikelihoodOutcomes: {
+          patch_caused: "unknown",
+          not_patch_caused: "low",
+        },
+        outcomes: {
+          patch_caused: "revise",
+          not_patch_caused: "merge",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "a terminal outcome cannot retain unknown regression likelihood",
+    );
+  });
+
+  test("allows patch-caused attribution to await another pivot", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "unknown";
+    payload.unknowns = [
+      {
+        id: "failure-attribution",
+        summary: "The failed check attribution is unknown.",
+        decisionCritical: true,
+      },
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Did the patch cause the failed check?",
+        action: "Run the same check against the immutable base.",
+        resolvesUnknowns: ["failure-attribution"],
+        remainingUnknowns: {
+          patch_caused: ["runtime-owner"],
+          not_patch_caused: ["runtime-owner"],
+        },
+        resolvesFailedValidation: ["focused request tests"],
+        outcomes: {
+          patch_caused: "hold_for_evidence",
+          not_patch_caused: "hold_for_evidence",
+        },
+      },
+      {
+        question: "Which runtime owns the changed path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: {
+          known: "hold_for_evidence",
+          unavailable: "hold_for_evidence",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
   test("requires critical likelihood for a patch-caused block", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
@@ -1407,6 +1545,23 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
+  test("routes established critical safety failures to block", async () => {
+    const payload = assessment();
+    payload.recommendation = "revise";
+    payload.workflowLabel = "revise";
+    payload.regressionLikelihood.rating = "critical";
+    payload.materialSafetyFailure = {
+      established: true,
+      evidence: "The changed boundary permits a cross-subject decision.",
+    };
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "critical regression likelihood with an established material safety failure requires block",
+    );
+  });
+
   test("rejects merge and applicable hold branches with critical safety failures", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
@@ -1456,6 +1611,15 @@ describe("patch risk assessment contract", () => {
     );
     expect(hold.stderr).toContain(
       "an applicable hold outcome cannot establish a material safety failure",
+    );
+
+    payload.unknowns = [payload.unknowns[0]!];
+    payload.evidencePlan[0]!.outcomes["unsafe"] = "revise";
+    delete payload.evidencePlan[0]!.remainingUnknowns;
+    const revise = await validate(payload);
+    expect(revise.status).not.toBe(0);
+    expect(revise.stderr).toContain(
+      "critical regression likelihood with an established material safety failure requires block",
     );
   });
 
@@ -1512,6 +1676,66 @@ describe("patch risk assessment contract", () => {
     expect(result.stderr).toContain(
       "a contradicted boundary outcome requires revise or block",
     );
+  });
+
+  test("allows a contradicted boundary branch to await applicability", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.applicability = {
+      status: "unknown",
+      rationale: "Runtime ownership remains unresolved.",
+    };
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "boundary-result",
+        summary: "The boundary result is unknown.",
+        decisionCritical: true,
+      },
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the boundary preserve the required control?",
+        action: "Trace both cases through the immutable patch.",
+        resolvesUnknowns: ["boundary-result"],
+        remainingUnknowns: {
+          supported: ["runtime-owner"],
+          contradicted: ["runtime-owner"],
+        },
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          supported: { "request-contract": "supported" },
+          contradicted: { "request-contract": "contradicted" },
+        },
+        outcomes: {
+          supported: "hold_for_evidence",
+          contradicted: "hold_for_evidence",
+        },
+      },
+      {
+        question: "Which runtime owns the changed path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        applicabilityOutcomes: {
+          owned: "confirmed",
+          not_owned: "wrong_owner",
+        },
+        outcomes: {
+          owned: "hold_for_evidence",
+          not_owned: "no_op",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
   });
 
   test("keeps terminal evidence branches on hold while another pivot remains", async () => {
