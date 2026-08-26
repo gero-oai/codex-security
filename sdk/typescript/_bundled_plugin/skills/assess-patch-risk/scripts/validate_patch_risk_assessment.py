@@ -287,7 +287,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     if (
         value["patch"]["sourceType"] in {"pull_request_diff", "commit_range"}
         and recommendation != "no_op"
-        and value["patch"]["base"].strip() == value["patch"]["head"].strip()
+        and value["patch"]["base"] == value["patch"]["head"]
     ):
         errors.append("patch base and head must identify distinct revisions")
 
@@ -397,7 +397,15 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             boundary_outcomes = item.get("boundaryOutcomes")
             remaining_unknown_outcomes = item.get("remainingUnknowns")
             if applicability_outcomes is not None:
-                planned_applicability = True
+                if any(
+                    status != "unknown"
+                    for status in applicability_outcomes.values()
+                ):
+                    planned_applicability = True
+                else:
+                    errors.append(
+                        f"evidencePlan.{index}: applicability remains unknown in every outcome"
+                    )
             if applicability_outcomes is not None and value["applicability"][
                 "status"
             ] != "unknown":
@@ -525,6 +533,18 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     outcome == "patch_caused"
                     and bool(item.get("resolvesFailedValidation", []))
                 )
+                branch_failed_validation_resolved = outcome in {
+                    "patch_caused",
+                    "not_patch_caused",
+                }
+                if (
+                    item.get("resolvesFailedValidation", [])
+                    and not branch_failed_validation_resolved
+                    and outcome_recommendation != "hold_for_evidence"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: an inconclusive failed-validation outcome must remain on hold"
+                    )
                 if outcome_recommendation == "revise" and not (
                     established_defect
                     or branch_contradiction
@@ -534,16 +554,23 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                         f"evidencePlan.{index}: a revise outcome requires branch evidence of a defect"
                     )
                 if outcome_recommendation == "block" and not (
-                    established_block_reason or branch_contradiction
+                    established_block_reason
+                    or branch_contradiction
+                    or branch_patch_failure
                 ):
                     errors.append(
-                        f"evidencePlan.{index}: a block outcome requires branch evidence of critical likelihood or a contradicted boundary"
+                        f"evidencePlan.{index}: a block outcome requires branch evidence of critical likelihood, a contradicted boundary, or a patch-caused validation failure"
                     )
                 remaining_decision_unknowns = (
                     decision_critical_unknowns - set(item["resolvesUnknowns"])
                 ) | outcome_remaining_unknowns
-                remaining_failures = unknown_failed_validations - set(
-                    item.get("resolvesFailedValidation", [])
+                resolved_failed_validations = (
+                    set(item.get("resolvesFailedValidation", []))
+                    if branch_failed_validation_resolved
+                    else set()
+                )
+                remaining_failures = (
+                    unknown_failed_validations - resolved_failed_validations
                 )
                 remaining_boundary_ids = unresolved_boundaries - set(
                     resolved_boundaries
@@ -569,10 +596,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     )
                 if (
                     outcome_recommendation != "hold_for_evidence"
-                    and outcome_remaining_unknowns
+                    and remaining_decision_unknowns
                 ):
                     errors.append(
-                        f"evidencePlan.{index}: only a hold outcome may retain an explicit unknown"
+                        f"evidencePlan.{index}: a terminal outcome cannot retain a decision-critical unknown"
                     )
                 if outcome_recommendation == "merge":
                     unresolved_unknowns = decision_critical_unknowns - set(
@@ -609,11 +636,27 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                         f"evidencePlan.{index}: {unknown_id!r} is not a decision-critical unknown"
                     )
                     continue
+                if remaining_unknown_outcomes is not None and all(
+                    unknown_id in remaining_unknown_outcomes[outcome]
+                    for outcome in item["outcomes"]
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: {unknown_id!r} remains unresolved in every outcome"
+                    )
+                    continue
                 planned_unknowns.add(unknown_id)
             for boundary_id in resolved_boundaries:
                 if boundary_id not in unresolved_boundaries:
                     errors.append(
                         f"evidencePlan.{index}: {boundary_id!r} is not an unresolved material boundary"
+                    )
+                    continue
+                if boundary_outcomes is None or all(
+                    outcome.get(boundary_id) == "unresolved"
+                    for outcome in boundary_outcomes.values()
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: {boundary_id!r} remains unresolved in every outcome"
                     )
                     continue
                 planned_boundaries.add(boundary_id)
@@ -684,9 +727,14 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         recommendation == "block"
         and value["regressionLikelihood"]["rating"] != "critical"
         and not any(item["result"] == "contradicted" for item in boundaries)
+        and not any(
+            item["status"] == "failed"
+            and item.get("failureAttribution") == "patch_caused"
+            for item in value["validation"]
+        )
     ):
         errors.append(
-            "block requires critical regression likelihood or a contradicted material boundary"
+            "block requires critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure"
         )
 
     if value["regressionProtection"]["rating"] == "strong":
@@ -694,6 +742,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("strong regression protection requires exact-head checks to pass")
         if not any(item["status"] in {"passed", "failed"} for item in validations):
             errors.append("strong regression protection requires an executed validation")
+    if value["regressionProtection"]["exactHeadChecksPassed"] and not any(
+        item["status"] == "passed" for item in validations
+    ):
+        errors.append("exact-head checks passed requires a passed validation")
 
     if workflow_label == "auto_merge_candidate":
         auto_merge_requirements = {
