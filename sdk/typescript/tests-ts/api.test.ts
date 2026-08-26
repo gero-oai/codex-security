@@ -4842,7 +4842,12 @@ describe("CodexSecurity orchestration", () => {
         clients.map((client) => client.run(repository).finally(releaseScans)),
       );
       for (const result of results) {
-        expect(result).toMatchObject({
+        expect(
+          result,
+          result.status === "rejected" && result.reason instanceof Error
+            ? result.reason.stack
+            : undefined,
+        ).toMatchObject({
           status: "rejected",
           reason: expect.objectContaining({
             message: "parallel API-key scan reached",

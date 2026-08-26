@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdirSync,
@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { describe, expect, test } from "bun:test";
 import { bashCommand } from "./support/shell.js";
 
@@ -4507,7 +4508,7 @@ describe("GitHub release workflow safeguards", () => {
     expect(result.stdout).toContain(`labels[]=${label}`);
   });
 
-  test("executes and recovers from concurrent skip-label creation", () => {
+  test("executes and recovers from concurrent skip-label creation", async () => {
     const script = workflowStepShell(
       releaseLabelsWorkflow,
       "Categorize pull request without checking out its code",
@@ -4545,17 +4546,20 @@ describe("GitHub release workflow safeguards", () => {
       "  esac",
       "}",
     ].join("\n");
-    const result = spawnSync(bash, ["-c", `${mock}\n${script}`], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        GITHUB_REPOSITORY: "test/codex-security",
-        PR_NUMBER: "17",
+    const result = await promisify(execFile)(
+      bash,
+      ["-c", `${mock}\n${script}`],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GITHUB_REPOSITORY: "test/codex-security",
+          PR_NUMBER: "17",
+        },
+        timeout: 10_000,
       },
-      timeout: 10_000,
-    });
+    );
 
-    expect(result.status).toBe(0);
     expect(result.stdout).toContain("applied skip-release-notes");
   });
 

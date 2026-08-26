@@ -84,6 +84,19 @@ async function settle(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 60));
 }
 
+async function waitFor(assertion: () => void): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    await settle();
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+    }
+  }
+}
+
 describe("interactive patch finding browser", () => {
   test("shows complete finding details and scrolls through source evidence", async () => {
     const app = render(
@@ -263,35 +276,43 @@ describe("interactive patch finding browser", () => {
     );
 
     app.stdin.write("i");
-    await settle();
-    expect(app.lastFrame()).toContain("Enter save");
+    await waitFor(() => expect(app.lastFrame()).toContain("Enter save"));
 
     app.stdin.write("Use the shared 2FA helper, not a new dependency.");
-    await settle();
-    expect(app.lastFrame()).toContain("Use the shared 2FA helper");
+    await waitFor(() =>
+      expect(app.lastFrame()).toContain("Use the shared 2FA helper"),
+    );
     expect(app.lastFrame()).toContain("2/2 selected");
 
     app.stdin.write("\r");
-    await settle();
+    await waitFor(() => {
+      expect(app.lastFrame()).toContain("i edit");
+      expect(app.lastFrame()).not.toContain("Enter save");
+    });
     expect(app.lastFrame()).toContain("PATCH INSTRUCTIONS");
     expect(app.lastFrame()).toContain("Use the shared 2FA helper");
     expect(app.lastFrame()).toContain("✎");
     expect(app.lastFrame()?.match(/PATCH INSTRUCTIONS/gu)).toHaveLength(1);
 
     app.stdin.write("\u001B[B");
-    await settle();
+    await waitFor(() => expect(app.lastFrame()).toContain("› [✓] MEDIUM"));
     app.stdin.write("i");
-    await settle();
+    await waitFor(() => expect(app.lastFrame()).toContain("Enter save"));
     app.stdin.write("Keep the existing middleware.");
-    await settle();
+    await waitFor(() =>
+      expect(app.lastFrame()).toContain("Keep the existing middleware."),
+    );
     app.stdin.write("\r");
-    await settle();
+    await waitFor(() => {
+      expect(app.lastFrame()).toContain("i edit");
+      expect(app.lastFrame()).not.toContain("Enter save");
+    });
     expect(app.lastFrame()).toContain("Keep the existing middleware.");
 
     app.stdin.write(" ");
-    await settle();
+    await waitFor(() => expect(app.lastFrame()).toContain("1/2 selected"));
     app.stdin.write("\r");
-    await settle();
+    await waitFor(() => expect(selected).toHaveLength(1));
 
     expect(selected).toEqual([
       {
@@ -347,24 +368,33 @@ describe("interactive patch finding browser", () => {
     );
 
     app.stdin.write("i");
-    await settle();
+    await waitFor(() => expect(app.lastFrame()).toContain("Enter save"));
     app.stdin.write("Discard this guidance.");
-    await settle();
+    await waitFor(() =>
+      expect(app.lastFrame()).toContain("Discard this guidance."),
+    );
     app.stdin.write("\u001B");
-    await settle();
+    await waitFor(() => {
+      expect(app.lastFrame()).toContain("i edit");
+      expect(app.lastFrame()).not.toContain("Enter save");
+    });
     expect(selected).toEqual([]);
     expect(app.lastFrame()).not.toContain("Discard this guidance.");
 
     app.stdin.write("i");
-    await settle();
+    await waitFor(() => expect(app.lastFrame()).toContain("Enter save"));
+    const emptyDraftFrame = app.lastFrame();
     app.stdin.write("x");
-    await settle();
+    await waitFor(() => expect(app.lastFrame()).not.toBe(emptyDraftFrame));
     app.stdin.write("\u007F");
-    await settle();
+    await waitFor(() => expect(app.lastFrame()).toBe(emptyDraftFrame));
     app.stdin.write("\r");
-    await settle();
+    await waitFor(() => {
+      expect(app.lastFrame()).toContain("i edit");
+      expect(app.lastFrame()).not.toContain("Enter save");
+    });
     app.stdin.write("\r");
-    await settle();
+    await waitFor(() => expect(selected).toHaveLength(1));
 
     expect(selected).toEqual([{ severity: "high", occurrenceIds: ["occ_1"] }]);
   });

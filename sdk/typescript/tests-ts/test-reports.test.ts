@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import {
   copyFile,
   mkdir,
@@ -49,20 +48,13 @@ function testcase(name: string, status = "") {
   return `<testcase file="tests-ts/example.test.ts" classname="example" name="${name}">${status}</testcase>`;
 }
 
-async function compare(baseline: string, ...candidates: string[]) {
-  const python = Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
-  if (python === null) throw new Error("A Python interpreter is required.");
+async function runCommand(
+  cmd: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number } = {},
+) {
   const child = Bun.spawn({
-    cmd: [
-      python,
-      "-I",
-      "-B",
-      fileURLToPath(
-        new URL("../scripts/compare-test-reports.py", import.meta.url),
-      ),
-      baseline,
-      ...candidates,
-    ],
+    ...options,
+    cmd,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -73,6 +65,21 @@ async function compare(baseline: string, ...candidates: string[]) {
     new Response(child.stderr).text(),
   ]);
   return { status, stdout, stderr };
+}
+
+async function compare(baseline: string, ...candidates: string[]) {
+  const python = Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
+  if (python === null) throw new Error("A Python interpreter is required.");
+  return await runCommand([
+    python,
+    "-I",
+    "-B",
+    fileURLToPath(
+      new URL("../scripts/compare-test-reports.py", import.meta.url),
+    ),
+    baseline,
+    ...candidates,
+  ]);
 }
 
 describe("CI file shards", () => {
@@ -127,13 +134,12 @@ describe("CI file shards", () => {
     const node = Bun.which("node");
     if (node === null) throw new Error("Node is required for the CI runner.");
     const run = (...args: string[]) =>
-      spawnSync(node, [runner, ...args], {
+      runCommand([node, runner, ...args], {
         cwd: root,
-        encoding: "utf8",
         timeout: 30_000,
       });
 
-    const failed = run("--seed", "12345");
+    const failed = await run("--seed", "12345");
     expect(failed.status, failed.stderr).toBe(1);
     expect((await readdir(join(root, "reports"))).sort()).toEqual([
       "junit-1.xml",
@@ -149,13 +155,13 @@ describe("CI file shards", () => {
     ).toContain('name="nested/d"');
 
     // The filter is forwarded to Bun, so the failing test is no longer selected.
-    const selected = run("1/2", "--test-name-pattern", "^c$");
+    const selected = await run("1/2", "--test-name-pattern", "^c$");
     expect(selected.status, selected.stderr).toBe(0);
     const report = await readFile(join(root, "reports", "junit-1.xml"), "utf8");
     expect(report).toContain('name="c"');
     expect(report).not.toContain("<failure");
-    expect(run("0/2").status).toBe(1);
-    expect(run("3/2").status).toBe(1);
+    expect((await run("0/2")).status).toBe(1);
+    expect((await run("3/2")).status).toBe(1);
   });
 });
 
@@ -188,12 +194,10 @@ describe("JUnit inventory comparison", () => {
     const summary = join(fixture.root, "summary.md");
     for (const failedReport of ["", expected[0]!]) {
       await writeFile(summary, "");
-      const result = spawnSync(
-        bash,
-        ["-e", "-o", "pipefail", "-c", `${mock}\n${script}`],
+      const result = await runCommand(
+        [bash, "-e", "-o", "pipefail", "-c", `${mock}\n${script}`],
         {
           cwd: fixture.root,
-          encoding: "utf8",
           env: {
             ...process.env,
             GITHUB_STEP_SUMMARY: "summary.md",
