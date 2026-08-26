@@ -5437,6 +5437,7 @@ describe("scan and patch workflow", () => {
     const home = join(directory, "home");
     const result = resultWithFindings(["high"]);
     result.findings.findings[0]!.locations[0]!.path = "value.ts";
+    let assessedHead = "";
     const previous = {
       HOME: process.env["HOME"],
       USERPROFILE: process.env["USERPROFILE"],
@@ -5493,11 +5494,16 @@ describe("scan and patch workflow", () => {
           result,
           onCodex: async (args, output) => {
             if (output!.appServer!.sandbox === "read-only") {
+              const patchRisk = output!.appServer!.prompt.includes(
+                "only the patch-risk-assessment review",
+              );
+              if (patchRisk) {
+                assessedHead = patchRiskArtifact(output!.appServer!.prompt)
+                  .patch.head;
+              }
               output!.stdout.write(
                 JSON.stringify(
-                  output!.appServer!.prompt.includes(
-                    "only the patch-risk-assessment review",
-                  )
+                  patchRisk
                     ? approvedPatchRiskVerdict(output!.appServer!.prompt)
                     : { status: "approved", findings: [] },
                 ),
@@ -5524,6 +5530,7 @@ describe("scan and patch workflow", () => {
       );
 
       expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(git("rev-parse", "HEAD^{tree}")).toBe(assessedHead);
       expect(git("show", "HEAD:value.ts")).toBe("fixed");
       expect(git("status", "--short")).toBe("");
     } finally {
