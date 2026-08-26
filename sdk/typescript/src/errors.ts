@@ -1,4 +1,4 @@
-import { formatUsd, type ScanCost } from "./cost.js";
+import { formatUsd, type ScanCost } from "./cost-model.js";
 
 /** Returns the original error message without altering its contents. */
 export function errorMessage(error: unknown): string {
@@ -38,6 +38,18 @@ export class LocalPluginBootstrapError extends PluginBootstrapError {}
 export class PluginPythonUnavailableError extends PluginBootstrapError {}
 export class InvalidTargetError extends CodexSecurityError {}
 export class OutputDirectoryError extends CodexSecurityError {}
+export class OutputDirectoryNotEmptyError extends OutputDirectoryError {
+  public constructor(
+    public readonly directory: string,
+    operation: "scan" | "policy" = "scan",
+  ) {
+    super(
+      operation === "policy"
+        ? `Policy output directory is not empty: ${directory}. Choose a new or empty directory.`
+        : `Scan output directory is not empty: ${directory}. To keep the existing results and start a new scan, add --archive-existing.`,
+    );
+  }
+}
 export type ProtectedScanPathKind = "output" | "temporary" | "runtime";
 
 export class OutputInsideProtectedRootError extends OutputDirectoryError {
