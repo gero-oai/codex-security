@@ -20,6 +20,11 @@ class DuplicateJsonKeyError(ValueError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate a patch-risk assessment.")
+    parser.add_argument(
+        "--review-envelope",
+        action="store_true",
+        help="Read the assessment from a review verdict's assessment field.",
+    )
     parser.add_argument("assessment", help="Assessment JSON path, or - for stdin.")
     return parser.parse_args()
 
@@ -466,7 +471,16 @@ def validate(value: dict[str, Any]) -> list[str]:
 def main() -> int:
     args = parse_args()
     try:
-        value = read_json_object(args.assessment, label="assessment")
+        document = read_json_object(
+            args.assessment,
+            label="review verdict" if args.review_envelope else "assessment",
+        )
+        if args.review_envelope:
+            value = document.get("assessment")
+            if not isinstance(value, dict):
+                raise ValueError("review verdict assessment must be a JSON object")
+        else:
+            value = document
         errors = validate(value)
     except ValueError as error:
         print(error, file=sys.stderr)

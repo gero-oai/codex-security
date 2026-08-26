@@ -1145,10 +1145,6 @@ const patchReviewSchema = z.object({
     .optional(),
 });
 
-type PatchRiskAssessment = NonNullable<
-  z.infer<typeof patchReviewSchema>["assessment"]
->;
-
 const findingVerificationSchema = z.object({
   id: z.string(),
   status: z.enum(["fixed", "still_vulnerable", "inconclusive"]),
@@ -1175,6 +1171,11 @@ interface SkillRunOptions extends PatchReviewOptions {
   reviewRepository?: PatchReviewRepositoryView;
   onReviewRepository?: (repository: string) => void;
   onReviewCandidate?: (candidate: PatchReviewCandidateDelta) => void;
+  publicationRequested?: boolean;
+  reviewPublicationCandidate?: PatchReviewPublicationCandidate;
+  onReviewPublicationCandidate?: (
+    candidate: PatchReviewPublicationCandidate,
+  ) => void;
   patchRiskArtifact?: PatchRiskReviewArtifactDescription;
 }
 
@@ -1211,6 +1212,12 @@ interface PatchReviewRepositoryView {
   gitExecutable: string;
 }
 
+interface PatchReviewPublicationCandidate extends PatchReviewCandidateDelta {
+  base: string;
+  head: string;
+  diffBytes: Buffer;
+}
+
 interface PatchRiskReviewArtifactDescription {
   path: string;
   patch: {
@@ -1232,6 +1239,10 @@ interface PatchReviewWorktreeSnapshot {
   directory: string;
   reviewRepository: PatchReviewRepositoryView;
   candidate(): Promise<PatchReviewCandidateDelta>;
+  publicationCandidate?(
+    candidate: PatchReviewCandidateDelta,
+    previous?: PatchReviewPublicationCandidate,
+  ): Promise<PatchReviewPublicationCandidate>;
   dispose(): Promise<void>;
 }
 
@@ -1291,7 +1302,7 @@ interface CliDependencies {
     signal?: AbortSignal,
   ) => Promise<PatchReviewWorktreeSnapshot>;
   validatePatchRiskAssessment?: (
-    assessment: PatchRiskAssessment,
+    reviewResponse: string,
     options: {
       environment?: NodeJS.ProcessEnv;
       pythonPath?: string;
@@ -4145,6 +4156,7 @@ export async function main(
                 reviewMinimality: options.reviewMinimality,
                 reviewStyle: options.reviewStyle,
                 assessPatchRisk: options.assessPatchRisk,
+                publicationRequested: options.createPr,
                 maxReviewRevisions: options.maxReviewRevisions,
               },
             );
@@ -4164,6 +4176,7 @@ export async function main(
                 patchRun.reviewRepository,
                 patchRun.reviewUnsafePublicationPaths,
                 patchRun.reviewPublicationEntries,
+                patchRun.reviewPublicationHead,
               );
             }
             if (format === "json" || format === "jsonl") {
@@ -5203,6 +5216,7 @@ async function createPatchPullRequest(
   reviewRepository?: string,
   reviewUnsafePublicationPaths: readonly string[] = [],
   reviewPublicationEntries: readonly PatchReviewTreeEntry[] = [],
+  reviewPublicationHead?: string,
 ): Promise<{ branch: string; url: string } | undefined> {
   const repository = reviewRepository ?? selected.repository;
   const files = [
@@ -5266,6 +5280,14 @@ async function createPatchPullRequest(
       );
     }
   }
+  if (
+    reviewPublicationHead !== undefined &&
+    (await run("git", ["rev-parse", "HEAD^{tree}"])) !== reviewPublicationHead
+  ) {
+    throw new CodexSecurityError(
+      "The published patch tree differs from the patch-risk assessment. Review it again before publishing.",
+    );
+  }
   const commit = await run("git", ["rev-parse", "HEAD"]);
   await run("git", ["config", "--local", patchCommitKey(branch), commit]);
   return publishPatchBranch(repository, branch, stderr, dependencies);
@@ -5293,7 +5315,7 @@ function patchReviewGitProcessEnvironment(): NodeJS.ProcessEnv {
 }
 
 function safePatchReport(value: string): string {
-  return value
+  return safeErrorMessage(value)
     .split(/\r?\n/u)
     .map((line) => safePatchText(line))
     .join("\n")
@@ -5703,6 +5725,10 @@ async function snapshotPatchReviewWorktree(
       }
     }
   };
+  const publicationEnvironment = {
+    ...objectEnvironment,
+    GIT_INDEX_FILE: join(temporaryDirectory, "publication-index"),
+  };
   const stageWorktree = async (): Promise<void> => {
     if (!capturingBaseline) await assertNestedRepositoriesUnchanged();
     const sparseEntries = await runPatchReviewGit(
@@ -5815,6 +5841,18 @@ async function snapshotPatchReviewWorktree(
       signal?.throwIfAborted();
       return undefined;
     });
+    let publicationBaseTree = headTree;
+    if (publicationBaseTree === undefined) {
+      await runPatchReviewGit(repository, ["read-tree", "--empty"], {
+        environment: publicationEnvironment,
+        signal,
+      });
+      publicationBaseTree = await runPatchReviewGit(
+        repository,
+        ["write-tree"],
+        { environment: publicationEnvironment, signal },
+      );
+    }
     const indexTree = await runPatchReviewGit(repository, ["write-tree"], {
       environment: objectEnvironment,
       signal,
@@ -5963,6 +6001,150 @@ async function snapshotPatchReviewWorktree(
           ),
           base: baselineTree,
           head: candidateTree,
+        };
+      },
+      async publicationCandidate(candidate, previous) {
+        signal?.throwIfAborted();
+        if (disposed) {
+          throw new CodexSecurityError(
+            "The patch review snapshot is no longer available.",
+          );
+        }
+        if (previous !== undefined && previous.base !== publicationBaseTree) {
+          throw new CodexSecurityError(
+            "The reviewed patches do not share one publication baseline.",
+          );
+        }
+        if (candidate.head === undefined) {
+          throw new CodexSecurityError(
+            "The reviewed patch has no candidate tree for publication.",
+          );
+        }
+
+        await runPatchReviewGit(
+          repository,
+          ["read-tree", publicationBaseTree],
+          { environment: publicationEnvironment, signal },
+        );
+        const cumulativePaths = [
+          ...new Set([...(previous?.paths ?? []), ...candidate.paths]),
+        ];
+        for (const path of cumulativePaths) {
+          await validatePatchReviewPath(repository, path);
+          const entry = parsePatchReviewTreeEntry(
+            path,
+            await runPatchReviewGit(
+              repository,
+              [
+                "ls-tree",
+                "--full-tree",
+                "-z",
+                candidate.head,
+                "--",
+                `:(top,literal)${path}`,
+              ],
+              { environment, signal, trim: false },
+            ),
+          );
+          await runPatchReviewGit(
+            repository,
+            entry.mode === undefined || entry.object === undefined
+              ? [
+                  "--literal-pathspecs",
+                  "update-index",
+                  "--force-remove",
+                  "--",
+                  path,
+                ]
+              : [
+                  "update-index",
+                  "--add",
+                  "--cacheinfo",
+                  entry.mode,
+                  entry.object,
+                  path,
+                ],
+            { environment: publicationEnvironment, signal },
+          );
+        }
+        const projectedHead = await runPatchReviewGit(
+          repository,
+          ["write-tree"],
+          { environment: publicationEnvironment, signal },
+        );
+        const names = await runPatchReviewGit(
+          repository,
+          [
+            "--no-pager",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--relative",
+            publicationBaseTree,
+            projectedHead,
+            "--",
+            ".",
+          ],
+          { environment: publicationEnvironment, signal, trim: false },
+        );
+        const parts = names.split("\0");
+        if (parts.at(-1) === "") parts.pop();
+        const paths = [...new Set(parts)];
+        const diffBytes =
+          paths.length === 0
+            ? Buffer.alloc(0)
+            : await runPatchReviewGitBytes(
+                repository,
+                [
+                  "--no-pager",
+                  "diff",
+                  "--no-color",
+                  "--no-ext-diff",
+                  "--no-textconv",
+                  "--no-renames",
+                  "--binary",
+                  "--relative",
+                  publicationBaseTree,
+                  projectedHead,
+                  "--",
+                  ".",
+                ],
+                { environment: publicationEnvironment, signal },
+              );
+        const publicationEntries = await Promise.all(
+          paths.map(async (path) =>
+            parsePatchReviewTreeEntry(
+              path,
+              await runPatchReviewGit(
+                repository,
+                [
+                  "ls-tree",
+                  "--full-tree",
+                  "-z",
+                  projectedHead,
+                  "--",
+                  `:(top,literal)${path}`,
+                ],
+                {
+                  environment: publicationEnvironment,
+                  signal,
+                  trim: false,
+                },
+              ),
+            ),
+          ),
+        );
+        return {
+          paths,
+          diff: diffBytes.toString("utf8"),
+          diffBytes,
+          publicationEntries,
+          base: publicationBaseTree,
+          head: projectedHead,
         };
       },
       async dispose() {
@@ -6407,7 +6589,7 @@ async function createPatchRiskReviewArtifact(
 }
 
 async function validatePatchRiskAssessment(
-  assessment: PatchRiskAssessment,
+  reviewResponse: string,
   options: {
     environment?: NodeJS.ProcessEnv;
     pythonPath?: string;
@@ -6428,7 +6610,7 @@ async function validatePatchRiskAssessment(
   );
   const assessmentPath = join(temporaryDirectory, "assessment.json");
   try {
-    await writeFile(assessmentPath, JSON.stringify(assessment), {
+    await writeFile(assessmentPath, reviewResponse, {
       flag: "wx",
       mode: 0o600,
     });
@@ -6446,6 +6628,7 @@ async function validatePatchRiskAssessment(
             "scripts",
             "validate_patch_risk_assessment.py",
           ),
+          "--review-envelope",
           assessmentPath,
         ],
         {
@@ -6481,6 +6664,7 @@ async function runFindingPatches(
   reviewRepository?: string;
   reviewUnsafePublicationPaths?: string[];
   reviewPublicationEntries?: PatchReviewTreeEntry[];
+  reviewPublicationHead?: string;
 }> {
   if (selected.findings.length === 0) {
     stderr.write("No matching open findings to patch.\n");
@@ -6494,6 +6678,7 @@ async function runFindingPatches(
   let reviewRepository: string | undefined;
   const reviewUnsafePublicationPaths = new Set<string>();
   const reviewPublicationEntries = new Map<string, PatchReviewTreeEntry>();
+  let reviewPublicationCandidate: PatchReviewPublicationCandidate | undefined;
   for (const finding of selected.findings) {
     const interruptedBeforeFinding = interruptedPatchExitCode(options.signal);
     if (interruptedBeforeFinding !== undefined) {
@@ -6519,6 +6704,7 @@ async function runFindingPatches(
         dependencies,
         {
           ...options,
+          reviewPublicationCandidate,
           directory: selected.repository,
           findings: [finding],
           onReviewRepository: (repository) => {
@@ -6552,6 +6738,9 @@ async function runFindingPatches(
             for (const entry of candidate.publicationEntries ?? []) {
               reviewPublicationEntries.set(entry.path, entry);
             }
+          },
+          onReviewPublicationCandidate: (candidate) => {
+            reviewPublicationCandidate = candidate;
           },
           findingInstructions: instruction?.trim()
             ? { [finding.occurrenceId]: instruction }
@@ -6636,6 +6825,9 @@ async function runFindingPatches(
       : {
           reviewPublicationEntries: [...reviewPublicationEntries.values()],
         }),
+    ...(reviewPublicationCandidate === undefined
+      ? {}
+      : { reviewPublicationHead: reviewPublicationCandidate.head }),
   };
 }
 
@@ -6689,6 +6881,7 @@ interface PatchReviewWorkflowContext {
     CliDependencies["validatePatchRiskAssessment"]
   >;
   candidate?: PatchReviewCandidateDelta;
+  publicationCandidate?: PatchReviewPublicationCandidate;
 }
 
 async function captureSkillStage(
@@ -6867,6 +7060,7 @@ async function runIndependentPatchReview(
   context.stderr.write(`Running independent ${stage} review...\n`);
   const candidate = context.candidate;
   let artifact: PatchRiskReviewArtifact | undefined;
+  let publicationCandidate: PatchReviewPublicationCandidate | undefined;
   if (stage === "patch-risk-assessment") {
     if (candidate === undefined) {
       return {
@@ -6875,9 +7069,23 @@ async function runIndependentPatchReview(
         reason: "patch-risk-assessment review has no observed candidate delta.",
       };
     }
+    if (context.options.publicationRequested) {
+      if (context.snapshot.publicationCandidate === undefined) {
+        return {
+          status: "failed",
+          exitCode: PATCH_REVIEW_EXIT_CODE.failure,
+          reason:
+            "patch-risk-assessment review cannot project the publication tree.",
+        };
+      }
+      publicationCandidate = await context.snapshot.publicationCandidate(
+        candidate,
+        context.options.reviewPublicationCandidate,
+      );
+    }
     artifact = await createPatchRiskReviewArtifact(
       context.snapshot,
-      candidate,
+      publicationCandidate ?? candidate,
       context.options.signal,
     );
   }
@@ -6927,11 +7135,10 @@ async function runIndependentPatchReview(
   }
 
   if (stage === "patch-risk-assessment") {
-    const assessment = verdict.assessment!;
     const artifactUnchanged = await artifact!.verify().catch(() => false);
     const assessmentValid = artifactUnchanged
       ? await context
-          .validatePatchRiskAssessment(assessment, {
+          .validatePatchRiskAssessment(review.response, {
             environment: context.options.environment ?? context.environment,
             pythonPath: context.options.pythonPath,
             signal: context.options.signal,
@@ -6951,6 +7158,7 @@ async function runIndependentPatchReview(
         reason,
       };
     }
+    context.publicationCandidate = publicationCandidate;
   }
 
   context.stderr.write(
@@ -7199,6 +7407,11 @@ async function runPatchReviewWorkflow(
 
   context.options.signal?.throwIfAborted();
   context.options.onReviewCandidate?.(candidate);
+  if (context.publicationCandidate !== undefined) {
+    context.options.onReviewPublicationCandidate?.(
+      context.publicationCandidate,
+    );
+  }
   stdout.write(
     subject.response === undefined
       ? patch.response
@@ -8865,6 +9078,9 @@ async function executeScan(
           reviewMinimality: arguments_.reviewMinimality,
           reviewStyle: arguments_.reviewStyle,
           assessPatchRisk: arguments_.assessPatchRisk,
+          publicationRequested: Boolean(
+            arguments_.createPr || patchSelection?.createPullRequest,
+          ),
           maxReviewRevisions: arguments_.maxReviewRevisions,
         },
       );
@@ -8894,6 +9110,7 @@ async function executeScan(
           patchRun.reviewRepository,
           patchRun.reviewUnsafePublicationPaths,
           patchRun.reviewPublicationEntries,
+          patchRun.reviewPublicationHead,
         );
         if (pullRequest !== undefined) {
           scanData = { ...scanData, pullRequest };

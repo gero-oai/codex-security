@@ -499,8 +499,12 @@ describe("CLI skill commands", () => {
         return 0;
       },
     });
-    current.validatePatchRiskAssessment = async (assessment) => {
-      validated = assessment as ReturnType<typeof patchRiskAssessment>;
+    current.validatePatchRiskAssessment = async (reviewResponse) => {
+      validated = (
+        JSON.parse(reviewResponse) as {
+          assessment: ReturnType<typeof patchRiskAssessment>;
+        }
+      ).assessment;
       return true;
     };
 
@@ -541,6 +545,74 @@ describe("CLI skill commands", () => {
         current,
       ),
     ).toBe(0);
+  });
+
+  test("redacts multiline credentials from patch-risk reports", async () => {
+    const stderr = capture();
+    const current = dependencies({
+      onCodex: (_args, output) => {
+        const { prompt, sandbox } = output!.appServer!;
+        if (sandbox !== "read-only") {
+          output!.stdout.write("Verified synthetic patch.");
+          return 0;
+        }
+        const verdict = patchRiskVerdict(prompt);
+        verdict.report = [
+          "## Patch risk",
+          "",
+          "-----BEGIN PRIVATE KEY-----",
+          "SYNTHETIC-MULTILINE-KEY-BODY",
+          "-----END PRIVATE KEY-----",
+        ].join("\n");
+        output!.stdout.write(JSON.stringify(verdict));
+        return 0;
+      },
+    });
+
+    expect(
+      await main(
+        ["patch", "Synthetic security issue", "--assess-patch-risk"],
+        capture().stream,
+        stderr.stream,
+        current,
+      ),
+    ).toBe(0);
+    expect(stderr.text()).toContain("[redacted]");
+    expect(stderr.text()).not.toContain("SYNTHETIC-MULTILINE-KEY-BODY");
+    expect(stderr.text()).not.toContain("-----END PRIVATE KEY-----");
+  });
+
+  test("rejects duplicate keys in the raw patch-risk review envelope", async () => {
+    const stderr = capture();
+    const current = dependencies({
+      environment: process.env,
+      onCodex: (_args, output) => {
+        const { prompt, sandbox } = output!.appServer!;
+        if (sandbox !== "read-only") {
+          output!.stdout.write("Verified synthetic patch.");
+          return 0;
+        }
+        const response = JSON.stringify(patchRiskVerdict(prompt)).replace(
+          '"recommendation":"merge"',
+          '"recommendation":"block","recommendation":"merge"',
+        );
+        output!.stdout.write(response);
+        return 0;
+      },
+    });
+    delete current.validatePatchRiskAssessment;
+
+    expect(
+      await main(
+        ["patch", "Synthetic security issue", "--assess-patch-risk"],
+        capture().stream,
+        stderr.stream,
+        current,
+      ),
+    ).toBe(2);
+    expect(stderr.text()).toContain(
+      "patch-risk-assessment review returned an invalid assessment",
+    );
   });
 
   test("fails closed on invalid or unvalidated patch-risk results", async () => {

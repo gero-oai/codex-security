@@ -158,13 +158,25 @@ function completePatches(
   return findings;
 }
 
-function approvedPatchRiskVerdict(prompt: string) {
+function patchRiskArtifact(prompt: string) {
   const lines = prompt.split("\n");
   const marker = "CLI-owned immutable patch artifact (JSON object):";
   const index = lines.indexOf(marker);
-  const artifact = JSON.parse(lines[index + 1]!) as {
-    patch: Record<string, unknown>;
+  return JSON.parse(lines[index + 1]!) as {
+    path: string;
+    patch: {
+      repository: string;
+      sourceType: "patch_file";
+      base: string;
+      head: string;
+      changedFiles: string[];
+      sha256: string;
+    };
   };
+}
+
+function approvedPatchRiskVerdict(prompt: string) {
+  const artifact = patchRiskArtifact(prompt);
   return {
     status: "approved",
     findings: [],
@@ -2410,10 +2422,17 @@ describe("scan and patch workflow", () => {
     const repository = join(directory, "repository");
     const remote = join(directory, "remote.git");
     const url = "https://github.example.test/example/repository/pull/15";
-    const result = resultWithFindings(["high", "medium"]);
+    const result = resultWithFindings(["high", "high", "medium"]);
     result.findings.findings[0]!.title = "Synthetic private finding";
     let pullRequestArguments: readonly string[] = [];
+    const assessedPatches: Array<{
+      base: string;
+      head: string;
+      changedFiles: string[];
+    }> = [];
+    const assessedDiffs: string[] = [];
     await mkdir(join(repository, "src"), { recursive: true });
+    const canonicalRepository = await realpath(repository);
     const git = (...args: string[]) =>
       execFileSync("git", args, {
         cwd: repository,
@@ -2427,9 +2446,11 @@ describe("scan and patch workflow", () => {
       git("config", "user.email", "synthetic@example.test");
       git("config", "commit.gpgsign", "false");
       await writeFile(join(repository, "src", "finding-1.ts"), "unsafe\n");
+      await writeFile(join(repository, "src", "finding-2.ts"), "unsafe\n");
       await writeFile(join(repository, "unrelated.ts"), "original\n");
       git("add", "--", ".");
       git("commit", "-m", "Initial synthetic checkout");
+      const baseTree = git("rev-parse", "HEAD^{tree}");
       git("init", "--bare", remote);
       git("remote", "add", "origin", remote);
       git("push", "--set-upstream", "origin", "main");
@@ -2442,6 +2463,7 @@ describe("scan and patch workflow", () => {
           "--patch",
           "--patch-severity",
           "high",
+          "--assess-patch-risk",
           "--create-pr",
           "--json",
         ],
@@ -2449,26 +2471,67 @@ describe("scan and patch workflow", () => {
           currentDirectory: repository,
           result,
           onCodex: async (args, output) => {
-            await writeFile(join(repository, "src", "finding-1.ts"), "fixed\n");
+            if (output!.appServer!.sandbox === "read-only") {
+              const artifact = patchRiskArtifact(output!.appServer!.prompt);
+              assessedPatches.push(artifact.patch);
+              assessedDiffs.push(await readFile(artifact.path, "utf8"));
+              output!.stdout.write(
+                JSON.stringify(
+                  approvedPatchRiskVerdict(output!.appServer!.prompt),
+                ),
+              );
+              return 0;
+            }
+            const [finding] = JSON.parse(
+              output!.appServer!.prompt.split("\n").at(-1)!,
+            ) as Finding[];
+            await writeFile(
+              join(repository, finding!.locations[0]!.path),
+              "fixed\n",
+            );
             completePatches(args, output);
             return 0;
           },
           onRepositoryCommand: (command, args, workingDirectory) => {
-            expect(workingDirectory).toBe(repository);
+            expect(workingDirectory).toBe(canonicalRepository);
             if (command === "git") return git(...args);
             if (args[1] === "list") return "";
             pullRequestArguments = args;
             return url;
           },
         },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
       );
 
-      expect(outcome.exitCode).toBe(0);
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
       expect(git("branch", "--show-current")).toBe("codex-security/patch-scan");
       expect(git("show", "--format=", "--name-only", "HEAD")).toBe(
-        "src/finding-1.ts",
+        "src/finding-1.ts\nsrc/finding-2.ts",
       );
       expect(git("diff", "--cached", "--name-only")).toBe("unrelated.ts");
+      expect(
+        assessedPatches.map(({ base, changedFiles }) => ({
+          base,
+          changedFiles,
+        })),
+      ).toEqual([
+        { base: baseTree, changedFiles: ["src/finding-1.ts"] },
+        {
+          base: baseTree,
+          changedFiles: ["src/finding-1.ts", "src/finding-2.ts"],
+        },
+      ]);
+      expect(assessedPatches.at(-1)?.head).toBe(
+        git("rev-parse", "HEAD^{tree}"),
+      );
+      expect(assessedDiffs.at(-1)).toContain("src/finding-1.ts");
+      expect(assessedDiffs.at(-1)).toContain("src/finding-2.ts");
+      expect(assessedDiffs.at(-1)).not.toContain("unrelated.ts");
+      expect(assessedDiffs.at(-1)).not.toContain("staged separately");
       expect(git("rev-parse", "HEAD")).toBe(
         git("rev-parse", "origin/codex-security/patch-scan"),
       );
