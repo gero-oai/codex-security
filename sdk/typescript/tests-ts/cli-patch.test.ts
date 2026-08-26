@@ -3278,7 +3278,7 @@ describe("scan and patch workflow", () => {
     }
   });
 
-  test.skipIf(process.platform === "win32")(
+  test.skipIf(process.platform === "win32" || process.platform === "darwin")(
     "preserves unrelated non-UTF-8 Git paths while capturing the baseline",
     async () => {
       const repository = await realpath(
@@ -3698,7 +3698,7 @@ describe("scan and patch workflow", () => {
             "const credential = process.env.GIT_CONFIG_VALUE_0 ?? process.env.OPENAI_API_KEY;",
             `if (existsSync(${JSON.stringify(armed)})) writeFileSync(${JSON.stringify(invoked)}, "invoked");`,
             `if (existsSync(${JSON.stringify(armed)}) && credential) writeFileSync(${JSON.stringify(leaked)}, credential);`,
-            "process.stdout.write(readFileSync(0));",
+            'process.stdout.write(Buffer.concat([Buffer.from("filtered:"), readFileSync(0)]));',
           ].join("\n"),
         );
         git(
@@ -4319,6 +4319,7 @@ describe("scan and patch workflow", () => {
       execFileSync("git", args, {
         cwd: repository,
         encoding: "utf8",
+        env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
       }).trim();
 
@@ -4327,9 +4328,20 @@ describe("scan and patch workflow", () => {
       git("config", "user.name", "Synthetic User");
       git("config", "user.email", "synthetic@example.test");
       git("config", "commit.gpgsign", "false");
+      expect(git("config", "--get", "core.autocrlf")).toBe("true");
       await writeFile(join(repository, "value.ts"), "unsafe\r\n");
       git("add", "--", ".");
       git("commit", "-m", "Initial synthetic checkout");
+      expect(
+        execFileSync("git", ["show", "HEAD:value.ts"], {
+          cwd: repository,
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+      ).toEqual(Buffer.from("unsafe\n"));
+      await writeFile(join(repository, "value.ts"), "unsafe\r\n");
+      expect(await readFile(join(repository, "value.ts"))).toEqual(
+        Buffer.from("unsafe\r\n"),
+      );
       expect(git("status", "--short")).toBe("");
       git("init", "--bare", remote);
       git("remote", "add", "origin", remote);
