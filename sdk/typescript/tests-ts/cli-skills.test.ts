@@ -31,7 +31,6 @@ function dependencies(options: Parameters<typeof fixtureDependencies>[0] = {}) {
       repository: directory,
       tree: "synthetic-baseline-tree",
       objectDirectory: resolve(directory, ".git", "objects"),
-      alternateObjectDirectory: resolve(directory, ".git", "objects"),
       runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
       gitExecutable: GIT_EXECUTABLE,
     },
@@ -1912,7 +1911,6 @@ lines.on("line", (line) => {
       repository: "/synthetic/repository",
       tree: "synthetic-baseline-tree",
       objectDirectory: "/synthetic/review-objects",
-      alternateObjectDirectory: "/synthetic/repository-objects",
       runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
       gitExecutable: GIT_EXECUTABLE,
     };
@@ -1950,7 +1948,6 @@ lines.on("line", (line) => {
               reviewRepository.repository,
               reviewRepository.tree,
               reviewRepository.objectDirectory,
-              reviewRepository.alternateObjectDirectory,
             ])},
             enabled: true,
           },

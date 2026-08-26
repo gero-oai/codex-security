@@ -15,6 +15,7 @@ interface GitTreeEntry {
   type: "blob" | "commit" | "tree";
   object: string;
   path: string;
+  rawPath: Buffer;
 }
 
 type JsonValue = string | number | boolean | null | JsonObject | JsonValue[];
@@ -46,12 +47,81 @@ function treePath(path: string, allowRoot = false): string {
   return allowRoot && confined === "." ? "" : confined;
 }
 
-function parseTreeEntries(output: string): GitTreeEntry[] {
-  const records = output.split("\0");
-  if (records.at(-1) === "") records.pop();
+const RAW_TREE_PATH_PREFIX = "$git-path-base64:";
+
+function splitRawTreePath(path: Buffer, allowRoot = false): Buffer[] {
+  if (path.length === 0) {
+    if (allowRoot) return [];
+    throw new Error("Repository inspection requires a confined relative path.");
+  }
+  const parts: Buffer[] = [];
+  let start = 0;
+  for (let index = 0; index <= path.length; index += 1) {
+    if (index !== path.length && path[index] !== 0x2f) continue;
+    const part = path.subarray(start, index);
+    if (
+      part.length === 0 ||
+      part.equals(Buffer.from(".")) ||
+      part.equals(Buffer.from(".."))
+    ) {
+      throw new Error(
+        "Repository inspection requires a confined relative path.",
+      );
+    }
+    parts.push(part);
+    start = index + 1;
+  }
+  return parts;
+}
+
+function publicTreePath(path: Buffer): string {
+  const decoded = path.toString("utf8");
+  return Buffer.from(decoded, "utf8").equals(path) &&
+    !decoded.startsWith(RAW_TREE_PATH_PREFIX)
+    ? decoded
+    : `${RAW_TREE_PATH_PREFIX}${path.toString("base64url")}`;
+}
+
+function rawTreePath(path: string, allowRoot = false): Buffer {
+  if (!path.startsWith(RAW_TREE_PATH_PREFIX)) {
+    return Buffer.from(treePath(path, allowRoot), "utf8");
+  }
+  const encoded = path.slice(RAW_TREE_PATH_PREFIX.length);
+  const decoded = Buffer.from(encoded, "base64url");
+  if (
+    encoded.length === 0 ||
+    decoded.toString("base64url") !== encoded ||
+    publicTreePath(decoded) !== path
+  ) {
+    throw new Error("Repository inspection requires a confined relative path.");
+  }
+  splitRawTreePath(decoded, allowRoot);
+  return decoded;
+}
+
+function splitNulRecords(output: Buffer): Buffer[] {
+  const records: Buffer[] = [];
+  let start = 0;
+  for (;;) {
+    const end = output.indexOf(0, start);
+    if (end < 0) {
+      if (start < output.length) records.push(output.subarray(start));
+      return records;
+    }
+    records.push(output.subarray(start, end));
+    start = end + 1;
+    if (start === output.length) return records;
+  }
+}
+
+function parseTreeEntries(output: Buffer): GitTreeEntry[] {
+  const records = splitNulRecords(output);
   return records.map((record) => {
-    const separator = record.indexOf("\t");
-    const metadata = separator < 0 ? [] : record.slice(0, separator).split(" ");
+    const separator = record.indexOf(0x09);
+    const metadata =
+      separator < 0
+        ? []
+        : record.subarray(0, separator).toString("ascii").split(" ");
     const [mode, type, object] = metadata;
     if (
       separator < 0 ||
@@ -63,7 +133,14 @@ function parseTreeEntries(output: string): GitTreeEntry[] {
     ) {
       throw new Error("The baseline repository tree is unreadable.");
     }
-    return { mode, type, object, path: record.slice(separator + 1) };
+    const rawPath = record.subarray(separator + 1);
+    return {
+      mode,
+      type,
+      object,
+      path: publicTreePath(rawPath),
+      rawPath,
+    };
   });
 }
 
@@ -128,6 +205,34 @@ async function runGit(
   return trim ? value.replace(/\r?\n$/u, "") : value;
 }
 
+async function runGitBytes(
+  executable: string,
+  repository: string,
+  args: readonly string[],
+  environment: Readonly<Record<string, string>>,
+): Promise<Buffer> {
+  const { stdout } = await execFile(
+    executable,
+    [
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "credential.helper=",
+      "-c",
+      "credential.interactive=never",
+      ...args,
+    ],
+    {
+      cwd: repository,
+      encoding: null,
+      env: gitEnvironment(environment),
+      maxBuffer: Number.POSITIVE_INFINITY,
+      windowsHide: true,
+    },
+  );
+  return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+}
+
 export async function runPatchReviewRepositoryMcp(
   args: readonly string[],
 ): Promise<number> {
@@ -156,48 +261,45 @@ export async function runPatchReviewRepositoryMcp(
     environment,
   );
 
-  const treeEntries = async (
-    directory: string,
-  ): Promise<{ prefix: string; entries: GitTreeEntry[] }> => {
-    const path = treePath(directory, true);
-    if (path.length === 0) {
-      return {
-        prefix: "",
-        entries: parseTreeEntries(
-          await runGit(
-            canonicalGit,
-            canonicalRepository,
-            ["ls-tree", "-z", tree],
-            environment,
-            false,
-          ),
-        ),
-      };
-    }
-    const entry = parseTreeEntries(
-      await runGit(
+  const readTree = async (object: string): Promise<GitTreeEntry[]> =>
+    parseTreeEntries(
+      await runGitBytes(
         canonicalGit,
         canonicalRepository,
-        ["ls-tree", "--full-tree", "-z", tree, "--", `:(top,literal)${path}`],
+        ["ls-tree", "-z", object],
         environment,
-        false,
       ),
-    ).find((candidate) => candidate.path === path);
-    if (entry?.type !== "tree") {
-      throw new Error("The requested baseline path is not a directory.");
+    );
+  const treeEntry = async (path: Buffer): Promise<GitTreeEntry | undefined> => {
+    const parts = splitRawTreePath(path);
+    let object = tree;
+    for (const [index, part] of parts.entries()) {
+      const entry = (await readTree(object)).find((candidate) =>
+        candidate.rawPath.equals(part),
+      );
+      if (entry === undefined) return undefined;
+      if (index === parts.length - 1) return entry;
+      if (entry.type !== "tree") return undefined;
+      object = entry.object;
     }
-    return {
-      prefix: `${path}/`,
-      entries: parseTreeEntries(
-        await runGit(
-          canonicalGit,
-          canonicalRepository,
-          ["ls-tree", "-z", entry.object],
-          environment,
-          false,
-        ),
-      ),
-    };
+    return undefined;
+  };
+  const treeEntries = async (
+    directory: string,
+  ): Promise<{ prefix: Buffer; entries: GitTreeEntry[] }> => {
+    const path = rawTreePath(directory, true);
+    const parts = splitRawTreePath(path, true);
+    let object = tree;
+    for (const part of parts) {
+      const entry = (await readTree(object)).find((candidate) =>
+        candidate.rawPath.equals(part),
+      );
+      if (entry?.type !== "tree") {
+        throw new Error("The requested baseline path is not a directory.");
+      }
+      object = entry.object;
+    }
+    return { prefix: path, entries: await readTree(object) };
   };
 
   const send = (value: JsonObject): void => {
@@ -334,39 +436,23 @@ export async function runPatchReviewRepositoryMcp(
         if (typeof values["path"] !== "string") {
           throw new Error("read_file requires a path.");
         }
-        const path = treePath(values["path"]);
-        const entry = parseTreeEntries(
-          await runGit(
-            canonicalGit,
-            canonicalRepository,
-            [
-              "ls-tree",
-              "--full-tree",
-              "-z",
-              tree,
-              "--",
-              `:(top,literal)${path}`,
-            ],
-            environment,
-            false,
-          ),
-        ).find((candidate) => candidate.path === path);
+        const path = rawTreePath(values["path"]);
+        const entry = await treeEntry(path);
         if (entry?.type !== "blob") {
           throw new Error("The requested baseline path is not a file.");
         }
-        const contents = await runGit(
+        const contents = await runGitBytes(
           canonicalGit,
           canonicalRepository,
           ["cat-file", "blob", entry.object],
           environment,
-          false,
         );
         send(
           result(
             id,
             entry.mode === "120000"
-              ? `Symbolic link target (not followed):\n${contents}`
-              : contents,
+              ? `Symbolic link target (not followed):\n${contents.toString("utf8")}`
+              : contents.toString("utf8"),
           ),
         );
         continue;
@@ -386,7 +472,11 @@ export async function runPatchReviewRepositoryMcp(
             id,
             JSON.stringify(
               entries.map((entry) => ({
-                path: `${prefix}${entry.path}`,
+                path: publicTreePath(
+                  prefix.length === 0
+                    ? entry.rawPath
+                    : Buffer.concat([prefix, Buffer.from("/"), entry.rawPath]),
+                ),
                 type:
                   entry.type === "tree"
                     ? "directory"
@@ -409,13 +499,19 @@ export async function runPatchReviewRepositoryMcp(
         ) {
           throw new Error("search requires a non-empty query.");
         }
-        const path = treePath(
+        const rawPath = rawTreePath(
           (values["path"] as string | undefined) ?? "",
           true,
         );
+        const path = publicTreePath(rawPath);
+        if (path.startsWith(RAW_TREE_PATH_PREFIX)) {
+          throw new Error(
+            "Search requires a UTF-8 directory path; use list_directory and read_file for encoded paths.",
+          );
+        }
         let matches = "";
         try {
-          matches = await runGit(
+          const output = await runGitBytes(
             canonicalGit,
             canonicalRepository,
             [
@@ -430,8 +526,13 @@ export async function runPatchReviewRepositoryMcp(
               ...(path.length === 0 ? [] : ["--", `:(top,literal)${path}`]),
             ],
             environment,
-            false,
           );
+          matches = output.toString("utf8");
+          if (!Buffer.from(matches, "utf8").equals(output)) {
+            throw new Error(
+              "Search results contain a path or content that is not UTF-8; use list_directory and read_file instead.",
+            );
+          }
         } catch (error) {
           if (
             typeof error !== "object" ||
