@@ -338,6 +338,14 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         errors.append("high confidence cannot retain an explicit unknown")
     if unresolved_boundaries and value["confidence"]["rating"] == "high":
         errors.append("an unresolved material boundary cannot support high confidence")
+    if (
+        unknown_failed_validations
+        and value["applicability"]["status"] == "confirmed"
+        and value["confidence"]["rating"] == "high"
+    ):
+        errors.append(
+            "a failed validation with unknown attribution cannot support high confidence"
+        )
 
     if recommendation == "merge":
         if workflow_label not in {"auto_merge_candidate", "human_review_required"}:
@@ -461,6 +469,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     f"evidencePlan.{index}: changedFilesOutcomes must name exactly the evidence outcome keys"
                 )
             if changed_files_outcomes is not None:
+                if value["patch"]["changedFiles"]:
+                    errors.append(
+                        f"evidencePlan.{index}: changedFilesOutcomes may only resolve an empty patch.changedFiles inventory"
+                    )
                 if any(changed_files_outcomes.values()):
                     planned_changed_files = True
                 else:
@@ -529,6 +541,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                         for boundary_id, result in outcome_boundaries.items()
                         if result == "unresolved"
                     }
+                effective_unknown_failed_validations = (
+                    unknown_failed_validations
+                    - set(item.get("resolvesFailedValidation", []))
+                )
                 outcome_remaining_unknowns = set(
                     remaining_unknown_outcomes.get(outcome, [])
                     if remaining_unknown_outcomes is not None
@@ -564,6 +580,21 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     if outcome_applicability is not None
                     else value["applicability"]["status"]
                 )
+                if effective_applicability not in NON_APPLICABLE:
+                    if (
+                        value["regressionLikelihood"]["rating"] == "critical"
+                        and outcome_likelihood != "critical"
+                    ):
+                        errors.append(
+                            f"evidencePlan.{index}: established critical regression likelihood must remain critical until a non-applicable disposition"
+                        )
+                    if (
+                        value["materialSafetyFailure"]["established"]
+                        and outcome_safety_failure is not True
+                    ):
+                        errors.append(
+                            f"evidencePlan.{index}: an established material safety failure must remain established until a non-applicable disposition"
+                        )
                 for unknown_id in outcome_remaining_unknowns:
                     if unknown_id not in decision_critical_unknowns:
                         errors.append(
@@ -750,6 +781,14 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 if effective_unresolved_boundaries and outcome_confidence == "high":
                     errors.append(
                         f"evidencePlan.{index}: an unresolved material boundary cannot support high confidence"
+                    )
+                if (
+                    effective_unknown_failed_validations
+                    and effective_applicability == "confirmed"
+                    and outcome_confidence == "high"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a failed validation with unknown attribution cannot support high confidence"
                     )
                 if outcome_recommendation == "merge":
                     if outcome_confidence == "low":

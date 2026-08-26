@@ -873,6 +873,46 @@ describe("patch risk assessment contract", () => {
     expect(noOp.status, noOp.stderr).toBe(0);
   });
 
+  test("does not replace an established changed-file identity with evidence outcomes", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "provider-result",
+        summary: "The provider result is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Can the provider result be confirmed?",
+        action: "Retrieve the immutable comparison again.",
+        resolvesUnknowns: ["provider-result"],
+        changedFilesOutcomes: {
+          complete: ["README.md"],
+          unavailable: ["docs/notes.md"],
+        },
+        confidenceOutcomes: { complete: "moderate", unavailable: "low" },
+        remainingUnknowns: {
+          complete: [],
+          unavailable: ["provider-result"],
+        },
+        outcomes: {
+          complete: "merge",
+          unavailable: "hold_for_evidence",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "changedFilesOutcomes may only resolve an empty patch.changedFiles inventory",
+    );
+  });
+
   test("requires an affected runtime root for auto-merge", async () => {
     const payload = assessment();
     payload.workflowLabel = "auto_merge_candidate";
@@ -998,6 +1038,17 @@ describe("patch risk assessment contract", () => {
     const critical = await validate(payload);
     expect(critical.status, critical.stderr).toBe(0);
 
+    payload.evidencePlan[0]!.regressionLikelihoodOutcomes = {
+      owned: "low",
+      not_owned: "low",
+    };
+    const downgraded = await validate(payload);
+    expect(downgraded.status).not.toBe(0);
+    expect(downgraded.stderr).toContain(
+      "established critical regression likelihood must remain critical until a non-applicable disposition",
+    );
+    delete payload.evidencePlan[0]!.regressionLikelihoodOutcomes;
+
     payload.regressionLikelihood.rating = "high";
     payload.validation[0]!.status = "failed";
     payload.validation[0]!.failureAttribution = "patch_caused";
@@ -1005,6 +1056,50 @@ describe("patch risk assessment contract", () => {
     payload.regressionProtection.exactHeadChecksPassed = false;
     const failed = await validate(payload);
     expect(failed.status, failed.stderr).toBe(0);
+  });
+
+  test("does not erase an established safety failure on an applicable branch", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionLikelihood.rating = "critical";
+    payload.materialSafetyFailure = {
+      established: true,
+      evidence: "The immutable patch establishes a cross-subject decision.",
+    };
+    payload.applicability = {
+      status: "unknown",
+      rationale: "Runtime ownership remains unresolved.",
+    };
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which runtime owns the changed path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: { owned: "merge", retired: "no_op" },
+        applicabilityOutcomes: {
+          owned: "confirmed",
+          retired: "no_live_effect",
+        },
+        regressionLikelihoodOutcomes: { owned: "low", retired: "low" },
+        materialSafetyFailureOutcomes: { owned: false, retired: false },
+        confidenceOutcomes: { owned: "moderate", retired: "moderate" },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "an established material safety failure must remain established until a non-applicable disposition",
+    );
   });
 
   test("allows an evidence action for every decision-critical unknown", async () => {
@@ -2198,6 +2293,73 @@ describe("patch risk assessment contract", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
       "an unresolved material boundary cannot support high confidence",
+    );
+  });
+
+  test("rejects high-confidence branches with unattributed failures", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "unknown";
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "branch-result",
+        summary: "The branch result is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the boundary preserve the supported control?",
+        action: "Trace both paths through the immutable patch.",
+        resolvesUnknowns: ["branch-result"],
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          supported: { "request-contract": "supported" },
+          contradicted: { "request-contract": "contradicted" },
+        },
+        outcomes: { supported: "merge", contradicted: "revise" },
+        confidenceOutcomes: { supported: "high", contradicted: "high" },
+      },
+      {
+        question: "Did the patch cause the failed check?",
+        action: "Run the same check against the immutable base.",
+        resolvesUnknowns: ["branch-result"],
+        resolvesFailedValidation: ["focused request tests"],
+        outcomes: { patch_caused: "revise", not_patch_caused: "merge" },
+        confidenceOutcomes: {
+          patch_caused: "moderate",
+          not_patch_caused: "moderate",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "a failed validation with unknown attribution cannot support high confidence",
+    );
+  });
+
+  test("rejects high-confidence terminal assessments with unattributed failures", async () => {
+    const payload = assessment();
+    payload.recommendation = "revise";
+    payload.workflowLabel = "revise";
+    payload.materialBoundaries[0]!.result = "contradicted";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "unknown";
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "a failed validation with unknown attribution cannot support high confidence",
     );
   });
 
