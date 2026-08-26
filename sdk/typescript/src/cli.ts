@@ -5509,7 +5509,7 @@ function safePatchReport(value: string): string {
     ) {
       const evidence = boundary.groups["evidence"];
       const safeEvidence =
-        safePatchBoundaryClassification(evidence) ?? safePatchText(evidence);
+        safePatchBoundaryClassification(evidence) ?? "[redacted]";
       lines.push(
         stripPatchControlCharacters(
           `${boundary.groups["prefix"]}${boundary.groups["label"]}${boundary.groups["separator"]}${safeEvidence}`,
