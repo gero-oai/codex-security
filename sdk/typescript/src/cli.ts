@@ -1393,13 +1393,12 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
     }
     const { stdout } = await execFile(executable.executable, [...args], {
       cwd: repository,
-      env:
-        options?.gitIndexFile === undefined
-          ? executable.environment
-          : {
-              ...executable.environment,
-              GIT_INDEX_FILE: options.gitIndexFile,
-            },
+      env: {
+        ...executable.environment,
+        ...(command === "git" && options?.gitIndexFile !== undefined
+          ? { GIT_INDEX_FILE: options.gitIndexFile }
+          : {}),
+      },
       windowsHide: true,
     });
     return stdout.trim();
@@ -5261,7 +5260,6 @@ async function createPatchPullRequest(
   stderr.write(
     "Creating a draft GitHub pull request for verified patches...\n",
   );
-  await run("git", ["switch", "-c", branch]);
   const temporaryRoot = await realpath(tmpdir());
   const temporaryDirectory = await realpath(
     await mkdtemp(join(temporaryRoot, "codex-security-publish-index-")),
@@ -5272,52 +5270,54 @@ async function createPatchPullRequest(
       dependencies.runRepositoryCommand("git", args, repository, {
         gitIndexFile: temporaryIndex,
       });
-    await runWithTemporaryIndex(["read-tree", "HEAD"]);
+    const head = await run("git", ["rev-parse", "--verify", "HEAD"]).catch(
+      () => undefined,
+    );
+    await runWithTemporaryIndex(
+      head === undefined ? ["read-tree", "--empty"] : ["read-tree", head],
+    );
     await runWithTemporaryIndex([
       "--literal-pathspecs",
       "add",
       "--",
       ...publicationPathspecs,
     ]);
+    const currentEntries = parsePatchReviewIndexEntries(
+      Buffer.from(
+        await runWithTemporaryIndex(["ls-files", "--stage", "-z", "--", "."]),
+      ),
+    );
+    for (const expected of reviewPublicationEntries) {
+      if (
+        !samePatchReviewTreeEntry(
+          currentEntries.get(expected.path) ?? { path: expected.path },
+          expected,
+        )
+      ) {
+        throw new CodexSecurityError(
+          "The patch changed after independent review. Review it again before publishing.",
+        );
+      }
+    }
+    const intendedTree = await runWithTemporaryIndex(["write-tree"]);
+    await run("git", ["switch", "-c", branch]);
     await runWithTemporaryIndex(["commit", "-m", PATCH_PR_TITLE]);
+    if ((await run("git", ["rev-parse", "HEAD^{tree}"])) !== intendedTree) {
+      throw new CodexSecurityError(
+        "The patch commit contains changes outside the independently reviewed tree.",
+      );
+    }
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
-  const committedEntries = await Promise.all(
-    files.map(async (path) =>
-      parsePatchReviewTreeEntry(
-        path,
-        await run("git", [
-          "ls-tree",
-          "--full-tree",
-          "-z",
-          "HEAD^{tree}",
-          "--",
-          `:(top,literal)${path}`,
-        ]),
-      ),
-    ),
-  );
-  for (const path of files) {
-    await run("git", [
-      "--literal-pathspecs",
-      "update-index",
-      "--force-remove",
-      "--",
-      path,
-    ]);
-  }
-  for (const entry of committedEntries) {
-    if (entry.mode === undefined || entry.object === undefined) continue;
-    await run("git", [
-      "update-index",
-      "--add",
-      "--cacheinfo",
-      entry.mode,
-      entry.object,
-      entry.path,
-    ]);
-  }
+  await run("git", [
+    "--literal-pathspecs",
+    "reset",
+    "--quiet",
+    "HEAD",
+    "--",
+    ...publicationPathspecs,
+  ]);
   for (const expected of reviewPublicationEntries) {
     const actual = parsePatchReviewTreeEntry(
       expected.path,
@@ -5409,7 +5409,7 @@ async function runPatchReviewGit(
   args: readonly string[],
   options: {
     environment?: NodeJS.ProcessEnv;
-    input?: string;
+    input?: string | Uint8Array;
     signal?: AbortSignal;
     trim?: boolean;
   } = {},
@@ -5451,7 +5451,7 @@ async function runPatchReviewGitOutput(
   encoding: "utf8" | null,
   environment?: NodeJS.ProcessEnv,
   signal?: AbortSignal,
-  input?: string,
+  input?: string | Uint8Array,
 ): Promise<string | Buffer> {
   signal?.throwIfAborted();
   const isolatedEnvironment = patchReviewGitProcessEnvironment();
@@ -5500,6 +5500,40 @@ function missingPatchReviewPath(error: unknown): boolean {
     "code" in error &&
     (error.code === "ENOENT" || error.code === "ENOTDIR")
   );
+}
+
+function splitNulRecords(output: Buffer): Buffer[] {
+  const records: Buffer[] = [];
+  let start = 0;
+  for (;;) {
+    const end = output.indexOf(0, start);
+    if (end < 0) {
+      if (start < output.length) records.push(output.subarray(start));
+      return records;
+    }
+    records.push(output.subarray(start, end));
+    start = end + 1;
+    if (start === output.length) return records;
+  }
+}
+
+function decodePatchReviewGitPath(path: Buffer): string | undefined {
+  const decoded = path.toString("utf8");
+  return Buffer.from(decoded, "utf8").equals(path) ? decoded : undefined;
+}
+
+function patchReviewGitPathKey(path: Buffer): string {
+  return path.toString("base64");
+}
+
+function patchReviewFilesystemPath(
+  repository: string,
+  path: Buffer,
+): string | Buffer {
+  const decoded = decodePatchReviewGitPath(path);
+  return decoded === undefined
+    ? Buffer.concat([Buffer.from(`${repository}${sep}`), path])
+    : join(repository, decoded);
 }
 
 async function validatePatchReviewPath(
@@ -5567,10 +5601,16 @@ async function validatePatchReviewPath(
   await inspect(absolute, new Set());
 }
 
+interface NestedPatchReviewRepository {
+  worktree: string;
+  gitDirectory: string;
+}
+
 async function nestedPatchReviewRepository(
   repository: string,
   path: string,
-): Promise<string | undefined> {
+  allowedGitDirectories: readonly string[],
+): Promise<NestedPatchReviewRepository | undefined> {
   let current = resolve(repository, path);
   try {
     if (!(await lstat(current)).isDirectory()) current = dirname(current);
@@ -5583,8 +5623,49 @@ async function nestedPatchReviewRepository(
     !isOutsidePath(relative(repository, current))
   ) {
     try {
-      await lstat(join(current, ".git"));
-      return await realpath(current);
+      const marker = join(current, ".git");
+      const metadata = await lstat(marker);
+      let gitDirectory: string;
+      if (metadata.isDirectory()) {
+        gitDirectory = await realpath(marker);
+      } else if (metadata.isFile()) {
+        const markerBytes = await readFile(marker);
+        const markerText = markerBytes.toString("utf8");
+        const match = /^gitdir: ([^\r\n]+)\r?\n?$/u.exec(markerText);
+        if (
+          !Buffer.from(markerText, "utf8").equals(markerBytes) ||
+          match === null
+        ) {
+          throw new CodexSecurityError(
+            "Nested Git metadata must use a confined Git directory.",
+          );
+        }
+        gitDirectory = await realpath(resolve(current, match[1]!));
+      } else {
+        throw new CodexSecurityError(
+          "Nested Git metadata must use a confined Git directory.",
+        );
+      }
+      if (
+        !allowedGitDirectories.some(
+          (directory) => !isOutsidePath(relative(directory, gitDirectory)),
+        )
+      ) {
+        throw new CodexSecurityError(
+          "Nested Git metadata must remain inside the selected repository.",
+        );
+      }
+      const configBytes = await readFile(join(gitDirectory, "config"));
+      const config = configBytes.toString("utf8");
+      if (
+        !Buffer.from(config, "utf8").equals(configBytes) ||
+        /^\s*\[\s*include(?:if)?(?:\s|\")/imu.test(config)
+      ) {
+        throw new CodexSecurityError(
+          "Nested Git metadata must not include external configuration.",
+        );
+      }
+      return { worktree: await realpath(current), gitDirectory };
     } catch (error) {
       if (!missingPatchReviewPath(error)) throw error;
     }
@@ -5655,19 +5736,27 @@ function parsePatchReviewTreeEntries(
 }
 
 function parsePatchReviewIndexEntries(
-  output: string,
+  output: Buffer,
 ): Map<string, PatchReviewTreeEntry> {
   const entries = new Map<string, PatchReviewTreeEntry>();
-  const records = output.split("\0");
-  if (records.at(-1) === "") records.pop();
+  const records = splitNulRecords(output);
   for (const record of records) {
-    const match = /^([0-7]{6}) ([0-9a-f]+) 0\t([\s\S]+)$/u.exec(record);
-    if (match === null || entries.has(match[3]!)) {
+    const separator = record.indexOf(0x09);
+    const metadata =
+      separator < 0
+        ? undefined
+        : record.subarray(0, separator).toString("ascii");
+    const match = /^([0-7]{6}) ([0-9a-f]+) 0$/u.exec(metadata ?? "");
+    const path =
+      separator < 0
+        ? undefined
+        : decodePatchReviewGitPath(record.subarray(separator + 1));
+    if (path === undefined) continue;
+    if (match === null || entries.has(path)) {
       throw new CodexSecurityError(
         "The reviewed patch contains an unreadable Git index entry.",
       );
     }
-    const path = match[3]!;
     entries.set(path, { path, mode: match[1], object: match[2] });
   }
   return entries;
@@ -5787,6 +5876,19 @@ async function snapshotPatchReviewWorktree(
       ),
     ),
   );
+  const repositoryGitDirectories = await Promise.all(
+    ["--absolute-git-dir", "--git-common-dir"].map(async (argument) =>
+      realpath(
+        resolve(
+          repository,
+          await runPatchReviewGit(repository, ["rev-parse", argument], {
+            signal,
+          }),
+        ),
+      ),
+    ),
+  );
+  const allowedNestedGitDirectories = [repository, ...repositoryGitDirectories];
 
   const temporaryRoot = await realpath(tmpdir());
   if (!isOutsidePath(relative(repository, temporaryRoot))) {
@@ -5794,7 +5896,7 @@ async function snapshotPatchReviewWorktree(
       "Patch review temporary storage must be outside the selected Git worktree.",
     );
   }
-  const ignored = await runPatchReviewGit(
+  const ignored = await runPatchReviewGitBytes(
     repository,
     [
       "ls-files",
@@ -5805,11 +5907,11 @@ async function snapshotPatchReviewWorktree(
       "--",
       ".",
     ],
-    { signal, trim: false },
+    { signal },
   );
-  const ignoredPaths = ignored.split("\0");
-  if (ignoredPaths.at(-1) === "") ignoredPaths.pop();
-  const ignoredPathSet = new Set(ignoredPaths);
+  const ignoredPathSet = new Set(
+    splitNulRecords(ignored).map(patchReviewGitPathKey),
+  );
   const temporaryDirectory = await mkdtemp(
     join(temporaryRoot, "codex-security-patch-review-"),
   );
@@ -5825,12 +5927,19 @@ async function snapshotPatchReviewWorktree(
     GIT_INDEX_FILE: join(temporaryDirectory, "index"),
   };
   const baselineMaterializedSkipWorktreePaths = new Set<string>();
-  const baselineNestedRepositoryStates = new Map<string, string>();
+  const baselineNestedRepositoryStates = new Map<
+    string,
+    { repository: NestedPatchReviewRepository; state: string }
+  >();
   let capturingBaseline = true;
-  const nestedRepositoryState = (nested: string): Promise<string> =>
+  const nestedRepositoryState = (
+    nested: NestedPatchReviewRepository,
+  ): Promise<string> =>
     runPatchReviewGit(
-      nested,
+      nested.worktree,
       [
+        `--git-dir=${nested.gitDirectory}`,
+        `--work-tree=${nested.worktree}`,
         "status",
         "--porcelain=v2",
         "--branch",
@@ -5841,7 +5950,10 @@ async function snapshotPatchReviewWorktree(
       { signal, trim: false },
     );
   const assertNestedRepositoriesUnchanged = async (): Promise<void> => {
-    for (const [nested, baseline] of baselineNestedRepositoryStates) {
+    for (const {
+      repository: nested,
+      state: baseline,
+    } of baselineNestedRepositoryStates.values()) {
       const current = await nestedRepositoryState(nested).catch(
         () => undefined,
       );
@@ -5858,18 +5970,22 @@ async function snapshotPatchReviewWorktree(
   };
   const stageWorktree = async (): Promise<void> => {
     if (!capturingBaseline) await assertNestedRepositoriesUnchanged();
-    const sparseEntries = await runPatchReviewGit(
+    const sparseEntries = await runPatchReviewGitBytes(
       repository,
       ["ls-files", "-v", "-z", "--", "."],
-      { signal, trim: false },
+      { signal },
     );
     const skipWorktreePaths = new Set(
-      sparseEntries
-        .split("\0")
-        .filter((entry) => /^[Ss] /u.test(entry))
-        .map((entry) => entry.slice(2)),
+      splitNulRecords(sparseEntries)
+        .filter(
+          (entry) =>
+            entry.length >= 2 &&
+            (entry[0] === 0x53 || entry[0] === 0x73) &&
+            entry[1] === 0x20,
+        )
+        .map((entry) => patchReviewGitPathKey(entry.subarray(2))),
     );
-    const listed = await runPatchReviewGit(
+    const listed = await runPatchReviewGitBytes(
       repository,
       [
         "ls-files",
@@ -5880,52 +5996,69 @@ async function snapshotPatchReviewWorktree(
         "--",
         ".",
       ],
-      { environment, signal, trim: false },
+      { environment, signal },
     );
-    const paths = listed.split("\0");
-    if (paths.at(-1) === "") paths.pop();
-    const included: string[] = [];
-    const removed: string[] = [];
-    for (const path of paths) {
-      if (ignoredPathSet.has(path)) continue;
-      const nested = await nestedPatchReviewRepository(repository, path);
+    const paths = splitNulRecords(listed);
+    const included: Buffer[] = [];
+    const removed: Buffer[] = [];
+    for (const pathBytes of paths) {
+      const key = patchReviewGitPathKey(pathBytes);
+      if (ignoredPathSet.has(key)) continue;
+      const path = decodePatchReviewGitPath(pathBytes);
+      const nested =
+        path === undefined
+          ? undefined
+          : await nestedPatchReviewRepository(
+              repository,
+              path,
+              allowedNestedGitDirectories,
+            );
       if (nested !== undefined) {
         const state = await nestedRepositoryState(nested);
-        const baseline = baselineNestedRepositoryStates.get(nested);
+        const baseline = baselineNestedRepositoryStates.get(nested.worktree);
         if (capturingBaseline && baseline === undefined) {
-          baselineNestedRepositoryStates.set(nested, state);
-        } else if (baseline !== state) {
+          baselineNestedRepositoryStates.set(nested.worktree, {
+            repository: nested,
+            state,
+          });
+        } else if (baseline?.state !== state) {
           throw new CodexSecurityError(
             "A nested Git worktree changed after patch review started. Review it as a separate patch target.",
           );
         }
         continue;
       }
-      if (skipWorktreePaths.has(path)) {
+      if (skipWorktreePaths.has(key)) {
         try {
-          await lstat(join(repository, path));
+          await lstat(patchReviewFilesystemPath(repository, pathBytes));
         } catch (error) {
           if (missingPatchReviewPath(error)) {
             if (
               !capturingBaseline &&
-              baselineMaterializedSkipWorktreePaths.has(path)
+              baselineMaterializedSkipWorktreePaths.has(key)
             ) {
-              removed.push(path);
+              removed.push(pathBytes);
             }
             continue;
           }
           throw error;
         }
         if (capturingBaseline) {
-          baselineMaterializedSkipWorktreePaths.add(path);
+          baselineMaterializedSkipWorktreePaths.add(key);
         }
       }
-      included.push(path);
+      included.push(pathBytes);
     }
     if (included.length > 0) {
       await writeFile(
         pathspecFile,
-        [...included.map((path) => `:(top,literal)${path}`), ""].join("\0"),
+        Buffer.concat(
+          included.flatMap((path) => [
+            Buffer.from(":(top,literal)"),
+            path,
+            Buffer.from([0]),
+          ]),
+        ),
         { mode: 0o600 },
       );
       await runPatchReviewGit(
@@ -5944,7 +6077,13 @@ async function snapshotPatchReviewWorktree(
       await runPatchReviewGit(
         repository,
         ["update-index", "--force-remove", "-z", "--stdin"],
-        { environment, input: `${removed.join("\0")}\0`, signal },
+        {
+          environment,
+          input: Buffer.concat(
+            removed.flatMap((path) => [path, Buffer.from([0])]),
+          ),
+          signal,
+        },
       );
     }
   };
@@ -5995,14 +6134,14 @@ async function snapshotPatchReviewWorktree(
       signal,
     });
     const baselineEntries = parsePatchReviewIndexEntries(
-      await runPatchReviewGit(
+      await runPatchReviewGitBytes(
         repository,
         ["ls-files", "--stage", "-z", "--", "."],
-        { environment, signal, trim: false },
+        { environment, signal },
       ),
     );
     const pathsChangedFromHead = async (tree: string): Promise<string[]> => {
-      const output = await runPatchReviewGit(
+      const output = await runPatchReviewGitBytes(
         repository,
         headTree === undefined
           ? ["ls-tree", "-r", "--name-only", "-z", tree]
@@ -6021,11 +6160,12 @@ async function snapshotPatchReviewWorktree(
               "--",
               ".",
             ],
-        { environment, signal, trim: false },
+        { environment, signal },
       );
-      const changed = output.split("\0");
-      if (changed.at(-1) === "") changed.pop();
-      return changed;
+      return splitNulRecords(output).flatMap((path) => {
+        const decoded = decodePatchReviewGitPath(path);
+        return decoded === undefined ? [] : [decoded];
+      });
     };
     const preexistingPathSet = new Set([
       ...(await pathsChangedFromHead(indexTree)),
@@ -6056,7 +6196,7 @@ async function snapshotPatchReviewWorktree(
           ["write-tree"],
           { environment, signal },
         );
-        const names = await runPatchReviewGit(
+        const names = await runPatchReviewGitBytes(
           repository,
           [
             "--no-pager",
@@ -6073,10 +6213,17 @@ async function snapshotPatchReviewWorktree(
             "--",
             ".",
           ],
-          { environment, signal, trim: false },
+          { environment, signal },
         );
-        const parts = names.split("\0");
-        if (parts.at(-1) === "") parts.pop();
+        const parts = splitNulRecords(names).map((path) => {
+          const decoded = decodePatchReviewGitPath(path);
+          if (decoded === undefined) {
+            throw new CodexSecurityError(
+              "Patch reviews cannot represent a changed path that is not UTF-8.",
+            );
+          }
+          return decoded;
+        });
         const paths = [...new Set(parts)];
         for (const path of paths) {
           signal?.throwIfAborted();
@@ -6104,10 +6251,10 @@ async function snapshotPatchReviewWorktree(
                 { environment, signal },
               );
         const candidateEntries = parsePatchReviewIndexEntries(
-          await runPatchReviewGit(
+          await runPatchReviewGitBytes(
             repository,
             ["ls-files", "--stage", "-z", "--", "."],
-            { environment, signal, trim: false },
+            { environment, signal },
           ),
         );
         signal?.throwIfAborted();

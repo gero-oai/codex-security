@@ -183,9 +183,23 @@ describe("patch risk assessment contract", () => {
   test("publishes a valid draft 2020-12 schema", async () => {
     const schema = JSON.parse(await readFile(schemaPath, "utf8"));
     expect(schema.$schema).toBe("https://json-schema.org/draft/2020-12/schema");
-    expect(() =>
-      new Ajv2020({ strict: false, validateFormats: false }).compile(schema),
-    ).not.toThrow();
+    const validateSchema = new Ajv2020({
+      strict: false,
+      validateFormats: false,
+    }).compile(schema);
+    const valid = assessment();
+    expect(validateSchema(valid), JSON.stringify(validateSchema.errors)).toBe(
+      true,
+    );
+
+    const digestWithTrailingNewline = assessment();
+    digestWithTrailingNewline.patch.sha256 = `${"c".repeat(64)}\n`;
+    expect(validateSchema(digestWithTrailingNewline)).toBe(false);
+
+    const identifierWithTrailingNewline = assessment();
+    identifierWithTrailingNewline.materialBoundaries[0]!.id =
+      "request-contract\n";
+    expect(validateSchema(identifierWithTrailingNewline)).toBe(false);
   });
 
   test("documents the configured validator command over stdin", async () => {
@@ -836,8 +850,23 @@ describe("patch risk assessment contract", () => {
     const unsafePatchOutcome = await validate(payload);
     expect(unsafePatchOutcome.status).not.toBe(0);
     expect(unsafePatchOutcome.stderr).toContain(
-      "a patch_caused outcome must recommend revise or block",
+      "a patch_caused outcome must recommend revise, block, or no_op",
     );
+
+    payload.applicability = {
+      status: "unknown",
+      rationale:
+        "The same evidence action determines whether the patch still applies.",
+    };
+    payload.evidencePlan[0]!.outcomes = {
+      patch_caused: "no_op",
+      not_patch_caused: "merge",
+    };
+    const inapplicablePatchOutcome = await validate(payload);
+    expect(
+      inapplicablePatchOutcome.status,
+      inapplicablePatchOutcome.stderr,
+    ).toBe(0);
 
     payload.evidencePlan[0]!.outcomes = {
       patch_caused: "revise",

@@ -387,9 +387,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 elif item["outcomes"]["patch_caused"] not in {
                     "revise",
                     "block",
+                    "no_op",
                 }:
                     errors.append(
-                        f"evidencePlan.{index}: a patch_caused outcome must recommend revise or block"
+                        f"evidencePlan.{index}: a patch_caused outcome must recommend revise, block, or no_op"
                     )
         for name in sorted(unknown_failed_validations - planned_failed_validations):
             errors.append(
