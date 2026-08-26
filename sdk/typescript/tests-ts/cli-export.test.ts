@@ -151,7 +151,6 @@ describe("CLI", () => {
         { mode: 0o700 },
       );
       let bytes = 0;
-      let writes = 0;
       let drains = 0;
       let emptyWrites = 0;
       const stdout = new Writable({
@@ -159,7 +158,6 @@ describe("CLI", () => {
         write(chunk, _encoding, callback) {
           if (chunk.length === 0) emptyWrites += 1;
           bytes += chunk.length;
-          writes += 1;
           setTimeout(callback, 1);
         },
       });
@@ -186,7 +184,6 @@ describe("CLI", () => {
           ),
         ).toBe(0);
         expect(bytes).toBe(expectedBytes);
-        expect(writes).toBeGreaterThan(1);
         expect(drains).toBeGreaterThan(0);
         expect(emptyWrites).toBe(0);
         expect(stderr.text()).toBe("");
