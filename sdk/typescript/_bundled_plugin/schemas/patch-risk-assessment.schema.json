@@ -200,6 +200,7 @@
             "$ref": "#/$defs/stringList",
             "minItems": 1
           },
+          "resolvesBoundaries": { "$ref": "#/$defs/stringList" },
           "applicabilityOutcomes": {
             "type": "object",
             "additionalProperties": {
@@ -224,7 +225,7 @@
     },
     "nonBlankString": {
       "type": "string",
-      "pattern": "\\S"
+      "pattern": "[^\\s\\uFEFF]"
     },
     "identifier": {
       "type": "string",

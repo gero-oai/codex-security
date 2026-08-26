@@ -91,6 +91,7 @@ function gitEnvironment(
   return {
     ...environment,
     GIT_ALLOW_PROTOCOL: "",
+    GIT_NO_REPLACE_OBJECTS: "1",
     GIT_TERMINAL_PROMPT: "0",
     GCM_INTERACTIVE: "never",
     ...overrides,
