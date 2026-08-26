@@ -2392,6 +2392,76 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("reviews beside a stable top-level merge conflict", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-top-level-conflict-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let observed: { paths: string[] } | undefined;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "conflicted.ts"), "baseline\n");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+      git("switch", "-c", "other");
+      await writeFile(join(repository, "conflicted.ts"), "other\n");
+      git("commit", "-am", "Other synthetic change");
+      git("switch", "main");
+      await writeFile(join(repository, "conflicted.ts"), "main\n");
+      git("commit", "-am", "Main synthetic change");
+      const merge = spawnSync("git", ["merge", "--no-edit", "other"], {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(merge.status).not.toBe(0);
+      const indexBefore = git("ls-files", "--stage");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              const lines = output!.appServer!.prompt.split("\n");
+              const marker = lines.findIndex((line) =>
+                line.startsWith("Review scope is exactly"),
+              );
+              observed = JSON.parse(lines[marker + 1]!);
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(observed?.paths).toEqual(["value.ts"]);
+      expect(git("ls-files", "--stage")).toBe(indexBefore);
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
   test("preserves an uninitialized Git submodule in the review snapshot", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-uninitialized-submodule-")),
