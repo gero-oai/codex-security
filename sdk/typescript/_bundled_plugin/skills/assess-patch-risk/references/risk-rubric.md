@@ -12,7 +12,7 @@ Rate each dimension from evidence, not from diff size or test count.
 
 ## Regression likelihood
 
-- `low`: narrow semantics, supported controls preserved, material counterexamples rejected, and directly relevant protection passes.
+- `low`: narrow semantics, supported controls preserved or authoritative retirement evidence establishes that no positive control remains, material counterexamples rejected, and directly relevant protection passes.
 - `moderate`: some coupling, partial protection, or bounded uncertainty remains but no source-visible defect is established.
 - `high`: complex or weakly protected behavior, important untested paths, contract ambiguity, or substantial unresolved coupling.
 - `critical`: evidence already demonstrates a serious regression, bypass, unsupported control break, or failed required safety property.
@@ -33,7 +33,7 @@ Rate each dimension from evidence, not from diff size or test count.
 
 ## Confidence
 
-- `high`: exact patch identity, affected roots and callers, material boundaries, controls, counterexamples, and relevant validation are all evidenced.
+- `high`: exact patch identity, affected roots and callers, material boundaries, counterexamples, and relevant validation are all evidenced, together with supported controls or authoritative retirement evidence that no positive control remains.
 - `moderate`: the main path is traced but a bounded non-decision-critical gap remains.
 - `low`: patch identity, applicability, runtime reachability, contract, or a decision-critical behavior remains uncertain.
 
