@@ -44,6 +44,18 @@ TARGET_REQUIRED_COORDINATE_FIELDS = {
     "directory_snapshot": {"snapshotDigest"},
 }
 DISPOSITIONS = {"reported", "no_issue_found", "rejected", "not_applicable", "needs_follow_up"}
+NON_COVERAGE_TARGET_WARNINGS = {
+    "Directory contents changed while the scan was running; "
+    "results were saved for the original snapshot.",
+    "The scanned Git repository became unavailable while the scan was running; "
+    "results were saved for the original revision.",
+    "Repository HEAD changed while the scan was running; "
+    "results were saved for the original revision.",
+    "Working-tree contents changed while the scan was running; "
+    "results were saved for the original snapshot.",
+    "The scan target became unavailable while the scan was running; "
+    "results were saved for the original revision or snapshot.",
+}
 SARIF_LEVELS = {
     "critical": "error",
     "high": "error",
@@ -1028,7 +1040,15 @@ def _recover_unsealed_coverage(
         and coverage.get("mode") == "deep_repository"
         and coverage["surfaces"]
         and not coverage["deferred"]
-        and not warnings
+        and all(
+            warning in NON_COVERAGE_TARGET_WARNINGS
+            or re.fullmatch(
+                r"Recovered finding [0-9]+: "
+                r"(?:normalized [a-z, ]+|retained stronger duplicate logical finding)\.",
+                warning,
+            )
+            for warning in warnings
+        )
         and not any(
             surface["disposition"] == "needs_follow_up"
             for surface in coverage["surfaces"]
