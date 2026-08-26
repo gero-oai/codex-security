@@ -775,17 +775,28 @@ def validate(value: dict[str, Any]) -> list[str]:
     return semantic_errors(value)
 
 
+def emit_error(error: object) -> None:
+    message = f"{error}\n".encode("utf-8", errors="backslashreplace")
+    stream = getattr(sys.stderr, "buffer", None)
+    if stream is not None:
+        stream.write(message)
+        stream.flush()
+        return
+    sys.stderr.write(message.decode("utf-8"))
+    sys.stderr.flush()
+
+
 def main() -> int:
     args = parse_args()
     try:
         value = read_json_object(args.assessment, label="assessment")
         errors = validate(value)
     except ValueError as error:
-        print(error, file=sys.stderr)
+        emit_error(error)
         return 1
     if errors:
         for error in errors:
-            print(error, file=sys.stderr)
+            emit_error(error)
         return 1
     return 0
 

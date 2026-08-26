@@ -304,6 +304,38 @@ describe("patch risk assessment contract", () => {
     expect(result.stdout).toBe("");
   });
 
+  test("emits UTF-8 validation errors under a legacy console encoding", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.name = "検証";
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "unknown";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which runtime owns this path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: { owned: "merge", unavailable: "hold_for_evidence" },
+      },
+    ];
+
+    const result = await validate(payload, true);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("failed validation '検証'");
+    expect(result.stderr).not.toContain("UnicodeEncodeError");
+  });
+
   test("accepts a strict low-risk auto-merge candidate", async () => {
     const payload = assessment();
     payload.workflowLabel = "auto_merge_candidate";
