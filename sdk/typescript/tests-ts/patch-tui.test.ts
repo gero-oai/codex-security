@@ -4,12 +4,12 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanup, render } from "ink-testing-library";
-import { createElement } from "react";
+import { act, createElement } from "react";
 import type { Finding, SeverityLevel } from "../src/index.js";
 import { PatchTui, type PatchSelection } from "../src/patch-tui.js";
 import { fakeResult } from "./cli-fixtures.js";
 
-afterEach(() => cleanup());
+afterEach(() => reactAct(cleanup));
 
 function findings(severities: readonly SeverityLevel[]): Finding[] {
   const result = fakeResult(severities);
@@ -80,26 +80,34 @@ function findings(severities: readonly SeverityLevel[]): Finding[] {
   return result.findings.findings;
 }
 
-async function settle(): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, 60));
+// A rendered frame can precede Ink's useInput effect. Flush both before the next key.
+async function reactAct<T>(action: () => T): Promise<T> {
+  const environment = globalThis as typeof globalThis & {
+    IS_REACT_ACT_ENVIRONMENT?: boolean;
+  };
+  const previous = environment.IS_REACT_ACT_ENVIRONMENT;
+  environment.IS_REACT_ACT_ENVIRONMENT = true;
+  try {
+    let result!: T;
+    await act(async () => {
+      result = action();
+      // Ink defers a bare Escape key with setImmediate.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    });
+    return result;
+  } finally {
+    if (previous === undefined) delete environment.IS_REACT_ACT_ENVIRONMENT;
+    else environment.IS_REACT_ACT_ENVIRONMENT = previous;
+  }
 }
 
-async function waitFor(assertion: () => void): Promise<void> {
-  const deadline = Date.now() + 5_000;
-  for (;;) {
-    await settle();
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      if (Date.now() >= deadline) throw error;
-    }
-  }
+async function renderTui(element: Parameters<typeof render>[0]) {
+  return await reactAct(() => render(element));
 }
 
 describe("interactive patch finding browser", () => {
   test("shows complete finding details and scrolls through source evidence", async () => {
-    const app = render(
+    const app = await renderTui(
       createElement(PatchTui, {
         repository: "/work/example",
         findings: findings(["high", "medium", "low"]),
@@ -125,11 +133,9 @@ describe("interactive patch finding browser", () => {
     expect(app.lastFrame()).not.toContain('"rationale"');
 
     const frames = [app.lastFrame() ?? ""];
-    app.stdin.write("\t");
-    await settle();
+    await reactAct(() => app.stdin.write("\t"));
     for (let page = 0; page < 12; page += 1) {
-      app.stdin.write("\u001B[6~");
-      await settle();
+      await reactAct(() => app.stdin.write("\u001B[6~"));
       frames.push(app.lastFrame() ?? "");
     }
 
@@ -202,7 +208,7 @@ describe("interactive patch finding browser", () => {
         { path: "../outside.ts", startLine: 1 },
         { path: "src/outside-link.ts", startLine: 1 },
       ];
-      const app = render(
+      const app = await renderTui(
         createElement(PatchTui, {
           repository,
           findings: [finding!],
@@ -213,8 +219,7 @@ describe("interactive patch finding browser", () => {
 
       const frames = [app.lastFrame() ?? ""];
       for (let page = 0; page < 12; page += 1) {
-        app.stdin.write("\u001B[6~");
-        await settle();
+        await reactAct(() => app.stdin.write("\u001B[6~"));
         frames.push(app.lastFrame() ?? "");
       }
       const reviewed = frames.join("\n");
@@ -238,7 +243,7 @@ describe("interactive patch finding browser", () => {
 
   test("combines severity presets with individual finding selection", async () => {
     const selected: (PatchSelection | null)[] = [];
-    const app = render(
+    const app = await renderTui(
       createElement(PatchTui, {
         repository: "/work/example",
         findings: findings(["high", "medium", "low"]),
@@ -247,18 +252,15 @@ describe("interactive patch finding browser", () => {
       }),
     );
 
-    app.stdin.write("2");
-    await settle();
+    await reactAct(() => app.stdin.write("2"));
     expect(app.lastFrame()).toContain("1/3 selected");
     expect(app.lastFrame()).toContain("high and above");
 
-    app.stdin.write("\u001B[B ");
-    await settle();
+    await reactAct(() => app.stdin.write("\u001B[B "));
     expect(app.lastFrame()).toContain("2/3 selected");
     expect(app.lastFrame()).toContain("custom");
 
-    app.stdin.write("\r");
-    await settle();
+    await reactAct(() => app.stdin.write("\r"));
     expect(selected).toEqual([
       { severity: "medium", occurrenceIds: ["occ_1", "occ_2"] },
     ]);
@@ -266,7 +268,7 @@ describe("interactive patch finding browser", () => {
 
   test("edits instructions per finding and only returns selected guidance", async () => {
     const selected: (PatchSelection | null)[] = [];
-    const app = render(
+    const app = await renderTui(
       createElement(PatchTui, {
         repository: "/work/example",
         findings: findings(["high", "medium"]),
@@ -275,44 +277,38 @@ describe("interactive patch finding browser", () => {
       }),
     );
 
-    app.stdin.write("i");
-    await waitFor(() => expect(app.lastFrame()).toContain("Enter save"));
+    await reactAct(() => app.stdin.write("i"));
+    expect(app.lastFrame()).toContain("Enter save");
 
-    app.stdin.write("Use the shared 2FA helper, not a new dependency.");
-    await waitFor(() =>
-      expect(app.lastFrame()).toContain("Use the shared 2FA helper"),
+    await reactAct(() =>
+      app.stdin.write("Use the shared 2FA helper, not a new dependency."),
     );
+    expect(app.lastFrame()).toContain("Use the shared 2FA helper");
     expect(app.lastFrame()).toContain("2/2 selected");
 
-    app.stdin.write("\r");
-    await waitFor(() => {
-      expect(app.lastFrame()).toContain("i edit");
-      expect(app.lastFrame()).not.toContain("Enter save");
-    });
+    await reactAct(() => app.stdin.write("\r"));
+    expect(app.lastFrame()).toContain("i edit");
+    expect(app.lastFrame()).not.toContain("Enter save");
     expect(app.lastFrame()).toContain("PATCH INSTRUCTIONS");
     expect(app.lastFrame()).toContain("Use the shared 2FA helper");
     expect(app.lastFrame()).toContain("✎");
     expect(app.lastFrame()?.match(/PATCH INSTRUCTIONS/gu)).toHaveLength(1);
 
-    app.stdin.write("\u001B[B");
-    await waitFor(() => expect(app.lastFrame()).toContain("› [✓] MEDIUM"));
-    app.stdin.write("i");
-    await waitFor(() => expect(app.lastFrame()).toContain("Enter save"));
-    app.stdin.write("Keep the existing middleware.");
-    await waitFor(() =>
-      expect(app.lastFrame()).toContain("Keep the existing middleware."),
-    );
-    app.stdin.write("\r");
-    await waitFor(() => {
-      expect(app.lastFrame()).toContain("i edit");
-      expect(app.lastFrame()).not.toContain("Enter save");
-    });
+    await reactAct(() => app.stdin.write("\u001B[B"));
+    expect(app.lastFrame()).toContain("› [✓] MEDIUM");
+    await reactAct(() => app.stdin.write("i"));
+    expect(app.lastFrame()).toContain("Enter save");
+    await reactAct(() => app.stdin.write("Keep the existing middleware."));
+    expect(app.lastFrame()).toContain("Keep the existing middleware.");
+    await reactAct(() => app.stdin.write("\r"));
+    expect(app.lastFrame()).toContain("i edit");
+    expect(app.lastFrame()).not.toContain("Enter save");
     expect(app.lastFrame()).toContain("Keep the existing middleware.");
 
-    app.stdin.write(" ");
-    await waitFor(() => expect(app.lastFrame()).toContain("1/2 selected"));
-    app.stdin.write("\r");
-    await waitFor(() => expect(selected).toHaveLength(1));
+    await reactAct(() => app.stdin.write(" "));
+    expect(app.lastFrame()).toContain("1/2 selected");
+    await reactAct(() => app.stdin.write("\r"));
+    expect(selected).toHaveLength(1);
 
     expect(selected).toEqual([
       {
@@ -327,7 +323,7 @@ describe("interactive patch finding browser", () => {
 
   test("optionally creates a draft pull request after selected patches", async () => {
     const selected: (PatchSelection | null)[] = [];
-    const app = render(
+    const app = await renderTui(
       createElement(PatchTui, {
         repository: "/work/example",
         findings: findings(["high"]),
@@ -339,13 +335,11 @@ describe("interactive patch finding browser", () => {
     expect(app.lastFrame()).toContain(
       "[ ] Create draft GitHub pull request after patching",
     );
-    app.stdin.write("r");
-    await settle();
+    await reactAct(() => app.stdin.write("r"));
     expect(app.lastFrame()).toContain(
       "[✓] Create draft GitHub pull request after patching",
     );
-    app.stdin.write("\r");
-    await settle();
+    await reactAct(() => app.stdin.write("\r"));
 
     expect(selected).toEqual([
       {
@@ -358,7 +352,7 @@ describe("interactive patch finding browser", () => {
 
   test("cancels and clears finding instructions without leaving the browser", async () => {
     const selected: (PatchSelection | null)[] = [];
-    const app = render(
+    const app = await renderTui(
       createElement(PatchTui, {
         repository: "/work/example",
         findings: findings(["high"]),
@@ -367,34 +361,28 @@ describe("interactive patch finding browser", () => {
       }),
     );
 
-    app.stdin.write("i");
-    await waitFor(() => expect(app.lastFrame()).toContain("Enter save"));
-    app.stdin.write("Discard this guidance.");
-    await waitFor(() =>
-      expect(app.lastFrame()).toContain("Discard this guidance."),
-    );
-    app.stdin.write("\u001B");
-    await waitFor(() => {
-      expect(app.lastFrame()).toContain("i edit");
-      expect(app.lastFrame()).not.toContain("Enter save");
-    });
+    await reactAct(() => app.stdin.write("i"));
+    expect(app.lastFrame()).toContain("Enter save");
+    await reactAct(() => app.stdin.write("Discard this guidance."));
+    expect(app.lastFrame()).toContain("Discard this guidance.");
+    await reactAct(() => app.stdin.write("\u001B"));
+    expect(app.lastFrame()).toContain("i edit");
+    expect(app.lastFrame()).not.toContain("Enter save");
     expect(selected).toEqual([]);
     expect(app.lastFrame()).not.toContain("Discard this guidance.");
 
-    app.stdin.write("i");
-    await waitFor(() => expect(app.lastFrame()).toContain("Enter save"));
+    await reactAct(() => app.stdin.write("i"));
+    expect(app.lastFrame()).toContain("Enter save");
     const emptyDraftFrame = app.lastFrame();
-    app.stdin.write("x");
-    await waitFor(() => expect(app.lastFrame()).not.toBe(emptyDraftFrame));
-    app.stdin.write("\u007F");
-    await waitFor(() => expect(app.lastFrame()).toBe(emptyDraftFrame));
-    app.stdin.write("\r");
-    await waitFor(() => {
-      expect(app.lastFrame()).toContain("i edit");
-      expect(app.lastFrame()).not.toContain("Enter save");
-    });
-    app.stdin.write("\r");
-    await waitFor(() => expect(selected).toHaveLength(1));
+    await reactAct(() => app.stdin.write("x"));
+    expect(app.lastFrame()).not.toBe(emptyDraftFrame);
+    await reactAct(() => app.stdin.write("\u007F"));
+    expect(app.lastFrame()).toBe(emptyDraftFrame);
+    await reactAct(() => app.stdin.write("\r"));
+    expect(app.lastFrame()).toContain("i edit");
+    expect(app.lastFrame()).not.toContain("Enter save");
+    await reactAct(() => app.stdin.write("\r"));
+    expect(selected).toHaveLength(1);
 
     expect(selected).toEqual([{ severity: "high", occurrenceIds: ["occ_1"] }]);
   });
@@ -402,7 +390,7 @@ describe("interactive patch finding browser", () => {
   test("allows selecting none and canceling without patching", async () => {
     for (const input of ["q", "\r"]) {
       const selected: (PatchSelection | null)[] = [];
-      const app = render(
+      const app = await renderTui(
         createElement(PatchTui, {
           repository: "/work/example",
           findings: findings(["high"]),
@@ -411,22 +399,20 @@ describe("interactive patch finding browser", () => {
         }),
       );
       if (input === "\r") {
-        app.stdin.write("n");
-        await settle();
+        await reactAct(() => app.stdin.write("n"));
         expect(app.lastFrame()).toContain("0/1 selected");
       }
-      app.stdin.write(input);
-      await settle();
+      await reactAct(() => app.stdin.write(input));
       expect(selected).toEqual([null]);
-      app.unmount();
+      await reactAct(app.unmount);
     }
   });
 
-  test("sanitizes terminal escapes and credential-bearing finding details", () => {
+  test("sanitizes terminal escapes and credential-bearing finding details", async () => {
     const [finding] = findings(["high"]);
     finding!.title = "\u001B[31mUnsafe title\u001B[0m\nforged line";
     finding!.summary = "sk-proj-SYNTHETIC_KEY_123";
-    const app = render(
+    const app = await renderTui(
       createElement(PatchTui, {
         repository: "/work/example",
         findings: [finding!],
@@ -444,13 +430,13 @@ describe("interactive patch finding browser", () => {
   test("keeps finding details restrained while honoring NO_COLOR", () => {
     const source = [
       'import {render} from "ink-testing-library";',
-      'import {createElement} from "react";',
+      'import {act,createElement} from "react";globalThis.IS_REACT_ACT_ENVIRONMENT=true;',
       `import {PatchTui} from ${JSON.stringify(new URL("../src/patch-tui.tsx", import.meta.url).href)};`,
       `const findings=${JSON.stringify(findings(["critical", "high", "medium", "low"]))};`,
-      'const app=render(createElement(PatchTui,{repository:"/work/example",findings,onComplete(){}}));',
-      'const frames=[app.lastFrame() ?? ""];app.stdin.write("\\t");',
-      'for(let page=0;page<12;page+=1){app.stdin.write("\\u001B[6~");await new Promise(resolve=>setTimeout(resolve,30));frames.push(app.lastFrame()??"");}',
-      'process.stdout.write(frames.join("\\n"));app.unmount();',
+      'let app;await act(async()=>{app=render(createElement(PatchTui,{repository:"/work/example",findings,onComplete(){}}));});',
+      'const frames=[app.lastFrame() ?? ""];await act(async()=>{app.stdin.write("\\t");await new Promise(resolve=>setImmediate(resolve));});',
+      'for(let page=0;page<12;page+=1){await act(async()=>{app.stdin.write("\\u001B[6~");await new Promise(resolve=>setImmediate(resolve));});frames.push(app.lastFrame()??"");}',
+      'process.stdout.write(frames.join("\\n"));await act(async()=>{app.unmount();});',
     ].join("");
     const run = (color: boolean) =>
       spawnSync(process.execPath, ["--eval", source], {
