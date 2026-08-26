@@ -6729,18 +6729,13 @@ async function writePatchReviewBlob(
   return object;
 }
 
-async function sealPatchReviewIndexObjects(
+async function sealPatchReviewObjects(
   repository: string,
-  entries: Buffer,
+  objects: ReadonlySet<string>,
   objectDirectory: string,
   objectFormat: "sha1" | "sha256",
   signal?: AbortSignal,
 ): Promise<void> {
-  const objects = new Set(
-    [...parseRawPatchReviewIndexEntries(entries).values()]
-      .filter(({ mode }) => mode !== "160000")
-      .map(({ object }) => object),
-  );
   if (objects.size === 0) return;
   const objectList = [...objects];
   const output = await runPatchReviewGitBytes(
@@ -6799,6 +6794,59 @@ async function sealPatchReviewIndexObjects(
       "The patch review baseline contains an unreadable Git object.",
     );
   }
+}
+
+async function sealPatchReviewIndexObjects(
+  repository: string,
+  entries: Buffer,
+  objectDirectory: string,
+  objectFormat: "sha1" | "sha256",
+  signal?: AbortSignal,
+): Promise<void> {
+  await sealPatchReviewObjects(
+    repository,
+    new Set(
+      [...parseRawPatchReviewIndexEntries(entries).values()]
+        .filter(({ mode }) => mode !== "160000")
+        .map(({ object }) => object),
+    ),
+    objectDirectory,
+    objectFormat,
+    signal,
+  );
+}
+
+async function sealPatchReviewTreeObjects(
+  repository: string,
+  entries: Buffer,
+  objectDirectory: string,
+  objectFormat: "sha1" | "sha256",
+  signal?: AbortSignal,
+): Promise<void> {
+  const objects = new Set<string>();
+  for (const record of splitNulRecords(entries)) {
+    const separator = record.indexOf(0x09);
+    const metadata =
+      separator < 0
+        ? undefined
+        : record.subarray(0, separator).toString("ascii");
+    const match = /^([0-7]{6}) (blob|commit) ([0-9a-f]+)$/u.exec(
+      metadata ?? "",
+    );
+    if (match === null || separator < 0) {
+      throw new CodexSecurityError(
+        "The selected repository contains an unreadable Git tree entry.",
+      );
+    }
+    if (match[2] === "blob") objects.add(match[3]!);
+  }
+  await sealPatchReviewObjects(
+    repository,
+    objects,
+    objectDirectory,
+    objectFormat,
+    signal,
+  );
 }
 
 async function nestedPatchReviewRepository(
@@ -8492,6 +8540,13 @@ async function snapshotPatchReviewWorktree(
             { signal },
           );
     const headEntries = parsePatchReviewTreeEntries(headTreeListing);
+    await sealPatchReviewTreeObjects(
+      repository,
+      headTreeListing,
+      objectDirectory,
+      objectFormat,
+      signal,
+    );
     await runPatchReviewGit(repository, ["read-tree", "--empty"], {
       environment: publicationEnvironment,
       signal,
@@ -9653,7 +9708,10 @@ async function runFindingPatches(
       ? snapshotPatchReviewWorktree
       : undefined);
   const patchRiskSnapshot =
-    options.assessPatchRisk === true && selected.findings.length > 1
+    selected.findings.length > 1 &&
+    (options.reviewMinimality === true ||
+      options.reviewStyle === true ||
+      options.assessPatchRisk === true)
       ? await snapshotCumulativePatchReviewWorktree?.(
           selected.repository,
           options.signal,
@@ -9701,6 +9759,9 @@ async function runFindingPatchesWithRiskSnapshot(
   const reviewPublicationEntries = new Map<string, PatchReviewTreeEntry>();
   let reviewPublicationCandidate: PatchReviewPublicationCandidate | undefined;
   let reviewCumulativeCandidate: PatchReviewCumulativeCandidate | undefined;
+  let finalReviewCumulativeCandidate:
+    | PatchReviewCumulativeCandidate
+    | undefined;
   let reviewBaseCommit: string | null | undefined;
   for (const finding of selected.findings) {
     const interruptedBeforeFinding = interruptedPatchExitCode(options.signal);
@@ -9719,6 +9780,7 @@ async function runFindingPatchesWithRiskSnapshot(
       ...acceptedPatchRiskInstructions,
       ...(instruction?.trim() ? { [finding.occurrenceId]: instruction } : {}),
     };
+    let findingReviewCandidate: PatchReviewCandidateDelta | undefined;
     let status: number;
     try {
       status = await runSkill(
@@ -9756,6 +9818,7 @@ async function runFindingPatchesWithRiskSnapshot(
             reviewRepository = repository;
           },
           onReviewCandidate: (candidate) => {
+            findingReviewCandidate = candidate;
             if (candidate.publicationBaseCommit !== undefined) {
               if (
                 reviewBaseCommit !== undefined &&
@@ -9890,6 +9953,96 @@ async function runFindingPatchesWithRiskSnapshot(
       acceptedPatchRiskFindings.push(finding);
       if (instruction?.trim()) {
         acceptedPatchRiskInstructions[finding.occurrenceId] = instruction;
+      }
+      if (
+        patchRiskSnapshot !== undefined &&
+        (options.reviewMinimality === true || options.reviewStyle === true)
+      ) {
+        if (
+          findingReviewCandidate === undefined ||
+          patchRiskSnapshot.cumulativeCandidate === undefined
+        ) {
+          throw new CodexSecurityError(
+            "The complete reviewed patch could not be composed for final review.",
+          );
+        }
+        finalReviewCumulativeCandidate =
+          await patchRiskSnapshot.cumulativeCandidate(
+            findingReviewCandidate,
+            finalReviewCumulativeCandidate,
+          );
+      }
+    }
+  }
+  const finalReviewStages: PatchReviewStage[] = [
+    ...(options.reviewMinimality === true ? ["minimality" as const] : []),
+    ...(options.reviewStyle === true ? ["local-coding-style" as const] : []),
+  ];
+  const finalReviewedFindings = selected.findings.filter(({ occurrenceId }) =>
+    patches.some(
+      (patch) =>
+        patch.occurrenceId === occurrenceId && patch.status === "verified",
+    ),
+  );
+  if (
+    finalReviewedFindings.length > 1 &&
+    finalReviewStages.length > 0 &&
+    patchRiskSnapshot !== undefined &&
+    finalReviewCumulativeCandidate !== undefined
+  ) {
+    const finalReviewOptions: SkillRunOptions = {
+      ...options,
+      directory: selected.repository,
+      findings: finalReviewedFindings,
+      findingInstructions: acceptedPatchRiskInstructions,
+    };
+    const finalReviewRun: SkillStageRunner = (
+      output,
+      configuration = finalReviewOptions,
+    ) =>
+      runSkillStage(
+        "fix-finding",
+        finalReviewedFindings,
+        codexOverrides,
+        effort,
+        output,
+        stderr,
+        dependencies,
+        configuration,
+      );
+    const finalReviewContext: PatchReviewWorkflowContext = {
+      run: finalReviewRun,
+      options: finalReviewOptions,
+      stderr,
+      snapshot: patchRiskSnapshot,
+      candidate: finalReviewCumulativeCandidate,
+      environment: dependencies.environment,
+      validatePatchRiskAssessment:
+        dependencies.validatePatchRiskAssessment ?? validatePatchRiskAssessment,
+    };
+    let finalReviewFailure: string | undefined;
+    for (const stage of finalReviewStages) {
+      const review = await runIndependentPatchReview(stage, finalReviewContext);
+      if (
+        review.status === "failed" &&
+        isInterruptedPatchReview(review.exitCode)
+      ) {
+        return { patches, interruptedExitCode: review.exitCode };
+      }
+      if (review.status === "failed" || review.verdict.status !== "approved") {
+        finalReviewFailure = `Final combined ${stage} review did not approve the cumulative patch.`;
+        break;
+      }
+    }
+    if (finalReviewFailure !== undefined) {
+      for (const [index, patch] of patches.entries()) {
+        if (patch.status !== "verified") continue;
+        patches[index] = {
+          occurrenceId: patch.occurrenceId,
+          status: "failed",
+          files: patch.files,
+          reason: finalReviewFailure,
+        };
       }
     }
   }

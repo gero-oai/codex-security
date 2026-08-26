@@ -171,7 +171,6 @@ function dependencies(
         repository: directory,
         tree: "synthetic-cumulative-baseline-tree",
         objectDirectory: resolve(directory, ".git", "objects"),
-        alternateObjectDirectory: resolve(directory, ".git", "objects"),
         runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
         gitExecutable: GIT_EXECUTABLE,
       },
@@ -1179,6 +1178,40 @@ describe("scan and patch workflow", () => {
       {
         result,
         onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          {
+            paths: ["src/finding-1.ts"],
+            diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n+first\n",
+          },
+          {
+            paths: ["src/finding-1.ts"],
+            diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n+first\n",
+          },
+          {
+            paths: ["src/finding-2.ts"],
+            diff: "diff --git a/src/finding-2.ts b/src/finding-2.ts\n+second\n",
+          },
+          {
+            paths: ["src/finding-2.ts"],
+            diff: "diff --git a/src/finding-2.ts b/src/finding-2.ts\n+second\n",
+          },
+        ],
+        cumulativePatchReviewDeltas: [
+          {
+            paths: ["src/finding-1.ts", "src/finding-2.ts"],
+            diff: "synthetic cumulative patch",
+          },
+        ],
+        cumulativePatchReviewComposedDeltas: [
+          {
+            paths: ["src/finding-1.ts"],
+            diff: "synthetic first patch",
+          },
+          {
+            paths: ["src/finding-1.ts", "src/finding-2.ts"],
+            diff: "synthetic cumulative patch",
+          },
+        ],
         onCodex: (args, output) => {
           const server = output!.appServer!;
           if (output!.command === "verify-fix") {
@@ -1225,6 +1258,7 @@ describe("scan and patch workflow", () => {
       "review",
       "author",
       "review",
+      "review",
       "combined-verification",
     ]);
     expect(JSON.parse(outcome.stdout)).toMatchObject({
@@ -1236,6 +1270,91 @@ describe("scan and patch workflow", () => {
             "Final combined verification found that a later patch reintroduced this finding.",
         },
         { occurrenceId: "occ_2", status: "verified" },
+      ],
+    });
+  });
+
+  test("reviews the final cumulative patch before combined verification", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const first = {
+      paths: ["src/finding-1.ts"],
+      diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n+first\n",
+      base: "a".repeat(40),
+      head: "b".repeat(40),
+    };
+    const second = {
+      paths: ["src/finding-2.ts"],
+      diff: "diff --git a/src/finding-2.ts b/src/finding-2.ts\n+second\n",
+      base: "b".repeat(40),
+      head: "c".repeat(40),
+    };
+    const combined = {
+      paths: ["src/finding-1.ts", "src/finding-2.ts"],
+      diff: `${first.diff}${second.diff}`,
+      base: "a".repeat(40),
+      head: "c".repeat(40),
+    };
+    const stages: string[] = [];
+    let reviews = 0;
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--review-minimality", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [first, first, second, second],
+        cumulativePatchReviewDeltas: [combined],
+        cumulativePatchReviewComposedDeltas: [first, combined],
+        onCodex: (args, output) => {
+          const server = output!.appServer!;
+          if (server.sandbox === "read-only") {
+            reviews += 1;
+            if (reviews === 3) {
+              stages.push("combined-review");
+              expect(server.prompt).toContain("src/finding-1.ts");
+              expect(server.prompt).toContain("src/finding-2.ts");
+              output!.stdout.write(
+                JSON.stringify({
+                  status: "revise",
+                  findings: ["The combined synthetic patch is not minimal."],
+                }),
+              );
+            } else {
+              stages.push("review");
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            }
+          } else {
+            stages.push("author");
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(2);
+    expect(stages).toEqual([
+      "author",
+      "review",
+      "author",
+      "review",
+      "combined-review",
+    ]);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      patches: [
+        {
+          occurrenceId: "occ_1",
+          status: "failed",
+          reason:
+            "Final combined minimality review did not approve the cumulative patch.",
+        },
+        {
+          occurrenceId: "occ_2",
+          status: "failed",
+          reason:
+            "Final combined minimality review did not approve the cumulative patch.",
+        },
       ],
     });
   });
