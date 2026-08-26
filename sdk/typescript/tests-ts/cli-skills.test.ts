@@ -741,6 +741,11 @@ describe("CLI skill commands", () => {
           "SYNTHETIC-BULLETED-CREDENTIAL",
           "1. API key:",
           "SYNTHETIC-NUMBERED-CREDENTIAL",
+          "API key:",
+          "```text",
+          "SYNTHETIC-FENCED-CREDENTIAL",
+          "SYNTHETIC-FENCED-CREDENTIAL-CONTINUED",
+          "```",
           "",
           "-----BEGIN PRIVATE KEY-----",
           "SYNTHETIC-MULTILINE-KEY-BODY",
@@ -784,6 +789,7 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-BULLETED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-NUMBERED-CREDENTIAL");
+    expect(stderr.text()).not.toContain("SYNTHETIC-FENCED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-AUTHORIZATION");
     expect(stderr.text()).not.toContain("-----END PRIVATE KEY-----");
   });

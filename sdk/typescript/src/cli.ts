@@ -5438,7 +5438,8 @@ const PRIVATE_KEY_BLOCK_START =
   /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PRIVATE_KEY_BLOCK_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PATCH_REPORT_EMPTY_SENSITIVE_FIELD =
-  /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:(?:api|access|private)[ _-]?key|authorization|auth|token|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
+  /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:(?:api|access|private)[ _-]?key|authorization|auth|token(?:[ _-]?handling)?|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
+const PATCH_REPORT_MARKDOWN_FENCE = /^\s*(?<fence>`{3,}|~{3,}).*$/u;
 
 function safePatchBoundaryClassification(value: string): string | undefined {
   const classification = PATCH_REPORT_BOUNDARY_CLASSIFICATION.exec(value);
@@ -5451,6 +5452,7 @@ function safePatchReport(value: string): string {
   const lines: string[] = [];
   let insidePrivateKey = false;
   let redactCredentialContinuation = false;
+  let credentialFence: "`" | "~" | undefined;
   let boundaryContinuationPrefix: string | undefined;
   for (const line of value.split(/\r?\n/u)) {
     if (insidePrivateKey) {
@@ -5461,9 +5463,29 @@ function safePatchReport(value: string): string {
       lines.push("[redacted]");
       insidePrivateKey = !PRIVATE_KEY_BLOCK_END.test(line);
       redactCredentialContinuation = false;
+      credentialFence = undefined;
       continue;
     }
     if (redactCredentialContinuation) {
+      const fence = PATCH_REPORT_MARKDOWN_FENCE.exec(line)?.groups?.["fence"];
+      if (fence !== undefined) {
+        const marker = fence[0] as "`" | "~";
+        if (credentialFence === undefined) {
+          credentialFence = marker;
+          lines.push("[redacted]");
+          continue;
+        }
+        if (credentialFence === marker) {
+          credentialFence = undefined;
+          redactCredentialContinuation = false;
+          boundaryContinuationPrefix = undefined;
+          continue;
+        }
+      }
+      if (credentialFence !== undefined) {
+        lines.push(line.trim().length === 0 ? "" : "[redacted]");
+        continue;
+      }
       if (line.trim().length === 0) {
         lines.push("");
         redactCredentialContinuation = false;
@@ -5496,10 +5518,11 @@ function safePatchReport(value: string): string {
         boundary.groups["prefix"] !== undefined &&
         boundary.groups["label"] !== undefined &&
         boundary.groups["separator"] !== undefined
-          ? `${boundary.groups["prefix"]}${boundary.groups["label"]}${boundary.groups["separator"]}`
+          ? `${boundary.groups["prefix"]}${boundary.groups["label"]}${boundary.groups["separator"].trimEnd()} `
           : undefined;
       if (boundaryContinuationPrefix === undefined) lines.push("[redacted]");
       redactCredentialContinuation = true;
+      credentialFence = undefined;
       continue;
     }
     const boundary = PATCH_REPORT_BOUNDARY_LINE.exec(line);
@@ -6518,6 +6541,7 @@ async function snapshotPatchReviewWorktree(
     { repository: NestedPatchReviewRepository; state: string }
   >();
   const baselineIgnoredPathStates = new Map<string, string>();
+  const baselineUninitializedGitlinkStates = new Map<string, string>();
   const baselineUnrepresentedFileModes = new Map<string, bigint>();
   const baselineUnrepresentedDirectoryModes = new Map<string, bigint>();
   let capturingBaseline = true;
@@ -6543,6 +6567,7 @@ async function snapshotPatchReviewWorktree(
       "hooks",
       "info/attributes",
       "info/exclude",
+      "info/sparse-checkout",
       "objects/info/alternates",
       "packed-refs",
       "refs",
@@ -6710,37 +6735,48 @@ async function snapshotPatchReviewWorktree(
     if (!capturingBaseline) {
       await assertNestedRepositoriesUnchanged(currentNestedRepositoryStates);
     }
-    const [sparseEntries, listed, currentIgnored] = await Promise.all([
-      runPatchReviewGitBytes(repository, ["ls-files", "-v", "-z", "--", "."], {
-        signal,
-      }),
-      runPatchReviewGitBytes(
-        repository,
-        [
-          "ls-files",
-          "--cached",
-          "--others",
-          "--exclude-standard",
-          "-z",
-          "--",
-          ".",
-        ],
-        { environment, signal },
-      ),
-      runPatchReviewGitBytes(
-        repository,
-        [
-          "ls-files",
-          "--others",
-          "--ignored",
-          "--exclude-standard",
-          "-z",
-          "--",
-          ".",
-        ],
-        { environment, signal },
-      ),
-    ]);
+    const [sparseEntries, listed, currentIgnored, rawIndexEntries] =
+      await Promise.all([
+        runPatchReviewGitBytes(
+          repository,
+          ["ls-files", "-v", "-z", "--", "."],
+          {
+            signal,
+          },
+        ),
+        runPatchReviewGitBytes(
+          repository,
+          [
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+          ],
+          { environment, signal },
+        ),
+        runPatchReviewGitBytes(
+          repository,
+          [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+          ],
+          { environment, signal },
+        ),
+        runPatchReviewGitBytes(
+          repository,
+          ["ls-files", "--stage", "-z", "--", "."],
+          { environment, signal },
+        ),
+      ]);
+    const currentEntries = parseRawPatchReviewIndexEntries(rawIndexEntries);
     const skipWorktreePaths = new Set(
       splitNulRecords(sparseEntries)
         .filter(
@@ -6956,6 +6992,20 @@ async function snapshotPatchReviewWorktree(
         }
         continue;
       }
+      if (currentEntries.get(key)?.mode === "160000") {
+        const digest = createHash("sha256");
+        await hashNestedPatchReviewPath(repository, pathBytes, digest, signal);
+        const state = digest.digest("hex");
+        const baseline = baselineUninitializedGitlinkStates.get(key);
+        if (capturingBaseline && baseline === undefined) {
+          baselineUninitializedGitlinkStates.set(key, state);
+        } else if (baseline !== state) {
+          throw new CodexSecurityError(
+            "An uninitialized Git submodule changed after patch review started. Review it as a separate patch target.",
+          );
+        }
+        continue;
+      }
       if (ignoredAtBaseline && !ignoredInstructionAtBaseline) {
         continue;
       }
@@ -6987,13 +7037,6 @@ async function snapshotPatchReviewWorktree(
       }
     }
     if (included.length > 0) {
-      const currentEntries = parseRawPatchReviewIndexEntries(
-        await runPatchReviewGitBytes(
-          repository,
-          ["ls-files", "--stage", "-z", "--", "."],
-          { environment, signal },
-        ),
-      );
       const indexInfo: Buffer[] = [];
       for (const path of included) {
         signal?.throwIfAborted();

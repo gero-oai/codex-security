@@ -82,3 +82,4 @@ Otherwise use `human_review_required` for a supported `merge`. Strong tests can 
 The validator enforces this gate and the recommendation-to-label mapping. A validation failure means the evidence packet is internally inconsistent; it is not permission to weaken a rating or omit evidence.
 
 Applicability is a decision pivot. If runtime reachability or ownership is unknown, use `hold_for_evidence`, preserve any established defect evidence on that hold, and do not issue a terminal `revise` or `block` verdict until applicability is established. A `revise` verdict also requires affirmative correction evidence: critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure.
+A `block` verdict requires critical regression likelihood; an ordinary contradicted contract or documentation boundary routes to `revise`.
