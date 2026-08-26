@@ -1417,6 +1417,7 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
           ? { GIT_INDEX_FILE: options.gitIndexFile }
           : {}),
       },
+      maxBuffer: Number.POSITIVE_INFINITY,
       windowsHide: true,
     });
     return stdout.trim();
@@ -5544,6 +5545,11 @@ function patchReviewGitPathKey(path: Buffer): string {
   return path.toString("base64");
 }
 
+function isPatchReviewInstructionPath(path: Buffer): boolean {
+  const separator = path.lastIndexOf(0x2f);
+  return path.subarray(separator + 1).equals(Buffer.from("AGENTS.md"));
+}
+
 function patchReviewFilesystemPath(
   repository: string,
   path: Buffer,
@@ -5927,8 +5933,13 @@ async function snapshotPatchReviewWorktree(
     ],
     { signal },
   );
-  const ignoredPathSet = new Set(
-    splitNulRecords(ignored).map(patchReviewGitPathKey),
+  const ignoredPaths = splitNulRecords(ignored);
+  const ignoredInstructionPaths = ignoredPaths.filter(
+    isPatchReviewInstructionPath,
+  );
+  const ignoredPathSet = new Set(ignoredPaths.map(patchReviewGitPathKey));
+  const ignoredInstructionPathSet = new Set(
+    ignoredInstructionPaths.map(patchReviewGitPathKey),
   );
   const temporaryDirectory = await mkdtemp(
     join(temporaryRoot, "codex-security-patch-review-"),
@@ -6016,12 +6027,14 @@ async function snapshotPatchReviewWorktree(
       ],
       { environment, signal },
     );
-    const paths = splitNulRecords(listed);
+    const paths = [...splitNulRecords(listed), ...ignoredInstructionPaths];
     const included: Buffer[] = [];
     const removed: Buffer[] = [];
     for (const pathBytes of paths) {
       const key = patchReviewGitPathKey(pathBytes);
-      if (ignoredPathSet.has(key)) continue;
+      if (ignoredPathSet.has(key) && !ignoredInstructionPathSet.has(key)) {
+        continue;
+      }
       const path = decodePatchReviewGitPath(pathBytes);
       const nested =
         path === undefined
@@ -6083,6 +6096,7 @@ async function snapshotPatchReviewWorktree(
         repository,
         [
           "add",
+          "--force",
           "--all",
           "--sparse",
           `--pathspec-from-file=${pathspecFile}`,
