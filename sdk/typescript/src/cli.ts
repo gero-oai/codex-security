@@ -5440,19 +5440,45 @@ const PRIVATE_KEY_BLOCK_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PATCH_REPORT_EMPTY_SENSITIVE_FIELD =
   /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:(?:api|access|private)[ _-]?key|authorization|auth|token(?:[ _-]?handling)?|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
 const PATCH_REPORT_MARKDOWN_FENCE = /^\s*(?<fence>`{3,}|~{3,}).*$/u;
+const PATCH_REPORT_MARKDOWN_FENCE_CLOSE = /^\s*(?<fence>`{3,}|~{3,})\s*$/u;
+const PATCH_REPORT_ENCODED_TOKEN = /[A-Za-z0-9+/]{12,}={0,2}/gu;
+
+function containsEncodedPatchCredential(value: string): boolean {
+  for (const match of value.matchAll(PATCH_REPORT_ENCODED_TOKEN)) {
+    const candidate = match[0];
+    const characterClasses = [/[a-z]/u, /[A-Z]/u, /[0-9+/]/u].filter(
+      (pattern) => pattern.test(candidate),
+    ).length;
+    if (characterClasses < 2 || candidate.length % 4 !== 0) continue;
+    const normalized = candidate.replace(/=+$/u, "");
+    const decoded = Buffer.from(candidate, "base64");
+    if (
+      decoded.length >= 6 &&
+      decoded.toString("base64").replace(/=+$/u, "") === normalized
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function safePatchBoundaryClassification(value: string): string | undefined {
   const classification = PATCH_REPORT_BOUNDARY_CLASSIFICATION.exec(value);
   if (classification?.groups?.["result"] === undefined) return;
-  const safeDetails = safePatchText(classification.groups["details"] ?? "");
-  return `${classification.groups["result"]}${safeDetails === "[redacted]" ? " [redacted]" : safeDetails}`;
+  const details = classification.groups["details"] ?? "";
+  const safeDetails = safePatchText(details);
+  return `${classification.groups["result"]}${
+    safeDetails === "[redacted]" || containsEncodedPatchCredential(details)
+      ? " [redacted]"
+      : safeDetails
+  }`;
 }
 
 function safePatchReport(value: string): string {
   const lines: string[] = [];
   let insidePrivateKey = false;
   let redactCredentialContinuation = false;
-  let credentialFence: "`" | "~" | undefined;
+  let credentialFence: { marker: "`" | "~"; length: number } | undefined;
   let boundaryContinuationPrefix: string | undefined;
   for (const line of value.split(/\r?\n/u)) {
     if (insidePrivateKey) {
@@ -5468,21 +5494,26 @@ function safePatchReport(value: string): string {
     }
     if (redactCredentialContinuation) {
       const fence = PATCH_REPORT_MARKDOWN_FENCE.exec(line)?.groups?.["fence"];
-      if (fence !== undefined) {
-        const marker = fence[0] as "`" | "~";
-        if (credentialFence === undefined) {
-          credentialFence = marker;
-          lines.push("[redacted]");
-          continue;
-        }
-        if (credentialFence === marker) {
+      if (credentialFence === undefined && fence !== undefined) {
+        credentialFence = {
+          marker: fence[0] as "`" | "~",
+          length: fence.length,
+        };
+        lines.push("[redacted]");
+        continue;
+      }
+      if (credentialFence !== undefined) {
+        const closingFence =
+          PATCH_REPORT_MARKDOWN_FENCE_CLOSE.exec(line)?.groups?.["fence"];
+        if (
+          closingFence?.[0] === credentialFence.marker &&
+          closingFence.length >= credentialFence.length
+        ) {
           credentialFence = undefined;
           redactCredentialContinuation = false;
           boundaryContinuationPrefix = undefined;
           continue;
         }
-      }
-      if (credentialFence !== undefined) {
         lines.push(line.trim().length === 0 ? "" : "[redacted]");
         continue;
       }
