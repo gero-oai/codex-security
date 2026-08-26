@@ -5,10 +5,16 @@ import {
   publishScan,
   type PublishScanOptions,
   type PublishScanResult,
+  planComponents,
+  runComponentScans,
+  type ComponentScanOptions,
+  type Finding,
   type ScanCost,
   type ScanOptions,
   type ScanProgress,
   type ScanResult,
+  type ValidationOptions,
+  type ValidationResult,
 } from "@openai/codex-security";
 
 const options: ScanOptions = {
@@ -48,5 +54,36 @@ export async function previewPublication(
   return result;
 }
 
+interface ImportedFinding {
+  id: string;
+  title: string;
+  location: { file: string; line: number };
+}
+
+export async function validate(
+  repositoryPath: string,
+  finding: Finding | ImportedFinding,
+): Promise<ValidationResult> {
+  await using client = new CodexSecurity();
+  const options: ValidationOptions = {
+    repositoryPath,
+    finding,
+  };
+  return await client.validate(options);
+}
+
 // @ts-expect-error The dependency-injection constructor is internal.
 new CodexSecurity({}, undefined as never, undefined as never);
+
+export async function scanComponents(repository: string, outputDir: string) {
+  const plan = await planComponents(repository);
+  const options: ComponentScanOptions = {
+    repository,
+    outputDir,
+    components: plan.components,
+  };
+  return await runComponentScans(options);
+}
+
+// @ts-expect-error The model client is an internal test dependency.
+planComponents("synthetic-repository", { codex: {} });
