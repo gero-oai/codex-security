@@ -195,8 +195,11 @@ function dependencies(
   return current;
 }
 
-function resultWithFindings(severities: readonly SeverityLevel[]) {
-  const result = fakeResult(severities);
+function resultWithFindings(
+  severities: readonly SeverityLevel[],
+  usage: unknown = null,
+) {
+  const result = fakeResult(severities, "complete", usage);
   result.findings.findings.forEach((finding, index) => {
     Object.assign(finding, {
       findingId: `csf_${index + 1}`,
@@ -3748,6 +3751,64 @@ describe("scan and patch workflow", () => {
   );
 
   test.skipIf(process.platform === "win32")(
+    "fails closed when a reviewed executable changes unrepresented execute bits",
+    async () => {
+      const repository = await realpath(
+        await mkdtemp(join(tmpdir(), "codex-security-executable-mode-")),
+      );
+      const path = join(repository, "value.sh");
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      let reviews = 0;
+      try {
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        await writeFile(path, "#!/bin/sh\nexit 1\n");
+        await chmod(path, 0o744);
+        git("add", "--", "value.sh");
+        git("commit", "-m", "Initial synthetic checkout");
+
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: async (_args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                reviews += 1;
+              } else {
+                await writeFile(path, "#!/bin/sh\nexit 0\n");
+                await chmod(path, 0o755);
+                output!.stdout.write("Verified synthetic patch.");
+              }
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode).toBe(2);
+        expect(reviews).toBe(0);
+        expect(outcome.stderr).toContain(
+          "file permission changed outside Git's reviewed mode",
+        );
+      } finally {
+        await rm(repository, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test.skipIf(process.platform === "win32")(
     "fails closed when a reviewed path ancestor changes permissions",
     async () => {
       const repository = await realpath(
@@ -3877,6 +3938,99 @@ describe("scan and patch workflow", () => {
       }
     },
   );
+
+  test("publishes a reviewed file-to-directory replacement", async () => {
+    const result = resultWithFindings(["high"]);
+    result.findings.findings[0]!.locations[0]!.path = "shape";
+    const baseCommit = "a".repeat(40);
+    const baseObject = "b".repeat(40);
+    const leafObject = "c".repeat(40);
+    const treeObject = "d".repeat(40);
+    const replacement = {
+      paths: ["shape", "shape/value.ts"],
+      diff:
+        "diff --git a/shape b/shape\n" +
+        "diff --git a/shape/value.ts b/shape/value.ts\n",
+      publicationBaseCommit: baseCommit,
+      publicationBaseEntries: [
+        { path: "shape", mode: "100644", object: baseObject },
+      ],
+      publicationEntries: [
+        { path: "shape/value.ts", mode: "100644", object: leafObject },
+      ],
+    };
+    const url = "https://github.example.test/example/repository/pull/22";
+    let pullRequestCreated = false;
+    const outcome = await runWorkflow(
+      [
+        "patch",
+        "--scan",
+        "scan-1",
+        "--review-minimality",
+        "--create-pr",
+        "--json",
+      ],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [replacement, replacement],
+        onCodex: (args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+        onRepositoryCommand: (command, args) => {
+          if (
+            command === "git" &&
+            args[0] === "rev-parse" &&
+            args[1] === "--verify" &&
+            (args[2] === "HEAD" || args[2] === "HEAD^")
+          ) {
+            return baseCommit;
+          }
+          if (command === "git" && args[0] === "ls-files") {
+            return `100644 ${leafObject} 0\tshape/value.ts\0`;
+          }
+          if (command === "git" && args[0] === "write-tree") {
+            return "verified-tree";
+          }
+          if (
+            command === "git" &&
+            args[0] === "rev-parse" &&
+            args[1] === "HEAD^{tree}"
+          ) {
+            return "verified-tree";
+          }
+          if (command === "git" && args[0] === "ls-tree") {
+            const path = args.at(-1)!.replace(":(top,literal)", "");
+            return path === "shape"
+              ? `040000 tree ${treeObject}\tshape\0`
+              : `100644 blob ${leafObject}\tshape/value.ts\0`;
+          }
+          if (command === "git" && args[0] === "rev-parse") {
+            return "verified-commit";
+          }
+          if (command === "gh" && args[1] === "list") return "";
+          if (command === "gh" && args[1] === "create") {
+            pullRequestCreated = true;
+            return url;
+          }
+          return "";
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(pullRequestCreated).toBe(true);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      pullRequest: { url },
+    });
+  });
 
   test("reviews case-only renames using the worktree spelling", async () => {
     const repository = await realpath(
@@ -5344,6 +5498,90 @@ describe("scan and patch workflow", () => {
     expect(invocation).toContain('model_provider="fireworks"');
     expect(invocation).toContain(
       'model_providers.fireworks.env_key="FIREWORKS_API_KEY"',
+    );
+  });
+
+  test("charges patch review turns against the scan cost limit", async () => {
+    const result = resultWithFindings(["high"], {
+      input_tokens: 600,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+    });
+    let turns = 0;
+    const outcome = await runWorkflow(
+      [
+        "scan",
+        "--patch",
+        "--review-minimality",
+        "--max-cost",
+        "0.00375",
+        "--json",
+      ],
+      {
+        result,
+        onCodex: (args, output) => {
+          turns += 1;
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          output!.appServer!.onEvent?.({
+            method: "thread/tokenUsage/updated",
+            params: {
+              tokenUsage: {
+                total: {
+                  totalTokens: 100,
+                  inputTokens: 100,
+                  cachedInputTokens: 0,
+                  outputTokens: 0,
+                  reasoningOutputTokens: 0,
+                },
+              },
+            },
+          });
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(2);
+    expect(turns).toBe(2);
+    expect(outcome.stderr).toContain(
+      "estimated cost $0.004 exceeded the $0.00375 limit",
+    );
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      cost: { estimatedUsd: 0.004 },
+      patches: [],
+    });
+  });
+
+  test("fails closed when patch turn usage is unavailable under a cost limit", async () => {
+    const result = resultWithFindings(["high"], {
+      input_tokens: 600,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+    });
+    const outcome = await runWorkflow(
+      ["scan", "--patch", "--max-cost", "0.004", "--json"],
+      {
+        result,
+        onCodex: (args, output) => {
+          completePatches(args, output);
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(2);
+    expect(outcome.stderr).toContain(
+      "did not report a usage receipt for a patch turn",
     );
   });
 
