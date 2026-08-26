@@ -46,6 +46,19 @@ function dependencies(options: Parameters<typeof fixtureDependencies>[0] = {}) {
       base: "a".repeat(40),
       head: "b".repeat(40),
     }),
+    publicationCandidate: async (candidate, previous) => {
+      if (candidate.base === undefined || candidate.head === undefined) {
+        throw new Error("The synthetic review candidate requires tree IDs.");
+      }
+      const diff = `${previous?.diff ?? ""}${candidate.diff}`;
+      return {
+        paths: [...new Set([...(previous?.paths ?? []), ...candidate.paths])],
+        diff,
+        diffBytes: Buffer.from(diff),
+        base: previous?.base ?? candidate.base,
+        head: candidate.head,
+      };
+    },
     dispose: async () => {},
   });
   current.validatePatchRiskAssessment = async () => true;

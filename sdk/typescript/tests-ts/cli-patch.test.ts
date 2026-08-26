@@ -127,6 +127,19 @@ function dependencies(
           head: selected.head ?? "b".repeat(40),
         };
       },
+      publicationCandidate: async (candidate, previous) => {
+        if (candidate.base === undefined || candidate.head === undefined) {
+          throw new Error("The synthetic review candidate requires tree IDs.");
+        }
+        const diff = `${previous?.diff ?? ""}${candidate.diff}`;
+        return {
+          paths: [...new Set([...(previous?.paths ?? []), ...candidate.paths])],
+          diff,
+          diffBytes: Buffer.from(diff),
+          base: previous?.base ?? candidate.base,
+          head: candidate.head,
+        };
+      },
       dispose: async () => {},
     }));
   current.validatePatchRiskAssessment = async () => true;
@@ -365,6 +378,63 @@ describe("scan and patch workflow", () => {
         "patch-risk-assessment",
       ]);
     }
+  });
+
+  test("assesses cumulative saved-finding patches without publication", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const firstPath = "src/finding-1.ts";
+    const secondPath = "src/finding-2.ts";
+    const assessedPaths: string[][] = [];
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--assess-patch-risk", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [secondPath],
+            diff: `diff --git a/${secondPath} b/${secondPath}\n`,
+          },
+          {
+            paths: [secondPath],
+            diff: `diff --git a/${secondPath} b/${secondPath}\n`,
+          },
+        ],
+        onCodex: (args, output) => {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_2"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
+            const prompt = output!.appServer!.prompt;
+            assessedPaths.push(patchRiskArtifact(prompt).patch.changedFiles);
+            output!.stdout.write(
+              JSON.stringify(approvedPatchRiskVerdict(prompt)),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(assessedPaths).toEqual([[firstPath], [firstPath, secondPath]]);
   });
 
   test("reverifies all accepted findings after the final reviewed patch", async () => {
@@ -4799,7 +4869,8 @@ describe("scan and patch workflow", () => {
                       {
                         id: "occ_1",
                         status: "fixed",
-                        evidence: "The complete synthetic patch preserves the fix.",
+                        evidence:
+                          "The complete synthetic patch preserves the fix.",
                       },
                     ],
                   }),

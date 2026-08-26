@@ -1175,7 +1175,6 @@ interface SkillRunOptions extends PatchReviewOptions {
   reviewRepository?: PatchReviewRepositoryView;
   onReviewRepository?: (repository: string) => void;
   onReviewCandidate?: (candidate: PatchReviewCandidateDelta) => void;
-  publicationRequested?: boolean;
   reviewPublicationCandidate?: PatchReviewPublicationCandidate;
   onReviewPublicationCandidate?: (
     candidate: PatchReviewPublicationCandidate,
@@ -4193,7 +4192,6 @@ export async function main(
                 reviewStyle: options.reviewStyle,
                 assessPatchRisk: options.assessPatchRisk,
                 pythonPath: options.python,
-                publicationRequested: options.createPr,
                 maxReviewRevisions: options.maxReviewRevisions,
               },
             );
@@ -8735,20 +8733,18 @@ async function runIndependentPatchReview(
         reason: "patch-risk-assessment review has no observed candidate delta.",
       };
     }
-    if (context.options.publicationRequested) {
-      if (context.snapshot.publicationCandidate === undefined) {
-        return {
-          status: "failed",
-          exitCode: PATCH_REVIEW_EXIT_CODE.failure,
-          reason:
-            "patch-risk-assessment review cannot project the publication tree.",
-        };
-      }
-      publicationCandidate = await context.snapshot.publicationCandidate(
-        candidate,
-        context.options.reviewPublicationCandidate,
-      );
+    if (context.snapshot.publicationCandidate === undefined) {
+      return {
+        status: "failed",
+        exitCode: PATCH_REVIEW_EXIT_CODE.failure,
+        reason:
+          "patch-risk-assessment review cannot project the cumulative patch tree.",
+      };
     }
+    publicationCandidate = await context.snapshot.publicationCandidate(
+      candidate,
+      context.options.reviewPublicationCandidate,
+    );
     artifact = await createPatchRiskReviewArtifact(
       context.snapshot,
       publicationCandidate ?? candidate,
@@ -10770,9 +10766,6 @@ async function executeScan(
           reviewMinimality: arguments_.reviewMinimality,
           reviewStyle: arguments_.reviewStyle,
           assessPatchRisk: arguments_.assessPatchRisk,
-          publicationRequested: Boolean(
-            arguments_.createPr || patchSelection?.createPullRequest,
-          ),
           maxReviewRevisions: arguments_.maxReviewRevisions,
         },
       );
