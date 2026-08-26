@@ -31,6 +31,8 @@ const PATCH_REVIEW_RUNTIME = join(
   "../src/patch-review-mcp.ts",
 );
 const GIT_EXECUTABLE = Bun.which("git") ?? process.execPath;
+const TEST_PYTHON_EXECUTABLE =
+  Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
 
 function runRepositoryGit(
   repository: string,
@@ -126,6 +128,12 @@ function dependencies(
       dispose: async () => {},
     }));
   current.validatePatchRiskAssessment = async () => true;
+  current.resolvePluginPython = async () => {
+    if (TEST_PYTHON_EXECUTABLE === null) {
+      throw new Error("The patch-risk test fixture requires Python.");
+    }
+    return TEST_PYTHON_EXECUTABLE;
+  };
   return current;
 }
 
