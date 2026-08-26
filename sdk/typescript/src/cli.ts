@@ -985,6 +985,7 @@ const PATCH_REVIEW_POLICY = [
   "3. Make the smallest complete, concise, easy-to-review change; treat broad issue descriptions and remediation suggestions as leads, not a checklist; do not redesign protocols, serialization formats, public interfaces, or architecture when a narrower fix closes the finding.",
   "4. Reuse applicable existing helpers, tests, build targets, and CI infrastructure. Do not add extensive testing infrastructure or move, extract, or export production code solely to improve testability. Keep testability improvements, broader hardening, and redesign suggestions as local notes; do not implement or publish them as part of this patch.",
   "5. Follow the nearest applicable project guidance without expanding the patch for an optional stylistic preference.",
+  "6. Keep changes in the selected Git worktree. Nested Git repositories and submodules are separate patch targets and must not be edited from the parent worktree.",
   "Request a structural change only when an applicable mandatory rule requires it, the current patch introduces a concrete problem, and no smaller compliant correction exists.",
 ].join("\n");
 
@@ -1122,11 +1123,13 @@ interface SkillRunOptions extends PatchReviewOptions {
   reviewFindings?: readonly string[];
   reviewCandidate?: PatchReviewCandidateDelta;
   onReviewRepository?: (repository: string) => void;
+  onReviewCandidate?: (candidate: PatchReviewCandidateDelta) => void;
 }
 
 interface PatchReviewCandidateDelta {
   paths: string[];
   diff: string;
+  publicationUnsafePaths?: string[];
 }
 
 interface PatchReviewWorktreeSnapshot {
@@ -4045,12 +4048,13 @@ export async function main(
                 errorOutput,
                 dependencies,
                 patchRun.reviewRepository,
+                patchRun.reviewUnsafePublicationPaths,
               );
             }
             if (format === "json" || format === "jsonl") {
               return {
                 scanId: selected.scanId,
-                repository: selected.repository,
+                repository: patchRun.reviewRepository ?? selected.repository,
                 patches,
                 ...(pullRequest === undefined ? {} : { pullRequest }),
               };
@@ -5081,6 +5085,7 @@ async function createPatchPullRequest(
   stderr: Writable,
   dependencies: CliDependencies,
   reviewRepository?: string,
+  reviewUnsafePublicationPaths: readonly string[] = [],
 ): Promise<{ branch: string; url: string } | undefined> {
   const repository = reviewRepository ?? selected.repository;
   const files = [
@@ -5101,6 +5106,12 @@ async function createPatchPullRequest(
   if (files.length === 0) {
     stderr.write("No verified patch changes to publish.\n");
     return;
+  }
+  const unsafePublicationPaths = new Set(reviewUnsafePublicationPaths);
+  if (files.some((file) => unsafePublicationPaths.has(file))) {
+    throw new CodexSecurityError(
+      "Reviewed patch files with pre-existing changes cannot be published automatically. Commit or stash those changes and retry.",
+    );
   }
 
   const branch = `codex-security/patch-${selected.scanId.replaceAll(/[^a-z\d._-]/giu, "-")}`;
@@ -5178,13 +5189,14 @@ async function validatePatchReviewPath(
   directory: string,
   path: string,
 ): Promise<void> {
-  const normalized = path.replaceAll("\\", "/");
+  const normalized =
+    process.platform === "win32" ? path.replaceAll("\\", "/") : path;
   if (
     path.length === 0 ||
     /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/u.test(path) ||
     isAbsolute(path) ||
-    win32.isAbsolute(path) ||
-    /^[A-Za-z]:/u.test(path) ||
+    (process.platform === "win32" &&
+      (win32.isAbsolute(path) || /^[A-Za-z]:/u.test(path))) ||
     normalized.split("/").some((part) => part === "..")
   ) {
     throw new CodexSecurityError(
@@ -5292,6 +5304,17 @@ async function snapshotPatchReviewWorktree(
     GIT_INDEX_FILE: join(temporaryDirectory, "index"),
   };
   const stageWorktree = async (): Promise<void> => {
+    const sparseEntries = await runPatchReviewGit(
+      repository,
+      ["ls-files", "-v", "-z", "--", "."],
+      { signal, trim: false },
+    );
+    const skipWorktreePaths = new Set(
+      sparseEntries
+        .split("\0")
+        .filter((entry) => entry.startsWith("S "))
+        .map((entry) => entry.slice(2)),
+    );
     const listed = await runPatchReviewGit(
       repository,
       [
@@ -5307,7 +5330,9 @@ async function snapshotPatchReviewWorktree(
     );
     const paths = listed.split("\0");
     if (paths.at(-1) === "") paths.pop();
-    const included = paths.filter((path) => !ignoredPathSet.has(path));
+    const included = paths.filter(
+      (path) => !ignoredPathSet.has(path) && !skipWorktreePaths.has(path),
+    );
     if (included.length === 0) return;
     await writeFile(
       pathspecFile,
@@ -5319,6 +5344,7 @@ async function snapshotPatchReviewWorktree(
       [
         "add",
         "--all",
+        "--sparse",
         `--pathspec-from-file=${pathspecFile}`,
         "--pathspec-file-nul",
       ],
@@ -5328,6 +5354,14 @@ async function snapshotPatchReviewWorktree(
   try {
     signal?.throwIfAborted();
     await mkdir(objectDirectory);
+    const headTree = await runPatchReviewGit(
+      repository,
+      ["rev-parse", "HEAD^{tree}"],
+      { environment: objectEnvironment, signal },
+    ).catch(() => {
+      signal?.throwIfAborted();
+      return undefined;
+    });
     const indexTree = await runPatchReviewGit(repository, ["write-tree"], {
       environment: objectEnvironment,
       signal,
@@ -5341,6 +5375,30 @@ async function snapshotPatchReviewWorktree(
       environment,
       signal,
     });
+    const preexisting = await runPatchReviewGit(
+      repository,
+      headTree === undefined
+        ? ["ls-tree", "-r", "--name-only", "-z", baselineTree]
+        : [
+            "--no-pager",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--relative",
+            headTree,
+            baselineTree,
+            "--",
+            ".",
+          ],
+      { environment, signal, trim: false },
+    );
+    const preexistingPaths = preexisting.split("\0");
+    if (preexistingPaths.at(-1) === "") preexistingPaths.pop();
+    const preexistingPathSet = new Set(preexistingPaths);
     let disposed = false;
     return {
       directory: repository,
@@ -5362,6 +5420,7 @@ async function snapshotPatchReviewWorktree(
           [
             "--no-pager",
             "diff",
+            "--no-color",
             "--no-ext-diff",
             "--no-textconv",
             "--no-renames",
@@ -5390,6 +5449,7 @@ async function snapshotPatchReviewWorktree(
                 [
                   "--no-pager",
                   "diff",
+                  "--no-color",
                   "--no-ext-diff",
                   "--no-textconv",
                   "--no-renames",
@@ -5403,7 +5463,13 @@ async function snapshotPatchReviewWorktree(
                 { environment, signal, trim: false },
               );
         signal?.throwIfAborted();
-        return { paths, diff };
+        return {
+          paths,
+          diff,
+          publicationUnsafePaths: paths.filter((path) =>
+            preexistingPathSet.has(path),
+          ),
+        };
       },
       async dispose() {
         disposed = true;
@@ -5427,6 +5493,7 @@ async function runFindingPatches(
   patches: FindingPatch[];
   interruptedExitCode?: 130 | 143;
   reviewRepository?: string;
+  reviewUnsafePublicationPaths?: string[];
 }> {
   if (selected.findings.length === 0) {
     stderr.write("No matching open findings to patch.\n");
@@ -5438,6 +5505,8 @@ async function runFindingPatches(
   );
   const patches: FindingPatch[] = [];
   let reviewRepository: string | undefined;
+  const reviewedPaths = new Set<string>();
+  const reviewUnsafePublicationPaths = new Set<string>();
   for (const finding of selected.findings) {
     const interruptedBeforeFinding = interruptedPatchExitCode(options.signal);
     if (interruptedBeforeFinding !== undefined) {
@@ -5475,6 +5544,14 @@ async function runFindingPatches(
               );
             }
             reviewRepository = repository;
+          },
+          onReviewCandidate: (candidate) => {
+            for (const path of candidate.publicationUnsafePaths ?? []) {
+              if (!reviewedPaths.has(path)) {
+                reviewUnsafePublicationPaths.add(path);
+              }
+            }
+            for (const path of candidate.paths) reviewedPaths.add(path);
           },
           findingInstructions: instruction?.trim()
             ? { [finding.occurrenceId]: instruction }
@@ -5549,6 +5626,11 @@ async function runFindingPatches(
   return {
     patches,
     ...(reviewRepository === undefined ? {} : { reviewRepository }),
+    ...(reviewUnsafePublicationPaths.size === 0
+      ? {}
+      : {
+          reviewUnsafePublicationPaths: [...reviewUnsafePublicationPaths],
+        }),
   };
 }
 
@@ -5723,7 +5805,13 @@ async function runIndependentPatchReview(
   const review = await captureSkillStage(context.run, {
     ...context.options,
     directory: context.snapshot.directory,
-    reviewCandidate: context.candidate,
+    reviewCandidate:
+      context.candidate === undefined
+        ? undefined
+        : {
+            paths: context.candidate.paths,
+            diff: context.candidate.diff,
+          },
     reviewStage: stage,
   });
   if (review.exitCode !== PATCH_REVIEW_EXIT_CODE.success) {
@@ -5797,6 +5885,10 @@ async function runPatchReviewWorkflow(
     return PATCH_REVIEW_EXIT_CODE.success;
   }
   if (candidate.paths.length === 0) {
+    if (subject.response === undefined) {
+      stdout.write(patch.response);
+      return PATCH_REVIEW_EXIT_CODE.success;
+    }
     const reason =
       "The patch reported a verified result without any observed candidate changes.";
     context.stderr.write(`${reason}\n`);
@@ -5883,7 +5975,7 @@ async function runPatchReviewWorkflow(
       context.options.signal?.throwIfAborted();
       patch = await captureSkillStage(context.run, {
         ...context.options,
-        reviewCandidate: candidate,
+        reviewCandidate: { paths: candidate.paths, diff: candidate.diff },
         reviewFindings: verdict.findings,
       });
       context.options.signal?.throwIfAborted();
@@ -5907,6 +5999,10 @@ async function runPatchReviewWorkflow(
         return PATCH_REVIEW_EXIT_CODE.success;
       }
       if (candidate.paths.length === 0) {
+        if (subject.response === undefined) {
+          stdout.write(patch.response);
+          return PATCH_REVIEW_EXIT_CODE.success;
+        }
         const reason =
           "The revised patch reported a verified result without any observed candidate changes.";
         context.stderr.write(`${reason}\n`);
@@ -5933,6 +6029,7 @@ async function runPatchReviewWorkflow(
   }
 
   context.options.signal?.throwIfAborted();
+  context.options.onReviewCandidate?.(candidate);
   stdout.write(
     subject.response === undefined
       ? patch.response
@@ -7483,7 +7580,14 @@ async function executeScan(
         },
       );
       patches = patchRun.patches;
-      scanData = { ...scanData, patchSeverity: patchThreshold, patches };
+      scanData = {
+        ...scanData,
+        patchSeverity: patchThreshold,
+        patches,
+        ...(patchRun.reviewRepository === undefined
+          ? {}
+          : { patchRepository: patchRun.reviewRepository }),
+      };
       if (patchRun.interruptedExitCode !== undefined) {
         return completedScan(patchRun.interruptedExitCode);
       }
@@ -7499,6 +7603,7 @@ async function executeScan(
           errorOutput,
           dependencies,
           patchRun.reviewRepository,
+          patchRun.reviewUnsafePublicationPaths,
         );
         if (pullRequest !== undefined) {
           scanData = { ...scanData, pullRequest };

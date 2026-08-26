@@ -561,12 +561,16 @@ checks project instructions, local conventions, and applicable style guides.
 Before the author runs, the CLI snapshots the containing Git worktree and
 derives review scope from the candidate-only delta after each author or
 revision run. Scope covers the full worktree even when patching starts in a
-subdirectory. It does not trust author-reported file paths, and it excludes
-pre-existing changes even when the author edits the same file. A `verified`
-result without an observed candidate delta fails instead of skipping selected
-reviews. Reviewer findings are treated as hypotheses that the revision author
-must independently validate against repository source and the shared patching
-policy. Both stages are disabled by default.
+subdirectory. Nested Git repositories and submodules are separate patch targets
+and must be patched from within their own worktree. The workflow does not trust
+author-reported file paths, and it excludes pre-existing changes even when the
+author edits the same file. Automatic pull-request creation stops when a
+reviewed file had pre-existing changes, so unpublished hunks cannot be included
+outside the reviewed delta. A `verified` result without an observed candidate
+delta fails instead of skipping selected reviews. Reviewer findings are treated
+as hypotheses that the revision author must independently validate against
+repository source and the shared patching policy. Both stages are disabled by
+default.
 Set `--max-review-revisions 5` to allow up to five author revisions across the
 selected review stages. After a later-stage revision, earlier selected reviews
 run again; blocked reviews still stop immediately. Without this option,
@@ -575,7 +579,9 @@ least one selected review stage.
 JSON scan results include `patchSeverity`. Scan and
 saved-finding results include one `patches` entry per selected finding with
 status `verified`, `no_change`, `blocked`, or `failed`, plus `pullRequest` when
-one is created. When `--fail-on-severity` is also set, verified and already-fixed
+one is created. Reviewed scan results also include `patchRepository`, the Git
+worktree root against which patch file paths are resolved. When
+`--fail-on-severity` is also set, verified and already-fixed
 findings no longer fail the policy.
 
 Scans use `gpt-5.6-sol` with extra-high reasoning effort by default. OpenAI is
