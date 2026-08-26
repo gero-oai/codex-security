@@ -255,8 +255,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("merge cannot have critical regression likelihood")
         if value["confidence"]["rating"] == "low":
             errors.append("merge cannot have low confidence")
+        if any(item["status"] == "failed" for item in value["validation"]):
+            errors.append("merge cannot include failed validation")
         if value["regressionLikelihood"]["rating"] == "low" and (
-            value["regressionProtection"]["rating"] == "none"
+            value["regressionProtection"]["rating"] in {"none", "unknown"}
             or not any(item["status"] == "passed" for item in value["validation"])
         ):
             errors.append(

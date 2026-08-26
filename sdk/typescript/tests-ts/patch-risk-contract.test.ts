@@ -625,17 +625,31 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
-  test("requires passing protection for a low-likelihood merge", async () => {
+  test.each(["none", "unknown"])(
+    "requires passing protection for a low-likelihood merge with %s protection",
+    async (rating) => {
+      const payload = assessment();
+      payload.regressionProtection.rating = rating;
+      payload.regressionProtection.exactHeadChecksPassed = false;
+
+      const result = await validate(payload);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        "merge with low regression likelihood requires passing protection",
+      );
+    },
+  );
+
+  test("rejects failed validation for merge", async () => {
     const payload = assessment();
-    payload.regressionProtection.rating = "none";
+    payload.regressionLikelihood.rating = "moderate";
+    payload.regressionProtection.rating = "partial";
     payload.regressionProtection.exactHeadChecksPassed = false;
-    payload.validation[0]!.status = "unavailable";
+    payload.validation[0]!.status = "failed";
 
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain(
-      "merge with low regression likelihood requires passing protection",
-    );
+    expect(result.stderr).toContain("merge cannot include failed validation");
   });
 
   test("validates large unique changed-file lists without dropping duplicates", async () => {
