@@ -46,7 +46,7 @@
         },
         "base": { "$ref": "#/$defs/nonBlankString" },
         "head": { "$ref": "#/$defs/nonBlankString" },
-        "changedFiles": { "$ref": "#/$defs/stringList" },
+        "changedFiles": { "$ref": "#/$defs/nonBlankStringList" },
         "sha256": {
           "type": "string",
           "pattern": "^[0-9A-Fa-f]{64}(?![\\s\\S])"

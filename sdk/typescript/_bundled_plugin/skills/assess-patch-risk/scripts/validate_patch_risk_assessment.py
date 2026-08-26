@@ -36,9 +36,9 @@ def object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any
 def read_json_object(path: str, *, label: str) -> dict[str, Any]:
     try:
         text = (
-            sys.stdin.buffer.read().decode("utf-8")
+            sys.stdin.buffer.read().decode("utf-8-sig")
             if path == "-"
-            else Path(path).read_text(encoding="utf-8")
+            else Path(path).read_text(encoding="utf-8-sig")
         )
         value = json.loads(text, object_pairs_hook=object_without_duplicate_keys)
     except (OSError, UnicodeError, json.JSONDecodeError, DuplicateJsonKeyError) as error:
@@ -640,6 +640,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     outcome_recommendation == "hold_for_evidence"
                     and effective_applicability != "unknown"
                 ):
+                    if branch_patch_failure:
+                        errors.append(
+                            f"evidencePlan.{index}: an applicable patch-caused failure requires revise or block"
+                        )
                     if outcome_likelihood == "critical":
                         errors.append(
                             f"evidencePlan.{index}: an applicable hold outcome cannot establish critical regression likelihood"
