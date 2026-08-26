@@ -38,6 +38,11 @@ function dependencies(
       paths: string[];
       diff: string;
       publicationUnsafePaths?: string[];
+      publicationBaseEntries?: Array<{
+        path: string;
+        mode?: string;
+        object?: string;
+      }>;
       publicationEntries?: Array<{
         path: string;
         mode?: string;
@@ -69,6 +74,7 @@ function dependencies(
           paths: [...selected.paths],
           diff: selected.diff,
           publicationUnsafePaths: [...(selected.publicationUnsafePaths ?? [])],
+          publicationBaseEntries: [...(selected.publicationBaseEntries ?? [])],
           publicationEntries: [...(selected.publicationEntries ?? [])],
         };
       },
@@ -595,6 +601,61 @@ describe("scan and patch workflow", () => {
     expect({ authors, reviews }).toEqual({ authors: 2, reviews: 1 });
     expect(JSON.parse(outcome.stdout)).toMatchObject({
       patches: [{ occurrenceId: "occ_1", status: "no_change", files: [] }],
+    });
+  });
+
+  test("rejects extra patch results before reviewing no_change output", async () => {
+    const result = resultWithFindings(["high"]);
+    let reviews = 0;
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--review-minimality", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        onCodex: (_args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            reviews += 1;
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            output!.stdout.write(
+              JSON.stringify({
+                patches: [
+                  {
+                    occurrenceId: "occ_1",
+                    status: "no_change",
+                    files: [],
+                    verification: "The issue was already fixed.",
+                  },
+                  {
+                    occurrenceId: "unexpected",
+                    status: "verified",
+                    files: ["src/finding-1.ts"],
+                    verification: "Synthetic extra result.",
+                  },
+                ],
+              }),
+            );
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(2);
+    expect(reviews).toBe(0);
+    expect(outcome.stderr).toContain(
+      "The generated patch did not return a valid review subject",
+    );
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      patches: [
+        {
+          occurrenceId: "occ_1",
+          status: "failed",
+          reason: "Patch command exited with status 2.",
+        },
+      ],
     });
   });
 
@@ -1246,6 +1307,178 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test.skipIf(process.platform === "win32")(
+    "strips inherited Git credentials from review snapshot helpers",
+    async () => {
+      const root = await mkdtemp(
+        join(tmpdir(), "codex-security-review-git-environment-"),
+      );
+      const repository = join(root, "repository");
+      const filter = join(root, "filter.mjs");
+      const leaked = join(root, "leaked.txt");
+      const armed = join(root, "armed");
+      const inherited = {
+        count: process.env["GIT_CONFIG_COUNT"],
+        key: process.env["GIT_CONFIG_KEY_0"],
+        value: process.env["GIT_CONFIG_VALUE_0"],
+        apiKey: process.env["OPENAI_API_KEY"],
+      };
+      try {
+        await mkdir(repository);
+        const git = (...args: string[]) =>
+          execFileSync("git", args, {
+            cwd: repository,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }).trim();
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        await writeFile(
+          filter,
+          [
+            'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
+            "const credential = process.env.GIT_CONFIG_VALUE_0 ?? process.env.OPENAI_API_KEY;",
+            `if (existsSync(${JSON.stringify(armed)}) && credential) writeFileSync(${JSON.stringify(leaked)}, credential);`,
+            "process.stdout.write(readFileSync(0));",
+          ].join("\n"),
+        );
+        git(
+          "config",
+          "filter.capture.clean",
+          `${JSON.stringify(process.execPath)} ${JSON.stringify(filter)}`,
+        );
+        await writeFile(
+          join(repository, ".gitattributes"),
+          "value.ts filter=capture\n",
+        );
+        await writeFile(join(repository, "value.ts"), "unsafe\n");
+        git("add", "--", ".");
+        git("commit", "-m", "Initial synthetic checkout");
+
+        process.env["GIT_CONFIG_COUNT"] = "1";
+        process.env["GIT_CONFIG_KEY_0"] = "http.extraHeader";
+        process.env["GIT_CONFIG_VALUE_0"] = "SYNTHETIC_GIT_CREDENTIAL";
+        process.env["OPENAI_API_KEY"] = "sk-proj-SYNTHETIC_REVIEW_CREDENTIAL";
+        await writeFile(armed, "armed\n");
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: async (_args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                output!.stdout.write(
+                  JSON.stringify({ status: "approved", findings: [] }),
+                );
+              } else {
+                await writeFile(join(repository, "value.ts"), "fixed\n");
+                output!.stdout.write("Verified synthetic patch.");
+              }
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode, outcome.stderr).toBe(0);
+        expect(
+          await readFile(leaked, "utf8").catch(
+            (error: NodeJS.ErrnoException) => {
+              if (error.code === "ENOENT") return undefined;
+              throw error;
+            },
+          ),
+        ).toBeUndefined();
+      } finally {
+        for (const [name, value] of [
+          ["GIT_CONFIG_COUNT", inherited.count],
+          ["GIT_CONFIG_KEY_0", inherited.key],
+          ["GIT_CONFIG_VALUE_0", inherited.value],
+          ["OPENAI_API_KEY", inherited.apiKey],
+        ] as const) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("captures broad review candidates without per-path Git fan-out", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-broad-review-")),
+    );
+    const files = Array.from(
+      { length: 256 },
+      (_, index) => `src/file-${index}.ts`,
+    );
+    let reviewedPaths: string[] = [];
+    try {
+      await mkdir(join(repository, "src"));
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      for (const file of files) {
+        await writeFile(join(repository, file), "unsafe\n");
+      }
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            const server = output!.appServer!;
+            if (server.sandbox === "read-only") {
+              const lines = server.prompt.split("\n");
+              const marker = lines.findIndex((line) =>
+                line.startsWith("Review scope is exactly"),
+              );
+              reviewedPaths = (
+                JSON.parse(lines[marker + 1]!) as {
+                  paths: string[];
+                }
+              ).paths;
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              for (const file of files) {
+                await writeFile(join(repository, file), "fixed\n");
+              }
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(reviewedPaths).toHaveLength(files.length);
+      expect(new Set(reviewedPaths)).toEqual(new Set(files));
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
   test("does not turn a symlink escape into a review candidate", async () => {
     const root = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-symlinked-patch-")),
@@ -1760,6 +1993,142 @@ describe("scan and patch workflow", () => {
       "The patch changed after independent review",
     );
     expect(commands.some(({ command }) => command === "gh")).toBe(false);
+  });
+
+  test("does not publish edits interleaved between reviewed findings", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const sharedPath = "src/shared.ts";
+    const delta = (
+      baseObject: string,
+      object: string,
+      publicationUnsafePaths: string[] = [],
+    ) => ({
+      paths: [sharedPath],
+      diff: `diff --git a/${sharedPath} b/${sharedPath}\n`,
+      publicationUnsafePaths,
+      publicationBaseEntries: [
+        { path: sharedPath, mode: "100644", object: baseObject },
+      ],
+      publicationEntries: [{ path: sharedPath, mode: "100644", object }],
+    });
+    let commandStarted = false;
+    const firstBase = "a".repeat(40);
+    const firstReviewed = "b".repeat(40);
+    const interleaved = "c".repeat(40);
+    const secondReviewed = "d".repeat(40);
+    const outcome = await runWorkflow(
+      [
+        "patch",
+        "--scan",
+        "scan-1",
+        "--review-minimality",
+        "--create-pr",
+        "--json",
+      ],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          delta(firstBase, firstReviewed),
+          delta(firstBase, firstReviewed),
+          delta(interleaved, secondReviewed, [sharedPath]),
+          delta(interleaved, secondReviewed, [sharedPath]),
+        ],
+        onCodex: (args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+        onRepositoryCommand: () => {
+          commandStarted = true;
+          return "";
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(2);
+    expect(commandStarted).toBe(false);
+    expect(outcome.stderr).toContain(
+      "Reviewed patch files with pre-existing changes cannot be published automatically",
+    );
+  });
+
+  test("publishes cumulative reviews when each baseline matches the prior tree", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const sharedPath = "src/shared.ts";
+    const firstBase = "a".repeat(40);
+    const firstReviewed = "b".repeat(40);
+    const secondReviewed = "d".repeat(40);
+    const delta = (
+      baseObject: string,
+      object: string,
+      publicationUnsafePaths: string[] = [],
+    ) => ({
+      paths: [sharedPath],
+      diff: `diff --git a/${sharedPath} b/${sharedPath}\n`,
+      publicationUnsafePaths,
+      publicationBaseEntries: [
+        { path: sharedPath, mode: "100644", object: baseObject },
+      ],
+      publicationEntries: [{ path: sharedPath, mode: "100644", object }],
+    });
+    const url = "https://github.example.test/example/repository/pull/19";
+    let pullRequestCreated = false;
+    const outcome = await runWorkflow(
+      [
+        "patch",
+        "--scan",
+        "scan-1",
+        "--review-minimality",
+        "--create-pr",
+        "--json",
+      ],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          delta(firstBase, firstReviewed),
+          delta(firstBase, firstReviewed),
+          delta(firstReviewed, secondReviewed, [sharedPath]),
+          delta(firstReviewed, secondReviewed, [sharedPath]),
+        ],
+        onCodex: (args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+        onRepositoryCommand: (command, args) => {
+          if (command === "git" && args[0] === "ls-tree") {
+            return `100644 blob ${secondReviewed}\t${sharedPath}\0`;
+          }
+          if (command === "git" && args[0] === "rev-parse") {
+            return "verified-commit";
+          }
+          if (command === "gh" && args[1] === "list") return "";
+          if (command === "gh" && args[1] === "create") {
+            pullRequestCreated = true;
+            return url;
+          }
+          return "";
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(pullRequestCreated).toBe(true);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      pullRequest: { url },
+    });
   });
 
   test("does not publish reviewed files with pre-existing changes", async () => {

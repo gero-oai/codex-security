@@ -1081,6 +1081,7 @@ interface SkillCommandOutput {
     readonly threadSource: SkillThreadSource;
     readonly approvalPolicy?: "never" | "on-request";
     readonly sandbox?: "read-only" | "workspace-write";
+    readonly isolateReviewerTools?: boolean;
     readonly onEvent?: (event: Readonly<Record<string, unknown>>) => void;
   };
 }
@@ -1131,6 +1132,7 @@ interface PatchReviewCandidateDelta {
   diff: string;
   diffBytes?: Buffer;
   publicationUnsafePaths?: string[];
+  publicationBaseEntries?: PatchReviewTreeEntry[];
   publicationEntries?: PatchReviewTreeEntry[];
 }
 
@@ -1461,6 +1463,7 @@ export async function runCodexSkillCommand(
                     input: invocation.stdin!,
                     approvalPolicy: output.appServer.approvalPolicy,
                     sandbox: output.appServer.sandbox,
+                    isolateReviewerTools: output.appServer.isolateReviewerTools,
                     onEvent: output.appServer.onEvent,
                   },
             ),
@@ -5182,23 +5185,31 @@ async function runPatchReviewGit(
 ): Promise<string> {
   const { environment, signal, trim = true } = options;
   signal?.throwIfAborted();
+  const isolatedEnvironment = {
+    ...exportEnvironment(),
+    GIT_ALLOW_PROTOCOL: "",
+  };
   const executable = await resolveTrustedExecutable(
     "git",
-    process.env,
+    isolatedEnvironment,
     directory,
   );
   if (executable === null) {
     throw new CodexSecurityError("git is not available on a trusted PATH.");
   }
   signal?.throwIfAborted();
-  const { stdout } = await execFile(executable.executable, [...args], {
-    cwd: directory,
-    encoding: "utf8",
-    env: { ...executable.environment, ...environment },
-    maxBuffer: Number.POSITIVE_INFINITY,
-    signal,
-    windowsHide: true,
-  });
+  const { stdout } = await execFile(
+    executable.executable,
+    ["-c", "core.fsmonitor=false", ...args],
+    {
+      cwd: directory,
+      encoding: "utf8",
+      env: { ...executable.environment, ...environment },
+      maxBuffer: Number.POSITIVE_INFINITY,
+      signal,
+      windowsHide: true,
+    },
+  );
   signal?.throwIfAborted();
   const value = String(stdout);
   return trim ? value.replace(/\r?\n$/u, "") : value;
@@ -5304,6 +5315,45 @@ function parsePatchReviewTreeEntry(
     );
   }
   return { path, mode: match[1], object: match[2] };
+}
+
+function parsePatchReviewIndexEntries(
+  output: string,
+): Map<string, PatchReviewTreeEntry> {
+  const entries = new Map<string, PatchReviewTreeEntry>();
+  const records = output.split("\0");
+  if (records.at(-1) === "") records.pop();
+  for (const record of records) {
+    const match = /^([0-7]{6}) ([0-9a-f]+) 0\t([\s\S]+)$/u.exec(record);
+    if (match === null || entries.has(match[3]!)) {
+      throw new CodexSecurityError(
+        "The reviewed patch contains an unreadable Git index entry.",
+      );
+    }
+    const path = match[3]!;
+    entries.set(path, { path, mode: match[1], object: match[2] });
+  }
+  return entries;
+}
+
+function selectedPatchReviewTreeEntries(
+  paths: readonly string[],
+  entries: ReadonlyMap<string, PatchReviewTreeEntry>,
+): PatchReviewTreeEntry[] {
+  return paths.map((path) => entries.get(path) ?? { path });
+}
+
+function samePatchReviewTreeEntry(
+  left: PatchReviewTreeEntry | undefined,
+  right: PatchReviewTreeEntry | undefined,
+): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.path === right.path &&
+    left.mode === right.mode &&
+    left.object === right.object
+  );
 }
 
 function samePatchReviewCandidate(
@@ -5472,6 +5522,13 @@ async function snapshotPatchReviewWorktree(
       environment,
       signal,
     });
+    const baselineEntries = parsePatchReviewIndexEntries(
+      await runPatchReviewGit(
+        repository,
+        ["ls-files", "--stage", "-z", "--", "."],
+        { environment, signal, trim: false },
+      ),
+    );
     const pathsChangedFromHead = async (tree: string): Promise<string[]> => {
       const output = await runPatchReviewGit(
         repository,
@@ -5565,30 +5622,25 @@ async function snapshotPatchReviewWorktree(
                 ],
                 { environment, signal, trim: false },
               );
-        const publicationEntries = await Promise.all(
-          paths.map(async (path) =>
-            parsePatchReviewTreeEntry(
-              path,
-              await runPatchReviewGit(
-                repository,
-                [
-                  "ls-tree",
-                  "--full-tree",
-                  "-z",
-                  candidateTree,
-                  "--",
-                  `:(top,literal)${path}`,
-                ],
-                { environment, signal, trim: false },
-              ),
-            ),
+        const candidateEntries = parsePatchReviewIndexEntries(
+          await runPatchReviewGit(
+            repository,
+            ["ls-files", "--stage", "-z", "--", "."],
+            { environment, signal, trim: false },
           ),
         );
         signal?.throwIfAborted();
         return {
           paths,
           diff,
-          publicationEntries,
+          publicationBaseEntries: selectedPatchReviewTreeEntries(
+            paths,
+            baselineEntries,
+          ),
+          publicationEntries: selectedPatchReviewTreeEntries(
+            paths,
+            candidateEntries,
+          ),
           publicationUnsafePaths: paths.filter((path) =>
             preexistingPathSet.has(path),
           ),
@@ -5629,7 +5681,6 @@ async function runFindingPatches(
   );
   const patches: FindingPatch[] = [];
   let reviewRepository: string | undefined;
-  const reviewedPaths = new Set<string>();
   const reviewUnsafePublicationPaths = new Set<string>();
   const reviewPublicationEntries = new Map<string, PatchReviewTreeEntry>();
   for (const finding of selected.findings) {
@@ -5671,12 +5722,22 @@ async function runFindingPatches(
             reviewRepository = repository;
           },
           onReviewCandidate: (candidate) => {
+            const baseEntries = new Map(
+              (candidate.publicationBaseEntries ?? []).map((entry) => [
+                entry.path,
+                entry,
+              ]),
+            );
             for (const path of candidate.publicationUnsafePaths ?? []) {
-              if (!reviewedPaths.has(path)) {
+              if (
+                !samePatchReviewTreeEntry(
+                  reviewPublicationEntries.get(path),
+                  baseEntries.get(path),
+                )
+              ) {
                 reviewUnsafePublicationPaths.add(path);
               }
             }
-            for (const path of candidate.paths) reviewedPaths.add(path);
             for (const entry of candidate.publicationEntries ?? []) {
               reviewPublicationEntries.set(entry.path, entry);
             }
@@ -5832,9 +5893,9 @@ async function captureSkillStage(
 
 function parsePatchReviewSubject(
   response: string,
-  scopedToFindings: boolean,
+  expectedFindingIds: readonly string[] | undefined,
 ): PatchReviewSubject {
-  if (!scopedToFindings) return { status: "ready" };
+  if (expectedFindingIds === undefined) return { status: "ready" };
   try {
     const reported: unknown = JSON.parse(response);
     if (
@@ -5853,6 +5914,16 @@ function parsePatchReviewSubject(
       const parsed = findingPatchSchema.safeParse(patch);
       if (!parsed.success) return { status: "invalid" };
       patches.push(parsed.data);
+    }
+    const returnedFindingIds = new Set(
+      patches.map(({ occurrenceId }) => occurrenceId),
+    );
+    if (
+      patches.length !== expectedFindingIds.length ||
+      returnedFindingIds.size !== patches.length ||
+      expectedFindingIds.some((id) => !returnedFindingIds.has(id))
+    ) {
+      return { status: "invalid" };
     }
     const structured = {
       document: reported as Record<string, unknown>,
@@ -6005,7 +6076,7 @@ async function runPatchReviewWorkflow(
   context.options.signal?.throwIfAborted();
   let subject = parsePatchReviewSubject(
     patch.response,
-    context.options.findings !== undefined,
+    context.options.findings?.map(({ occurrenceId }) => occurrenceId),
   );
   if (subject.status === "invalid") {
     context.stderr.write(
@@ -6139,7 +6210,7 @@ async function runPatchReviewWorkflow(
       }
       subject = parsePatchReviewSubject(
         patch.response,
-        context.options.findings !== undefined,
+        context.options.findings?.map(({ occurrenceId }) => occurrenceId),
       );
       if (subject.status === "invalid") {
         context.stderr.write(
@@ -6494,6 +6565,7 @@ async function runSkillStage(
               threadSource,
               approvalPolicy,
               ...(readOnly ? { sandbox: "read-only" as const } : {}),
+              ...(review ? { isolateReviewerTools: true } : {}),
               ...(options.onEvent === undefined
                 ? {}
                 : { onEvent: options.onEvent }),
@@ -6515,6 +6587,7 @@ export async function readSkillCommandOutput(
     readonly input: NodeJS.WritableStream;
     readonly approvalPolicy?: "never" | "on-request";
     readonly sandbox?: "read-only" | "workspace-write";
+    readonly isolateReviewerTools?: boolean;
     readonly onEvent?: (event: Readonly<Record<string, unknown>>) => void;
   },
 ): Promise<{
@@ -6653,25 +6726,57 @@ export async function readSkillCommandOutput(
               }
             }
           }
-          const conflict = [...repositoryServers].find((server) =>
-            configuredServers.has(server),
-          );
+          const conflict = appServer.isolateReviewerTools
+            ? undefined
+            : [...repositoryServers].find((server) =>
+                configuredServers.has(server),
+              );
           if (conflict !== undefined) {
             error = `Repository-local MCP server ${JSON.stringify(conflict)} overrides a configured integration; remove the repository override before verifying fixes.`;
             appServer.input.end();
             continue;
           }
-          startThread(
-            repositoryServers.size === 0
-              ? undefined
+          const disabledServers = appServer.isolateReviewerTools
+            ? new Set([...repositoryServers, ...configuredServers])
+            : repositoryServers;
+          const disabledMcpConfiguration: JsonObject =
+            disabledServers.size === 0
+              ? {}
               : {
                   mcp_servers: Object.fromEntries(
-                    [...repositoryServers].map((server) => [
+                    [...disabledServers].map((server) => [
                       server,
                       { enabled: false },
                     ]),
                   ),
-                },
+                };
+          startThread(
+            appServer.isolateReviewerTools
+              ? {
+                  ...disabledMcpConfiguration,
+                  allow_login_shell: false,
+                  web_search: "disabled",
+                  sandbox_workspace_write: { network_access: false },
+                  features: {
+                    apps: false,
+                    code_mode: false,
+                    code_mode_only: false,
+                    js_repl: false,
+                    multi_agent: false,
+                    multi_agent_v2: false,
+                    plugins: false,
+                    shell_tool: false,
+                    unified_exec: false,
+                  },
+                  shell_environment_policy: {
+                    inherit: "core",
+                    ignore_default_excludes: false,
+                    exclude: ["CODEX_HOME", "*KEY*", "*SECRET*", "*TOKEN*"],
+                  },
+                }
+              : disabledServers.size === 0
+                ? undefined
+                : disabledMcpConfiguration,
           );
         } else if (value["id"] === 2) {
           threadId = (value["result"] as { thread: { id: string } }).thread.id;

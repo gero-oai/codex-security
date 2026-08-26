@@ -178,6 +178,7 @@ describe("CLI skill commands", () => {
         prompt: string;
         approvalPolicy: "never" | "on-request" | undefined;
         sandbox: "read-only" | "workspace-write" | undefined;
+        isolateReviewerTools: boolean | undefined;
       }> = [];
       const stdout = capture();
       expect(
@@ -192,6 +193,7 @@ describe("CLI skill commands", () => {
                 prompt: server.prompt,
                 approvalPolicy: server.approvalPolicy,
                 sandbox: server.sandbox,
+                isolateReviewerTools: server.isolateReviewerTools,
               });
               output!.stdout.write(
                 server.sandbox === "read-only"
@@ -208,12 +210,18 @@ describe("CLI skill commands", () => {
       ).toBe(0);
       expect(invocations).toHaveLength(expected.length + 1);
       expect(invocations[0]!.sandbox).toBeUndefined();
+      expect(invocations[0]!.isolateReviewerTools).toBeUndefined();
       expect(invocations.slice(1).map(({ sandbox }) => sandbox)).toEqual(
         expected.map(() => "read-only"),
       );
       expect(
         invocations.slice(1).map(({ approvalPolicy }) => approvalPolicy),
       ).toEqual(expected.map(() => "never"));
+      expect(
+        invocations
+          .slice(1)
+          .map(({ isolateReviewerTools }) => isolateReviewerTools),
+      ).toEqual(expected.map(() => true));
       for (const { prompt } of invocations) {
         if (expected.length === 0) {
           expect(prompt).not.toContain(
@@ -1884,6 +1892,93 @@ lines.on("line", (line) => {
       "item/completed",
     ]);
     expect(JSON.stringify(activity)).not.toContain("private command");
+  });
+
+  test("starts reviewer threads without inherited external tools", async () => {
+    const source = `
+const assert = require("node:assert/strict");
+const lines = require("node:readline").createInterface({ input: process.stdin });
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+lines.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: 1, result: {} });
+  if (request.method === "config/read") {
+    send({ id: 4, result: { layers: [
+      { name: { type: "project" }, config: { mcp_servers: { repository: { command: "untrusted" } } } },
+      { name: { type: "user" }, config: { mcp_servers: { trusted: { command: "trusted" } } } },
+      { name: { type: "system" }, config: { mcp_servers: { shared: { command: "shared" } } } },
+    ] } });
+  }
+  if (request.method === "thread/start") {
+    assert.deepEqual(request.params, {
+      threadSource: "security_remediation",
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      config: {
+        mcp_servers: {
+          repository: { enabled: false },
+          trusted: { enabled: false },
+          shared: { enabled: false },
+        },
+        allow_login_shell: false,
+        web_search: "disabled",
+        sandbox_workspace_write: { network_access: false },
+        features: {
+          apps: false,
+          code_mode: false,
+          code_mode_only: false,
+          js_repl: false,
+          multi_agent: false,
+          multi_agent_v2: false,
+          plugins: false,
+          shell_tool: false,
+          unified_exec: false,
+        },
+        shell_environment_policy: {
+          inherit: "core",
+          ignore_default_excludes: false,
+          exclude: ["CODEX_HOME", "*KEY*", "*SECRET*", "*TOKEN*"],
+        },
+      },
+    });
+    send({ id: 2, result: { thread: { id: "review" } } });
+  }
+  if (request.method === "turn/start") {
+    send({ id: 3, result: { turn: { id: "review-turn" } } });
+    send({ method: "item/completed", params: {
+      threadId: "review", turnId: "review-turn",
+      item: { type: "agentMessage", text: "Review complete" },
+    } });
+    send({ method: "turn/completed", params: {
+      threadId: "review", turn: { id: "review-turn", status: "completed" },
+    } });
+  }
+});
+`;
+    const stdout = capture();
+    const stderr = capture();
+
+    await expect(
+      runCodexSkillCommand(
+        ["-e", source],
+        {
+          command: "patch",
+          stdout: stdout.stream,
+          stderr: stderr.stream,
+          appServer: {
+            directory: process.cwd(),
+            prompt: "Review the synthetic patch",
+            threadSource: "security_remediation",
+            approvalPolicy: "never",
+            sandbox: "read-only",
+            isolateReviewerTools: true,
+          },
+        },
+        { command: process.execPath },
+      ),
+    ).resolves.toBe(0);
+    expect(stdout.text()).toBe("Review complete\n");
+    expect(stderr.text()).toBe("");
   });
 
   test.each([
