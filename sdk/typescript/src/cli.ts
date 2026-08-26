@@ -5438,7 +5438,8 @@ const PRIVATE_KEY_BLOCK_START =
   /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PRIVATE_KEY_BLOCK_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PATCH_REPORT_EMPTY_SENSITIVE_FIELD =
-  /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:(?:api|access|private)[ _-]?key|authorization|auth|token|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
+  /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:(?:api|access|private)[ _-]?key|authorization|auth|token(?:[ _-]?handling)?|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
+const PATCH_REPORT_MARKDOWN_FENCE = /^\s*(?<fence>`{3,}|~{3,}).*$/u;
 
 function safePatchBoundaryClassification(value: string): string | undefined {
   const classification = PATCH_REPORT_BOUNDARY_CLASSIFICATION.exec(value);
@@ -5451,6 +5452,7 @@ function safePatchReport(value: string): string {
   const lines: string[] = [];
   let insidePrivateKey = false;
   let redactCredentialContinuation = false;
+  let credentialFence: "`" | "~" | undefined;
   let boundaryContinuationPrefix: string | undefined;
   for (const line of value.split(/\r?\n/u)) {
     if (insidePrivateKey) {
@@ -5461,9 +5463,29 @@ function safePatchReport(value: string): string {
       lines.push("[redacted]");
       insidePrivateKey = !PRIVATE_KEY_BLOCK_END.test(line);
       redactCredentialContinuation = false;
+      credentialFence = undefined;
       continue;
     }
     if (redactCredentialContinuation) {
+      const fence = PATCH_REPORT_MARKDOWN_FENCE.exec(line)?.groups?.["fence"];
+      if (fence !== undefined) {
+        const marker = fence[0] as "`" | "~";
+        if (credentialFence === undefined) {
+          credentialFence = marker;
+          lines.push("[redacted]");
+          continue;
+        }
+        if (credentialFence === marker) {
+          credentialFence = undefined;
+          redactCredentialContinuation = false;
+          boundaryContinuationPrefix = undefined;
+          continue;
+        }
+      }
+      if (credentialFence !== undefined) {
+        lines.push(line.trim().length === 0 ? "" : "[redacted]");
+        continue;
+      }
       if (line.trim().length === 0) {
         lines.push("");
         redactCredentialContinuation = false;
@@ -5496,10 +5518,11 @@ function safePatchReport(value: string): string {
         boundary.groups["prefix"] !== undefined &&
         boundary.groups["label"] !== undefined &&
         boundary.groups["separator"] !== undefined
-          ? `${boundary.groups["prefix"]}${boundary.groups["label"]}${boundary.groups["separator"]}`
+          ? `${boundary.groups["prefix"]}${boundary.groups["label"]}${boundary.groups["separator"].trimEnd()} `
           : undefined;
       if (boundaryContinuationPrefix === undefined) lines.push("[redacted]");
       redactCredentialContinuation = true;
+      credentialFence = undefined;
       continue;
     }
     const boundary = PATCH_REPORT_BOUNDARY_LINE.exec(line);
