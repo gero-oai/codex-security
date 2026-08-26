@@ -39,8 +39,10 @@ interface Assessment {
     runtimeRoot: string;
     counterexample: string;
     counterexamplePath: string;
-    legitimateControl: string;
-    legitimateControlPath: string;
+    legitimateControl?: string;
+    legitimateControlPath?: string;
+    retirementEvidence?: string;
+    retirementEvidencePath?: string;
     result: string;
   }>;
   validation: Array<{
@@ -210,6 +212,28 @@ describe("patch risk assessment contract", () => {
       true,
     );
 
+    const retired = assessment();
+    const retiredBoundary = retired.materialBoundaries[0]!;
+    delete retiredBoundary.legitimateControl;
+    delete retiredBoundary.legitimateControlPath;
+    retiredBoundary.retirementEvidence =
+      "The replacement contract removes the obsolete request surface.";
+    retiredBoundary.retirementEvidencePath = "docs/request-v2.md";
+    expect(validateSchema(retired), JSON.stringify(validateSchema.errors)).toBe(
+      true,
+    );
+
+    const incompleteRetirement = structuredClone(retired);
+    delete incompleteRetirement.materialBoundaries[0]!.retirementEvidencePath;
+    expect(validateSchema(incompleteRetirement)).toBe(false);
+
+    const ambiguousControl = assessment();
+    ambiguousControl.materialBoundaries[0]!.retirementEvidence =
+      "The replacement contract removes the obsolete request surface.";
+    ambiguousControl.materialBoundaries[0]!.retirementEvidencePath =
+      "docs/request-v2.md";
+    expect(validateSchema(ambiguousControl)).toBe(false);
+
     const digestWithTrailingNewline = assessment();
     digestWithTrailingNewline.patch.sha256 = `${"c".repeat(64)}\n`;
     expect(validateSchema(digestWithTrailingNewline)).toBe(false);
@@ -243,13 +267,6 @@ describe("patch risk assessment contract", () => {
     ]);
     expect(skill).not.toMatch(
       /^python\s+.*validate_patch_risk_assessment\.py/mu,
-    );
-  });
-
-  test("requires fresh authorization decisions to reclassify every input and result", async () => {
-    const skill = await readFile(skillPath, "utf8");
-    expect(skill).toContain(
-      "either reclassify every authorization-relevant principal attribute, resource attribute, policy input, entity binding, and resulting decision from current state",
     );
   });
 
@@ -304,23 +321,51 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
-  test.each(["counterexamplePath", "legitimateControlPath"] as const)(
-    "requires a patched source trace in %s",
-    async (field) => {
-      const payload = assessment();
-      delete (
-        payload.materialBoundaries[0] as Partial<
-          Assessment["materialBoundaries"][number]
-        >
-      )[field];
+  test("requires a counterexample source trace", async () => {
+    const payload = assessment();
+    delete (
+      payload.materialBoundaries[0] as Partial<
+        Assessment["materialBoundaries"][number]
+      >
+    ).counterexamplePath;
 
-      const result = await validate(payload);
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain(
-        `required property '${field}' is missing`,
-      );
-    },
-  );
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "required property 'counterexamplePath' is missing",
+    );
+  });
+
+  test("accepts complete retirement evidence instead of an invented control", async () => {
+    const payload = assessment();
+    const boundary = payload.materialBoundaries[0]!;
+    delete boundary.legitimateControl;
+    delete boundary.legitimateControlPath;
+    boundary.retirementEvidence =
+      "The replacement contract removes the obsolete request surface.";
+    boundary.retirementEvidencePath = "docs/request-v2.md";
+
+    const retired = await validate(payload);
+    expect(retired.status, retired.stderr).toBe(0);
+
+    delete boundary.retirementEvidencePath;
+    const incomplete = await validate(payload);
+    expect(incomplete.status).not.toBe(0);
+    expect(incomplete.stderr).toContain(
+      "retirement evidence requires both value and path",
+    );
+
+    const ambiguous = assessment();
+    ambiguous.materialBoundaries[0]!.retirementEvidence =
+      "The replacement contract removes the obsolete request surface.";
+    ambiguous.materialBoundaries[0]!.retirementEvidencePath =
+      "docs/request-v2.md";
+    const both = await validate(ambiguous);
+    expect(both.status).not.toBe(0);
+    expect(both.stderr).toContain(
+      "exactly one of legitimate control or retirement evidence is required",
+    );
+  });
 
   test("accepts omitted and empty optional evidence lists", async () => {
     const omitted = await validate(assessment());

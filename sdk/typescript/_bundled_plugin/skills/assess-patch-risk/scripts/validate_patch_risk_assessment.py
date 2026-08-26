@@ -247,6 +247,25 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     boundary_ids = [item["id"] for item in boundaries]
     if len(set(boundary_ids)) != len(boundary_ids):
         errors.append("material boundary identifiers must be unique")
+    control_fields = {"legitimateControl", "legitimateControlPath"}
+    retirement_fields = {"retirementEvidence", "retirementEvidencePath"}
+    for index, item in enumerate(boundaries):
+        present_controls = control_fields & item.keys()
+        present_retirement = retirement_fields & item.keys()
+        if present_controls and present_controls != control_fields:
+            errors.append(
+                f"materialBoundaries.{index}: legitimate control evidence requires both value and path"
+            )
+        if present_retirement and present_retirement != retirement_fields:
+            errors.append(
+                f"materialBoundaries.{index}: retirement evidence requires both value and path"
+            )
+        if (present_controls == control_fields) == (
+            present_retirement == retirement_fields
+        ):
+            errors.append(
+                f"materialBoundaries.{index}: exactly one of legitimate control or retirement evidence is required"
+            )
     decision_critical_unknowns = {
         item["id"] for item in unknowns if item["decisionCritical"]
     }

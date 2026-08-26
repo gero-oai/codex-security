@@ -141,8 +141,6 @@
           "runtimeRoot",
           "counterexample",
           "counterexamplePath",
-          "legitimateControl",
-          "legitimateControlPath",
           "result"
         ],
         "properties": {
@@ -153,10 +151,32 @@
           "counterexamplePath": { "$ref": "#/$defs/nonBlankString" },
           "legitimateControl": { "$ref": "#/$defs/nonBlankString" },
           "legitimateControlPath": { "$ref": "#/$defs/nonBlankString" },
+          "retirementEvidence": { "$ref": "#/$defs/nonBlankString" },
+          "retirementEvidencePath": { "$ref": "#/$defs/nonBlankString" },
           "result": {
             "enum": ["supported", "contradicted", "unresolved"]
           }
-        }
+        },
+        "oneOf": [
+          {
+            "required": ["legitimateControl", "legitimateControlPath"],
+            "not": {
+              "anyOf": [
+                { "required": ["retirementEvidence"] },
+                { "required": ["retirementEvidencePath"] }
+              ]
+            }
+          },
+          {
+            "required": ["retirementEvidence", "retirementEvidencePath"],
+            "not": {
+              "anyOf": [
+                { "required": ["legitimateControl"] },
+                { "required": ["legitimateControlPath"] }
+              ]
+            }
+          }
+        ]
       }
     },
     "validation": {
