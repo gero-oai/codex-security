@@ -5210,6 +5210,7 @@ async function createPatchPullRequest(
     await mkdtemp(join(temporaryRoot, "codex-security-publish-index-")),
   );
   const temporaryIndex = join(temporaryDirectory, "index");
+  let filterArguments: string[] = [];
   try {
     const runWithTemporaryIndex = (args: string[]) =>
       dependencies.runRepositoryCommand("git", args, repository, {
@@ -5227,7 +5228,25 @@ async function createPatchPullRequest(
     await runWithTemporaryIndex(
       head === undefined ? ["read-tree", "--empty"] : ["read-tree", head],
     );
-    await runWithTemporaryIndex(["--literal-pathspecs", "add", "--", ...files]);
+    filterArguments = disabledPatchReviewFilterArgumentsFromAttributes(
+      Buffer.from(
+        await runWithTemporaryIndex([
+          "--literal-pathspecs",
+          "check-attr",
+          "-z",
+          "filter",
+          "--",
+          ...files,
+        ]),
+      ),
+    );
+    await runWithTemporaryIndex([
+      ...filterArguments,
+      "--literal-pathspecs",
+      "add",
+      "--",
+      ...files,
+    ]);
     const currentEntries = parsePatchReviewIndexEntries(
       Buffer.from(
         await runWithTemporaryIndex(["ls-files", "--stage", "-z", "--", "."]),
@@ -5259,8 +5278,13 @@ async function createPatchPullRequest(
         "The repository HEAD changed after independent review. Review the patch again before publishing.",
       );
     }
-    await run("git", ["switch", "-c", branch]);
-    await runWithTemporaryIndex(["commit", "-m", PATCH_PR_TITLE]);
+    await run("git", [...filterArguments, "switch", "-c", branch]);
+    await runWithTemporaryIndex([
+      ...filterArguments,
+      "commit",
+      "-m",
+      PATCH_PR_TITLE,
+    ]);
     if ((await run("git", ["rev-parse", "HEAD^{tree}"])) !== intendedTree) {
       throw new CodexSecurityError(
         "The patch commit contains changes outside the independently reviewed tree.",
@@ -5280,6 +5304,7 @@ async function createPatchPullRequest(
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
   await run("git", [
+    ...filterArguments,
     "--literal-pathspecs",
     "reset",
     "--quiet",
@@ -5389,13 +5414,19 @@ async function disabledPatchReviewFilterArguments(
   environment: NodeJS.ProcessEnv,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const attributes = splitNulRecords(
+  return disabledPatchReviewFilterArgumentsFromAttributes(
     await runPatchReviewGitBytes(
       directory,
       ["check-attr", "-z", "--stdin", "filter"],
       { environment, input: paths, signal },
     ),
   );
+}
+
+function disabledPatchReviewFilterArgumentsFromAttributes(
+  output: Uint8Array,
+): string[] {
+  const attributes = splitNulRecords(Buffer.from(output));
   if (attributes.length % 3 !== 0) {
     throw new CodexSecurityError(
       "Git clean-filter attributes could not be read safely.",
