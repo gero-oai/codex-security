@@ -229,7 +229,34 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     unknowns = value["unknowns"]
     evidence_plan = value["evidencePlan"]
     boundaries = value["materialBoundaries"]
+    validations = value["validation"]
     errors: list[str] = []
+
+    validation_names = [item["name"] for item in validations]
+    if len(set(validation_names)) != len(validation_names):
+        errors.append("validation names must be unique")
+
+    unknown_failed_validations: set[str] = set()
+    for index, item in enumerate(validations):
+        attribution = item.get("failureAttribution")
+        if item["status"] == "failed":
+            if attribution is None:
+                errors.append(
+                    f"validation.{index}: failed validation requires failureAttribution"
+                )
+            elif attribution == "unknown":
+                unknown_failed_validations.add(item["name"])
+            elif attribution == "patch_caused" and recommendation not in {
+                "revise",
+                "block",
+            }:
+                errors.append(
+                    "a patch-caused validation failure requires revise or block"
+                )
+        elif attribution is not None:
+            errors.append(
+                f"validation.{index}: only failed validation may set failureAttribution"
+            )
 
     if recommendation not in {"no_op", "hold_for_evidence"} and not value[
         "patch"
@@ -287,11 +314,36 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("hold_for_evidence cannot have critical regression likelihood")
         if any(item["result"] == "contradicted" for item in boundaries):
             errors.append("hold_for_evidence cannot retain a contradicted material boundary")
+        planned_failed_validations: set[str] = set()
         for index, item in enumerate(evidence_plan):
             if len(set(item["outcomes"].values())) < 2:
                 errors.append(
                     f"evidencePlan.{index}: requires at least two distinct outcome recommendations"
                 )
+            for name in item.get("resolvesFailedValidation", []):
+                if name not in unknown_failed_validations:
+                    errors.append(
+                        f"evidencePlan.{index}: {name!r} is not a failed validation with unknown attribution"
+                    )
+                    continue
+                planned_failed_validations.add(name)
+                if not {"patch_caused", "not_patch_caused"}.issubset(
+                    item["outcomes"]
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: failed-validation attribution requires patch_caused and not_patch_caused outcomes"
+                    )
+                elif item["outcomes"]["patch_caused"] not in {
+                    "revise",
+                    "block",
+                }:
+                    errors.append(
+                        f"evidencePlan.{index}: a patch_caused outcome must recommend revise or block"
+                    )
+        for name in sorted(unknown_failed_validations - planned_failed_validations):
+            errors.append(
+                f"failed validation {name!r} with unknown attribution requires a matching evidence plan"
+            )
     elif evidence_plan:
         errors.append("only hold_for_evidence may include an evidence plan")
 

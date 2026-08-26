@@ -40,11 +40,17 @@ interface Assessment {
     legitimateControl: string;
     result: string;
   }>;
-  validation: Array<{ name: string; status: string; protects: string }>;
+  validation: Array<{
+    name: string;
+    status: string;
+    protects: string;
+    failureAttribution?: string;
+  }>;
   unknowns: Array<{ summary: string; decisionCritical: boolean }>;
   evidencePlan: Array<{
     question: string;
     action: string;
+    resolvesFailedValidation?: string[];
     outcomes: Record<string, string>;
   }>;
 }
@@ -179,7 +185,7 @@ describe("patch risk assessment contract", () => {
 
   test("documents the configured validator command over stdin", async () => {
     const skill = await readFile(skillPath, "utf8");
-    const command = /```bash\s+(.*?)\s+```/su.exec(skill)?.[1];
+    const command = /```text\s+(.*?)\s+```/su.exec(skill)?.[1];
     expect(command?.trim().split(/\s+/u)).toEqual([
       "<python_command>",
       "<plugin_dir>/skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py",
@@ -188,6 +194,10 @@ describe("patch risk assessment contract", () => {
     expect(skill).not.toMatch(
       /^python\s+.*validate_patch_risk_assessment\.py/mu,
     );
+    expect(skill).toContain('`"$PYTHON"` in POSIX shells');
+    expect(skill).toContain('`& "$env:PYTHON"` in PowerShell');
+    expect(skill).toContain("the directory three levels above this `SKILL.md`");
+    expect(skill).toContain("paths remain single arguments");
   });
 
   test("validates a supported human-review merge without site packages", async () => {
@@ -442,7 +452,7 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
-  test("rejects established defects but allows unattributed failures when holding", async () => {
+  test("requires failed checks to be attributed or matched to evidence", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
     payload.workflowLabel = "hold_for_evidence";
@@ -483,10 +493,66 @@ describe("patch risk assessment contract", () => {
     payload.regressionProtection.rating = "partial";
     payload.regressionProtection.exactHeadChecksPassed = false;
     payload.validation[0]!.status = "failed";
-    const failedValidation = await validate(payload);
-    expect(failedValidation.status, failedValidation.stderr).toBe(0);
+    const missingAttribution = await validate(payload);
+    expect(missingAttribution.status).not.toBe(0);
+    expect(missingAttribution.stderr).toContain(
+      "failed validation requires failureAttribution",
+    );
+
+    payload.validation[0]!.failureAttribution = "patch_caused";
+    const establishedFailure = await validate(payload);
+    expect(establishedFailure.status).not.toBe(0);
+    expect(establishedFailure.stderr).toContain(
+      "a patch-caused validation failure requires revise or block",
+    );
+
+    payload.validation[0]!.failureAttribution = "unknown";
+    const missingMatchingPlan = await validate(payload);
+    expect(missingMatchingPlan.status).not.toBe(0);
+    expect(missingMatchingPlan.stderr).toContain(
+      "with unknown attribution requires a matching evidence plan",
+    );
+
+    payload.evidencePlan[0]!.resolvesFailedValidation = ["another check"];
+    const mismatchedPlan = await validate(payload);
+    expect(mismatchedPlan.status).not.toBe(0);
+    expect(mismatchedPlan.stderr).toContain(
+      "is not a failed validation with unknown attribution",
+    );
+
+    payload.evidencePlan[0]!.resolvesFailedValidation = [
+      "focused request tests",
+    ];
+    const missingAttributionOutcomes = await validate(payload);
+    expect(missingAttributionOutcomes.status).not.toBe(0);
+    expect(missingAttributionOutcomes.stderr).toContain(
+      "failed-validation attribution requires patch_caused and not_patch_caused outcomes",
+    );
+
+    payload.evidencePlan[0]!.outcomes = {
+      patch_caused: "merge",
+      not_patch_caused: "revise",
+    };
+    const unsafePatchOutcome = await validate(payload);
+    expect(unsafePatchOutcome.status).not.toBe(0);
+    expect(unsafePatchOutcome.stderr).toContain(
+      "a patch_caused outcome must recommend revise or block",
+    );
+
+    payload.evidencePlan[0]!.outcomes = {
+      patch_caused: "revise",
+      not_patch_caused: "merge",
+    };
+    const unattributedFailure = await validate(payload);
+    expect(unattributedFailure.status, unattributedFailure.stderr).toBe(0);
+
+    payload.validation[0]!.failureAttribution = "not_patch_caused";
+    delete payload.evidencePlan[0]!.resolvesFailedValidation;
+    const attributedFailure = await validate(payload);
+    expect(attributedFailure.status, attributedFailure.stderr).toBe(0);
 
     payload.validation[0]!.status = "unavailable";
+    delete payload.validation[0]!.failureAttribution;
     const unresolved = await validate(payload);
     expect(unresolved.status, unresolved.stderr).toBe(0);
   });
@@ -679,6 +745,7 @@ describe("patch risk assessment contract", () => {
     payload.regressionProtection.rating = "partial";
     payload.regressionProtection.exactHeadChecksPassed = false;
     payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "patch_caused";
 
     const result = await validate(payload);
     expect(result.status).not.toBe(0);

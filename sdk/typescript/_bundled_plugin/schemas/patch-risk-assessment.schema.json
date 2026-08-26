@@ -166,8 +166,21 @@
           "status": {
             "enum": ["passed", "failed", "skipped", "unavailable"]
           },
-          "protects": { "$ref": "#/$defs/nonEmptyString" }
-        }
+          "protects": { "$ref": "#/$defs/nonEmptyString" },
+          "failureAttribution": {
+            "enum": ["patch_caused", "not_patch_caused", "unknown"]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "status": { "const": "failed" } },
+              "required": ["status"]
+            },
+            "then": { "required": ["failureAttribution"] },
+            "else": { "not": { "required": ["failureAttribution"] } }
+          }
+        ]
       }
     },
     "unknowns": {
@@ -191,6 +204,7 @@
         "properties": {
           "question": { "$ref": "#/$defs/nonEmptyString" },
           "action": { "$ref": "#/$defs/nonEmptyString" },
+          "resolvesFailedValidation": { "$ref": "#/$defs/stringList" },
           "outcomes": {
             "type": "object",
             "additionalProperties": { "$ref": "#/$defs/recommendation" },
