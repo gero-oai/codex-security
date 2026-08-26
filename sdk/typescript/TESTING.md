@@ -80,6 +80,9 @@ npm download cache, and caches the resolved pnpm store separately. Cache
 failures do not suppress installation failures. Unix keeps its pinned pnpm
 setup action. Windows package inspection enables npm's native phase timings to
 diagnose installation delays without changing its failure or timeout behavior.
+It also logs npm cache/fetch activity and trials a 16-thread libuv pool for the
+observed unpacking delays. This is a scheduling experiment, not a proven speedup;
+compare hosted install phases and whole-workflow timings before retaining it.
 
 When forwarding `--test-name-pattern` to a sharded run, also pass Bun's
 `--pass-with-no-tests` if some workers may have no matching tests. Normal CI
