@@ -1835,6 +1835,26 @@ describe("patch risk assessment contract", () => {
     );
   });
 
+  test.each(["low", "moderate", "high"] as const)(
+    "rejects %s likelihood for an established safety failure",
+    async (rating) => {
+      const payload = assessment();
+      payload.recommendation = "revise";
+      payload.workflowLabel = "revise";
+      payload.regressionLikelihood.rating = rating;
+      payload.materialSafetyFailure = {
+        established: true,
+        evidence: "The changed boundary permits a cross-subject decision.",
+      };
+
+      const result = await validate(payload);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        "an established material safety failure requires critical regression likelihood",
+      );
+    },
+  );
+
   test("rejects merge and applicable hold branches with critical safety failures", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
