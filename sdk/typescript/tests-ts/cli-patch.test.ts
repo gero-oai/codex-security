@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -1522,6 +1523,97 @@ describe("scan and patch workflow", () => {
       expect(await readFile(join(nested, "value.ts"), "utf8")).toBe(
         "nested changed\n",
       );
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("binds patch-risk artifacts to canonical raw diff bytes", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-raw-risk-patch-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let artifactMatched = false;
+    try {
+      await mkdir(join(repository, "src"));
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "src", "value.ts"), "safe\n");
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--assess-patch-risk"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            const server = output!.appServer!;
+            if (server.sandbox !== "read-only") {
+              await writeFile(
+                join(repository, "src", "value.ts"),
+                Buffer.from([0x75, 0x6e, 0x73, 0x61, 0x66, 0xff, 0x0a]),
+              );
+              output!.stdout.write("Verified synthetic patch.");
+              return 0;
+            }
+
+            const lines = server.prompt.split("\n");
+            const marker = lines.indexOf(
+              "CLI-owned immutable patch artifact (JSON object):",
+            );
+            const artifact = JSON.parse(lines[marker + 1]!) as {
+              path: string;
+              patch: { sha256: string };
+            };
+            const actual = await readFile(artifact.path);
+            const expected = execFileSync(
+              "git",
+              [
+                "--no-pager",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--binary",
+                "--relative",
+                "HEAD",
+                "--",
+                ".",
+              ],
+              {
+                cwd: repository,
+                stdio: ["ignore", "pipe", "pipe"],
+              },
+            );
+            expect(actual.includes(0xff)).toBe(true);
+            expect(actual.equals(expected)).toBe(true);
+            expect(createHash("sha256").update(actual).digest("hex")).toBe(
+              artifact.patch.sha256,
+            );
+            artifactMatched = true;
+            output!.stdout.write(
+              JSON.stringify(approvedPatchRiskVerdict(server.prompt)),
+            );
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(artifactMatched).toBe(true);
     } finally {
       await rm(repository, { recursive: true, force: true });
     }

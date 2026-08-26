@@ -6366,7 +6366,10 @@ async function createPatchRiskReviewArtifact(
       "Patch-risk assessment requires an immutable baseline and candidate identity.",
     );
   }
-  const bytes = Buffer.from(candidate.diff, "utf8");
+  const bytes =
+    candidate.diffBytes === undefined
+      ? Buffer.from(candidate.diff, "utf8")
+      : Buffer.from(candidate.diffBytes);
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   const temporaryRoot = await realpath(tmpdir());
   const temporaryDirectory = await realpath(
