@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -53,6 +54,8 @@ const REQUIRED_ARTIFACTS = [
 ];
 const LOCK_LEASE_MS = 30_000;
 const LOCK_HEARTBEAT_MS = 5_000;
+const WINDOWS_DEVICE_PATH_NAME =
+  /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu;
 
 interface MultiscanTask {
   id: string;
@@ -86,6 +89,7 @@ export interface MultiscanOptions {
   maxAttempts: number;
   maxCostUsd?: number;
   scanPrompt?: string;
+  validationPrompt?: string;
   postScanPrompt?: string;
   config: CodexSecurityConfig;
   createSecurity(
@@ -129,6 +133,12 @@ export async function runMultiscan(
     dirname(resolve(options.inputPath)),
     options.mode,
   );
+  if (
+    options.validationPrompt !== undefined &&
+    tasks.some((task) => task.mode === "deep")
+  ) {
+    throw new Error("Custom validation is not supported for Deep scans.");
+  }
   const requestedOutput = resolve(options.outputDir);
   const output = await ensureOutputDirectory(requestedOutput);
   await requireSecureOutputAncestry(output);
@@ -400,6 +410,9 @@ async function runCampaign(
             mode: task.mode,
             outputDir: scanDir,
             ...(scanPrompt ? { scanPrompt } : {}),
+            ...(options.validationPrompt === undefined
+              ? {}
+              : { validationPrompt: options.validationPrompt }),
             ...(options.postScanPrompt === undefined
               ? {}
               : { postScanPrompt: options.postScanPrompt }),
@@ -512,16 +525,28 @@ function notifyProgress(
 }
 
 async function ensureOutputDirectory(path: string): Promise<string> {
-  const metadata = await lstat(path).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "ENOENT") throw error;
-    return undefined;
-  });
+  const metadata = await lstat(path, { bigint: true }).catch(
+    (error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+      return undefined;
+    },
+  );
   if (metadata?.isSymbolicLink()) {
     throw new Error("Multiscan output directories must not be symbolic links.");
   }
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const canonical = await realpath(path);
-  const directory = await lstat(canonical);
+  if (metadata !== undefined && !metadata.isDirectory()) {
+    throw new Error("Multiscan output paths must be directories.");
+  }
+  let prepared = path;
+  if (metadata === undefined) {
+    prepared =
+      process.platform === "win32"
+        ? await canonicalWindowsCreationPath(path)
+        : path;
+    await mkdir(prepared, { recursive: true, mode: 0o700 });
+  }
+  const canonical = await realpath(prepared);
+  const directory = await lstat(canonical, { bigint: true });
   if (
     metadata !== undefined &&
     (directory.dev !== metadata.dev || directory.ino !== metadata.ino)
@@ -529,18 +554,32 @@ async function ensureOutputDirectory(path: string): Promise<string> {
     throw new Error("Multiscan output directories changed during preparation.");
   }
   if (process.platform === "win32") return canonical;
-  if ((directory.mode & 0o022) !== 0) {
+  if ((directory.mode & 0o022n) !== 0n) {
     throw new Error(
       "Multiscan output directories must not be group- or world-writable.",
     );
   }
   const owner = process.geteuid?.();
-  if (owner !== undefined && directory.uid !== owner) {
+  if (owner !== undefined && directory.uid !== BigInt(owner)) {
     throw new Error(
       "Multiscan output directories must be owned by the current user.",
     );
   }
   return canonical;
+}
+
+async function canonicalWindowsCreationPath(path: string): Promise<string> {
+  let ancestor = dirname(path);
+  for (;;) {
+    try {
+      return resolve(await realpath(ancestor), relative(ancestor, path));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw error;
+      ancestor = parent;
+    }
+  }
 }
 
 async function appendReceipt(path: string, receipt: string): Promise<void> {
@@ -571,7 +610,8 @@ async function acquireLock(output: string): Promise<() => Promise<void>> {
       await rm(stale, { recursive: true, force: true });
     }
   }
-  const createdLock = await lstat(path);
+  // Windows file IDs can exceed JavaScript's safe integer range.
+  const createdLock = await lstat(path, { bigint: true });
   const owner = `${JSON.stringify({
     pid: process.pid,
     ownerId: randomUUID(),
@@ -581,7 +621,7 @@ async function acquireLock(output: string): Promise<() => Promise<void>> {
   try {
     await writeFile(ownerPath, owner, { flag: "wx", mode: 0o600 });
   } catch (error) {
-    const currentLock = await lstat(path).catch(
+    const currentLock = await lstat(path, { bigint: true }).catch(
       (cleanup: NodeJS.ErrnoException) => {
         if (cleanup.code !== "ENOENT") throw cleanup;
         return undefined;
@@ -743,7 +783,7 @@ async function ensureManifest(
   tasks: MultiscanTask[],
   options: Pick<
     MultiscanOptions,
-    "scanPrompt" | "postScanPrompt" | "maxCostUsd"
+    "scanPrompt" | "validationPrompt" | "postScanPrompt" | "maxCostUsd"
   >,
 ): Promise<void> {
   const expected = `${JSON.stringify(
@@ -753,6 +793,9 @@ async function ensureManifest(
       ...(options.scanPrompt === undefined
         ? {}
         : { scanPrompt: options.scanPrompt }),
+      ...(options.validationPrompt === undefined
+        ? {}
+        : { validationPrompt: options.validationPrompt }),
       ...(options.postScanPrompt === undefined
         ? {}
         : { postScanPrompt: options.postScanPrompt }),
@@ -1090,7 +1133,7 @@ function parseInventory(
     if (
       !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(id) ||
       id.endsWith(".") ||
-      /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(id)
+      WINDOWS_DEVICE_PATH_NAME.test(id)
     ) {
       throw new Error("Multiscan task IDs must be safe, unique path names.");
     }
@@ -1112,6 +1155,7 @@ function parseInventory(
       (isAbsolute(scope) ||
         scope.includes("\\") ||
         scope.split("/").includes("..") ||
+        (process.platform === "win32" && scope.includes(":")) ||
         scope.includes("\0"))
     ) {
       throw new Error("Multiscan scope must stay inside its repository.");
@@ -1134,7 +1178,15 @@ function normalizeRepository(repository: string, directory: string): string {
     );
   }
   if (/^[^@\s/:]+@[^:\s/]+:.+$/u.test(repository)) return repository;
-  if (!repository.includes("://")) return resolve(directory, repository);
+  if (!repository.includes("://")) {
+    const path = resolve(directory, repository);
+    if (process.platform !== "win32") return path;
+    try {
+      return realpathSync.native(path);
+    } catch {
+      return path;
+    }
+  }
   let url: URL;
   try {
     url = new URL(repository);
