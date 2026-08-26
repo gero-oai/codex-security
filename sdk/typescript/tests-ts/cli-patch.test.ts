@@ -8,7 +8,9 @@ import {
   realpath,
   rename,
   rm,
+  rmdir,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -379,6 +381,62 @@ describe("scan and patch workflow", () => {
             "Final combined verification found that a later patch reintroduced this finding.",
         },
         { occurrenceId: "occ_2", status: "verified" },
+      ],
+    });
+  });
+
+  test("reverifies an accepted finding after a later patch attempt is blocked", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const verificationIds: string[][] = [];
+    let authors = 0;
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--review-minimality", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        onCodex: (args, output) => {
+          if (output!.command === "verify-fix") {
+            const prompt = output!.appServer!.prompt;
+            const identifiers = JSON.parse(
+              prompt.split("\n").at(-1)!,
+            ) as Finding[];
+            verificationIds.push(
+              identifiers.map(({ occurrenceId }) => occurrenceId),
+            );
+            output!.stdout.write(
+              JSON.stringify({
+                results: [
+                  {
+                    id: "occ_1",
+                    status: "fixed",
+                    evidence: "The complete synthetic patch preserves the fix.",
+                  },
+                ],
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            authors += 1;
+            completePatches(
+              args,
+              output,
+              authors === 1 ? "verified" : "blocked",
+            );
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(1);
+    expect(verificationIds).toEqual([["occ_1"]]);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      patches: [
+        { occurrenceId: "occ_1", status: "verified" },
+        { occurrenceId: "occ_2", status: "blocked" },
       ],
     });
   });
@@ -1829,7 +1887,12 @@ describe("scan and patch workflow", () => {
     }
   });
 
-  test.each(["configuration", "hook", "sparse checkout"] as const)(
+  test.each([
+    "common directory",
+    "configuration",
+    "hook",
+    "sparse checkout",
+  ] as const)(
     "fails closed when the author changes top-level Git %s",
     async (kind) => {
       const repository = await realpath(
@@ -1866,7 +1929,9 @@ describe("scan and patch workflow", () => {
                 reviews += 1;
               } else {
                 await writeFile(join(repository, "value.ts"), "fixed\n");
-                if (kind === "configuration") {
+                if (kind === "common directory") {
+                  await writeFile(join(repository, ".git", "commondir"), ".\n");
+                } else if (kind === "configuration") {
                   git("config", "review.synthetic", "changed");
                 } else if (kind === "hook") {
                   await writeFile(
@@ -1901,6 +1966,111 @@ describe("scan and patch workflow", () => {
       }
     },
   );
+
+  test("fails closed when the author deletes an empty untracked directory", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-empty-directory-")),
+    );
+    const emptyDirectory = join(repository, "preserve-empty");
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviews = 0;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+      await mkdir(emptyDirectory);
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              await rmdir(emptyDirectory);
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain(
+        "untracked directory changed after patch review started",
+      );
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("allows a reviewed file inside a pre-existing empty directory", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-empty-directory-patch-")),
+    );
+    const emptyDirectory = join(repository, "preserve-empty");
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+      await mkdir(emptyDirectory);
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              await writeFile(join(emptyDirectory, "added.ts"), "reviewed\n");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
 
   test("rejects object alternates outside the selected repository", async () => {
     const root = await realpath(
@@ -2214,6 +2384,70 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("does not let nested status refresh mutate the nested index", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-nested-index-refresh-")),
+    );
+    const nested = join(repository, "nested");
+    const nestedValue = join(nested, "value.ts");
+    const git = (directory: string, ...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: directory,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    try {
+      git(repository, "init", "--initial-branch=main");
+      git(repository, "config", "user.name", "Synthetic User");
+      git(repository, "config", "user.email", "synthetic@example.test");
+      git(repository, "config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git(repository, "add", "--", "value.ts");
+      git(repository, "commit", "-m", "Initial synthetic checkout");
+
+      await mkdir(nested);
+      git(nested, "init", "--initial-branch=main");
+      git(nested, "config", "user.name", "Synthetic User");
+      git(nested, "config", "user.email", "synthetic@example.test");
+      git(nested, "config", "commit.gpgsign", "false");
+      await writeFile(nestedValue, "nested baseline\n");
+      git(nested, "add", "--", "value.ts");
+      const baselineIndex = await readFile(join(nested, ".git", "index"));
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              const future = new Date(Date.now() + 60_000);
+              await utimes(nestedValue, future, future);
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(await readFile(join(nested, ".git", "index"))).toEqual(
+        baselineIndex,
+      );
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
   test("fails closed when the author changes descendant embedded Git metadata", async () => {
     const repository = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-descendant-metadata-")),
@@ -2330,7 +2564,11 @@ describe("scan and patch workflow", () => {
     }
   });
 
-  test.each(["tracked file marked assume-unchanged", "Git metadata"] as const)(
+  test.each([
+    "tracked file marked assume-unchanged",
+    "Git metadata",
+    "sparse checkout",
+  ] as const)(
     "fails closed when the author changes a nested %s",
     async (kind) => {
       const repository = await realpath(
@@ -2363,6 +2601,11 @@ describe("scan and patch workflow", () => {
         git(nested, "commit", "-m", "Initial nested checkout");
         if (kind === "tracked file marked assume-unchanged") {
           git(nested, "update-index", "--assume-unchanged", "tracked.ts");
+        } else if (kind === "sparse checkout") {
+          await writeFile(
+            join(nested, ".git", "info", "sparse-checkout"),
+            "/*\n",
+          );
         }
 
         const outcome = await runWorkflow(
@@ -2376,6 +2619,11 @@ describe("scan and patch workflow", () => {
                 await writeFile(join(repository, "value.ts"), "fixed\n");
                 if (kind === "tracked file marked assume-unchanged") {
                   await writeFile(join(nested, "tracked.ts"), "changed\n");
+                } else if (kind === "sparse checkout") {
+                  await writeFile(
+                    join(nested, ".git", "info", "sparse-checkout"),
+                    "/src/\n",
+                  );
                 } else {
                   git(nested, "config", "review.synthetic", "changed");
                 }
@@ -4198,7 +4446,8 @@ describe("scan and patch workflow", () => {
     expect(commandDirectories.length).toBeGreaterThan(0);
     expect(new Set(commandDirectories)).toEqual(new Set([root]));
     expect(JSON.parse(outcome.stdout)).toMatchObject({
-      repository: root,
+      repository: selected,
+      patchRepository: root,
       patches: [
         {
           status: "verified",
@@ -4299,6 +4548,13 @@ describe("scan and patch workflow", () => {
             paths: ["src/finding-1.ts"],
             diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n",
             publicationBaseCommit: "a".repeat(40),
+            publicationBaseEntries: [
+              {
+                path: "src/finding-1.ts",
+                mode: "100644",
+                object: "c".repeat(40),
+              },
+            ],
           },
         ],
         onRepositoryCommand: (command, args) => {
@@ -4492,6 +4748,122 @@ describe("scan and patch workflow", () => {
 
     expect(outcome.exitCode, outcome.stderr).toBe(0);
     expect(pullRequestCreated).toBe(true);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      pullRequest: { url },
+    });
+  });
+
+  test("omits a path created and removed across reviewed findings", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    result.findings.findings[0]!.locations[0]!.path = "transient.ts";
+    result.findings.findings[1]!.locations[0]!.path = "kept.ts";
+    const baseCommit = "a".repeat(40);
+    const baseObject = "b".repeat(40);
+    const transientObject = "c".repeat(40);
+    const keptObject = "d".repeat(40);
+    const creation = {
+      paths: ["transient.ts"],
+      diff: "diff --git a/transient.ts b/transient.ts\n",
+      publicationBaseCommit: baseCommit,
+      publicationBaseEntries: [],
+      publicationEntries: [
+        { path: "transient.ts", mode: "100644", object: transientObject },
+      ],
+    };
+    const final = {
+      paths: ["kept.ts"],
+      diff: "diff --git a/kept.ts b/kept.ts\n",
+      publicationBaseCommit: baseCommit,
+      publicationBaseEntries: [
+        { path: "kept.ts", mode: "100644", object: baseObject },
+      ],
+      publicationEntries: [
+        { path: "kept.ts", mode: "100644", object: keptObject },
+      ],
+    };
+    const stagedPaths: string[][] = [];
+    const url = "https://github.example.test/example/repository/pull/20";
+    const outcome = await runWorkflow(
+      [
+        "patch",
+        "--scan",
+        "scan-1",
+        "--review-minimality",
+        "--create-pr",
+        "--json",
+      ],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [creation, creation, final, final],
+        onCodex: (args, output) => {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_2"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+        onRepositoryCommand: (command, args) => {
+          if (command === "git" && args.includes("add")) {
+            stagedPaths.push(args.slice(args.indexOf("--") + 1));
+          }
+          if (
+            command === "git" &&
+            args[0] === "rev-parse" &&
+            args[1] === "--verify" &&
+            args[2] === "HEAD"
+          ) {
+            return baseCommit;
+          }
+          if (command === "git" && args[0] === "ls-files") {
+            return `100644 ${keptObject} 0\tkept.ts\0`;
+          }
+          if (command === "git" && args[0] === "ls-tree") {
+            return `100644 blob ${keptObject}\tkept.ts\0`;
+          }
+          if (command === "git" && args[0] === "write-tree") {
+            return "verified-tree";
+          }
+          if (
+            command === "git" &&
+            args[0] === "rev-parse" &&
+            args[1] === "HEAD^{tree}"
+          ) {
+            return "verified-tree";
+          }
+          if (
+            command === "git" &&
+            args[0] === "rev-parse" &&
+            args[1] === "--verify" &&
+            args[2] === "HEAD^"
+          ) {
+            return baseCommit;
+          }
+          if (command === "git" && args[0] === "rev-parse") {
+            return "verified-commit";
+          }
+          if (command === "gh" && args[1] === "list") return "";
+          if (command === "gh" && args[1] === "create") return url;
+          return "";
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(stagedPaths).toEqual([["kept.ts"]]);
     expect(JSON.parse(outcome.stdout)).toMatchObject({
       pullRequest: { url },
     });
