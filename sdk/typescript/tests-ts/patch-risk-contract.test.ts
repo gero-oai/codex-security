@@ -320,6 +320,36 @@ describe("patch risk assessment contract", () => {
     }
   });
 
+  test("requires usable and distinct range identities", async () => {
+    for (const field of ["repository", "base", "head"] as const) {
+      const payload = assessment();
+      payload.patch[field] = " \t";
+
+      const result = await validate(payload);
+      expect(result.status, `${field}: ${result.stderr}`).not.toBe(0);
+      expect(result.stderr).toContain(
+        `patch.${field}: string does not match the required pattern`,
+      );
+    }
+
+    const emptyRange = assessment();
+    emptyRange.patch.head = emptyRange.patch.base;
+    const rejected = await validate(emptyRange);
+    expect(rejected.status).not.toBe(0);
+    expect(rejected.stderr).toContain(
+      "patch base and head must identify distinct revisions",
+    );
+
+    emptyRange.recommendation = "no_op";
+    emptyRange.workflowLabel = "no_op";
+    emptyRange.applicability = {
+      status: "wrong_owner",
+      rationale: "The comparison belongs to a different runtime owner.",
+    };
+    const noOp = await validate(emptyRange);
+    expect(noOp.status, noOp.stderr).toBe(0);
+  });
+
   test("rejects non-low impact for auto-merge", async () => {
     const payload = assessment();
     payload.workflowLabel = "auto_merge_candidate";
@@ -567,6 +597,40 @@ describe("patch risk assessment contract", () => {
         },
       },
     ];
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("holds a known defect while its applicability remains unknown", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.regressionLikelihood.rating = "high";
+    payload.applicability = {
+      status: "unknown",
+      rationale: "Runtime ownership remains unresolved.",
+    };
+    payload.materialBoundaries[0]!.result = "contradicted";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The deployment owner is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does this repository own the affected runtime?",
+        action: "Inspect the checked-in deployment registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: {
+          owned: "revise",
+          not_owned: "no_op",
+        },
+      },
+    ];
+
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
   });
@@ -980,7 +1044,19 @@ describe("patch risk assessment contract", () => {
 
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("merge cannot include failed validation");
+    expect(result.stderr).toContain(
+      "merge cannot include a patch-caused or unattributed failure",
+    );
+  });
+
+  test("allows human review when a failed check is not patch caused", async () => {
+    const payload = assessment();
+    payload.regressionLikelihood.rating = "moderate";
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "not_patch_caused";
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
   });
 
   test("validates large unique changed-file lists without dropping duplicates", async () => {
@@ -1000,18 +1076,14 @@ describe("patch risk assessment contract", () => {
     );
   });
 
-  test("requires every validation item to pass for strong protection", async () => {
+  test("keeps protection strength separate from validation outcomes", async () => {
     const payload = assessment();
-    payload.validation.push({
-      name: "platform check",
-      status: "unavailable",
-      protects: "Architecture-specific behavior.",
-    });
+    payload.recommendation = "revise";
+    payload.workflowLabel = "revise";
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "patch_caused";
     const result = await validate(payload);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain(
-      "strong regression protection requires every validation item to pass",
-    );
+    expect(result.status, result.stderr).toBe(0);
   });
 
   test("requires an established non-applicable no-op disposition", async () => {

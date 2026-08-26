@@ -39,12 +39,12 @@
         "sha256"
       ],
       "properties": {
-        "repository": { "$ref": "#/$defs/nonEmptyString" },
+        "repository": { "$ref": "#/$defs/nonBlankString" },
         "sourceType": {
           "enum": ["pull_request_diff", "patch_file", "commit_range"]
         },
-        "base": { "$ref": "#/$defs/nonEmptyString" },
-        "head": { "$ref": "#/$defs/nonEmptyString" },
+        "base": { "$ref": "#/$defs/nonBlankString" },
+        "head": { "$ref": "#/$defs/nonBlankString" },
         "changedFiles": { "$ref": "#/$defs/stringList" },
         "sha256": {
           "type": "string",

@@ -269,6 +269,13 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 f"validation.{index}: only failed validation may set failureAttribution"
             )
 
+    if (
+        value["patch"]["sourceType"] in {"pull_request_diff", "commit_range"}
+        and recommendation != "no_op"
+        and value["patch"]["base"].strip() == value["patch"]["head"].strip()
+    ):
+        errors.append("patch base and head must identify distinct revisions")
+
     if recommendation not in {"no_op", "hold_for_evidence"} and not value[
         "patch"
     ]["changedFiles"]:
@@ -295,8 +302,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("merge cannot have critical regression likelihood")
         if value["confidence"]["rating"] == "low":
             errors.append("merge cannot have low confidence")
-        if any(item["status"] == "failed" for item in value["validation"]):
-            errors.append("merge cannot include failed validation")
+        if any(
+            item["status"] == "failed"
+            and item.get("failureAttribution") != "not_patch_caused"
+            for item in value["validation"]
+        ):
+            errors.append("merge cannot include a patch-caused or unattributed failure")
         if value["regressionLikelihood"]["rating"] == "low" and (
             value["regressionProtection"]["rating"] in {"none", "unknown"}
             or not any(item["status"] == "passed" for item in value["validation"])
@@ -326,7 +337,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("hold_for_evidence requires a bounded evidence plan")
         if value["regressionLikelihood"]["rating"] == "critical":
             errors.append("hold_for_evidence cannot have critical regression likelihood")
-        if any(item["result"] == "contradicted" for item in boundaries):
+        if (
+            any(item["result"] == "contradicted" for item in boundaries)
+            and value["applicability"]["status"] != "unknown"
+        ):
             errors.append("hold_for_evidence cannot retain a contradicted material boundary")
         planned_failed_validations: set[str] = set()
         planned_unknowns: set[str] = set()
@@ -391,10 +405,6 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     if value["regressionProtection"]["rating"] == "strong":
         if not value["regressionProtection"]["exactHeadChecksPassed"]:
             errors.append("strong regression protection requires exact-head checks to pass")
-        if not all(item["status"] == "passed" for item in value["validation"]):
-            errors.append(
-                "strong regression protection requires every validation item to pass"
-            )
 
     if workflow_label == "auto_merge_candidate":
         auto_merge_requirements = {
