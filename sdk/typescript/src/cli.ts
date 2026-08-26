@@ -6541,6 +6541,7 @@ async function snapshotPatchReviewWorktree(
     { repository: NestedPatchReviewRepository; state: string }
   >();
   const baselineIgnoredPathStates = new Map<string, string>();
+  const baselineUninitializedGitlinkStates = new Map<string, string>();
   const baselineUnrepresentedFileModes = new Map<string, bigint>();
   const baselineUnrepresentedDirectoryModes = new Map<string, bigint>();
   let capturingBaseline = true;
@@ -6566,6 +6567,7 @@ async function snapshotPatchReviewWorktree(
       "hooks",
       "info/attributes",
       "info/exclude",
+      "info/sparse-checkout",
       "objects/info/alternates",
       "packed-refs",
       "refs",
@@ -6733,37 +6735,48 @@ async function snapshotPatchReviewWorktree(
     if (!capturingBaseline) {
       await assertNestedRepositoriesUnchanged(currentNestedRepositoryStates);
     }
-    const [sparseEntries, listed, currentIgnored] = await Promise.all([
-      runPatchReviewGitBytes(repository, ["ls-files", "-v", "-z", "--", "."], {
-        signal,
-      }),
-      runPatchReviewGitBytes(
-        repository,
-        [
-          "ls-files",
-          "--cached",
-          "--others",
-          "--exclude-standard",
-          "-z",
-          "--",
-          ".",
-        ],
-        { environment, signal },
-      ),
-      runPatchReviewGitBytes(
-        repository,
-        [
-          "ls-files",
-          "--others",
-          "--ignored",
-          "--exclude-standard",
-          "-z",
-          "--",
-          ".",
-        ],
-        { environment, signal },
-      ),
-    ]);
+    const [sparseEntries, listed, currentIgnored, rawIndexEntries] =
+      await Promise.all([
+        runPatchReviewGitBytes(
+          repository,
+          ["ls-files", "-v", "-z", "--", "."],
+          {
+            signal,
+          },
+        ),
+        runPatchReviewGitBytes(
+          repository,
+          [
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+          ],
+          { environment, signal },
+        ),
+        runPatchReviewGitBytes(
+          repository,
+          [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+          ],
+          { environment, signal },
+        ),
+        runPatchReviewGitBytes(
+          repository,
+          ["ls-files", "--stage", "-z", "--", "."],
+          { environment, signal },
+        ),
+      ]);
+    const currentEntries = parseRawPatchReviewIndexEntries(rawIndexEntries);
     const skipWorktreePaths = new Set(
       splitNulRecords(sparseEntries)
         .filter(
@@ -6979,6 +6992,20 @@ async function snapshotPatchReviewWorktree(
         }
         continue;
       }
+      if (currentEntries.get(key)?.mode === "160000") {
+        const digest = createHash("sha256");
+        await hashNestedPatchReviewPath(repository, pathBytes, digest, signal);
+        const state = digest.digest("hex");
+        const baseline = baselineUninitializedGitlinkStates.get(key);
+        if (capturingBaseline && baseline === undefined) {
+          baselineUninitializedGitlinkStates.set(key, state);
+        } else if (baseline !== state) {
+          throw new CodexSecurityError(
+            "An uninitialized Git submodule changed after patch review started. Review it as a separate patch target.",
+          );
+        }
+        continue;
+      }
       if (ignoredAtBaseline && !ignoredInstructionAtBaseline) {
         continue;
       }
@@ -7010,13 +7037,6 @@ async function snapshotPatchReviewWorktree(
       }
     }
     if (included.length > 0) {
-      const currentEntries = parseRawPatchReviewIndexEntries(
-        await runPatchReviewGitBytes(
-          repository,
-          ["ls-files", "--stage", "-z", "--", "."],
-          { environment, signal },
-        ),
-      );
       const indexInfo: Buffer[] = [];
       for (const path of included) {
         signal?.throwIfAborted();
