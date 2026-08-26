@@ -1172,7 +1172,7 @@ interface PatchReviewRepositoryView {
   tree: string;
   objectDirectory: string;
   alternateObjectDirectory: string;
-  runtime: string;
+  runtimeSource: string;
   gitExecutable: string;
 }
 
@@ -6365,8 +6365,7 @@ function patchReviewPromptCandidate(
   };
 }
 
-async function sealPatchReviewMcpRuntime(
-  temporaryDirectory: string,
+async function patchReviewMcpRuntimeSource(
   signal?: AbortSignal,
 ): Promise<string> {
   const moduleDirectory = dirname(fileURLToPath(import.meta.url));
@@ -6378,16 +6377,12 @@ async function sealPatchReviewMcpRuntime(
       throw error;
     });
     if (!metadata?.isFile()) continue;
-    const runtime = join(
-      temporaryDirectory,
-      name.endsWith(".ts") ? "patch-review-mcp.ts" : "patch-review-mcp.mjs",
-    );
-    await writeFile(runtime, await readFile(source), {
-      flag: "wx",
-      mode: 0o400,
-    });
+    const bytes = await readFile(source);
+    const contents = bytes.toString("utf8");
+    if (!Buffer.from(contents, "utf8").equals(bytes)) continue;
     signal?.throwIfAborted();
-    return runtime;
+    const module = contents.replace(/^#![^\r\n]*(?:\r?\n|$)/u, "");
+    return `${module}\nvoid runPatchReviewRepositoryMcp(process.argv.slice(1)).then(\n  (exitCode) => { process.exitCode = exitCode; },\n  (error) => { process.stderr.write(\`codex-security: \${safeMessage(error)}\\n\`); process.exitCode = 2; },\n);\n`;
   }
   throw new CodexSecurityError(
     "The independent patch reviewer runtime is unavailable.",
@@ -6395,8 +6390,23 @@ async function sealPatchReviewMcpRuntime(
 }
 
 const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
+  "AUTO_MERGE",
+  "BISECT_EXPECTED_REV",
+  "BISECT_LOG",
+  "BISECT_NAMES",
+  "BISECT_START",
+  "BISECT_TERMS",
+  "CHERRY_PICK_HEAD",
   "HEAD",
   "HEAD.lock",
+  "MERGE_AUTOSTASH",
+  "MERGE_HEAD",
+  "MERGE_MODE",
+  "MERGE_MSG",
+  "ORIG_HEAD",
+  "REBASE_HEAD",
+  "REVERT_HEAD",
+  "SQUASH_MSG",
   "commondir",
   "config",
   "config.lock",
@@ -6411,6 +6421,9 @@ const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
   "packed-refs",
   "packed-refs.lock",
   "refs",
+  "rebase-apply",
+  "rebase-merge",
+  "sequencer",
   "shallow",
   "shallow.lock",
 ] as const;
@@ -6563,6 +6576,7 @@ async function snapshotPatchReviewWorktree(
   const ignoredInstructionPathSet = new Set(
     ignoredInstructionPaths.map(patchReviewGitPathKey),
   );
+  const runtimeSource = await patchReviewMcpRuntimeSource(signal);
   const temporaryDirectory = await mkdtemp(
     join(temporaryRoot, "codex-security-patch-review-"),
   );
@@ -6628,7 +6642,13 @@ async function snapshotPatchReviewWorktree(
     }
     return digest.digest("hex");
   };
-  const baselineRepositoryGitMetadataState = await repositoryGitMetadataState();
+  let baselineRepositoryGitMetadataState: string;
+  try {
+    baselineRepositoryGitMetadataState = await repositoryGitMetadataState();
+  } catch (error) {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+    throw error;
+  }
   const assertRepositoryGitMetadataUnchanged = async (): Promise<void> => {
     const current = await repositoryGitMetadataState().catch(() => {
       signal?.throwIfAborted();
@@ -7365,7 +7385,6 @@ async function snapshotPatchReviewWorktree(
   try {
     signal?.throwIfAborted();
     await Promise.all([mkdir(objectDirectory), mkdir(reviewDirectory)]);
-    const runtime = await sealPatchReviewMcpRuntime(temporaryDirectory, signal);
     const reviewerGit = await resolveTrustedExecutable(
       "git",
       patchReviewGitProcessEnvironment(),
@@ -7804,7 +7823,7 @@ async function snapshotPatchReviewWorktree(
         tree: baselineTree,
         objectDirectory,
         alternateObjectDirectory: repositoryObjectDirectory,
-        runtime,
+        runtimeSource,
         gitExecutable: reviewerGit.executable,
       },
       async assertBaselineUnchanged() {
@@ -9261,7 +9280,9 @@ export async function readSkillCommandOutput(
                     codex_security_review: {
                       command: process.execPath,
                       args: [
-                        reviewRepository!.runtime,
+                        "--input-type=module",
+                        "--eval",
+                        reviewRepository!.runtimeSource,
                         reviewRepository!.gitExecutable,
                         reviewRepository!.repository,
                         reviewRepository!.tree,

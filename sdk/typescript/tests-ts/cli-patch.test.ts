@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -27,10 +28,7 @@ import {
 const CURRENT_REPOSITORY = resolve("/current/repository");
 const SAVED_REPOSITORY = resolve("/saved/repository");
 const STATE_DIRECTORY = resolve("/tmp/codex-security-state");
-const PATCH_REVIEW_RUNTIME = join(
-  import.meta.dir,
-  "../src/patch-review-mcp.ts",
-);
+const PATCH_REVIEW_RUNTIME_SOURCE = "synthetic patch review runtime";
 const GIT_EXECUTABLE = Bun.which("git") ?? process.execPath;
 
 function runRepositoryGit(
@@ -92,7 +90,7 @@ function dependencies(
         tree: "synthetic-baseline-tree",
         objectDirectory: resolve(directory, ".git", "objects"),
         alternateObjectDirectory: resolve(directory, ".git", "objects"),
-        runtime: PATCH_REVIEW_RUNTIME,
+        runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
         gitExecutable: GIT_EXECUTABLE,
       },
       candidate: async () => {
@@ -881,7 +879,7 @@ describe("scan and patch workflow", () => {
                         ".git",
                         "objects",
                       ),
-                      runtime: PATCH_REVIEW_RUNTIME,
+                      runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
                       gitExecutable: GIT_EXECUTABLE,
                     },
                     candidate: async () => {
@@ -1250,10 +1248,7 @@ describe("scan and patch workflow", () => {
             expect(server.directory).toBe(view.directory);
             expect(server.directory).not.toBe(repository);
             expect(view.repository).toBe(repository);
-            expect(view.runtime.startsWith(repository)).toBe(false);
-            expect(await readFile(view.runtime, "utf8")).toContain(
-              "codex-security-patch-review",
-            );
+            expect(view.runtimeSource).toContain("runPatchReviewRepositoryMcp");
             expect(server.prompt).toContain("candidate-only-instruction");
             const messages = [
               {
@@ -1330,7 +1325,9 @@ describe("scan and patch workflow", () => {
             const execution = spawnSync(
               process.execPath,
               [
-                view.runtime,
+                "--input-type=module",
+                "--eval",
+                view.runtimeSource,
                 view.gitExecutable,
                 view.repository,
                 view.tree,
@@ -1397,7 +1394,7 @@ describe("scan and patch workflow", () => {
     } finally {
       await rm(repository, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("supplies applicable ancestor instructions to style review", async () => {
     const root = await realpath(
@@ -2017,6 +2014,7 @@ describe("scan and patch workflow", () => {
     "configuration",
     "hook",
     "index lock",
+    "merge state",
     "sparse checkout",
   ] as const)(
     "fails closed when the author changes top-level Git %s",
@@ -2064,6 +2062,11 @@ describe("scan and patch workflow", () => {
                     join(repository, ".git", "hooks", "pre-commit"),
                     "#!/bin/sh\nexit 0\n",
                   );
+                } else if (kind === "merge state") {
+                  await writeFile(
+                    join(repository, ".git", "MERGE_HEAD"),
+                    `${"a".repeat(40)}\n`,
+                  );
                 } else if (kind === "sparse checkout") {
                   await writeFile(
                     join(repository, ".git", "info", "sparse-checkout"),
@@ -2096,6 +2099,63 @@ describe("scan and patch workflow", () => {
         await rm(repository, { recursive: true, force: true });
       }
     },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "cleans temporary review storage when baseline metadata capture fails",
+    async () => {
+      const repository = await realpath(
+        await mkdtemp(join(tmpdir(), "codex-security-metadata-cleanup-")),
+      );
+      const mergeHead = join(repository, ".git", "MERGE_HEAD");
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      const reviewDirectories = async () =>
+        (await readdir(tmpdir()))
+          .filter((name) => name.startsWith("codex-security-patch-review-"))
+          .sort();
+      try {
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        await writeFile(join(repository, "value.ts"), "unsafe\n");
+        git("add", "--", "value.ts");
+        git("commit", "-m", "Initial synthetic checkout");
+        await writeFile(mergeHead, `${"a".repeat(40)}\n`);
+        await chmod(mergeHead, 0o000);
+        const before = await reviewDirectories();
+        let authorStarted = false;
+
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: () => {
+              authorStarted = true;
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode).toBe(2);
+        expect(authorStarted).toBe(false);
+        expect(await reviewDirectories()).toEqual(before);
+      } finally {
+        await chmod(mergeHead, 0o600).catch(() => {});
+        await rm(repository, { recursive: true, force: true });
+      }
+    },
+    30_000,
   );
 
   test("fails closed when the author deletes an empty untracked directory", async () => {
@@ -5165,7 +5225,7 @@ describe("scan and patch workflow", () => {
               tree: "synthetic-baseline-tree",
               objectDirectory: resolve(root, ".git", "objects"),
               alternateObjectDirectory: resolve(root, ".git", "objects"),
-              runtime: PATCH_REVIEW_RUNTIME,
+              runtimeSource: PATCH_REVIEW_RUNTIME_SOURCE,
               gitExecutable: GIT_EXECUTABLE,
             },
             candidate: async () => ({
