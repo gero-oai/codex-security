@@ -5677,7 +5677,7 @@ async function nestedPatchReviewRepository(
       const config = configBytes.toString("utf8");
       if (
         !Buffer.from(config, "utf8").equals(configBytes) ||
-        /^\s*\[\s*include(?:if)?(?:\s|\")/imu.test(config)
+        /^\s*\[\s*include(?:if)?(?:\s|")/imu.test(config)
       ) {
         throw new CodexSecurityError(
           "Nested Git metadata must not include external configuration.",
