@@ -1618,6 +1618,10 @@ describe("scan and patch workflow", () => {
                 join(repository, "candidate.md"),
                 "candidate-only-instruction\n",
               );
+              await writeFile(
+                join(repository, ".gitattributes"),
+                "baseline.md binary\n",
+              );
               await writeFile(join(repository, "src", "value.ts"), "fixed\n");
               output!.stdout.write("Verified synthetic patch.");
               return 0;
@@ -2249,6 +2253,68 @@ describe("scan and patch workflow", () => {
               await writeFile(join(repository, "value.ts"), "fixed\n");
               git("update-index", "--skip-worktree", "hidden.ts");
               await rm(hidden);
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(reviews).toBe(0);
+      expect(outcome.stderr).toContain(
+        "Git index changed after patch review started",
+      );
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when the author clears intent-to-add", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-index-intent-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviews = 0;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+      await writeFile(join(repository, "planned.ts"), "planned\n");
+      git("add", "--intent-to-add", "--", "planned.ts");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviews += 1;
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              const empty = git("hash-object", "-w", "--stdin");
+              git(
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                empty,
+                "planned.ts",
+              );
               output!.stdout.write("Verified synthetic patch.");
             }
             return 0;
@@ -5771,6 +5837,70 @@ describe("scan and patch workflow", () => {
           commands.push({ command, args });
           if (command === "git" && args[0] === "ls-tree") {
             return `100644 blob ${"b".repeat(40)}\tsrc/finding-1.ts\0`;
+          }
+          return "";
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(2);
+    expect(outcome.stderr).toContain(
+      "The patch changed after independent review",
+    );
+    expect(commands.some(({ command }) => command === "gh")).toBe(false);
+    expect(
+      commands.some(
+        ({ command, args }) => command === "git" && args[0] === "commit",
+      ),
+    ).toBe(false);
+  });
+
+  test("does not publish a reviewed deletion recreated before staging", async () => {
+    const result = resultWithFindings(["high"]);
+    const path = "src/finding-1.ts";
+    const base = "a".repeat(40);
+    const recreated = "b".repeat(40);
+    const commands: Array<{ command: string; args: readonly string[] }> = [];
+    const outcome = await runWorkflow(
+      [
+        "patch",
+        "--scan",
+        "scan-1",
+        "--review-minimality",
+        "--create-pr",
+        "--json",
+      ],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        onCodex: (args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+        patchReviewDeltas: [
+          {
+            paths: [path],
+            diff: `diff --git a/${path} b/${path}\ndeleted file mode 100644\n`,
+            publicationBaseCommit: base,
+            publicationBaseEntries: [
+              { path, mode: "100644", object: "c".repeat(40) },
+            ],
+            publicationEntries: [],
+          },
+        ],
+        onRepositoryCommand: (command, args) => {
+          commands.push({ command, args });
+          if (command === "git" && args[0] === "rev-parse") {
+            return base;
+          }
+          if (command === "git" && args[0] === "ls-files") {
+            return `100644 ${recreated} 0\t${path}\0`;
           }
           return "";
         },

@@ -5369,10 +5369,18 @@ async function createPatchPullRequest(
         await runWithTemporaryIndex(["ls-files", "--stage", "-z", "--", "."]),
       ),
     );
-    for (const expected of reviewPublicationEntries) {
+    const expectedEntries = new Map(
+      reviewPublicationEntries.map((entry) => [entry.path, entry]),
+    );
+    const publicationPaths =
+      reviewBaseCommit === undefined
+        ? new Set(expectedEntries.keys())
+        : new Set([...files, ...expectedEntries.keys()]);
+    for (const path of publicationPaths) {
+      const expected = expectedEntries.get(path) ?? { path };
       if (
         !samePatchReviewTreeEntry(
-          currentEntries.get(expected.path) ?? { path: expected.path },
+          currentEntries.get(path) ?? { path },
           expected,
         )
       ) {
@@ -5415,16 +5423,24 @@ async function createPatchPullRequest(
     "--",
     ...publicationPathspecs,
   ]);
-  for (const expected of reviewPublicationEntries) {
+  const expectedEntries = new Map(
+    reviewPublicationEntries.map((entry) => [entry.path, entry]),
+  );
+  const publicationPaths =
+    reviewBaseCommit === undefined
+      ? new Set(expectedEntries.keys())
+      : new Set([...files, ...expectedEntries.keys()]);
+  for (const path of publicationPaths) {
+    const expected = expectedEntries.get(path) ?? { path };
     const actual = parsePatchReviewTreeEntry(
-      expected.path,
+      path,
       await run("git", [
         "ls-tree",
         "--full-tree",
         "-z",
         "HEAD^{tree}",
         "--",
-        `:(top,literal)${expected.path}`,
+        `:(top,literal)${path}`,
       ]),
     );
     if (actual.mode !== expected.mode || actual.object !== expected.object) {
@@ -7771,19 +7787,38 @@ async function snapshotPatchReviewWorktree(
         }),
       };
     };
-    const [indexSnapshot, indexState] = await Promise.all([
+    const repositoryIntentToAddState = (): Promise<Buffer> =>
+      runPatchReviewGitBytes(
+        repository,
+        [
+          "diff",
+          "--cached",
+          "--ita-invisible-in-index",
+          "--raw",
+          "--no-abbrev",
+          "-z",
+          "--",
+          ".",
+        ],
+        { environment: objectEnvironment, signal },
+      );
+    const [indexSnapshot, indexState, intentToAddState] = await Promise.all([
       repositoryIndexTree(),
       repositoryIndexState(),
+      repositoryIntentToAddState(),
     ]);
     const indexTree = indexSnapshot.tree;
     const assertRepositoryIndexUnchanged = async (): Promise<void> => {
-      const [currentIndexSnapshot, currentIndexState] = await Promise.all([
-        repositoryIndexTree(),
-        repositoryIndexState(),
-      ]);
+      const [currentIndexSnapshot, currentIndexState, currentIntentToAddState] =
+        await Promise.all([
+          repositoryIndexTree(),
+          repositoryIndexState(),
+          repositoryIntentToAddState(),
+        ]);
       let unchanged =
         currentIndexSnapshot.tree === indexTree &&
         currentIndexSnapshot.entries.equals(indexSnapshot.entries) &&
+        currentIntentToAddState.equals(intentToAddState) &&
         currentIndexState.size === indexState.size;
       if (unchanged) {
         for (const [key, baseline] of indexState) {
