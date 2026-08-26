@@ -30,6 +30,22 @@ const PATCH_REVIEW_RUNTIME = join(
 );
 const GIT_EXECUTABLE = Bun.which("git") ?? process.execPath;
 
+function runRepositoryGit(
+  repository: string,
+  args: readonly string[],
+  options?: { gitIndexFile?: string },
+): string {
+  return execFileSync("git", args, {
+    cwd: repository,
+    encoding: "utf8",
+    env:
+      options?.gitIndexFile === undefined
+        ? process.env
+        : { ...process.env, GIT_INDEX_FILE: options.gitIndexFile },
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
 type FixtureOptions = Exclude<
   Parameters<typeof fixtureDependencies>[0],
   undefined
@@ -2492,9 +2508,10 @@ describe("scan and patch workflow", () => {
             completePatches(args, output);
             return 0;
           },
-          onRepositoryCommand: (command, args, workingDirectory) => {
+          onRepositoryCommand: (command, args, workingDirectory, options) => {
             expect(workingDirectory).toBe(canonicalRepository);
-            if (command === "git") return git(...args);
+            if (command === "git")
+              return runRepositoryGit(repository, args, options);
             if (args[1] === "list") return "";
             pullRequestArguments = args;
             return url;
@@ -2512,6 +2529,7 @@ describe("scan and patch workflow", () => {
       expect(git("show", "--format=", "--name-only", "HEAD")).toBe(
         "src/finding-1.ts\nsrc/finding-2.ts",
       );
+      expect(git("show", "HEAD:unrelated.ts")).toBe("original");
       expect(git("diff", "--cached", "--name-only")).toBe("unrelated.ts");
       expect(
         assessedPatches.map(({ base, changedFiles }) => ({
@@ -2636,6 +2654,97 @@ describe("scan and patch workflow", () => {
         else process.env[name] = value;
       }
       await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("projects file and directory replacements before publication", async () => {
+    for (const transition of [
+      "directory-to-file",
+      "file-to-directory",
+    ] as const) {
+      const directory = await mkdtemp(
+        join(tmpdir(), `codex-security-patch-${transition}-`),
+      );
+      const repository = join(directory, "repository");
+      const remote = join(directory, "remote.git");
+      const target = join(repository, "shape");
+      const result = resultWithFindings(["high"]);
+      result.findings.findings[0]!.locations[0]!.path =
+        transition === "directory-to-file" ? "shape/value.ts" : "shape";
+      let assessedHead = "";
+      await mkdir(repository);
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+
+      try {
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        if (transition === "directory-to-file") {
+          await mkdir(target);
+          await writeFile(join(target, "value.ts"), "unsafe\n");
+        } else {
+          await writeFile(target, "unsafe\n");
+        }
+        git("add", "--", ".");
+        git("commit", "-m", "Initial synthetic checkout");
+        git("init", "--bare", remote);
+        git("remote", "add", "origin", remote);
+        git("push", "--set-upstream", "origin", "main");
+
+        const outcome = await runWorkflow(
+          ["scan", "--patch", "--assess-patch-risk", "--create-pr", "--json"],
+          {
+            currentDirectory: repository,
+            result,
+            onCodex: async (args, output) => {
+              const server = output!.appServer!;
+              if (server.sandbox === "read-only") {
+                const artifact = patchRiskArtifact(server.prompt);
+                assessedHead = artifact.patch.head;
+                output!.stdout.write(
+                  JSON.stringify(approvedPatchRiskVerdict(server.prompt)),
+                );
+                return 0;
+              }
+              await rm(target, { recursive: true, force: true });
+              if (transition === "directory-to-file") {
+                await writeFile(target, "fixed\n");
+              } else {
+                await mkdir(target);
+                await writeFile(join(target, "value.ts"), "fixed\n");
+              }
+              completePatches(args, output);
+              return 0;
+            },
+            onRepositoryCommand: (command, args, _repository, options) => {
+              if (command === "git")
+                return runRepositoryGit(repository, args, options);
+              return args[1] === "list"
+                ? ""
+                : "https://github.example.test/example/repository/pull/19";
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode, outcome.stderr).toBe(0);
+        expect(git("rev-parse", "HEAD^{tree}")).toBe(assessedHead);
+        expect(git("ls-tree", "-r", "--name-only", "HEAD", "--", "shape")).toBe(
+          transition === "directory-to-file" ? "shape" : "shape/value.ts",
+        );
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
     }
   });
 
@@ -3196,7 +3305,7 @@ describe("scan and patch workflow", () => {
             completePatches(args, output);
             return 0;
           },
-          onRepositoryCommand: (command, args) => {
+          onRepositoryCommand: (command, args, _repository, options) => {
             if (command === "git") {
               if (args[0] === "push") {
                 pushCalls += 1;
@@ -3205,7 +3314,7 @@ describe("scan and patch workflow", () => {
                   throw new Error("Synthetic push failure");
                 }
               }
-              return git(...args);
+              return runRepositoryGit(repository, args, options);
             }
             if (args[1] === "list") return publishedUrl;
             expect(args[1]).toBe("create");

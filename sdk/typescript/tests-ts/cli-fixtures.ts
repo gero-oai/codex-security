@@ -264,8 +264,8 @@ export function dependencies(
     writeSynchronously: (stream, value) => stream.write(value),
     forceExit: () => {},
     runCodex: async (...args) => (await options.onCodex?.(...args)) ?? 0,
-    runRepositoryCommand: async (command, args, repository) =>
-      (await options.onRepositoryCommand?.(command, args, repository)) ?? "",
+    runRepositoryCommand: async (...args) =>
+      (await options.onRepositoryCommand?.(...args)) ?? "",
     ...(options.bulkScan === undefined ? {} : { bulkScan: options.bulkScan }),
     ...(options.linearClient === undefined
       ? {}

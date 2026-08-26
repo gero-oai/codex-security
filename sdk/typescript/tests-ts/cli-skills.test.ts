@@ -458,8 +458,12 @@ describe("CLI skill commands", () => {
           expect(prompt).not.toContain("candidate.patch");
         } else {
           expect(prompt).toContain("$codex-security:assess-patch-risk");
+          expect(prompt).toContain("# Assess Patch Risk");
+          expect(prompt).toContain("# Patch risk rubric");
+          expect(prompt).toContain('"title": "Patch risk assessment"');
+          expect(prompt).toContain("class DuplicateJsonKeyError");
           expect(prompt).toContain("candidate.patch");
-          expect(prompt).not.toContain("diff --git");
+          expect(prompt).toContain("diff --git");
         }
       }
       expect(stdout.text()).toBe("Verified synthetic patch.\n");
@@ -572,7 +576,9 @@ describe("CLI skill commands", () => {
           "## Patch risk",
           "",
           "Authorization: unchanged",
+          "Authorization: preserved by the existing route check",
           "Token handling: unaffected",
+          "Authorization: Bearer SYNTHETIC_REPORT_CREDENTIAL",
           "",
           "-----BEGIN PRIVATE KEY-----",
           "SYNTHETIC-MULTILINE-KEY-BODY",
@@ -595,9 +601,13 @@ describe("CLI skill commands", () => {
     ).toBe(0);
     expect(stderr.text()).toContain("[redacted]");
     expect(stderr.text()).toContain("Authorization: unchanged");
+    expect(stderr.text()).toContain(
+      "Authorization: preserved by the existing route check",
+    );
     expect(stderr.text()).toContain("Token handling: unaffected");
     expect(stderr.text()).toContain("Recoverability: easy");
     expect(stderr.text()).not.toContain("SYNTHETIC-MULTILINE-KEY-BODY");
+    expect(stderr.text()).not.toContain("SYNTHETIC_REPORT_CREDENTIAL");
     expect(stderr.text()).not.toContain("-----END PRIVATE KEY-----");
   });
 
