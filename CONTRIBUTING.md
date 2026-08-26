@@ -69,3 +69,10 @@ before rerunning. Maintainers must review every generated public artifact,
 complete the disclosure checklist, and satisfy the normal approval and CI
 requirements. To check eligibility without writing, run `node-release-pr`
 manually from `main` with `dry_run` enabled.
+
+[GitHub Releases](https://github.com/openai/codex-security/releases) is the
+canonical changelog. Maintainers should follow [RELEASING.md](RELEASING.md) to
+prepare, publish, verify, or repair a release.
+
+See the [SDK testing guide](sdk/typescript/TESTING.md) for local checks,
+test conventions, and the required and experimental CI jobs.
