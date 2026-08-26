@@ -9192,22 +9192,24 @@ async function runIndependentPatchReview(
         reason: "patch-risk-assessment review has no observed candidate delta.",
       };
     }
-    if (context.snapshot.publicationCandidate === undefined) {
-      return {
-        status: "failed",
-        exitCode: PATCH_REVIEW_EXIT_CODE.failure,
-        reason:
-          "patch-risk-assessment review cannot project the cumulative patch tree.",
-      };
+    if (context.options.createPr === true) {
+      if (context.snapshot.publicationCandidate === undefined) {
+        return {
+          status: "failed",
+          exitCode: PATCH_REVIEW_EXIT_CODE.failure,
+          reason:
+            "patch-risk-assessment review cannot project the cumulative patch tree.",
+        };
+      }
+      publicationCandidate = await context.snapshot.publicationCandidate(
+        candidate,
+        context.options.reviewPublicationCandidate,
+      );
     }
-    publicationCandidate = await context.snapshot.publicationCandidate(
-      candidate,
-      context.options.reviewPublicationCandidate,
-    );
     riskSnapshot = context.patchRiskSnapshot ?? context.snapshot;
     riskCandidate =
       context.options.createPr === true
-        ? publicationCandidate
+        ? publicationCandidate!
         : riskSnapshot === context.snapshot
           ? candidate
           : await riskSnapshot.candidate();

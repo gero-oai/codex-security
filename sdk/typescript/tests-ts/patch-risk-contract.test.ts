@@ -33,6 +33,9 @@ interface Assessment {
   statusQuoRisk: { rating: string; rationale: string };
   autoMergeExclusions: string[];
   affectedRuntimeRoots: string[];
+  importantCallers: string[];
+  riskDrivers: string[];
+  protectiveFactors: string[];
   materialBoundaries: Array<{
     id: string;
     invariant: string;
@@ -137,6 +140,9 @@ function assessment(): Assessment {
     },
     autoMergeExclusions: [],
     affectedRuntimeRoots: ["service.request"],
+    importantCallers: ["src/request.ts"],
+    riskDrivers: ["The changed branch handles a supported request."],
+    protectiveFactors: ["Focused exact-head validation passed."],
     materialBoundaries: [
       {
         id: "request-contract",
@@ -369,14 +375,25 @@ describe("patch risk assessment contract", () => {
     );
   });
 
-  test("accepts omitted and empty optional evidence lists", async () => {
-    const omitted = await validate(assessment());
-    expect(omitted.status, omitted.stderr).toBe(0);
+  test("requires documented assessment inventories while allowing empty lists", async () => {
+    for (const field of [
+      "importantCallers",
+      "riskDrivers",
+      "protectiveFactors",
+    ] as const) {
+      const omitted = assessment();
+      delete (omitted as Partial<Assessment>)[field];
+      const result = await validate(omitted);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        `required property '${field}' is missing`,
+      );
+    }
 
     const payload = assessment();
-    payload["importantCallers"] = [];
-    payload["riskDrivers"] = [];
-    payload["protectiveFactors"] = [];
+    payload.importantCallers = [];
+    payload.riskDrivers = [];
+    payload.protectiveFactors = [];
     const empty = await validate(payload);
     expect(empty.status, empty.stderr).toBe(0);
   });
@@ -680,6 +697,10 @@ describe("patch risk assessment contract", () => {
       unreachable: [],
     };
     payload.evidencePlan[0]!.regressionLikelihoodOutcomes = {
+      reachable: "unknown",
+      unreachable: "low",
+    };
+    payload.evidencePlan[0]!.impactOutcomes = {
       reachable: "unknown",
       unreachable: "low",
     };
@@ -2040,6 +2061,82 @@ describe("patch risk assessment contract", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
       "unknown regression protection cannot support high confidence",
+    );
+  });
+
+  test("rejects high-confidence branches retaining noncritical unknowns", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unknown.",
+        decisionCritical: true,
+      },
+      {
+        id: "release-note",
+        summary: "The release note wording is unknown.",
+        decisionCritical: false,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which runtime owns the changed path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: { owned: "merge", unavailable: "hold_for_evidence" },
+        confidenceOutcomes: { owned: "high", unavailable: "low" },
+        remainingUnknowns: {
+          owned: [],
+          unavailable: ["runtime-owner"],
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "high confidence cannot retain an explicit unknown",
+    );
+  });
+
+  test("requires evidence plans for unknown risk ratings", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.impact.rating = "unknown";
+    payload.regressionLikelihood.rating = "unknown";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which runtime owns the changed path?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: { owned: "merge", unavailable: "hold_for_evidence" },
+        confidenceOutcomes: { owned: "moderate", unavailable: "low" },
+        remainingUnknowns: {
+          owned: [],
+          unavailable: ["runtime-owner"],
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "unknown impact requires a matching impact evidence plan",
+    );
+    expect(result.stderr).toContain(
+      "unknown regression likelihood requires a matching likelihood evidence plan",
     );
   });
 
