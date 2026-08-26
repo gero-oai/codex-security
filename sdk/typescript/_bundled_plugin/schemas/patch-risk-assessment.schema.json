@@ -86,16 +86,7 @@
       "additionalProperties": false,
       "required": ["status", "rationale"],
       "properties": {
-        "status": {
-          "enum": [
-            "confirmed",
-            "no_live_effect",
-            "wrong_owner",
-            "duplicate",
-            "superseded",
-            "unknown"
-          ]
-        },
+        "status": { "$ref": "#/$defs/applicabilityStatus" },
         "rationale": { "$ref": "#/$defs/nonBlankString" }
       }
     },
@@ -209,7 +200,13 @@
             "$ref": "#/$defs/stringList",
             "minItems": 1
           },
-          "resolvesApplicability": { "type": "boolean" },
+          "applicabilityOutcomes": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/$defs/applicabilityStatus"
+            },
+            "minProperties": 2
+          },
           "resolvesFailedValidation": { "$ref": "#/$defs/stringList" },
           "outcomes": {
             "type": "object",
@@ -232,6 +229,16 @@
     "identifier": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9_-]*(?![\\s\\S])"
+    },
+    "applicabilityStatus": {
+      "enum": [
+        "confirmed",
+        "no_live_effect",
+        "wrong_owner",
+        "duplicate",
+        "superseded",
+        "unknown"
+      ]
     },
     "stringList": {
       "type": "array",
