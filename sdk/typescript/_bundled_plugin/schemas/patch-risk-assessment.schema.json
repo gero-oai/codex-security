@@ -320,6 +320,47 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "recommendation": { "not": { "const": "hold_for_evidence" } }
+        },
+        "required": ["recommendation"]
+      },
+      "then": {
+        "properties": {
+          "materialBoundaries": {
+            "items": {
+              "anyOf": [
+                {
+                  "required": ["legitimateControl", "legitimateControlPath"],
+                  "not": {
+                    "anyOf": [
+                      { "required": ["retirementEvidence"] },
+                      { "required": ["retirementEvidencePath"] }
+                    ]
+                  }
+                },
+                {
+                  "required": [
+                    "retirementEvidence",
+                    "retirementEvidencePath"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      { "required": ["legitimateControl"] },
+                      { "required": ["legitimateControlPath"] }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "nonEmptyString": {
       "type": "string",

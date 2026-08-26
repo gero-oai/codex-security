@@ -259,6 +259,8 @@ describe("patch risk assessment contract", () => {
     expect(validateSchema(versionOne)).toBe(false);
 
     const unresolved = assessment();
+    unresolved.recommendation = "hold_for_evidence";
+    unresolved.workflowLabel = "hold_for_evidence";
     const unresolvedBoundary = unresolved.materialBoundaries[0]!;
     unresolvedBoundary.result = "unresolved";
     delete unresolvedBoundary.legitimateControl;
@@ -401,6 +403,25 @@ describe("patch risk assessment contract", () => {
     expect(both.status).not.toBe(0);
     expect(both.stderr).toContain(
       "exactly one of legitimate control or retirement evidence is required",
+    );
+  });
+
+  test("restricts evidence-free boundaries to bounded evidence holds", async () => {
+    const payload = assessment();
+    payload.recommendation = "revise";
+    payload.workflowLabel = "revise";
+    payload.regressionLikelihood.rating = "high";
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "patch_caused";
+    const boundary = payload.materialBoundaries[0]!;
+    boundary.result = "unresolved";
+    delete boundary.legitimateControl;
+    delete boundary.legitimateControlPath;
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "only hold_for_evidence may defer boundary evidence",
     );
   });
 
@@ -1340,6 +1361,18 @@ describe("patch risk assessment contract", () => {
 
     const complete = await validate(payload);
     expect(complete.status, complete.stderr).toBe(0);
+
+    const deferredRetirement =
+      payload.evidencePlan[0]!.boundaryEvidenceOutcomes!["retired"]![
+        "request-contract"
+      ]!;
+    delete deferredRetirement.retirementEvidencePath;
+    const incompletePair = await validate(payload);
+    expect(incompletePair.status).not.toBe(0);
+    expect(incompletePair.stderr).toContain(
+      "retirement evidence requires both value and path",
+    );
+    deferredRetirement.retirementEvidencePath = "docs/request-v2.md";
 
     delete payload.evidencePlan[0]!.boundaryEvidenceOutcomes!["retired"]![
       "request-contract"

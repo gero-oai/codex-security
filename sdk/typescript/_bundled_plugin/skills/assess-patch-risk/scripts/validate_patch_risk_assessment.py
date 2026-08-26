@@ -276,6 +276,14 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append(
                 f"materialBoundaries.{index}: a resolved boundary requires legitimate control or retirement evidence"
             )
+        elif (
+            not complete_control
+            and not complete_retirement
+            and recommendation != "hold_for_evidence"
+        ):
+            errors.append(
+                f"materialBoundaries.{index}: only hold_for_evidence may defer boundary evidence"
+            )
     decision_critical_unknowns = {
         item["id"] for item in unknowns if item["decisionCritical"]
     }
@@ -441,6 +449,30 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             boundary_outcomes = item.get("boundaryOutcomes")
             boundary_evidence_outcomes = item.get("boundaryEvidenceOutcomes")
             remaining_unknown_outcomes = item.get("remainingUnknowns")
+            if boundary_evidence_outcomes is not None:
+                for evidence_outcome, evidence_by_boundary in (
+                    boundary_evidence_outcomes.items()
+                ):
+                    for boundary_id, evidence in evidence_by_boundary.items():
+                        present_controls = control_fields & evidence.keys()
+                        present_retirement = retirement_fields & evidence.keys()
+                        if present_controls and present_controls != control_fields:
+                            errors.append(
+                                f"evidencePlan.{index}.boundaryEvidenceOutcomes.{evidence_outcome}.{boundary_id}: legitimate control evidence requires both value and path"
+                            )
+                        if (
+                            present_retirement
+                            and present_retirement != retirement_fields
+                        ):
+                            errors.append(
+                                f"evidencePlan.{index}.boundaryEvidenceOutcomes.{evidence_outcome}.{boundary_id}: retirement evidence requires both value and path"
+                            )
+                        if (present_controls == control_fields) == (
+                            present_retirement == retirement_fields
+                        ):
+                            errors.append(
+                                f"evidencePlan.{index}.boundaryEvidenceOutcomes.{evidence_outcome}.{boundary_id}: exactly one of legitimate control or retirement evidence is required"
+                            )
             if applicability_outcomes is not None:
                 if any(
                     status != "unknown"
