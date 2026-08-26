@@ -1812,6 +1812,62 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("supplies applicable ancestor instructions to style review", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-ancestor-instructions-")),
+    );
+    const repository = join(root, "repository");
+    const instruction = "Preserve the synthetic ancestor convention.\n";
+    await mkdir(repository);
+    await writeFile(join(root, "AGENTS.md"), instruction);
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let reviewerPrompt = "";
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-style"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              reviewerPrompt = output!.appServer!.prompt;
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(reviewerPrompt).toContain(JSON.stringify("../AGENTS.md"));
+      expect(reviewerPrompt).toContain(instruction.trim());
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("keeps baseline ignored files out of reviews in paths with list separators", async () => {
     const root = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-ignored-patch-")),
@@ -3578,6 +3634,61 @@ describe("scan and patch workflow", () => {
       await rm(repository, { recursive: true, force: true });
     }
   });
+
+  test.skipIf(process.platform === "win32")(
+    "fails closed when an author changes an initially empty worktree root mode",
+    async () => {
+      const repository = await realpath(
+        await mkdtemp(join(tmpdir(), "codex-security-empty-root-mode-")),
+      );
+      const git = (...args: string[]) =>
+        execFileSync("git", args, {
+          cwd: repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      let reviews = 0;
+      try {
+        git("init", "--initial-branch=main");
+        git("config", "user.name", "Synthetic User");
+        git("config", "user.email", "synthetic@example.test");
+        git("config", "commit.gpgsign", "false");
+        git("commit", "--allow-empty", "-m", "Initial empty checkout");
+        await chmod(repository, 0o755);
+
+        const outcome = await runWorkflow(
+          ["patch", "Synthetic security issue", "--review-minimality"],
+          {
+            currentDirectory: repository,
+            onCodex: async (_args, output) => {
+              if (output!.appServer!.sandbox === "read-only") {
+                reviews += 1;
+              } else {
+                await writeFile(join(repository, "value.ts"), "fixed\n");
+                await chmod(repository, 0o777);
+                output!.stdout.write("Verified synthetic patch.");
+              }
+              return 0;
+            },
+          },
+          {
+            configure: (current) => {
+              delete current.snapshotPatchReviewWorktree;
+            },
+          },
+        );
+
+        expect(outcome.exitCode).toBe(2);
+        expect(reviews).toBe(0);
+        expect(outcome.stderr).toContain(
+          "directory permission changed outside Git's reviewed state",
+        );
+      } finally {
+        await chmod(repository, 0o755).catch(() => {});
+        await rm(repository, { recursive: true, force: true });
+      }
+    },
+  );
 
   test.skipIf(process.platform === "win32")(
     "fails closed when a reviewed file changes non-executable permissions",
