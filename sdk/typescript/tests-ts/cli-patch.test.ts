@@ -5830,6 +5830,9 @@ describe("scan and patch workflow", () => {
     });
     expect(outcome.stdout).not.toContain(credential);
     expect(outcome.stderr).not.toContain(credential);
+    expect(outcome.stderr).toContain(
+      "patch-risk-assessment review blocked the patch: Authorization: [redacted]",
+    );
   });
 
   test("continues with separate patch tasks when one finding fails", async () => {

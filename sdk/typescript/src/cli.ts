@@ -9874,7 +9874,7 @@ async function runPatchReviewWorkflow(
         const reason = `${stage} review ${
           blocked ? "blocked the patch" : "exhausted the revision budget"
         }${details.length === 0 ? "." : `: ${details}`}`;
-        context.stderr.write(`${safePatchText(reason)}\n`);
+        context.stderr.write(`${reason}\n`);
         if (subject.response !== undefined) {
           stdout.write(
             renderTerminalReviewResponse(
