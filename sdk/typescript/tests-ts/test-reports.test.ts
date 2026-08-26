@@ -154,12 +154,50 @@ describe("CI file shards", () => {
       await readFile(join(root, "reports", "junit-4.xml"), "utf8"),
     ).toContain('name="nested/d"');
 
-    // The filter is forwarded to Bun, so the failing test is no longer selected.
-    const selected = await run("1/2", "--test-name-pattern", "^c$");
+    await rm(join(root, "reports"), { recursive: true });
+    const selectedFailure = await run("1/2");
+    expect(selectedFailure.status, selectedFailure.stderr).toBe(1);
+    const selectedReports = (await readdir(join(root, "reports"))).sort();
+    expect(selectedReports).toEqual(
+      process.platform === "win32"
+        ? ["junit-1-1.xml", "junit-1-2.xml"]
+        : ["junit-1.xml"],
+    );
+    const selectedContents = await Promise.all(
+      selectedReports.map((file) =>
+        readFile(join(root, "reports", file), "utf8"),
+      ),
+    );
+    expect(selectedContents.join("\n")).toContain('name="a"');
+    expect(selectedContents.join("\n")).toContain('name="c"');
+    expect(selectedContents.join("\n")).toContain("<failure");
+
+    // Allow a worker with no matches when intentionally filtering the suite.
+    const selected = await run(
+      "1/2",
+      "--test-name-pattern",
+      "^c$",
+      "--pass-with-no-tests",
+    );
     expect(selected.status, selected.stderr).toBe(0);
-    const report = await readFile(join(root, "reports", "junit-1.xml"), "utf8");
+    const report = await readFile(
+      join(root, "reports", selectedReports.at(-1)!),
+      "utf8",
+    );
     expect(report).toContain('name="c"');
     expect(report).not.toContain("<failure");
+
+    // A singleton shard must not start an empty worker that discovers all tests.
+    await rm(join(root, "reports"), { recursive: true });
+    const singleton = await run("2/4");
+    expect(singleton.status, singleton.stderr).toBe(0);
+    const singletonReports = await readdir(join(root, "reports"));
+    expect(singletonReports).toEqual([
+      process.platform === "win32" ? "junit-2-1.xml" : "junit-2.xml",
+    ]);
+    expect(
+      await readFile(join(root, "reports", singletonReports[0]!), "utf8"),
+    ).toContain('name="b"');
     expect((await run("0/2")).status).toBe(1);
     expect((await run("3/2")).status).toBe(1);
   });

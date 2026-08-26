@@ -71,13 +71,19 @@ tests block CI; a failed diagnostic upload does not.
 `scripts/run-ci-tests.mjs` discovers the test files and balances them using
 rounded timings in `scripts/test-shards.mjs`. Unix jobs run four processes;
 Windows runs seven separate jobs with `node scripts/run-ci-tests.mjs 1/7`
-(substitute the shard number). Each file runs once. New files are included
-automatically; stale timing estimates can affect balance, but not coverage.
+(substitute the shard number), each using up to two Bun processes with separate
+reports such as `junit-1-1.xml` and `junit-1-2.xml`. Each file runs once. New files
+are included automatically; stale timing estimates can affect balance, but not coverage.
 The machine-wide Windows policy test still runs separately and serially.
 Windows installs the pnpm version from `packageManager` directly, reuses the
 npm download cache, and caches the resolved pnpm store separately. Cache
 failures do not suppress installation failures. Unix keeps its pinned pnpm
-setup action.
+setup action. Windows package inspection enables npm's native phase timings to
+diagnose installation delays without changing its failure or timeout behavior.
+
+When forwarding `--test-name-pattern` to a sharded run, also pass Bun's
+`--pass-with-no-tests` if some workers may have no matching tests. Normal CI
+does not enable that option, and empty file partitions are never launched.
 
 To compare the serial and CI runners on the same machine, commit, and seed:
 

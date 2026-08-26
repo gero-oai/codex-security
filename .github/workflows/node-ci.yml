@@ -355,6 +355,8 @@ jobs:
       - name: Inspect package
         working-directory: sdk/typescript
         shell: bash
+        env:
+          npm_config_timing: "true"
         run: pnpm run check:package ../../dist/*.tgz
 
   windows:

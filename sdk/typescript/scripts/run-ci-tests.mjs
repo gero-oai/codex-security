@@ -5,8 +5,8 @@ import { partitionTestFiles } from "./test-shards.mjs";
 
 const packageDirectory = fileURLToPath(new URL("../", import.meta.url));
 const args = process.argv.slice(2);
-// Unix jobs run four independent Bun processes. Windows jobs each run one of
-// seven shards, so native credential checks do not compete on the same host.
+// Unix jobs run four independent Bun processes. Each selected Windows shard
+// uses up to two processes; the machine-wide policy test runs separately.
 const selection =
   args[0] !== undefined && !args[0].startsWith("-") ? args.shift() : undefined;
 const [requestedShard, count] = selection?.split("/").map(Number) ?? [0, 4];
@@ -36,10 +36,17 @@ const selectedShards = shards
 if (selectedShards.some(({ files }) => files.length === 0)) {
   throw new Error("CI test shards must not be empty.");
 }
+const workers = selectedShards.flatMap(({ files, shard }) =>
+  process.platform === "win32" && selection !== undefined
+    ? partitionTestFiles(files, 2)
+        .filter((files) => files.length > 0)
+        .map((files, index) => ({ files, shard: `${shard}-${index + 1}` }))
+    : [{ files, shard: String(shard) }],
+);
 await mkdir(new URL("../reports/", import.meta.url), { recursive: true });
 
 const results = await Promise.all(
-  selectedShards.map(async ({ files, shard }) => {
+  workers.map(async ({ files, shard }) => {
     console.log(`CI test shard ${shard}/${count}: ${files.join(" ")}`);
     return await new Promise((resolve) => {
       const child = spawn(
