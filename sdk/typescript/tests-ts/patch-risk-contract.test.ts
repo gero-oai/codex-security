@@ -2693,6 +2693,62 @@ describe("patch risk assessment contract", () => {
     );
   });
 
+  test("keeps terminal defect branches on hold while a boundary remains unresolved", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    const requestBoundary = payload.materialBoundaries[0]!;
+    requestBoundary.result = "unresolved";
+    payload.materialBoundaries.push({
+      ...requestBoundary,
+      id: "runtime-contract",
+      invariant: "The runtime contract remains supported.",
+      counterexample: "The runtime contract rejects a supported request.",
+    });
+    payload.unknowns = [
+      {
+        id: "contract-evidence",
+        summary: "The authoritative contract evidence is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which contracts remain supported?",
+        action: "Inspect both authoritative runtime contracts.",
+        resolvesUnknowns: ["contract-evidence"],
+        resolvesBoundaries: ["request-contract", "runtime-contract"],
+        boundaryOutcomes: {
+          defect: {
+            "request-contract": "contradicted",
+            "runtime-contract": "unresolved",
+          },
+          supported: {
+            "request-contract": "supported",
+            "runtime-contract": "supported",
+          },
+        },
+        outcomes: { defect: "revise", supported: "merge" },
+        confidenceOutcomes: {
+          defect: "moderate",
+          supported: "moderate",
+        },
+      },
+    ];
+
+    const unresolved = await validate(payload);
+    expect(unresolved.status).not.toBe(0);
+    expect(unresolved.stderr).toContain(
+      "an unresolved material boundary requires hold_for_evidence",
+    );
+
+    payload.evidencePlan[0]!.boundaryOutcomes!["defect"]!["runtime-contract"] =
+      "contradicted";
+    const resolved = await validate(payload);
+    expect(resolved.status, resolved.stderr).toBe(0);
+  });
+
   test("allows a non-applicable no-op to discard unrelated pivots", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";

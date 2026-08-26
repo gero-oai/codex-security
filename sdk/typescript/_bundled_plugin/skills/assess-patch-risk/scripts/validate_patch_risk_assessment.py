@@ -638,6 +638,17 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     if outcome_applicability is not None
                     else value["applicability"]["status"]
                 )
+                if (
+                    effective_unresolved_boundaries
+                    and outcome_recommendation != "hold_for_evidence"
+                    and not (
+                        outcome_recommendation == "no_op"
+                        and effective_applicability in NON_APPLICABLE
+                    )
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: an unresolved material boundary requires hold_for_evidence"
+                    )
                 if effective_applicability not in NON_APPLICABLE:
                     if (
                         value["regressionLikelihood"]["rating"] == "critical"
