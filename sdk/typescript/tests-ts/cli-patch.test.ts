@@ -425,6 +425,8 @@ describe("scan and patch workflow", () => {
     const firstPath = "src/finding-1.ts";
     const secondPath = "src/finding-2.ts";
     const assessedPaths: string[][] = [];
+    const assessedFindingIds: string[][] = [];
+    const authorFindingIds: string[][] = [];
     const outcome = await runWorkflow(
       ["patch", "--scan", "scan-1", "--assess-patch-risk", "--json"],
       {
@@ -474,10 +476,22 @@ describe("scan and patch workflow", () => {
           } else if (output!.appServer!.sandbox === "read-only") {
             const prompt = output!.appServer!.prompt;
             assessedPaths.push(patchRiskArtifact(prompt).patch.changedFiles);
+            assessedFindingIds.push(
+              (JSON.parse(prompt.split("\n").at(-1)!) as Finding[]).map(
+                ({ occurrenceId }) => occurrenceId,
+              ),
+            );
             output!.stdout.write(
               JSON.stringify(approvedPatchRiskVerdict(prompt)),
             );
           } else {
+            authorFindingIds.push(
+              (
+                JSON.parse(
+                  output!.appServer!.prompt.split("\n").at(-1)!,
+                ) as Finding[]
+              ).map(({ occurrenceId }) => occurrenceId),
+            );
             completePatches(args, output);
           }
           return 0;
@@ -487,6 +501,109 @@ describe("scan and patch workflow", () => {
 
     expect(outcome.exitCode, outcome.stderr).toBe(0);
     expect(assessedPaths).toEqual([[firstPath], [firstPath, secondPath]]);
+    expect(authorFindingIds).toEqual([["occ_1"], ["occ_2"]]);
+    expect(assessedFindingIds).toEqual([["occ_1"], ["occ_1", "occ_2"]]);
+  });
+
+  test("keeps authors finding-scoped while cumulative risk review receives prior constraints", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const firstPath = "src/finding-1.ts";
+    const secondPath = "src/finding-2.ts";
+    const instructions = {
+      occ_1: "Preserve the first synthetic compatibility path.",
+      occ_2: "Preserve the second synthetic compatibility path.",
+    };
+    const authorInstructions: Array<Record<string, string>> = [];
+    const riskInstructions: Array<Record<string, string>> = [];
+    const outcome = await runWorkflow(
+      ["scan", "--patch", "--assess-patch-risk"],
+      {
+        result,
+        patchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [secondPath],
+            diff: `diff --git a/${secondPath} b/${secondPath}\n`,
+          },
+          {
+            paths: [secondPath],
+            diff: `diff --git a/${secondPath} b/${secondPath}\n`,
+          },
+        ],
+        cumulativePatchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath, secondPath],
+            diff: [firstPath, secondPath]
+              .map((path) => `diff --git a/${path} b/${path}\n`)
+              .join(""),
+          },
+        ],
+        onCodex: (args, output) => {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_2"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+            return 0;
+          }
+          const prompt = output!.appServer!.prompt;
+          const lines = prompt.split("\n");
+          const instructionLine = lines.findIndex((line) =>
+            line.includes("user-provided"),
+          );
+          const observed = JSON.parse(lines[instructionLine + 1]!) as Record<
+            string,
+            string
+          >;
+          if (output!.appServer!.sandbox === "read-only") {
+            riskInstructions.push(observed);
+            output!.stdout.write(
+              JSON.stringify(approvedPatchRiskVerdict(prompt)),
+            );
+          } else {
+            authorInstructions.push(observed);
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+      {
+        interactive: true,
+        configure: (current) => {
+          current.patchEditor = async () => ({
+            severity: "high",
+            occurrenceIds: ["occ_1", "occ_2"],
+            instructions,
+          });
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(authorInstructions).toEqual([
+      { occ_1: instructions.occ_1 },
+      { occ_2: instructions.occ_2 },
+    ]);
+    expect(riskInstructions).toEqual([
+      { occ_1: instructions.occ_1 },
+      instructions,
+    ]);
   });
 
   test("preserves cumulative risk assessment across a no-change finding", async () => {

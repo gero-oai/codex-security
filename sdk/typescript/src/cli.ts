@@ -1182,6 +1182,8 @@ interface SkillRunOptions extends PatchReviewOptions {
   ) => void;
   patchRiskArtifact?: PatchRiskReviewArtifactDescription;
   patchRiskContract?: PatchRiskReviewContract;
+  patchRiskFindings?: readonly Finding[];
+  patchRiskFindingInstructions?: Readonly<Record<string, string>>;
 }
 
 interface PatchReviewCandidateDelta {
@@ -5462,6 +5464,9 @@ const PATCH_REPORT_EMPTY_SENSITIVE_FIELD =
 const PATCH_REPORT_MARKDOWN_FENCE = /^\s*(?<fence>`{3,}|~{3,}).*$/u;
 const PATCH_REPORT_MARKDOWN_FENCE_CLOSE = /^\s*(?<fence>`{3,}|~{3,})\s*$/u;
 const PATCH_REPORT_ENCODED_TOKEN = /[A-Za-z0-9+/_-]{12,}={0,2}/gu;
+const PATCH_REPORT_HEADING = /^\s{0,3}#{1,6}\s+\S/u;
+const PATCH_REPORT_FIELD =
+  /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:schema version|patch(?: identity)?|analyzed base|recommendation|workflow label|impact|(?:regression )?likelihood|material safety failure|regression protection|recoverability|confidence|applicability|status[- ]quo risk|auto[- ]merge exclusions|affected (?:production|runtime) roots|important callers|risk drivers|protective factors|material boundaries|validation|tests(?: and checks)?|unknowns|evidence plan)\s*:/iu;
 
 function containsEncodedPatchCredential(value: string): boolean {
   for (const match of value.matchAll(PATCH_REPORT_ENCODED_TOKEN)) {
@@ -5484,7 +5489,10 @@ function containsEncodedPatchCredential(value: string): boolean {
       decoded.length >= 6 &&
       decoded.toString("base64").replace(/=+$/u, "") === normalized &&
       (decoded.every((byte) => byte >= 0x20 && byte <= 0x7e) ||
-        /[+/_-]/u.test(candidate))
+        (/[A-Z]/u.test(candidate) &&
+          /[a-z]/u.test(candidate) &&
+          /\d/u.test(candidate) &&
+          /[-_]/u.test(candidate)))
     ) {
       return true;
     }
@@ -5502,6 +5510,17 @@ function safePatchBoundaryClassification(value: string): string | undefined {
       ? " [redacted]"
       : safeDetails
   }`;
+}
+
+function isPatchReportStructuralBoundary(line: string): boolean {
+  if (PATCH_REPORT_HEADING.test(line) || PATCH_REPORT_FIELD.test(line)) {
+    return true;
+  }
+  const boundary = PATCH_REPORT_BOUNDARY_LINE.exec(line);
+  return (
+    boundary?.groups?.["evidence"] !== undefined &&
+    safePatchBoundaryClassification(boundary.groups["evidence"]) !== undefined
+  );
 }
 
 function safePatchReport(value: string): string {
@@ -5567,9 +5586,13 @@ function safePatchReport(value: string): string {
         boundaryContinuationPrefix = undefined;
         continue;
       }
-      lines.push("[redacted]");
+      if (!isPatchReportStructuralBoundary(line)) {
+        lines.push("[redacted]");
+        boundaryContinuationPrefix = undefined;
+        continue;
+      }
+      redactCredentialContinuation = false;
       boundaryContinuationPrefix = undefined;
-      continue;
     }
     if (PATCH_REPORT_EMPTY_SENSITIVE_FIELD.test(line)) {
       const boundary = PATCH_REPORT_BOUNDARY_LINE.exec(line);
@@ -8496,6 +8519,8 @@ async function runFindingPatchesWithRiskSnapshot(
     `\nPatching ${selected.findings.length} confirmed finding${selected.findings.length === 1 ? "" : "s"}...\n`,
   );
   const patches: FindingPatch[] = [];
+  const acceptedPatchRiskFindings: Finding[] = [];
+  const acceptedPatchRiskInstructions: Record<string, string> = {};
   let reviewRepository: string | undefined;
   const reviewUnsafePublicationPaths = new Set<string>();
   const reviewPublicationPaths = new Set<string>();
@@ -8516,6 +8541,10 @@ async function runFindingPatchesWithRiskSnapshot(
       },
     };
     const instruction = options.findingInstructions?.[finding.occurrenceId];
+    const patchRiskFindingInstructions = {
+      ...acceptedPatchRiskInstructions,
+      ...(instruction?.trim() ? { [finding.occurrenceId]: instruction } : {}),
+    };
     let status: number;
     try {
       status = await runSkill(
@@ -8530,6 +8559,14 @@ async function runFindingPatchesWithRiskSnapshot(
           ...options,
           reviewPublicationCandidate,
           ...(patchRiskSnapshot === undefined ? {} : { patchRiskSnapshot }),
+          ...(options.assessPatchRisk === true
+            ? {
+                patchRiskFindings: [...acceptedPatchRiskFindings, finding],
+                ...(Object.keys(patchRiskFindingInstructions).length === 0
+                  ? {}
+                  : { patchRiskFindingInstructions }),
+              }
+            : {}),
           directory: selected.repository,
           findings: [finding],
           onReviewRepository: (repository) => {
@@ -8671,6 +8708,12 @@ async function runFindingPatchesWithRiskSnapshot(
       `  ${patch.status.toUpperCase()}  ${title}${patch.reason === undefined ? "" : `: ${safePatchText(patch.reason)}`}\n`,
     );
     patches.push(patch);
+    if (patch.status === "verified") {
+      acceptedPatchRiskFindings.push(finding);
+      if (instruction?.trim()) {
+        acceptedPatchRiskInstructions[finding.occurrenceId] = instruction;
+      }
+    }
     if (patch.status !== "verified" && patch.status !== "no_change") {
       patchRiskSnapshot = undefined;
     }
@@ -9078,6 +9121,11 @@ async function runIndependentPatchReview(
   try {
     review = await captureSkillStage(context.run, {
       ...context.options,
+      findingInstructions:
+        stage === "patch-risk-assessment" &&
+        context.options.patchRiskFindingInstructions !== undefined
+          ? context.options.patchRiskFindingInstructions
+          : context.options.findingInstructions,
       directory: reviewRepository.directory,
       reviewRepository,
       reviewCandidate:
@@ -9523,6 +9571,15 @@ async function runSkill(
     directory,
     options.signal,
   );
+  const patchRiskContents =
+    options.patchRiskFindings === undefined
+      ? contents
+      : await prepareSkillContents(
+          inputs,
+          options.patchRiskFindings,
+          directory,
+          options.signal,
+        );
   const stages: PatchReviewStage[] =
     skill === "fix-finding"
       ? [
@@ -9536,7 +9593,9 @@ async function runSkill(
   const run = (output: Writable, configuration: SkillRunOptions = options) =>
     runSkillStage(
       skill,
-      contents,
+      configuration.reviewStage === "patch-risk-assessment"
+        ? patchRiskContents
+        : contents,
       codexOverrides,
       effort,
       output,

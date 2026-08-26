@@ -759,6 +759,7 @@ describe("CLI skill commands", () => {
           "Token handling: changed",
           "Authorization: contradicted because Bearer SYNTHETIC_ADVERSE_CREDENTIAL",
           "Authorization: changed because FeatureFlagName1",
+          "Authorization: changed because src/feature_flag",
           "Authorization: changed because dXNlcjpwYXNz",
           "Authorization: changed because YWJjZGVmZ2hpag",
           "Token handling: changed via __79_Pv6-fj39vX0",
@@ -774,6 +775,13 @@ describe("CLI skill commands", () => {
           "SYNTHETIC-CONTINUED-CREDENTIAL",
           "SYNTHETIC-WRAPPED-CREDENTIAL",
           "",
+          "API key:",
+          "SYNTHETIC-SINGLE-CREDENTIAL",
+          "Authorization: changed",
+          "API key:",
+          "SYNTHETIC-HEADING-CREDENTIAL",
+          "## Evidence",
+          "Impact: low",
           "- Token:",
           "SYNTHETIC-BULLETED-CREDENTIAL",
           "1. API key:",
@@ -824,6 +832,12 @@ describe("CLI skill commands", () => {
       "Authorization: changed because FeatureFlagName1",
     );
     expect(stderr.text()).toContain(
+      "Authorization: changed because src/feature_flag",
+    );
+    expect(stderr.text()).toContain("Authorization: changed");
+    expect(stderr.text()).toContain("## Evidence");
+    expect(stderr.text()).toContain("Impact: low");
+    expect(stderr.text()).toContain(
       "Authorization: contradicted because the existing route omits the check",
     );
     expect(stderr.text()).toContain(
@@ -838,6 +852,8 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).not.toContain("SYNTHETIC_ADVERSE_CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-WRAPPED-CREDENTIAL");
+    expect(stderr.text()).not.toContain("SYNTHETIC-SINGLE-CREDENTIAL");
+    expect(stderr.text()).not.toContain("SYNTHETIC-HEADING-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-BULLETED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-NUMBERED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-FENCED-CREDENTIAL");
