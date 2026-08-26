@@ -235,6 +235,13 @@
             },
             "minProperties": 2
           },
+          "impactOutcomes": {
+            "type": "object",
+            "additionalProperties": {
+              "enum": ["low", "moderate", "high", "critical", "unknown"]
+            },
+            "minProperties": 2
+          },
           "regressionLikelihoodOutcomes": {
             "type": "object",
             "additionalProperties": {

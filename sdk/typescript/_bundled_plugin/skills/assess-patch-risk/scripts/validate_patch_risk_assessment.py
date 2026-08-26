@@ -394,6 +394,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         )
         for index, item in enumerate(evidence_plan):
             applicability_outcomes = item.get("applicabilityOutcomes")
+            impact_outcomes = item.get("impactOutcomes")
             likelihood_outcomes = item.get("regressionLikelihoodOutcomes")
             safety_failure_outcomes = item.get("materialSafetyFailureOutcomes")
             resolved_boundaries = item.get("resolvesBoundaries", [])
@@ -420,6 +421,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             ) != set(item["outcomes"]):
                 errors.append(
                     f"evidencePlan.{index}: applicabilityOutcomes must name exactly the evidence outcome keys"
+                )
+            if impact_outcomes is not None and set(impact_outcomes) != set(
+                item["outcomes"]
+            ):
+                errors.append(
+                    f"evidencePlan.{index}: impactOutcomes must name exactly the evidence outcome keys"
                 )
             if likelihood_outcomes is not None and set(likelihood_outcomes) != set(
                 item["outcomes"]
@@ -474,10 +481,20 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     if likelihood_outcomes is not None
                     else value["regressionLikelihood"]["rating"]
                 )
+                outcome_impact = (
+                    impact_outcomes.get(outcome)
+                    if impact_outcomes is not None
+                    else value["impact"]["rating"]
+                )
                 outcome_safety_failure = (
                     safety_failure_outcomes.get(outcome)
                     if safety_failure_outcomes is not None
                     else value["materialSafetyFailure"]["established"]
+                )
+                effective_applicability = (
+                    outcome_applicability
+                    if outcome_applicability is not None
+                    else value["applicability"]["status"]
                 )
                 for unknown_id in outcome_remaining_unknowns:
                     if unknown_id not in decision_critical_unknowns:
@@ -539,6 +556,13 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                         f"evidencePlan.{index}: unknown applicability requires hold_for_evidence"
                     )
                 if (
+                    outcome_recommendation != "hold_for_evidence"
+                    and outcome_likelihood == "unknown"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: a terminal outcome cannot retain unknown regression likelihood"
+                    )
+                if (
                     established_defect
                     and outcome_applicability == "confirmed"
                     and outcome_recommendation not in {"revise", "block"}
@@ -580,12 +604,21 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: a revise outcome requires branch evidence of a defect"
                     )
-                if branch_contradiction and outcome_recommendation not in {
-                    "revise",
-                    "block",
-                }:
+                if (
+                    branch_contradiction
+                    and effective_applicability == "confirmed"
+                    and outcome_recommendation not in {"revise", "block"}
+                ):
                     errors.append(
                         f"evidencePlan.{index}: a contradicted boundary outcome requires revise or block"
+                    )
+                if (
+                    outcome_recommendation == "revise"
+                    and outcome_likelihood == "critical"
+                    and outcome_safety_failure is True
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: critical regression likelihood with an established material safety failure requires block"
                     )
                 if outcome_recommendation == "block" and not (
                     outcome_likelihood == "critical"
@@ -603,11 +636,6 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                         errors.append(
                             f"evidencePlan.{index}: a merge outcome cannot establish a material safety failure"
                         )
-                effective_applicability = (
-                    outcome_applicability
-                    if outcome_applicability is not None
-                    else value["applicability"]["status"]
-                )
                 if (
                     outcome_recommendation == "hold_for_evidence"
                     and effective_applicability != "unknown"
@@ -665,7 +693,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                         f"evidencePlan.{index}: a terminal outcome cannot retain a decision-critical unknown"
                     )
                 if outcome_recommendation == "merge":
-                    if value["impact"]["rating"] == "unknown":
+                    if outcome_impact == "unknown":
                         errors.append(
                             f"evidencePlan.{index}: a merge outcome cannot retain unknown impact"
                         )
@@ -748,9 +776,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     "revise",
                     "block",
                     "no_op",
+                    "hold_for_evidence",
                 }:
                     errors.append(
-                        f"evidencePlan.{index}: a patch_caused outcome must recommend revise, block, or no_op"
+                        f"evidencePlan.{index}: a patch_caused outcome must recommend revise, block, or no_op unless another pivot requires hold_for_evidence"
                     )
         for name in sorted(unknown_failed_validations - planned_failed_validations):
             errors.append(
@@ -793,6 +822,15 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     ):
         errors.append(
             "revise requires critical regression likelihood, an established material safety failure, a contradicted material boundary, or a patch-caused validation failure"
+        )
+
+    if (
+        recommendation == "revise"
+        and value["regressionLikelihood"]["rating"] == "critical"
+        and value["materialSafetyFailure"]["established"]
+    ):
+        errors.append(
+            "critical regression likelihood with an established material safety failure requires block"
         )
 
     if recommendation == "block" and not (
