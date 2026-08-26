@@ -7818,7 +7818,9 @@ async function runFindingPatches(
   );
   if (
     finalVerificationFindings.length > 1 &&
-    (options.reviewMinimality === true || options.reviewStyle === true)
+    (options.reviewMinimality === true ||
+      options.reviewStyle === true ||
+      options.assessPatchRisk === true)
   ) {
     let response = "";
     const verificationOutput: Writable = {
