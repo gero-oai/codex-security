@@ -84,12 +84,14 @@ function dependencies(
     >;
     patchReviewDeltas?: readonly PatchReviewDeltaFixture[];
     cumulativePatchReviewDeltas?: readonly PatchReviewDeltaFixture[];
+    onPatchReviewPublicationCandidate?: () => void;
   } = {},
 ) {
   const {
     onPatchReviewSnapshot,
     patchReviewDeltas,
     cumulativePatchReviewDeltas,
+    onPatchReviewPublicationCandidate,
     ...fixtureOptions
   } = options;
   const current = fixtureDependencies(fixtureOptions);
@@ -135,6 +137,7 @@ function dependencies(
         };
       },
       publicationCandidate: async (candidate, previous) => {
+        onPatchReviewPublicationCandidate?.();
         if (candidate.base === undefined || candidate.head === undefined) {
           throw new Error("The synthetic review candidate requires tree IDs.");
         }
@@ -418,6 +421,35 @@ describe("scan and patch workflow", () => {
         "patch-risk-assessment",
       ]);
     }
+  });
+
+  test("skips publication projection when patch-risk review will not create a PR", async () => {
+    const result = resultWithFindings(["high"]);
+    let publicationCandidates = 0;
+    const outcome = await runWorkflow(
+      ["scan", "--patch", "--assess-patch-risk"],
+      {
+        result,
+        onPatchReviewPublicationCandidate: () => {
+          publicationCandidates += 1;
+        },
+        onCodex: (args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify(
+                approvedPatchRiskVerdict(output!.appServer!.prompt),
+              ),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(publicationCandidates).toBe(0);
   });
 
   test("assesses cumulative saved-finding patches without publication", async () => {
