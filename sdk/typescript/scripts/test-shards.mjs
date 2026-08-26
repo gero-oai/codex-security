@@ -15,7 +15,7 @@ const timings = {
   "publication-integration.test.ts": [17, 19],
   "publication-store.test.ts": [31, 30],
   "release-automation.test.ts": [18, 50],
-  "runtime-credentials.test.ts": [11, 87],
+  "runtime-credentials.test.ts": [18, 87],
   "runtime.test.ts": [16, 60],
   "scan-comparison.test.ts": [1, 11],
   "scan-recovery.test.ts": [55, 83],

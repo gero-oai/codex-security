@@ -1486,19 +1486,41 @@ describe("plugin runtime preparation", () => {
     await mkdir(ambient);
     await writeFile(join(ambient, "auth.json"), '{"token":"ambient"}\n');
 
-    const imports = await Promise.all(
-      Array.from({ length: 8 }, async () =>
-        importAmbientAuth(ambient, isolated),
-      ),
+    const temporaryPaths: string[] = [];
+    let releaseCopies!: () => void;
+    const copiesReady = new Promise<void>((resolve) => {
+      releaseCopies = resolve;
+    });
+    const originalCopyFile = fsPromises.copyFile;
+    const copyCredentials = spyOn(fsPromises, "copyFile").mockImplementation(
+      async (source, destination, flags) => {
+        if (String(source) === join(ambient, "auth.json")) {
+          // Both imports must pass credential checks before either publishes auth.
+          temporaryPaths.push(String(destination));
+          if (temporaryPaths.length === 2) releaseCopies();
+          await copiesReady;
+        }
+        await originalCopyFile(source, destination, flags);
+      },
     );
-
-    expect(imports).toEqual(Array.from({ length: 8 }, () => true));
-    expect(await readFile(join(isolated, "auth.json"), "utf8")).toBe(
-      '{"token":"ambient"}\n',
-    );
-    expect(
-      (await readdir(isolated)).filter((path) => path.startsWith(".auth-")),
-    ).toEqual([]);
+    const imports = [
+      importAmbientAuth(ambient, isolated),
+      importAmbientAuth(ambient, isolated),
+    ];
+    try {
+      expect(await Promise.all(imports)).toEqual([true, true]);
+      expect(new Set(temporaryPaths).size).toBe(2);
+      expect(await readFile(join(isolated, "auth.json"), "utf8")).toBe(
+        '{"token":"ambient"}\n',
+      );
+      expect(
+        (await readdir(isolated)).filter((path) => path.startsWith(".auth-")),
+      ).toEqual([]);
+    } finally {
+      releaseCopies();
+      await Promise.allSettled(imports);
+      copyCredentials.mockRestore();
+    }
   });
 
   test.skipIf(process.platform === "win32")(
