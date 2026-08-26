@@ -62,7 +62,7 @@ Apply these challenges when the patch contains the corresponding structure:
 - after validation, trace mutation, interpretation, callbacks, retries, lazy initialization, and re-resolution to the first sensitive sink; and
 - for UI, discovery, prompt, instruction, or visibility changes, require capability removal or independent downstream enforcement before assigning authorization or isolation impact.
 
-A trigger alone is not a defect. Mark the boundary contradicted only when source or an authoritative contract establishes a concrete cross-subject decision, post-validation bypass, or capability-preserving enforcement gap.
+A trigger alone is not a defect. Mark the boundary contradicted only when source or an authoritative contract establishes a source-proven rejection of a supported control, concrete cross-subject decision, post-validation bypass, or capability-preserving enforcement gap.
 
 ## Strict auto-merge gate
 

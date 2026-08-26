@@ -1160,6 +1160,23 @@ describe("patch risk assessment contract", () => {
     expect(failedResult.status, failedResult.stderr).toBe(0);
   });
 
+  test("represents a wrong comparison as a patch-caused validation failure", async () => {
+    const payload = assessment();
+    payload.recommendation = "revise";
+    payload.workflowLabel = "revise";
+    payload.validation = [
+      {
+        name: "patch comparison scope",
+        status: "failed",
+        protects: "The immutable comparison contains only the stated change.",
+        failureAttribution: "patch_caused",
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
   test("requires an established non-applicable no-op disposition", async () => {
     const payload = assessment();
     payload.recommendation = "no_op";
