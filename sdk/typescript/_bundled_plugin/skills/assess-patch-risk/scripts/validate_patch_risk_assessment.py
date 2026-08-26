@@ -242,6 +242,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     decision_critical_unknowns = {
         item["id"] for item in unknowns if item["decisionCritical"]
     }
+    unresolved_boundaries = {
+        item["id"] for item in boundaries if item["result"] == "unresolved"
+    }
 
     unknown_failed_validations: set[str] = set()
     for index, item in enumerate(validations):
@@ -359,6 +362,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("hold_for_evidence cannot retain a contradicted material boundary")
         planned_failed_validations: set[str] = set()
         planned_unknowns: set[str] = set()
+        planned_boundaries: set[str] = set()
         planned_applicability = False
         established_defect = (
             value["regressionLikelihood"]["rating"] == "critical"
@@ -373,10 +377,6 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             if len(set(item["outcomes"].values())) < 2:
                 errors.append(
                     f"evidencePlan.{index}: requires at least two distinct outcome recommendations"
-                )
-            if established_defect and "merge" in item["outcomes"].values():
-                errors.append(
-                    f"evidencePlan.{index}: a merge outcome cannot retain an established defect"
                 )
             applicability_outcomes = item.get("applicabilityOutcomes")
             if applicability_outcomes is not None:
@@ -428,6 +428,47 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: unknown applicability requires hold_for_evidence"
                     )
+                if (
+                    established_defect
+                    and outcome_applicability == "confirmed"
+                    and outcome_recommendation not in {"revise", "block"}
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: confirmed applicability with an established defect requires revise or block"
+                    )
+                if established_defect and outcome_recommendation == "merge":
+                    errors.append(
+                        f"evidencePlan.{index}: a merge outcome cannot retain an established defect"
+                    )
+                if outcome_recommendation == "merge":
+                    unresolved_unknowns = decision_critical_unknowns - set(
+                        item["resolvesUnknowns"]
+                    )
+                    unresolved_failures = unknown_failed_validations - set(
+                        item.get("resolvesFailedValidation", [])
+                    )
+                    unresolved_boundary_ids = unresolved_boundaries - set(
+                        item.get("resolvesBoundaries", [])
+                    )
+                    if unresolved_unknowns:
+                        errors.append(
+                            f"evidencePlan.{index}: a merge outcome must resolve every decision-critical unknown"
+                        )
+                    if unresolved_failures:
+                        errors.append(
+                            f"evidencePlan.{index}: a merge outcome must resolve every failed validation with unknown attribution"
+                        )
+                    if unresolved_boundary_ids:
+                        errors.append(
+                            f"evidencePlan.{index}: a merge outcome must resolve every unresolved material boundary"
+                        )
+                    if (
+                        value["applicability"]["status"] == "unknown"
+                        and outcome_applicability != "confirmed"
+                    ):
+                        errors.append(
+                            f"evidencePlan.{index}: a merge outcome must resolve unknown applicability as confirmed"
+                        )
             for unknown_id in item["resolvesUnknowns"]:
                 if unknown_id not in decision_critical_unknowns:
                     errors.append(
@@ -435,6 +476,13 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     )
                     continue
                 planned_unknowns.add(unknown_id)
+            for boundary_id in item.get("resolvesBoundaries", []):
+                if boundary_id not in unresolved_boundaries:
+                    errors.append(
+                        f"evidencePlan.{index}: {boundary_id!r} is not an unresolved material boundary"
+                    )
+                    continue
+                planned_boundaries.add(boundary_id)
             for name in item.get("resolvesFailedValidation", []):
                 if name not in unknown_failed_validations:
                     errors.append(
@@ -463,6 +511,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         for unknown_id in sorted(decision_critical_unknowns - planned_unknowns):
             errors.append(
                 f"decision-critical unknown {unknown_id!r} requires a matching evidence plan"
+            )
+        for boundary_id in sorted(unresolved_boundaries - planned_boundaries):
+            errors.append(
+                f"unresolved material boundary {boundary_id!r} requires a matching evidence plan"
             )
         if (
             value["applicability"]["status"] == "unknown"
@@ -506,6 +558,8 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     if value["regressionProtection"]["rating"] == "strong":
         if not value["regressionProtection"]["exactHeadChecksPassed"]:
             errors.append("strong regression protection requires exact-head checks to pass")
+        if not any(item["status"] == "passed" for item in validations):
+            errors.append("strong regression protection requires an executed passing validation")
 
     if workflow_label == "auto_merge_candidate":
         auto_merge_requirements = {
