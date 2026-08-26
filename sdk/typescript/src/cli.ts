@@ -1188,6 +1188,7 @@ interface PatchReviewCandidateDelta {
   paths: string[];
   diff: string;
   diffBytes?: Buffer;
+  publicationBaseCommit?: string | null;
   publicationUnsafePaths?: string[];
   publicationBaseEntries?: PatchReviewTreeEntry[];
   publicationEntries?: PatchReviewTreeEntry[];
@@ -4211,6 +4212,7 @@ export async function main(
                 patchRun.reviewUnsafePublicationPaths,
                 patchRun.reviewPublicationEntries,
                 patchRun.reviewPublicationHead,
+                patchRun.reviewBaseCommit,
               );
             }
             if (format === "json" || format === "jsonl") {
@@ -5252,6 +5254,7 @@ async function createPatchPullRequest(
   reviewUnsafePublicationPaths: readonly string[] = [],
   reviewPublicationEntries: readonly PatchReviewTreeEntry[] = [],
   reviewPublicationHead?: string,
+  reviewBaseCommit?: string | null,
 ): Promise<{ branch: string; url: string } | undefined> {
   const repository = reviewRepository ?? selected.repository;
   const files = [
@@ -5299,9 +5302,15 @@ async function createPatchPullRequest(
       dependencies.runRepositoryCommand("git", args, repository, {
         gitIndexFile: temporaryIndex,
       });
-    const head = await run("git", ["rev-parse", "--verify", "HEAD"]).catch(
-      () => undefined,
-    );
+    const readHead = () =>
+      run("git", ["rev-parse", "--verify", "HEAD"]).catch(() => undefined);
+    const head = await readHead();
+    const expectedHead = reviewBaseCommit ?? undefined;
+    if (reviewBaseCommit !== undefined && head !== expectedHead) {
+      throw new CodexSecurityError(
+        "The repository HEAD changed after independent review. Review the patch again before publishing.",
+      );
+    }
     await runWithTemporaryIndex(
       head === undefined ? ["read-tree", "--empty"] : ["read-tree", head],
     );
@@ -5329,12 +5338,27 @@ async function createPatchPullRequest(
       }
     }
     const intendedTree = await runWithTemporaryIndex(["write-tree"]);
+    if (reviewBaseCommit !== undefined && (await readHead()) !== expectedHead) {
+      throw new CodexSecurityError(
+        "The repository HEAD changed after independent review. Review the patch again before publishing.",
+      );
+    }
     await run("git", ["switch", "-c", branch]);
     await runWithTemporaryIndex(["commit", "-m", PATCH_PR_TITLE]);
     if ((await run("git", ["rev-parse", "HEAD^{tree}"])) !== intendedTree) {
       throw new CodexSecurityError(
         "The patch commit contains changes outside the independently reviewed tree.",
       );
+    }
+    if (reviewBaseCommit !== undefined) {
+      const parent = await run("git", ["rev-parse", "--verify", "HEAD^"]).catch(
+        () => undefined,
+      );
+      if (parent !== expectedHead) {
+        throw new CodexSecurityError(
+          "The repository HEAD changed while the reviewed patch was published. Review the resulting local commit before retrying.",
+        );
+      }
     }
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -5414,10 +5438,18 @@ const PRIVATE_KEY_BLOCK_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PATCH_REPORT_EMPTY_SENSITIVE_FIELD =
   /^\s*(?:(?:[-*+]\s+)?(?:api|access|private)[ _-]?key|authorization|auth|token|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
 
+function safePatchBoundaryClassification(value: string): string | undefined {
+  const classification = PATCH_REPORT_BOUNDARY_CLASSIFICATION.exec(value);
+  if (classification?.groups?.["result"] === undefined) return;
+  const safeDetails = safePatchText(classification.groups["details"] ?? "");
+  return `${classification.groups["result"]}${safeDetails === "[redacted]" ? " [redacted]" : safeDetails}`;
+}
+
 function safePatchReport(value: string): string {
   const lines: string[] = [];
   let insidePrivateKey = false;
   let redactCredentialContinuation = false;
+  let boundaryContinuationPrefix: string | undefined;
   for (const line of value.split(/\r?\n/u)) {
     if (insidePrivateKey) {
       if (PRIVATE_KEY_BLOCK_END.test(line)) insidePrivateKey = false;
@@ -5433,14 +5465,38 @@ function safePatchReport(value: string): string {
       if (line.trim().length === 0) {
         lines.push("");
         redactCredentialContinuation = false;
+        boundaryContinuationPrefix = undefined;
+        continue;
+      }
+      const safeClassification =
+        boundaryContinuationPrefix === undefined
+          ? undefined
+          : safePatchBoundaryClassification(line.trim());
+      if (safeClassification !== undefined) {
+        lines.push(
+          stripPatchControlCharacters(
+            `${boundaryContinuationPrefix}${safeClassification}`,
+          ),
+        );
+        redactCredentialContinuation = false;
+        boundaryContinuationPrefix = undefined;
         continue;
       }
       lines.push("[redacted]");
       redactCredentialContinuation = false;
+      boundaryContinuationPrefix = undefined;
       continue;
     }
     if (PATCH_REPORT_EMPTY_SENSITIVE_FIELD.test(line)) {
-      lines.push("[redacted]");
+      const boundary = PATCH_REPORT_BOUNDARY_LINE.exec(line);
+      boundaryContinuationPrefix =
+        boundary?.groups?.["evidence"] === "" &&
+        boundary.groups["prefix"] !== undefined &&
+        boundary.groups["label"] !== undefined &&
+        boundary.groups["separator"] !== undefined
+          ? `${boundary.groups["prefix"]}${boundary.groups["label"]}${boundary.groups["separator"]}`
+          : undefined;
+      if (boundaryContinuationPrefix === undefined) lines.push("[redacted]");
       redactCredentialContinuation = true;
       continue;
     }
@@ -5452,15 +5508,8 @@ function safePatchReport(value: string): string {
       boundary.groups["separator"] !== undefined
     ) {
       const evidence = boundary.groups["evidence"];
-      const classification =
-        PATCH_REPORT_BOUNDARY_CLASSIFICATION.exec(evidence);
-      let safeEvidence = safePatchText(evidence);
-      if (classification?.groups?.["result"] !== undefined) {
-        const safeDetails = safePatchText(
-          classification.groups["details"] ?? "",
-        );
-        safeEvidence = `${classification.groups["result"]}${safeDetails === "[redacted]" ? " [redacted]" : safeDetails}`;
-      }
+      const safeEvidence =
+        safePatchBoundaryClassification(evidence) ?? safePatchText(evidence);
       lines.push(
         stripPatchControlCharacters(
           `${boundary.groups["prefix"]}${boundary.groups["label"]}${boundary.groups["separator"]}${safeEvidence}`,
@@ -6252,6 +6301,8 @@ async function snapshotPatchReviewWorktree(
   const baselineMaterializedTrackedPaths = new Set<string>();
   let baselineTrackedPaths: Buffer[] = [];
   let baselineTrackedPathSet = new Set<string>();
+  let baselineSnapshotPaths: Buffer[] = [];
+  let baselineSnapshotPathSet = new Set<string>();
   const baselineNestedRepositoryStates = new Map<
     string,
     { repository: NestedPatchReviewRepository; state: string }
@@ -6406,6 +6457,7 @@ async function snapshotPatchReviewWorktree(
     for (const path of [
       ...splitNulRecords(listed),
       ...baselineTrackedPaths,
+      ...baselineSnapshotPaths,
       ...ignoredPaths,
       ...ignoredInstructionPaths,
     ]) {
@@ -6415,6 +6467,18 @@ async function snapshotPatchReviewWorktree(
     const removed: Buffer[] = [];
     for (const pathBytes of paths.values()) {
       const key = patchReviewGitPathKey(pathBytes);
+      if (
+        baselineSnapshotPathSet.has(key) &&
+        !baselineTrackedPathSet.has(key)
+      ) {
+        try {
+          await lstat(patchReviewFilesystemPath(repository, pathBytes));
+        } catch (error) {
+          if (!missingPatchReviewPath(error)) throw error;
+          removed.push(pathBytes);
+          continue;
+        }
+      }
       if (baselineTrackedPathSet.has(key)) {
         try {
           await lstat(patchReviewFilesystemPath(repository, pathBytes));
@@ -6545,14 +6609,22 @@ async function snapshotPatchReviewWorktree(
     if (reviewerGit === null) {
       throw new CodexSecurityError("git is not available on a trusted PATH.");
     }
-    const headTree = await runPatchReviewGit(
+    const headCommit = await runPatchReviewGit(
       repository,
-      ["rev-parse", "HEAD^{tree}"],
+      ["rev-parse", "--verify", "HEAD"],
       { environment: objectEnvironment, signal },
     ).catch(() => {
       signal?.throwIfAborted();
       return undefined;
     });
+    const headTree =
+      headCommit === undefined
+        ? undefined
+        : await runPatchReviewGit(
+            repository,
+            ["rev-parse", `${headCommit}^{tree}`],
+            { environment: objectEnvironment, signal },
+          );
     let publicationBaseTree = headTree;
     if (publicationBaseTree === undefined) {
       await runPatchReviewGit(repository, ["read-tree", "--empty"], {
@@ -6581,6 +6653,21 @@ async function snapshotPatchReviewWorktree(
         );
       }
     };
+    const assertRepositoryHeadUnchanged = async (): Promise<void> => {
+      const currentHead = await runPatchReviewGit(
+        repository,
+        ["rev-parse", "--verify", "HEAD"],
+        { environment: objectEnvironment, signal },
+      ).catch(() => {
+        signal?.throwIfAborted();
+        return undefined;
+      });
+      if (currentHead !== headCommit) {
+        throw new CodexSecurityError(
+          "The repository HEAD changed after patch review started. Retry from the intended base commit.",
+        );
+      }
+    };
     await runPatchReviewGit(repository, ["read-tree", indexTree], {
       environment,
       signal,
@@ -6596,6 +6683,16 @@ async function snapshotPatchReviewWorktree(
       baselineTrackedPaths.map(patchReviewGitPathKey),
     );
     await stageWorktree();
+    baselineSnapshotPaths = splitNulRecords(
+      await runPatchReviewGitBytes(
+        repository,
+        ["ls-files", "--cached", "-z", "--", "."],
+        { environment, signal },
+      ),
+    );
+    baselineSnapshotPathSet = new Set(
+      baselineSnapshotPaths.map(patchReviewGitPathKey),
+    );
     const baselineTree = await runPatchReviewGit(repository, ["write-tree"], {
       environment,
       signal,
@@ -6608,6 +6705,7 @@ async function snapshotPatchReviewWorktree(
       { environment, signal },
     );
     await assertRepositoryIndexUnchanged();
+    await assertRepositoryHeadUnchanged();
     if (confirmedBaselineTree !== baselineTree) {
       throw new CodexSecurityError(
         "The patch worktree changed while its review baseline was captured. Retry from a stable worktree.",
@@ -6664,6 +6762,7 @@ async function snapshotPatchReviewWorktree(
         gitExecutable: reviewerGit.executable,
       },
       async assertBaselineUnchanged() {
+        await assertRepositoryHeadUnchanged();
         await assertRepositoryIndexUnchanged();
         await stageWorktree();
         const current = await runPatchReviewGit(repository, ["write-tree"], {
@@ -6671,6 +6770,7 @@ async function snapshotPatchReviewWorktree(
           signal,
         });
         await assertRepositoryIndexUnchanged();
+        await assertRepositoryHeadUnchanged();
         if (current !== baselineTree) {
           throw new CodexSecurityError(
             "The patch worktree changed after its review baseline was captured. Retry so pre-author changes remain outside the patch.",
@@ -6684,6 +6784,7 @@ async function snapshotPatchReviewWorktree(
             "The patch review snapshot is no longer available.",
           );
         }
+        await assertRepositoryHeadUnchanged();
         await assertRepositoryIndexUnchanged();
         await stageWorktree();
         const candidateTree = await runPatchReviewGit(
@@ -6753,11 +6854,13 @@ async function snapshotPatchReviewWorktree(
           ),
         );
         await assertRepositoryIndexUnchanged();
+        await assertRepositoryHeadUnchanged();
         signal?.throwIfAborted();
         return {
           paths,
           diff: diffBytes.toString("utf8"),
           diffBytes,
+          publicationBaseCommit: headCommit ?? null,
           publicationBaseEntries: selectedPatchReviewTreeEntries(
             paths,
             baselineEntries,
@@ -7166,6 +7269,7 @@ async function runFindingPatches(
   reviewUnsafePublicationPaths?: string[];
   reviewPublicationEntries?: PatchReviewTreeEntry[];
   reviewPublicationHead?: string;
+  reviewBaseCommit?: string | null;
 }> {
   if (selected.findings.length === 0) {
     stderr.write("No matching open findings to patch.\n");
@@ -7180,6 +7284,7 @@ async function runFindingPatches(
   const reviewUnsafePublicationPaths = new Set<string>();
   const reviewPublicationEntries = new Map<string, PatchReviewTreeEntry>();
   let reviewPublicationCandidate: PatchReviewPublicationCandidate | undefined;
+  let reviewBaseCommit: string | null | undefined;
   for (const finding of selected.findings) {
     const interruptedBeforeFinding = interruptedPatchExitCode(options.signal);
     if (interruptedBeforeFinding !== undefined) {
@@ -7220,6 +7325,17 @@ async function runFindingPatches(
             reviewRepository = repository;
           },
           onReviewCandidate: (candidate) => {
+            if (candidate.publicationBaseCommit !== undefined) {
+              if (
+                reviewBaseCommit !== undefined &&
+                reviewBaseCommit !== candidate.publicationBaseCommit
+              ) {
+                throw new CodexSecurityError(
+                  "Patch reviews must use one base commit.",
+                );
+              }
+              reviewBaseCommit = candidate.publicationBaseCommit;
+            }
             const baseEntries = new Map(
               (candidate.publicationBaseEntries ?? []).map((entry) => [
                 entry.path,
@@ -7329,6 +7445,7 @@ async function runFindingPatches(
     ...(reviewPublicationCandidate === undefined
       ? {}
       : { reviewPublicationHead: reviewPublicationCandidate.head }),
+    ...(reviewBaseCommit === undefined ? {} : { reviewBaseCommit }),
   };
 }
 
@@ -9630,6 +9747,7 @@ async function executeScan(
           patchRun.reviewUnsafePublicationPaths,
           patchRun.reviewPublicationEntries,
           patchRun.reviewPublicationHead,
+          patchRun.reviewBaseCommit,
         );
         if (pullRequest !== undefined) {
           scanData = { ...scanData, pullRequest };
