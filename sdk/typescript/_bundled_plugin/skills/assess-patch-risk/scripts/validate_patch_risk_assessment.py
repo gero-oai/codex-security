@@ -268,6 +268,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append(
                 f"materialBoundaries.{index}: exactly one of legitimate control or retirement evidence is required"
             )
+        elif complete_retirement and item["result"] == "contradicted":
+            errors.append(
+                f"materialBoundaries.{index}: retirement evidence cannot support a contradicted boundary"
+            )
         elif (
             not complete_control
             and not complete_retirement
@@ -679,12 +683,24 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     boundary_id
                     for boundary_id, result in (outcome_boundaries or {}).items()
                     if result != "unresolved"
-                    and not boundary_has_evidence.get(boundary_id, False)
+                    and (
+                        boundary_id in unresolved_boundaries
+                        or not boundary_has_evidence.get(boundary_id, False)
+                    )
                 }
                 if set(outcome_boundary_evidence) != expected_boundary_evidence:
                     errors.append(
-                        f"evidencePlan.{index}: boundaryEvidenceOutcomes.{outcome} must supply evidence for exactly the resolved boundaries that lack it"
+                        f"evidencePlan.{index}: boundaryEvidenceOutcomes.{outcome} must supply branch-specific evidence for exactly the resolved boundaries that require it"
                     )
+                for boundary_id, evidence in outcome_boundary_evidence.items():
+                    if (
+                        (outcome_boundaries or {}).get(boundary_id)
+                        == "contradicted"
+                        and retirement_fields <= evidence.keys()
+                    ):
+                        errors.append(
+                            f"evidencePlan.{index}.boundaryEvidenceOutcomes.{outcome}.{boundary_id}: retirement evidence cannot support a contradicted boundary"
+                        )
                 if (
                     outcome_recommendation == "merge"
                     and outcome_boundaries is not None

@@ -1307,6 +1307,20 @@ describe("patch risk assessment contract", () => {
       supported: { "request-contract": "supported" },
       contradicted: { "request-contract": "contradicted" },
     };
+    payload.evidencePlan[0]!.boundaryEvidenceOutcomes = {
+      supported: {
+        "request-contract": {
+          legitimateControl: "The contract retains bounded requests.",
+          legitimateControlPath: "docs/request-v2.md",
+        },
+      },
+      contradicted: {
+        "request-contract": {
+          legitimateControl: "The contract requires bounded requests.",
+          legitimateControlPath: "docs/request-v2.md",
+        },
+      },
+    };
     const covered = await validate(payload);
     expect(covered.status, covered.stderr).toBe(0);
   });
@@ -1380,7 +1394,132 @@ describe("patch risk assessment contract", () => {
     const incomplete = await validate(payload);
     expect(incomplete.status).not.toBe(0);
     expect(incomplete.stderr).toContain(
-      "boundaryEvidenceOutcomes.retired must supply evidence for exactly the resolved boundaries that lack it",
+      "boundaryEvidenceOutcomes.retired must supply branch-specific evidence for exactly the resolved boundaries that require it",
+    );
+  });
+
+  test("requires branch-specific evidence when resolving an evidenced boundary", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "request-contract-evidence",
+        summary: "The governing request contract is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the governing contract retain or retire the request?",
+        action: "Inspect the authoritative request contract.",
+        resolvesUnknowns: ["request-contract-evidence"],
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          retained: { "request-contract": "supported" },
+          retired: { "request-contract": "supported" },
+        },
+        outcomes: { retained: "merge", retired: "merge" },
+        confidenceOutcomes: {
+          retained: "moderate",
+          retired: "moderate",
+        },
+      },
+    ];
+
+    const inherited = await validate(payload);
+    expect(inherited.status).not.toBe(0);
+    expect(inherited.stderr).toContain(
+      "boundaryEvidenceOutcomes.retired must supply branch-specific evidence for exactly the resolved boundaries that require it",
+    );
+
+    payload.evidencePlan[0]!.boundaryEvidenceOutcomes = {
+      retained: {
+        "request-contract": {
+          legitimateControl: "The contract retains bounded requests.",
+          legitimateControlPath: "docs/request-v2.md",
+        },
+      },
+      retired: {
+        "request-contract": {
+          retirementEvidence: "The contract retires the request surface.",
+          retirementEvidencePath: "docs/request-v2.md",
+        },
+      },
+    };
+    const branchSpecific = await validate(payload);
+    expect(branchSpecific.status, branchSpecific.stderr).toBe(0);
+  });
+
+  test("rejects retirement evidence for contradicted boundaries", async () => {
+    const payload = assessment();
+    const boundary = payload.materialBoundaries[0]!;
+    boundary.result = "contradicted";
+    delete boundary.legitimateControl;
+    delete boundary.legitimateControlPath;
+    boundary.retirementEvidence =
+      "The authoritative contract retires the request surface.";
+    boundary.retirementEvidencePath = "docs/request-v2.md";
+    payload.recommendation = "revise";
+    payload.workflowLabel = "revise";
+
+    const topLevel = await validate(payload);
+    expect(topLevel.status).not.toBe(0);
+    expect(topLevel.stderr).toContain(
+      "retirement evidence cannot support a contradicted boundary",
+    );
+
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    boundary.result = "unresolved";
+    delete boundary.retirementEvidence;
+    delete boundary.retirementEvidencePath;
+    payload.unknowns = [
+      {
+        id: "request-contract-evidence",
+        summary: "The governing request contract is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the governing contract retain the request?",
+        action: "Inspect the authoritative request contract.",
+        resolvesUnknowns: ["request-contract-evidence"],
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          retained: { "request-contract": "supported" },
+          contradicted: { "request-contract": "contradicted" },
+        },
+        boundaryEvidenceOutcomes: {
+          retained: {
+            "request-contract": {
+              legitimateControl: "The contract retains bounded requests.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
+          contradicted: {
+            "request-contract": {
+              retirementEvidence: "The contract retires the request surface.",
+              retirementEvidencePath: "docs/request-v2.md",
+            },
+          },
+        },
+        outcomes: { retained: "merge", contradicted: "revise" },
+        confidenceOutcomes: {
+          retained: "moderate",
+          contradicted: "moderate",
+        },
+      },
+    ];
+
+    const branch = await validate(payload);
+    expect(branch.status).not.toBe(0);
+    expect(branch.stderr).toContain(
+      "retirement evidence cannot support a contradicted boundary",
     );
   });
 
@@ -1432,6 +1571,20 @@ describe("patch risk assessment contract", () => {
       supported: { "request-contract": "supported" },
       contradicted: { "request-contract": "contradicted" },
     };
+    payload.evidencePlan[0]!.boundaryEvidenceOutcomes = {
+      supported: {
+        "request-contract": {
+          legitimateControl: "The contract retains bounded requests.",
+          legitimateControlPath: "docs/request-v2.md",
+        },
+      },
+      contradicted: {
+        "request-contract": {
+          legitimateControl: "The contract requires bounded requests.",
+          legitimateControlPath: "docs/request-v2.md",
+        },
+      },
+    };
     const valid = await validate(payload);
     expect(valid.status, valid.stderr).toBe(0);
 
@@ -1467,6 +1620,15 @@ describe("patch risk assessment contract", () => {
         boundaryOutcomes: {
           supported: { "request-contract": "supported" },
           inconclusive: { "request-contract": "unresolved" },
+        },
+        boundaryEvidenceOutcomes: {
+          supported: {
+            "request-contract": {
+              legitimateControl: "The contract retains bounded requests.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
+          inconclusive: {},
         },
         outcomes: {
           supported: "merge",
@@ -2404,6 +2566,20 @@ describe("patch risk assessment contract", () => {
           supported: { "request-contract": "supported" },
           contradicted: { "request-contract": "contradicted" },
         },
+        boundaryEvidenceOutcomes: {
+          supported: {
+            "request-contract": {
+              legitimateControl: "The contract retains bounded requests.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
+          contradicted: {
+            "request-contract": {
+              legitimateControl: "The contract requires bounded requests.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
+        },
         outcomes: { supported: "merge", contradicted: "revise" },
         confidenceOutcomes: {
           supported: "moderate",
@@ -2556,6 +2732,20 @@ describe("patch risk assessment contract", () => {
           supported: { "request-contract": "supported" },
           contradicted: { "request-contract": "contradicted" },
         },
+        boundaryEvidenceOutcomes: {
+          supported: {
+            "request-contract": {
+              legitimateControl: "The contract retains bounded requests.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
+          contradicted: {
+            "request-contract": {
+              legitimateControl: "The contract requires bounded requests.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
+        },
         outcomes: {
           supported: "hold_for_evidence",
           contradicted: "hold_for_evidence",
@@ -2614,6 +2804,20 @@ describe("patch risk assessment contract", () => {
         boundaryOutcomes: {
           supported: { "request-contract": "supported" },
           contradicted: { "request-contract": "contradicted" },
+        },
+        boundaryEvidenceOutcomes: {
+          supported: {
+            "request-contract": {
+              legitimateControl: "The contract retains bounded requests.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
+          contradicted: {
+            "request-contract": {
+              legitimateControl: "The contract requires bounded requests.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
         },
         outcomes: {
           supported: "hold_for_evidence",
@@ -2729,6 +2933,24 @@ describe("patch risk assessment contract", () => {
             "runtime-contract": "supported",
           },
         },
+        boundaryEvidenceOutcomes: {
+          defect: {
+            "request-contract": {
+              legitimateControl: "The request contract requires support.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+          },
+          supported: {
+            "request-contract": {
+              legitimateControl: "The request contract remains supported.",
+              legitimateControlPath: "docs/request-v2.md",
+            },
+            "runtime-contract": {
+              legitimateControl: "The runtime contract remains supported.",
+              legitimateControlPath: "docs/runtime-v2.md",
+            },
+          },
+        },
         outcomes: { defect: "revise", supported: "merge" },
         confidenceOutcomes: {
           defect: "moderate",
@@ -2745,6 +2967,12 @@ describe("patch risk assessment contract", () => {
 
     payload.evidencePlan[0]!.boundaryOutcomes!["defect"]!["runtime-contract"] =
       "contradicted";
+    payload.evidencePlan[0]!.boundaryEvidenceOutcomes!["defect"]![
+      "runtime-contract"
+    ] = {
+      legitimateControl: "The runtime contract requires support.",
+      legitimateControlPath: "docs/runtime-v2.md",
+    };
     const resolved = await validate(payload);
     expect(resolved.status, resolved.stderr).toBe(0);
   });
