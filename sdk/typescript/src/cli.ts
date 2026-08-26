@@ -6778,7 +6778,17 @@ async function snapshotPatchReviewWorktree(
             ["rev-parse", `${headCommit}^{tree}`],
             { environment: objectEnvironment, signal },
           );
-    const repositoryIndexState = async (): Promise<Buffer> => {
+    const repositoryIndexState = async (): Promise<
+      Map<
+        string,
+        {
+          path: Buffer;
+          status: string;
+          assumeUnchanged: boolean;
+          fsMonitorValid: boolean;
+        }
+      >
+    > => {
       const [assumeAndSparse, fsMonitor] = await Promise.all([
         runPatchReviewGitBytes(
           repository,
@@ -6791,11 +6801,67 @@ async function snapshotPatchReviewWorktree(
           { environment: objectEnvironment, signal },
         ),
       ]);
-      return createHash("sha256")
-        .update(assumeAndSparse)
-        .update(Buffer.from([0]))
-        .update(fsMonitor)
-        .digest();
+      const parseFlags = (output: Buffer) => {
+        const entries = new Map<
+          string,
+          { path: Buffer; status: string; special: boolean }
+        >();
+        for (const record of splitNulRecords(output)) {
+          if (record.length < 3 || record[1] !== 0x20) {
+            throw new CodexSecurityError(
+              "The selected repository contains an unreadable Git index entry.",
+            );
+          }
+          const tag = String.fromCharCode(record[0]!);
+          const path = record.subarray(2);
+          const key = patchReviewGitPathKey(path);
+          if (entries.has(key)) {
+            throw new CodexSecurityError(
+              "The selected repository contains an unreadable Git index entry.",
+            );
+          }
+          entries.set(key, {
+            path,
+            status: tag.toUpperCase(),
+            special: tag !== tag.toUpperCase(),
+          });
+        }
+        return entries;
+      };
+      const assumeEntries = parseFlags(assumeAndSparse);
+      const fsMonitorEntries = parseFlags(fsMonitor);
+      const entries = new Map<
+        string,
+        {
+          path: Buffer;
+          status: string;
+          assumeUnchanged: boolean;
+          fsMonitorValid: boolean;
+        }
+      >();
+      for (const [key, entry] of assumeEntries) {
+        const fsMonitorEntry = fsMonitorEntries.get(key);
+        if (
+          fsMonitorEntry === undefined ||
+          fsMonitorEntry.status !== entry.status
+        ) {
+          throw new CodexSecurityError(
+            "The selected repository contains an unreadable Git index entry.",
+          );
+        }
+        entries.set(key, {
+          path: entry.path,
+          status: entry.status,
+          assumeUnchanged: entry.special,
+          fsMonitorValid: fsMonitorEntry.special,
+        });
+      }
+      if (entries.size !== fsMonitorEntries.size) {
+        throw new CodexSecurityError(
+          "The selected repository contains an unreadable Git index entry.",
+        );
+      }
+      return entries;
     };
     const [indexTree, indexState] = await Promise.all([
       runPatchReviewGit(repository, ["write-tree"], {
@@ -6812,10 +6878,46 @@ async function snapshotPatchReviewWorktree(
         }),
         repositoryIndexState(),
       ]);
-      if (
-        currentIndexTree !== indexTree ||
-        !currentIndexState.equals(indexState)
-      ) {
+      let unchanged =
+        currentIndexTree === indexTree &&
+        currentIndexState.size === indexState.size;
+      if (unchanged) {
+        for (const [key, baseline] of indexState) {
+          const current = currentIndexState.get(key);
+          if (current === undefined) {
+            unchanged = false;
+            break;
+          }
+          const sameFlags =
+            current.status === baseline.status &&
+            current.assumeUnchanged === baseline.assumeUnchanged &&
+            current.fsMonitorValid === baseline.fsMonitorValid;
+          if (sameFlags) continue;
+          const clearedSparseFlag =
+            baseline.status === "S" &&
+            current.status === "H" &&
+            current.assumeUnchanged === baseline.assumeUnchanged &&
+            current.fsMonitorValid === baseline.fsMonitorValid &&
+            !baselineMaterializedSkipWorktreePaths.has(key);
+          if (!clearedSparseFlag) {
+            unchanged = false;
+            break;
+          }
+          await validatePatchReviewGitPath(
+            repository,
+            baseline.path,
+            repository,
+          );
+          try {
+            await lstat(patchReviewFilesystemPath(repository, baseline.path));
+          } catch (error) {
+            if (!missingPatchReviewPath(error)) throw error;
+            unchanged = false;
+            break;
+          }
+        }
+      }
+      if (!unchanged) {
         throw new CodexSecurityError(
           "The Git index changed after patch review started. Preserve staged user changes and retry.",
         );
