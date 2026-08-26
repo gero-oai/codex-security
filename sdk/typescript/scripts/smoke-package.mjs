@@ -297,7 +297,14 @@ assert.equal(
   "Plugin contract must not contain duplicate installed paths.",
 );
 
-const consumer = await mkdtemp(join(tmpdir(), "codex-security-package-"));
+const consumer = await mkdtemp(
+  join(
+    process.platform === "win32"
+      ? process.env.RUNNER_TEMP ?? tmpdir()
+      : tmpdir(),
+    "codex-security-package-",
+  ),
+);
 try {
   await writeFile(
     join(consumer, "package.json"),
@@ -556,15 +563,27 @@ try {
     /lin_api_|security@example\.test/u,
   );
 
-  run(
-    process.execPath,
-    [
-      join(packageRoot, "scripts", "fixtures", "credential-lock.mjs"),
-      pathToFileURL(join(installedRoot, "dist", "runtime.js")).href,
-      join(consumer, "credential-lock-state"),
-    ],
-    { cwd: consumer },
+  const credentialState = await mkdtemp(
+    join(tmpdir(), "codex-security-package-credentials-"),
   );
+  try {
+    run(
+      process.execPath,
+      [
+        join(packageRoot, "scripts", "fixtures", "credential-lock.mjs"),
+        pathToFileURL(join(installedRoot, "dist", "runtime.js")).href,
+        credentialState,
+      ],
+      { cwd: consumer },
+    );
+  } finally {
+    await rm(credentialState, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
+  }
 
   await smokeNestedDeepScanWorker(installedRoot, consumer);
 
