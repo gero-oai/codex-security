@@ -5411,10 +5411,13 @@ const PATCH_REPORT_BOUNDARY_CLASSIFICATION =
 const PRIVATE_KEY_BLOCK_START =
   /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PRIVATE_KEY_BLOCK_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
+const PATCH_REPORT_EMPTY_SENSITIVE_FIELD =
+  /^\s*(?:(?:[-*+]\s+)?(?:api|access|private)[ _-]?key|authorization|auth|token|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
 
 function safePatchReport(value: string): string {
   const lines: string[] = [];
   let insidePrivateKey = false;
+  let redactCredentialContinuation = false;
   for (const line of value.split(/\r?\n/u)) {
     if (insidePrivateKey) {
       if (PRIVATE_KEY_BLOCK_END.test(line)) insidePrivateKey = false;
@@ -5423,6 +5426,22 @@ function safePatchReport(value: string): string {
     if (PRIVATE_KEY_BLOCK_START.test(line)) {
       lines.push("[redacted]");
       insidePrivateKey = !PRIVATE_KEY_BLOCK_END.test(line);
+      redactCredentialContinuation = false;
+      continue;
+    }
+    if (redactCredentialContinuation) {
+      if (line.trim().length === 0) {
+        lines.push("");
+        redactCredentialContinuation = false;
+        continue;
+      }
+      lines.push("[redacted]");
+      redactCredentialContinuation = false;
+      continue;
+    }
+    if (PATCH_REPORT_EMPTY_SENSITIVE_FIELD.test(line)) {
+      lines.push("[redacted]");
+      redactCredentialContinuation = true;
       continue;
     }
     const boundary = PATCH_REPORT_BOUNDARY_LINE.exec(line);
