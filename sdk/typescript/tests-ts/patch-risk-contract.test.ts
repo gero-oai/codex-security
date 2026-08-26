@@ -73,6 +73,13 @@ const validatorPath = join(
   "validate_patch_risk_assessment.py",
 );
 const skillPath = join(PLUGIN_ROOT, "skills", "assess-patch-risk", "SKILL.md");
+const rubricPath = join(
+  PLUGIN_ROOT,
+  "skills",
+  "assess-patch-risk",
+  "references",
+  "risk-rubric.md",
+);
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
@@ -216,6 +223,21 @@ describe("patch risk assessment contract", () => {
     expect(skill).not.toMatch(
       /^python\s+.*validate_patch_risk_assessment\.py/mu,
     );
+  });
+
+  test("distinguishes authorized narrowing and recorded authority snapshots", async () => {
+    const [skill, rubric] = await Promise.all([
+      readFile(skillPath, "utf8"),
+      readFile(rubricPath, "utf8"),
+    ]);
+    for (const contract of [skill, rubric]) {
+      expect(contract).toContain(
+        "Prior base support is a counterexample, not by itself proof that support must remain",
+      );
+      expect(contract).toContain(
+        "recorded or versioned authority snapshot as the governing decision context",
+      );
+    }
   });
 
   test("isolates validator imports from the subject environment", async () => {

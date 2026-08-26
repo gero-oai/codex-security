@@ -50,11 +50,11 @@ For each material changed boundary, record:
 
 When a decision depends on a complete enum, allowlist, routing table, protocol matrix, identity class, state transition, or similar bounded domain, derive the partitions from an independent contract or an exhaustive self-contained new contract. Representative tests are not proof of completeness.
 
-When a patch newly rejects inputs or narrows an existing contract, derive at least one legitimate control from exact-base source or callers outside the patch's own tests. Mark the boundary contradicted when the head rejects an independently evidenced supported control.
+When a patch newly rejects inputs or narrows an existing contract, derive at least one legitimate control from exact-base source or callers outside the patch's own tests. Prior base support is a counterexample, not by itself proof that support must remain. Mark the boundary contradicted only when a current governing contract or required caller establishes that the control must remain supported; if authorization to narrow is unresolved, keep the boundary unresolved, and if authoritative evidence permits the narrowing, assess compatibility and migration impact without calling the boundary contradicted solely because the base accepted the control.
 
 When behavior derives a new target or reuses saved authority, independently classify the derived URL, callback, nested resource, cached principal, historical object, retry, replay, or re-execution at the consuming policy decision. Inherited trust is not evidence of safety.
 
-When an authentication or authorization patch claims complete or unconditional enforcement, trace saved, cached, historical, and versioned authority through every applicable refresh, reconnect, replay, retry, and re-execution. At each consuming decision, reclassify the current principal, resource, and policy or prove from source that their binding cannot change.
+When an authentication or authorization patch claims complete or unconditional enforcement, trace saved, cached, historical, and versioned authority through every applicable refresh, reconnect, replay, retry, and re-execution. At each consuming decision, reclassify the current principal, resource, and policy; prove that an authoritative contract defines a recorded or versioned authority snapshot as the governing decision context and that source binds the operation to that snapshot; or prove from source that the binding cannot change.
 
 Apply these challenges when the patch contains the corresponding structure:
 
