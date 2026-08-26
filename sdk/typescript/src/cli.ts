@@ -5671,6 +5671,12 @@ interface NestedPatchReviewRepository {
   gitDirectory: string;
 }
 
+function nestedPatchReviewRepositoryKey(
+  nested: NestedPatchReviewRepository,
+): string {
+  return JSON.stringify([nested.worktree, nested.gitDirectory]);
+}
+
 const NESTED_PATCH_REVIEW_GIT_METADATA_PATHS = [
   "HEAD",
   "config",
@@ -5736,6 +5742,48 @@ async function hashNestedPatchReviewGitMetadata(
       signal,
     );
   }
+}
+
+async function hashNestedPatchReviewGitMarker(
+  worktree: string,
+  digest: ReturnType<typeof createHash>,
+  signal?: AbortSignal,
+): Promise<void> {
+  const markerPath = Buffer.from(".git");
+  const metadata = await lstat(join(worktree, ".git"), { bigint: true });
+  if (metadata.isDirectory()) {
+    updateNestedPatchReviewDigest(
+      digest,
+      markerPath,
+      `directory:${metadata.mode.toString(8)}`,
+      "",
+    );
+    return;
+  }
+  await hashNestedPatchReviewPath(worktree, markerPath, digest, signal);
+}
+
+async function hashNestedPatchReviewDirectoryMode(
+  worktree: string,
+  path: Buffer,
+  digest: ReturnType<typeof createHash>,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  const metadata = await lstat(patchReviewFilesystemPath(worktree, path), {
+    bigint: true,
+  });
+  if (!metadata.isDirectory()) {
+    throw new CodexSecurityError(
+      "A nested Git worktree path ancestor is no longer a directory.",
+    );
+  }
+  updateNestedPatchReviewDigest(
+    digest,
+    path,
+    `directory:${metadata.mode.toString(8)}`,
+    "",
+  );
 }
 
 async function hashNestedPatchReviewPath(
@@ -6535,6 +6583,19 @@ async function snapshotPatchReviewWorktree(
         ),
       ]);
     const digest = createHash("sha256").update(status);
+    updateNestedPatchReviewDigest(
+      digest,
+      Buffer.from("worktree"),
+      "identity",
+      Buffer.from(nested.worktree),
+    );
+    updateNestedPatchReviewDigest(
+      digest,
+      Buffer.from("git-directory"),
+      "identity",
+      Buffer.from(nested.gitDirectory),
+    );
+    await hashNestedPatchReviewGitMarker(nested.worktree, digest, signal);
     const paths = new Map<string, Buffer>();
     for (const output of [changed, untracked, ignoredPaths]) {
       for (const path of splitNulRecords(output)) {
@@ -6543,6 +6604,33 @@ async function snapshotPatchReviewWorktree(
     }
     for (const path of parseRawPatchReviewIndexPaths(indexEntries)) {
       paths.set(patchReviewGitPathKey(path), path);
+    }
+    const directories = new Map<string, Buffer>([
+      [patchReviewGitPathKey(Buffer.alloc(0)), Buffer.alloc(0)],
+    ]);
+    for (const path of paths.values()) {
+      const parts = splitPatchReviewGitPath(path);
+      if (parts === undefined) {
+        throw new CodexSecurityError(
+          "A nested Git worktree contains an unsafe path.",
+        );
+      }
+      let directory = Buffer.alloc(0);
+      for (const part of parts.slice(0, -1)) {
+        directory =
+          directory.length === 0
+            ? Buffer.from(part)
+            : Buffer.concat([directory, Buffer.from("/"), part]);
+        directories.set(patchReviewGitPathKey(directory), directory);
+      }
+    }
+    for (const directory of [...directories.values()].sort(Buffer.compare)) {
+      await hashNestedPatchReviewDirectoryMode(
+        nested.worktree,
+        directory,
+        digest,
+        signal,
+      );
     }
     for (const path of [...paths.values()].sort(Buffer.compare)) {
       await hashNestedPatchReviewPath(nested.worktree, path, digest, signal);
@@ -6567,10 +6655,20 @@ async function snapshotPatchReviewWorktree(
       repository: nested,
       state: baseline,
     } of baselineNestedRepositoryStates.values()) {
-      const current = await nestedRepositoryState(nested).catch(
-        () => undefined,
-      );
-      if (current !== undefined) currentStates.set(nested.worktree, current);
+      const rediscovered = await nestedPatchReviewRepository(
+        repository,
+        relative(repository, nested.worktree),
+        allowedNestedGitDirectories,
+      ).catch(() => undefined);
+      const current =
+        rediscovered !== undefined &&
+        nestedPatchReviewRepositoryKey(rediscovered) ===
+          nestedPatchReviewRepositoryKey(nested)
+          ? await nestedRepositoryState(rediscovered).catch(() => undefined)
+          : undefined;
+      if (current !== undefined) {
+        currentStates.set(nestedPatchReviewRepositoryKey(nested), current);
+      }
       if (current !== baseline) {
         throw new CodexSecurityError(
           "A nested Git worktree changed after patch review started. Review it as a separate patch target.",
@@ -6984,10 +7082,11 @@ async function snapshotPatchReviewWorktree(
               allowedNestedGitDirectories,
             );
       if (nested !== undefined) {
-        let state = currentNestedRepositoryStates.get(nested.worktree);
+        const repositoryKey = nestedPatchReviewRepositoryKey(nested);
+        let state = currentNestedRepositoryStates.get(repositoryKey);
         if (state === undefined) {
           state = await nestedRepositoryState(nested);
-          currentNestedRepositoryStates.set(nested.worktree, state);
+          currentNestedRepositoryStates.set(repositoryKey, state);
         }
         const baseline = baselineNestedRepositoryStates.get(nested.worktree);
         if (capturingBaseline && baseline === undefined) {
@@ -6995,7 +7094,12 @@ async function snapshotPatchReviewWorktree(
             repository: nested,
             state,
           });
-        } else if (baseline?.state !== state) {
+        } else if (
+          baseline === undefined ||
+          nestedPatchReviewRepositoryKey(baseline.repository) !==
+            repositoryKey ||
+          baseline.state !== state
+        ) {
           throw new CodexSecurityError(
             "A nested Git worktree changed after patch review started. Review it as a separate patch target.",
           );
