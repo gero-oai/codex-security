@@ -309,8 +309,16 @@ describe("scan and patch workflow", () => {
   test("reverifies all accepted findings after the final reviewed patch", async () => {
     const result = resultWithFindings(["high", "high"]);
     const stages: string[] = [];
+    let publicationStarted = false;
     const outcome = await runWorkflow(
-      ["patch", "--scan", "scan-1", "--review-minimality", "--json"],
+      [
+        "patch",
+        "--scan",
+        "scan-1",
+        "--review-minimality",
+        "--create-pr",
+        "--json",
+      ],
       {
         result,
         onWorkbench: () => savedScan(result),
@@ -346,10 +354,15 @@ describe("scan and patch workflow", () => {
           }
           return 0;
         },
+        onRepositoryCommand: () => {
+          publicationStarted = true;
+          return "";
+        },
       },
     );
 
     expect(outcome.exitCode).toBe(2);
+    expect(publicationStarted).toBe(false);
     expect(stages).toEqual([
       "author",
       "review",
@@ -1754,7 +1767,7 @@ describe("scan and patch workflow", () => {
     }
   });
 
-  test.each(["configuration", "hook"] as const)(
+  test.each(["configuration", "hook", "sparse checkout"] as const)(
     "fails closed when the author changes top-level Git %s",
     async (kind) => {
       const repository = await realpath(
@@ -1775,6 +1788,12 @@ describe("scan and patch workflow", () => {
         await writeFile(join(repository, "value.ts"), "unsafe\n");
         git("add", "--", "value.ts");
         git("commit", "-m", "Initial synthetic checkout");
+        if (kind === "sparse checkout") {
+          await writeFile(
+            join(repository, ".git", "info", "sparse-checkout"),
+            "/*\n",
+          );
+        }
 
         const outcome = await runWorkflow(
           ["patch", "Synthetic security issue", "--review-minimality"],
@@ -1787,10 +1806,15 @@ describe("scan and patch workflow", () => {
                 await writeFile(join(repository, "value.ts"), "fixed\n");
                 if (kind === "configuration") {
                   git("config", "review.synthetic", "changed");
-                } else {
+                } else if (kind === "hook") {
                   await writeFile(
                     join(repository, ".git", "hooks", "pre-commit"),
                     "#!/bin/sh\nexit 0\n",
+                  );
+                } else {
+                  await writeFile(
+                    join(repository, ".git", "info", "sparse-checkout"),
+                    "/src/\n",
                   );
                 }
                 output!.stdout.write("Verified synthetic patch.");
@@ -1977,6 +2001,65 @@ describe("scan and patch workflow", () => {
         stdio: ["ignore", "pipe", "pipe"],
       });
       expect(merge.status).not.toBe(0);
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an uninitialized Git submodule in the review snapshot", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-uninitialized-submodule-")),
+    );
+    const dependency = join(repository, "dependency");
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+      await mkdir(dependency);
+      git(
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "160000",
+        git("rev-parse", "HEAD"),
+        "dependency",
+      );
+      git("commit", "-m", "Add synthetic dependency pointer");
 
       const outcome = await runWorkflow(
         ["patch", "Synthetic security issue", "--review-minimality"],
