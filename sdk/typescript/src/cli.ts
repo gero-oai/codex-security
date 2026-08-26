@@ -5628,6 +5628,7 @@ async function runPatchReviewGitBytes(
   args: readonly string[],
   options: {
     environment?: NodeJS.ProcessEnv;
+    input?: string | Uint8Array;
     signal?: AbortSignal;
   } = {},
 ): Promise<Buffer> {
@@ -5637,8 +5638,54 @@ async function runPatchReviewGitBytes(
     null,
     options.environment,
     options.signal,
+    options.input,
   );
   return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout, "utf8");
+}
+
+async function disabledPatchReviewFilterArguments(
+  directory: string,
+  paths: Uint8Array,
+  environment: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const attributes = splitNulRecords(
+    await runPatchReviewGitBytes(
+      directory,
+      ["check-attr", "-z", "--stdin", "filter"],
+      { environment, input: paths, signal },
+    ),
+  );
+  if (attributes.length % 3 !== 0) {
+    throw new CodexSecurityError(
+      "Git clean-filter attributes could not be read safely.",
+    );
+  }
+  const drivers = new Set<string>();
+  for (let index = 0; index < attributes.length; index += 3) {
+    const attribute = decodePatchReviewGitPath(attributes[index + 1]!);
+    const driver = decodePatchReviewGitPath(attributes[index + 2]!);
+    if (attribute !== "filter" || driver === undefined) {
+      throw new CodexSecurityError(
+        "Git clean-filter attributes could not be read safely.",
+      );
+    }
+    if (driver === "unspecified" || driver === "unset") continue;
+    if (/[=\r\n]/u.test(driver)) {
+      throw new CodexSecurityError(
+        "Git clean-filter configuration contains an unsupported name.",
+      );
+    }
+    drivers.add(driver);
+  }
+  return [...drivers].flatMap((driver) => [
+    "-c",
+    `filter.${driver}.clean=`,
+    "-c",
+    `filter.${driver}.process=`,
+    "-c",
+    `filter.${driver}.required=false`,
+  ]);
 }
 
 async function runPatchReviewGitOutput(
@@ -7624,13 +7671,6 @@ async function snapshotPatchReviewWorktree(
         "The patch worktree changed while its review baseline was captured. Retry from a stable worktree.",
       );
     }
-    const baselineEntries = parsePatchReviewIndexEntries(
-      await runPatchReviewGitBytes(
-        repository,
-        ["ls-files", "--stage", "-z", "--", "."],
-        { environment, signal },
-      ),
-    );
     const pathsChangedFromHead = async (tree: string): Promise<string[]> => {
       const output = await runPatchReviewGitBytes(
         repository,
@@ -7658,9 +7698,120 @@ async function snapshotPatchReviewWorktree(
         return decoded === undefined ? [] : [decoded];
       });
     };
+    const normalizationEnvironment = {
+      ...objectEnvironment,
+      GIT_INDEX_FILE: join(temporaryDirectory, "normalization-index"),
+    };
+    const indexEntries = parsePatchReviewIndexEntries(
+      await runPatchReviewGitBytes(
+        repository,
+        ["ls-files", "--stage", "-z", "--", "."],
+        { environment: objectEnvironment, signal },
+      ),
+    );
+    const normalizedPublicationTree = async (
+      paths: readonly string[],
+    ): Promise<{
+      tree: string;
+      entries: Map<string, PatchReviewTreeEntry>;
+    }> => {
+      const pathsToAdd: string[] = [];
+      for (const path of paths) {
+        const key = patchReviewGitPathKey(Buffer.from(path));
+        if (ignoredPathSet.has(key) && !indexState.has(key)) continue;
+        if (indexState.has(key)) {
+          pathsToAdd.push(path);
+          continue;
+        }
+        try {
+          await lstat(join(repository, path));
+          pathsToAdd.push(path);
+        } catch (error) {
+          if (!missingPatchReviewPath(error)) throw error;
+        }
+      }
+      if (pathsToAdd.length === 0) {
+        return { tree: indexTree, entries: indexEntries };
+      }
+      const pathspecs = Buffer.concat(
+        pathsToAdd.flatMap((path) => [Buffer.from(path), Buffer.from([0])]),
+      );
+      const trackedPathspecs = Buffer.concat(
+        pathsToAdd
+          .filter((path) =>
+            indexState.has(patchReviewGitPathKey(Buffer.from(path))),
+          )
+          .flatMap((path) => [Buffer.from(path), Buffer.from([0])]),
+      );
+      const filterArguments = await disabledPatchReviewFilterArguments(
+        repository,
+        pathspecs,
+        objectEnvironment,
+        signal,
+      );
+      await runPatchReviewGit(
+        repository,
+        [...filterArguments, "read-tree", indexTree],
+        { environment: normalizationEnvironment, signal },
+      );
+      if (trackedPathspecs.length > 0) {
+        await runPatchReviewGit(
+          repository,
+          [
+            ...filterArguments,
+            "update-index",
+            "--no-assume-unchanged",
+            "--no-skip-worktree",
+            "-z",
+            "--stdin",
+          ],
+          {
+            environment: normalizationEnvironment,
+            input: trackedPathspecs,
+            signal,
+          },
+        );
+      }
+      await runPatchReviewGit(
+        repository,
+        [
+          ...filterArguments,
+          "--literal-pathspecs",
+          "add",
+          "--all",
+          "--sparse",
+          "--pathspec-from-file=-",
+          "--pathspec-file-nul",
+        ],
+        {
+          environment: normalizationEnvironment,
+          input: pathspecs,
+          signal,
+        },
+      );
+      return {
+        tree: await runPatchReviewGit(
+          repository,
+          [...filterArguments, "write-tree"],
+          { environment: normalizationEnvironment, signal },
+        ),
+        entries: parsePatchReviewIndexEntries(
+          await runPatchReviewGitBytes(
+            repository,
+            [...filterArguments, "ls-files", "--stage", "-z", "--", "."],
+            { environment: normalizationEnvironment, signal },
+          ),
+        ),
+      };
+    };
+    const baselinePathsChangedFromHead =
+      await pathsChangedFromHead(baselineTree);
+    const normalizedBaseline = await normalizedPublicationTree(
+      baselinePathsChangedFromHead,
+    );
     const preexistingPathSet = new Set([
       ...(await pathsChangedFromHead(indexTree)),
-      ...(await pathsChangedFromHead(baselineTree)),
+      ...(await pathsChangedFromHead(normalizedBaseline.tree)),
     ]);
     let disposed = false;
     return {
@@ -7762,13 +7913,7 @@ async function snapshotPatchReviewWorktree(
                 ],
                 { environment, signal },
               );
-        const candidateEntries = parsePatchReviewIndexEntries(
-          await runPatchReviewGitBytes(
-            repository,
-            ["ls-files", "--stage", "-z", "--", "."],
-            { environment, signal },
-          ),
-        );
+        const normalizedCandidate = await normalizedPublicationTree(paths);
         await assertRepositoryGitMetadataUnchanged();
         await assertRepositoryIndexUnchanged();
         await assertRepositoryHeadUnchanged();
@@ -7780,11 +7925,11 @@ async function snapshotPatchReviewWorktree(
           publicationBaseCommit: headCommit ?? null,
           publicationBaseEntries: selectedPatchReviewTreeEntries(
             paths,
-            baselineEntries,
+            normalizedBaseline.entries,
           ),
           publicationEntries: selectedPatchReviewTreeEntries(
             paths,
-            candidateEntries,
+            normalizedCandidate.entries,
           ),
           publicationUnsafePaths: paths.filter((path) =>
             preexistingPathSet.has(path),
