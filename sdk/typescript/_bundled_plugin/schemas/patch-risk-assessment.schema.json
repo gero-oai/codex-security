@@ -11,6 +11,7 @@
     "workflowLabel",
     "impact",
     "regressionLikelihood",
+    "materialSafetyFailure",
     "regressionProtection",
     "recoverability",
     "confidence",
@@ -65,6 +66,15 @@
     },
     "impact": { "$ref": "#/$defs/riskRating" },
     "regressionLikelihood": { "$ref": "#/$defs/riskRating" },
+    "materialSafetyFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["established", "evidence"],
+      "properties": {
+        "established": { "type": "boolean" },
+        "evidence": { "$ref": "#/$defs/nonBlankString" }
+      }
+    },
     "regressionProtection": {
       "type": "object",
       "additionalProperties": false,
@@ -130,7 +140,9 @@
           "invariant",
           "runtimeRoot",
           "counterexample",
+          "counterexamplePath",
           "legitimateControl",
+          "legitimateControlPath",
           "result"
         ],
         "properties": {
@@ -138,7 +150,9 @@
           "invariant": { "$ref": "#/$defs/nonBlankString" },
           "runtimeRoot": { "$ref": "#/$defs/nonBlankString" },
           "counterexample": { "$ref": "#/$defs/nonBlankString" },
+          "counterexamplePath": { "$ref": "#/$defs/nonBlankString" },
           "legitimateControl": { "$ref": "#/$defs/nonBlankString" },
+          "legitimateControlPath": { "$ref": "#/$defs/nonBlankString" },
           "result": {
             "enum": ["supported", "contradicted", "unresolved"]
           }
@@ -219,6 +233,18 @@
             "additionalProperties": {
               "$ref": "#/$defs/applicabilityStatus"
             },
+            "minProperties": 2
+          },
+          "regressionLikelihoodOutcomes": {
+            "type": "object",
+            "additionalProperties": {
+              "enum": ["low", "moderate", "high", "critical", "unknown"]
+            },
+            "minProperties": 2
+          },
+          "materialSafetyFailureOutcomes": {
+            "type": "object",
+            "additionalProperties": { "type": "boolean" },
             "minProperties": 2
           },
           "resolvesFailedValidation": { "$ref": "#/$defs/stringList" },
