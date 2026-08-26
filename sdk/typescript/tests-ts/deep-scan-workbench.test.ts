@@ -284,6 +284,173 @@ test.each([
 );
 
 describe("deep scan workbench ownership", () => {
+  function runCoverageProbe(script: string[], cases: readonly unknown[]) {
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const result = Bun.spawnSync(
+      [
+        python!,
+        "-I",
+        "-B",
+        "-c",
+        script.join("\n"),
+        PLUGIN_ROOT,
+        JSON.stringify(cases),
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
+    return JSON.parse(new TextDecoder().decode(result.stdout)) as Array<{
+      expected: string;
+      completeness: string;
+      warnings: string[];
+      openQuestions?: Array<{ question: string }>;
+    }>;
+  }
+
+  test("restores complete deep coverage only without pending or lost work", () => {
+    const cases = [
+      { expected: "complete" },
+      {
+        expected: "partial",
+        warnings: ["Saved checkpoint could not be read."],
+      },
+      { expected: "partial", coverage: { surfaces: [] } },
+      {
+        expected: "partial",
+        coverage: {
+          deferred: [{ id: "pending", reason: "Review is incomplete." }],
+        },
+      },
+      {
+        expected: "partial",
+        coverage: {
+          surfaces: [
+            {
+              id: "pending",
+              label: "Pending review",
+              disposition: "needs_follow_up",
+              receiptRefs: [],
+            },
+          ],
+        },
+      },
+      {
+        expected: "partial",
+        coverage: {
+          surfaces: [
+            {
+              id: "invalid-receipt",
+              label: "Source review",
+              disposition: "reported",
+              receiptRefs: ["artifacts/missing-receipt.json"],
+            },
+          ],
+        },
+      },
+      { expected: "partial", coverage: { explicitExclusions: [null] } },
+      { expected: "partial", discarded: ["Discarded malformed finding."] },
+      { expected: "partial", coverage: { mode: "repository" } },
+    ] as const;
+    const recovered = runCoverageProbe(
+      [
+        "import copy, json, pathlib, runpy, sys",
+        "plugin = pathlib.Path(sys.argv[1])",
+        "examples = plugin / 'examples' / 'completed-scan'",
+        "example = json.loads((examples / 'coverage.json').read_text())",
+        "recover = runpy.run_path(str(plugin / 'scripts' / 'finalize_scan_contract.py'))['_recover_unsealed_coverage']",
+        "results = []",
+        "for case in json.loads(sys.argv[2]):",
+        "    coverage = copy.deepcopy(example)",
+        "    coverage.update(mode='deep_repository', completeness='partial', openQuestions=[{'question': 'Which deployment controls apply?'}])",
+        "    coverage.update(case.get('coverage', {}))",
+        "    warnings = list(case.get('warnings', []))",
+        "    recover(coverage, plugin / 'schemas', examples, warnings, case.get('discarded', []))",
+        "    results.append({'expected': case['expected'], 'completeness': coverage['completeness'], 'warnings': warnings, 'openQuestions': coverage['openQuestions']})",
+        "print(json.dumps(results))",
+      ],
+      cases,
+    );
+    for (const result of recovered) {
+      expect(result.completeness).toBe(result.expected);
+      expect(result.openQuestions).toEqual([
+        { question: "Which deployment controls apply?" },
+      ]);
+    }
+  });
+
+  test("preserves incomplete worker provenance when recovering deep coverage", () => {
+    const cases = [
+      ["complete", false, "complete", null, "partial"],
+      ["partial", false, "complete", null, "partial"],
+      ["complete", null, "unknown", null, "partial"],
+      ["partial", null, "unknown", null, "partial"],
+      ["partial", null, null, null, "partial"],
+      ["partial", null, "invalid", null, "partial"],
+      ["partial", null, [], null, "partial"],
+      ["partial", null, "partial", "deferred", "partial"],
+      ["complete", null, "complete", "surfaces", "partial"],
+      ["complete", null, "partial", null, "complete"],
+      ["partial", null, "partial", null, "complete"],
+      ["partial", null, "complete", null, "complete"],
+    ] as const;
+    const recovered = runCoverageProbe(
+      [
+        "import copy, json, pathlib, sys",
+        "plugin = pathlib.Path(sys.argv[1])",
+        "sys.path.insert(0, str(plugin / 'scripts'))",
+        "import finalize_scan_contract as finalizer",
+        "import workbench_saved_results as saved",
+        "examples = plugin / 'examples' / 'completed-scan'",
+        "example = json.loads((examples / 'coverage.json').read_text())",
+        "binding = dict(allowedTargetKinds=['directory_snapshot'],",
+        "    target={'targetId': 'synthetic-target', 'displayName': 'synthetic-repository'},",
+        "    scope={'includePaths': ['.'], 'excludePaths': []},",
+        "    coverageMode='deep_repository', status='completed')",
+        "workers = []",
+        "for index in range(2):",
+        "    name = f'synthetic-worker-{index}'",
+        "    workers.append(dict(id=name, kind='discovery', status='succeeded',",
+        "        artifact_dir=str(examples / name),",
+        "        result_manifest_path=str(examples / name / 'result.json'),",
+        "        completed_at='now', attempt=1))",
+        "saved._children = lambda *_: []",
+        "saved.write_scan_local_bytes = lambda *_args, **_kwargs: None",
+        "results = []",
+        "for parent_status, worker_complete, worker_status, malformed, expected in json.loads(sys.argv[2]):",
+        "    parent_coverage = copy.deepcopy(example)",
+        "    parent_coverage.update(scanId='synthetic-scan', mode='deep_repository', completeness=parent_status)",
+        "    worker_coverage = {'surfaces': [], 'explicitExclusions': [], 'deferred': []}",
+        "    if worker_status is not None: worker_coverage['completeness'] = worker_status",
+        "    if malformed is not None: worker_coverage[malformed] = 'unverified review'",
+        "    parent_scan = dict(id='synthetic-scan', complete=True, scope=binding['scope'],",
+        "        target={'kind': 'directory_snapshot', **binding['target']})",
+        "    drafts = {'scan-manifest.json': {'scan': parent_scan},",
+        "        'findings.json': {'findings': []}, 'coverage.json': parent_coverage}",
+        "    worker_draft = {'scanId': 'synthetic-scan', 'findings': [], 'coverage': worker_coverage}",
+        "    if worker_complete is not None: worker_draft['complete'] = worker_complete",
+        "    for worker in workers: drafts[f\"{worker['id']}/result.json\"] = worker_draft",
+        "    saved._read_scan_local_json = lambda _root, relative, _label: copy.deepcopy(drafts[relative])",
+        "    warnings = []",
+        "    coverage = saved.merge_saved_results(examples, 'synthetic-scan', binding, workers, warnings, stopped=False, reason='')[2]",
+        "    finalizer._recover_unsealed_coverage(coverage, plugin / 'schemas', examples, warnings, [])",
+        "    results.append({'expected': expected, 'completeness': coverage['completeness'], 'warnings': warnings})",
+        "print(json.dumps(results))",
+      ],
+      cases,
+    );
+    for (const result of recovered) {
+      expect(result.completeness).toBe(result.expected);
+      expect(
+        result.warnings.filter(
+          (warning) =>
+            warning ===
+            "Saved scan source is incomplete or has unverified coverage; coverage remains partial.",
+        ),
+      ).toHaveLength(result.expected === "partial" ? 1 : 0);
+    }
+  });
+
   test("starts a Deep Scan with oversized stdin user context", async () => {
     const root = await realpath(
       await mkdtemp(join(tmpdir(), "codex-security-deep-context-stdin-")),

@@ -577,16 +577,27 @@ def merge_saved_results(
                 for saved_path, current, saved_worker in sources
             )
         )
-        if (
-            (relative != "parent" or not parent_manifest)
-            and not superseded
-            and (
+        if (relative != "parent" or not parent_manifest) and not superseded:
+            source_coverage = draft["coverage"]
+            source_completeness = source_coverage.get("completeness")
+            if (
                 draft.get("complete") is False
-                or draft["coverage"].get("completeness") != "complete"
-            )
-            and coverage.get("completeness") in {"complete", "unknown"}
-        ):
-            coverage["completeness"] = "partial"
+                or source_completeness not in ("complete", "partial")
+                or any(
+                    not isinstance(source_coverage.get(field), list)
+                    for field in ("surfaces", "explicitExclusions", "deferred")
+                )
+            ):
+                warning = (
+                    "Saved scan source is incomplete or has unverified coverage; "
+                    "coverage remains partial."
+                )
+                if warning not in warnings:
+                    warnings.append(warning)
+            if (
+                draft.get("complete") is False or source_completeness != "complete"
+            ) and coverage.get("completeness") in {"complete", "unknown"}:
+                coverage["completeness"] = "partial"
         if superseded and not stopped:
             continue
         if "threatModel" not in manifest["scan"] and isinstance(draft.get("threatModel"), dict):

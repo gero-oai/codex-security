@@ -1023,6 +1023,21 @@ def _recover_unsealed_coverage(
         partial = True
     if partial:
         coverage["completeness"] = "partial"
+    elif (
+        completeness == "partial"
+        and coverage.get("mode") == "deep_repository"
+        and coverage["surfaces"]
+        and not coverage["deferred"]
+        and not warnings
+        and not any(
+            surface["disposition"] == "needs_follow_up"
+            for surface in coverage["surfaces"]
+        )
+    ):
+        coverage["completeness"] = "complete"
+        warnings.append(
+            "Recovered Deep Scan coverage marked partial without deferred review work."
+        )
 
 
 def _recover_unsealed_hardening(
