@@ -4212,6 +4212,7 @@ export async function main(
                 dependencies,
                 patchRun.reviewRepository,
                 patchRun.reviewUnsafePublicationPaths,
+                patchRun.reviewPublicationBaseEntries,
                 patchRun.reviewPublicationEntries,
                 patchRun.reviewPublicationHead,
                 patchRun.reviewBaseCommit,
@@ -4220,7 +4221,10 @@ export async function main(
             if (format === "json" || format === "jsonl") {
               return {
                 scanId: selected.scanId,
-                repository: patchRun.reviewRepository ?? selected.repository,
+                repository: selected.repository,
+                ...(patchRun.reviewRepository === undefined
+                  ? {}
+                  : { patchRepository: patchRun.reviewRepository }),
                 patches,
                 ...(pullRequest === undefined ? {} : { pullRequest }),
               };
@@ -5254,12 +5258,13 @@ async function createPatchPullRequest(
   dependencies: CliDependencies,
   reviewRepository?: string,
   reviewUnsafePublicationPaths: readonly string[] = [],
+  reviewPublicationBaseEntries: readonly PatchReviewTreeEntry[] = [],
   reviewPublicationEntries: readonly PatchReviewTreeEntry[] = [],
   reviewPublicationHead?: string,
   reviewBaseCommit?: string | null,
 ): Promise<{ branch: string; url: string } | undefined> {
   const repository = reviewRepository ?? selected.repository;
-  const files = [
+  let files = [
     ...new Set(
       patches.flatMap(({ status, files }) =>
         status === "verified" ? files : [],
@@ -5274,6 +5279,17 @@ async function createPatchPullRequest(
     }
     return nativePath.split(sep).join("/");
   });
+  if (reviewBaseCommit !== undefined) {
+    const basePaths = new Set(
+      reviewPublicationBaseEntries.map(({ path }) => path),
+    );
+    const reviewedPaths = new Set(
+      reviewPublicationEntries.map(({ path }) => path),
+    );
+    files = files.filter(
+      (file) => basePaths.has(file) || reviewedPaths.has(file),
+    );
+  }
   if (files.length === 0) {
     stderr.write("No verified patch changes to publish.\n");
     return;
@@ -6520,6 +6536,20 @@ async function sealPatchReviewMcpRuntime(
   );
 }
 
+const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
+  "HEAD",
+  "commondir",
+  "config",
+  "config.worktree",
+  "hooks",
+  "info/attributes",
+  "info/exclude",
+  "info/sparse-checkout",
+  "objects/info/alternates",
+  "packed-refs",
+  "refs",
+] as const;
+
 async function snapshotPatchReviewWorktree(
   directory: string,
   signal?: AbortSignal,
@@ -6634,6 +6664,10 @@ async function snapshotPatchReviewWorktree(
   const baselineUninitializedGitlinkStates = new Map<string, string>();
   const baselineUnrepresentedFileModes = new Map<string, bigint>();
   const baselineUnrepresentedDirectoryModes = new Map<string, bigint>();
+  const baselineUntrackedDirectoryModes = new Map<
+    string,
+    { path: Buffer; mode: bigint }
+  >();
   let capturingBaseline = true;
   const repositoryGitMetadataState = async (): Promise<string> => {
     const digest = createHash("sha256");
@@ -6650,18 +6684,6 @@ async function snapshotPatchReviewWorktree(
       await hashNestedPatchReviewPath(repository, markerPath, digest, signal);
     }
     const gitDirectories = [...new Set(repositoryGitDirectories)];
-    const protectedPaths = [
-      "HEAD",
-      "config",
-      "config.worktree",
-      "hooks",
-      "info/attributes",
-      "info/exclude",
-      "info/sparse-checkout",
-      "objects/info/alternates",
-      "packed-refs",
-      "refs",
-    ];
     for (const [index, gitDirectory] of gitDirectories.entries()) {
       updateNestedPatchReviewDigest(
         digest,
@@ -6669,7 +6691,7 @@ async function snapshotPatchReviewWorktree(
         "git-directory",
         "",
       );
-      for (const path of protectedPaths) {
+      for (const path of PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS) {
         await hashNestedPatchReviewPath(
           gitDirectory,
           Buffer.from(path),
@@ -6713,7 +6735,7 @@ async function snapshotPatchReviewWorktree(
             "--ignored=matching",
             "--ignore-submodules=all",
           ],
-          { signal },
+          { environment: { GIT_OPTIONAL_LOCKS: "0" }, signal },
         ),
         runPatchReviewGitBytes(
           nested.worktree,
@@ -6782,7 +6804,10 @@ async function snapshotPatchReviewWorktree(
     for (const path of [...paths.values()].sort(Buffer.compare)) {
       await hashNestedPatchReviewPath(nested.worktree, path, digest, signal);
     }
-    for (const path of ["HEAD", "config", "index", "packed-refs", "refs"]) {
+    for (const path of [
+      ...PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS,
+      "index",
+    ]) {
       await hashNestedPatchReviewPath(
         nested.gitDirectory,
         Buffer.from(path),
@@ -6825,47 +6850,168 @@ async function snapshotPatchReviewWorktree(
     if (!capturingBaseline) {
       await assertNestedRepositoriesUnchanged(currentNestedRepositoryStates);
     }
-    const [sparseEntries, listed, currentIgnored, rawIndexEntries] =
-      await Promise.all([
-        runPatchReviewGitBytes(
-          repository,
-          ["ls-files", "-v", "-z", "--", "."],
-          {
-            signal,
-          },
+    const [
+      sparseEntries,
+      listed,
+      currentIgnored,
+      rawIndexEntries,
+      currentUntrackedDirectories,
+      currentNonemptyUntrackedDirectories,
+      currentIgnoredDirectories,
+      currentNonemptyIgnoredDirectories,
+    ] = await Promise.all([
+      runPatchReviewGitBytes(repository, ["ls-files", "-v", "-z", "--", "."], {
+        signal,
+      }),
+      runPatchReviewGitBytes(
+        repository,
+        [
+          "ls-files",
+          "--cached",
+          "--others",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { environment, signal },
+      ),
+      runPatchReviewGitBytes(
+        repository,
+        [
+          "ls-files",
+          "--others",
+          "--ignored",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { environment, signal },
+      ),
+      runPatchReviewGitBytes(
+        repository,
+        ["ls-files", "--stage", "-z", "--", "."],
+        { environment, signal },
+      ),
+      runPatchReviewGitBytes(
+        repository,
+        [
+          "ls-files",
+          "--others",
+          "--directory",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+      runPatchReviewGitBytes(
+        repository,
+        [
+          "ls-files",
+          "--others",
+          "--directory",
+          "--no-empty-directory",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+      runPatchReviewGitBytes(
+        repository,
+        [
+          "ls-files",
+          "--others",
+          "--ignored",
+          "--directory",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+      runPatchReviewGitBytes(
+        repository,
+        [
+          "ls-files",
+          "--others",
+          "--ignored",
+          "--directory",
+          "--no-empty-directory",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+    ]);
+    const untrackedDirectories = new Map<
+      string,
+      { path: Buffer; mode: bigint }
+    >();
+    const nonemptyDirectoryKeys = new Set(
+      [
+        ...splitNulRecords(currentNonemptyUntrackedDirectories),
+        ...splitNulRecords(currentNonemptyIgnoredDirectories),
+      ].map((listedPath) =>
+        patchReviewGitPathKey(
+          listedPath.at(-1) === 0x2f ? listedPath.subarray(0, -1) : listedPath,
         ),
-        runPatchReviewGitBytes(
-          repository,
-          [
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-            ".",
-          ],
-          { environment, signal },
-        ),
-        runPatchReviewGitBytes(
-          repository,
-          [
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "-z",
-            "--",
-            ".",
-          ],
-          { environment, signal },
-        ),
-        runPatchReviewGitBytes(
-          repository,
-          ["ls-files", "--stage", "-z", "--", "."],
-          { environment, signal },
-        ),
-      ]);
+      ),
+    );
+    for (const output of [
+      currentUntrackedDirectories,
+      currentIgnoredDirectories,
+    ]) {
+      for (const listedPath of splitNulRecords(output)) {
+        const path =
+          listedPath.at(-1) === 0x2f ? listedPath.subarray(0, -1) : listedPath;
+        if (nonemptyDirectoryKeys.has(patchReviewGitPathKey(path))) continue;
+        await validatePatchReviewGitPath(repository, path, repository);
+        const metadata = await lstat(
+          patchReviewFilesystemPath(repository, path),
+          { bigint: true },
+        );
+        if (!metadata.isDirectory()) continue;
+        untrackedDirectories.set(patchReviewGitPathKey(path), {
+          path: Buffer.from(path),
+          mode: metadata.mode & 0o7777n,
+        });
+      }
+    }
+    if (capturingBaseline) {
+      for (const [key, state] of untrackedDirectories) {
+        baselineUntrackedDirectoryModes.set(key, state);
+      }
+    } else {
+      for (const baseline of baselineUntrackedDirectoryModes.values()) {
+        let current: BigIntStats | undefined;
+        try {
+          current = await lstat(
+            patchReviewFilesystemPath(repository, baseline.path),
+            { bigint: true },
+          );
+        } catch (error) {
+          if (!missingPatchReviewPath(error)) throw error;
+        }
+        if (
+          current === undefined ||
+          !current.isDirectory() ||
+          (process.platform !== "win32" &&
+            (current.mode & 0o7777n) !== baseline.mode)
+        ) {
+          throw new CodexSecurityError(
+            "An untracked directory changed after patch review started. Preserve unrelated filesystem state and retry.",
+          );
+        }
+      }
+    }
     const currentEntries = parseRawPatchReviewIndexEntries(rawIndexEntries);
     const skipWorktreePaths = new Set(
       splitNulRecords(sparseEntries)
@@ -7327,19 +7473,45 @@ async function snapshotPatchReviewWorktree(
       }
       return entries;
     };
-    const [indexTree, indexState] = await Promise.all([
-      runPatchReviewGit(repository, ["write-tree"], {
-        environment: objectEnvironment,
+    let repositoryIndexSnapshot = 0;
+    const repositoryIndexTree = async (): Promise<string> => {
+      repositoryIndexSnapshot += 1;
+      const indexEnvironment = {
+        ...objectEnvironment,
+        GIT_INDEX_FILE: join(
+          temporaryDirectory,
+          `repository-index-${repositoryIndexSnapshot}`,
+        ),
+        GIT_WORK_TREE: reviewDirectory,
+      };
+      const entries = await runPatchReviewGitBytes(
+        repository,
+        ["ls-files", "--stage", "-z", "--", "."],
+        { environment: objectEnvironment, signal },
+      );
+      await runPatchReviewGit(repository, ["read-tree", "--empty"], {
+        environment: indexEnvironment,
         signal,
-      }),
+      });
+      if (entries.length > 0) {
+        await runPatchReviewGit(
+          repository,
+          ["update-index", "-z", "--index-info"],
+          { environment: indexEnvironment, input: entries, signal },
+        );
+      }
+      return runPatchReviewGit(repository, ["write-tree"], {
+        environment: indexEnvironment,
+        signal,
+      });
+    };
+    const [indexTree, indexState] = await Promise.all([
+      repositoryIndexTree(),
       repositoryIndexState(),
     ]);
     const assertRepositoryIndexUnchanged = async (): Promise<void> => {
       const [currentIndexTree, currentIndexState] = await Promise.all([
-        runPatchReviewGit(repository, ["write-tree"], {
-          environment: objectEnvironment,
-          signal,
-        }),
+        repositoryIndexTree(),
         repositoryIndexState(),
       ]);
       let unchanged =
@@ -8009,6 +8181,7 @@ async function runFindingPatches(
   interruptedExitCode?: 130 | 143;
   reviewRepository?: string;
   reviewUnsafePublicationPaths?: string[];
+  reviewPublicationBaseEntries?: PatchReviewTreeEntry[];
   reviewPublicationEntries?: PatchReviewTreeEntry[];
   reviewPublicationHead?: string;
   reviewBaseCommit?: string | null;
@@ -8024,6 +8197,7 @@ async function runFindingPatches(
   const patches: FindingPatch[] = [];
   let reviewRepository: string | undefined;
   const reviewUnsafePublicationPaths = new Set<string>();
+  const reviewPublicationBaseEntries = new Map<string, PatchReviewTreeEntry>();
   const reviewPublicationEntries = new Map<string, PatchReviewTreeEntry>();
   let reviewPublicationCandidate: PatchReviewPublicationCandidate | undefined;
   let reviewBaseCommit: string | null | undefined;
@@ -8067,6 +8241,9 @@ async function runFindingPatches(
             reviewRepository = repository;
           },
           onReviewCandidate: (candidate) => {
+            const priorPublicationEntries = new Map(reviewPublicationEntries);
+            reviewPublicationBaseEntries.clear();
+            reviewPublicationEntries.clear();
             if (candidate.publicationBaseCommit !== undefined) {
               if (
                 reviewBaseCommit !== undefined &&
@@ -8084,10 +8261,13 @@ async function runFindingPatches(
                 entry,
               ]),
             );
+            for (const entry of baseEntries.values()) {
+              reviewPublicationBaseEntries.set(entry.path, entry);
+            }
             for (const path of candidate.publicationUnsafePaths ?? []) {
               if (
                 !samePatchReviewTreeEntry(
-                  reviewPublicationEntries.get(path),
+                  priorPublicationEntries.get(path),
                   baseEntries.get(path),
                 )
               ) {
@@ -8179,8 +8359,14 @@ async function runFindingPatches(
   const finalVerificationFindings = selected.findings.filter(
     ({ occurrenceId }) => verifiedPatchIds.has(occurrenceId),
   );
+  const firstVerifiedPatch = patches.findIndex(
+    ({ status }) => status === "verified",
+  );
+  const laterPatchAttempted =
+    firstVerifiedPatch >= 0 && firstVerifiedPatch < patches.length - 1;
   if (
-    finalVerificationFindings.length > 1 &&
+    finalVerificationFindings.length > 0 &&
+    laterPatchAttempted &&
     (options.reviewMinimality === true ||
       options.reviewStyle === true ||
       options.assessPatchRisk === true)
@@ -8266,6 +8452,13 @@ async function runFindingPatches(
     ...(reviewPublicationCandidate === undefined
       ? {}
       : { reviewPublicationHead: reviewPublicationCandidate.head }),
+    ...(reviewPublicationBaseEntries.size === 0
+      ? {}
+      : {
+          reviewPublicationBaseEntries: [
+            ...reviewPublicationBaseEntries.values(),
+          ],
+        }),
     ...(reviewBaseCommit === undefined ? {} : { reviewBaseCommit }),
   };
 }
@@ -10581,6 +10774,7 @@ async function executeScan(
           dependencies,
           patchRun.reviewRepository,
           patchRun.reviewUnsafePublicationPaths,
+          patchRun.reviewPublicationBaseEntries,
           patchRun.reviewPublicationEntries,
           patchRun.reviewPublicationHead,
           patchRun.reviewBaseCommit,
