@@ -3,58 +3,17 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import { afterEach, describe, expect, test } from "bun:test";
-import { CodexSecurity } from "../src/index.js";
-import { PLUGIN_ROOT } from "./plugin-root.js";
+import { TestClient } from "./support/api-client.js";
 import {
   completedEvents,
   createApiTestFixtures,
+  preparedRuntime,
 } from "./support/api-events.js";
 
 const { cleanup, copyCompletedScan, temporaryDirectory } =
   createApiTestFixtures();
 
 afterEach(cleanup);
-
-const TestClient = CodexSecurity as unknown as new (
-  config: Record<string, unknown>,
-  dependencies: Record<string, unknown>,
-) => CodexSecurity;
-
-function preparedRuntime(codexHome: string): Record<string, unknown> {
-  return {
-    codexHome,
-    plugin: {
-      pluginRoot: PLUGIN_ROOT,
-      marketplaceRoot: PLUGIN_ROOT,
-      installedRoot: PLUGIN_ROOT,
-      marketplaceName: "codex-security-sdk",
-      name: "codex-security",
-      version: "0.1.0",
-    },
-    environment: {},
-    credentialsAvailable: true,
-  };
-}
-
-function runWorkbench(_options: unknown, args: readonly string[]) {
-  if (args[0] === "register-cli-scan") {
-    return Promise.resolve({
-      scanId: "scan_example_001",
-      targetId: "target_sha256_example",
-      targetRevision: "deadbeef",
-      scanDir: args[args.indexOf("--scan-dir") + 1],
-      contract: { target: { allowedKinds: ["git_revision"] } },
-    });
-  }
-  if (args[0] === "get-scan-feedback") {
-    return Promise.resolve({
-      scanId: "scan_example_001",
-      targetId: "target_sha256_example",
-      falsePositives: [],
-    });
-  }
-  return Promise.resolve({});
-}
 
 describe("completed scan follow-up instructions", () => {
   test.each([
@@ -82,7 +41,6 @@ describe("completed scan follow-up instructions", () => {
           resolvePluginPython: async () => "/managed/python",
           prepareOutputDir: async () => scanDir,
           repositoryRevision: async () => "deadbeef",
-          runWorkbench,
           createCodex: () => ({
             startThread: () => ({
               id: "thread-1",

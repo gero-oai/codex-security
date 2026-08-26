@@ -1,17 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { brotliDecompressSync } from "node:zlib";
 import { expect, test } from "bun:test";
-import { PLUGIN_ROOT } from "./plugin-root.js";
-
-const bundledRuntime = Promise.all(
-  ["000", "001"].map((part) =>
-    readFile(join(PLUGIN_ROOT, "mcp", `server.mjs.br.part-${part}`)),
-  ),
-).then((parts) => brotliDecompressSync(Buffer.concat(parts)).toString("utf8"));
+import { loadBundledRuntime, PLUGIN_ROOT } from "./plugin-root.js";
 
 function bundledFunction(runtime: string, name: string): string {
   const source = new RegExp(
@@ -23,7 +15,7 @@ function bundledFunction(runtime: string, name: string): string {
 }
 
 test("keeps every advertised Deep worker tool within Codex's name limit", async () => {
-  const runtime = await bundledRuntime;
+  const runtime = await loadBundledRuntime();
   const method = /  compactArtifactServer\(request\) \{[\s\S]*?\n  \}/u.exec(
     runtime,
   )?.[0];
@@ -112,7 +104,7 @@ test("keeps every advertised Deep worker tool within Codex's name limit", async 
 });
 
 test("classifies owned worker tool failures without exposing their contents", async () => {
-  const runtime = await bundledRuntime;
+  const runtime = await loadBundledRuntime();
   const diagnosticSource = bundledFunction(runtime, "appendSafeItemDiagnostic");
   const recordHelper = /\b(isRecord\d*)\(item\)/u.exec(diagnosticSource)?.[1];
   expect(recordHelper).toBeDefined();
@@ -181,14 +173,46 @@ test("classifies owned worker tool failures without exposing their contents", as
   expect(unrelatedDiagnostics).toEqual([]);
 });
 
-test("resumes only when the exact reducer result is missing", async () => {
-  const runtime = await bundledRuntime;
-  const source = bundledFunction(runtime, "isMissingReducerResult");
+test("does not retry textual missing-path worker failures", async () => {
+  const runtime = await loadBundledRuntime();
+  const errorClass =
+    /var DeepScanNonRetryableError = class extends Error \{[\s\S]*?\n\};/u.exec(
+      runtime,
+    )?.[0];
+  expect(errorClass).toBeDefined();
+  const classify = new Function(
+    "ARTIFACT_MCP_STARTUP_TIMEOUT_PATTERN",
+    "REMOTE_PLUGIN_AUTH_WARNING_PATTERN",
+    "isCodexCybersecurityPolicyRefusal",
+    [
+      errorClass!,
+      bundledFunction(runtime, "classifyCodexWorkerError"),
+      bundledFunction(runtime, "isCodexConfigurationFailure"),
+      "return classifyCodexWorkerError;",
+    ].join("\n"),
+  )(/$^/u, /$^/u, () => false) as (error: Error) => Error;
+
+  for (const diagnostic of [
+    "Error: No such file or directory (os error 2)",
+    "Error: The system cannot find the file specified. (os error 2)",
+  ]) {
+    const original = new Error(
+      ["Codex Exec exited with code 1:", diagnostic].join("\n"),
+    );
+    const classified = classify(original);
+    expect(classified.name).toBe("DeepScanNonRetryableError");
+    expect(classified.cause).toBe(original);
+  }
+});
+
+test("resumes only when the exact Standard worker or reducer result is missing", async () => {
+  const runtime = await loadBundledRuntime();
+  const source = bundledFunction(runtime, "isMissingWorkerResult");
   const pathImport = /\(0, (import_node_path\d+)\.join\)/u.exec(source)?.[1];
   expect(pathImport).toBeDefined();
-  const isMissingReducerResult = new Function(
+  const isMissingWorkerResult = new Function(
     pathImport!,
-    `${source}\nreturn isMissingReducerResult;`,
+    `${source}\nreturn isMissingWorkerResult;`,
   )({ join }) as (error: Error, artifactDirectory: string) => boolean;
   const artifactDirectory = join(tmpdir(), "codex-security-reducer-artifacts");
   const missingResult = Object.assign(new Error("result missing"), {
@@ -200,12 +224,12 @@ test("resumes only when the exact reducer result is missing", async () => {
     { code: "artifact_tool_failed" },
   );
 
-  expect(isMissingReducerResult(missingResult, artifactDirectory)).toBe(true);
+  expect(isMissingWorkerResult(missingResult, artifactDirectory)).toBe(true);
+  expect(isMissingWorkerResult(diagnosedMissingResult, artifactDirectory)).toBe(
+    true,
+  );
   expect(
-    isMissingReducerResult(diagnosedMissingResult, artifactDirectory),
-  ).toBe(true);
-  expect(
-    isMissingReducerResult(
+    isMissingWorkerResult(
       Object.assign(new Error("different artifact missing"), {
         code: "ENOENT",
         path: join(artifactDirectory, "candidates.jsonl"),
@@ -214,7 +238,7 @@ test("resumes only when the exact reducer result is missing", async () => {
     ),
   ).toBe(false);
   expect(
-    isMissingReducerResult(
+    isMissingWorkerResult(
       Object.assign(new Error("result cannot be read"), {
         code: "EACCES",
         path: join(artifactDirectory, "result.json"),
@@ -222,6 +246,12 @@ test("resumes only when the exact reducer result is missing", async () => {
       artifactDirectory,
     ),
   ).toBe(false);
+
+  const standardContinuation = new Function(
+    `${bundledFunction(runtime, "standardScanCompletionContinuation")}\nreturn standardScanCompletionContinuation;`,
+  )() as (attempt: number) => string;
+  expect(standardContinuation(1)).toContain("record_codex_security_scan_draft");
+  expect(standardContinuation(1)).toMatch(/retry.*until it succeeds/iu);
 
   const continuation = new Function(
     `${bundledFunction(runtime, "reducerCompletionContinuation")}\nreturn reducerCompletionContinuation;`,

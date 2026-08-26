@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { InvalidTargetError } from "./errors.js";
 import { resolveTrustedExecutable } from "./trusted-executable.js";
+import { windowsUnsafePathComponent } from "./windows-path.js";
 
 const execFile = promisify(execFileCallback);
 const UNSUPPORTED_GIT_ENVIRONMENT = new Set([
@@ -16,6 +17,17 @@ const UNSUPPORTED_GIT_ENVIRONMENT = new Set([
   "GIT_ALTERNATE_OBJECT_DIRECTORIES",
   "GIT_COMMON_DIR",
   "GIT_REPLACE_REF_BASE",
+]);
+const GIT_REPOSITORY_ENVIRONMENT = new Set([
+  ...UNSUPPORTED_GIT_ENVIRONMENT,
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  "GIT_GRAFT_FILE",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_NAMESPACE",
+  "GIT_NO_REPLACE_OBJECTS",
+  "GIT_PREFIX",
+  "GIT_SHALLOW_FILE",
 ]);
 
 export type ScanMode = "standard" | "deep";
@@ -100,6 +112,7 @@ export async function normalizeRepository(
   signal?: AbortSignal,
 ): Promise<string> {
   const candidate = resolveRepositoryPath(repository);
+  requirePortableWindowsRepositoryPath(candidate);
   let canonical: string;
   try {
     canonical = await abortable(() => realpath(candidate), signal);
@@ -115,11 +128,22 @@ export async function normalizeRepository(
       },
     );
   }
+  requirePortableWindowsRepositoryPath(canonical);
   return canonical;
 }
 
 export function resolveRepositoryPath(repository: string): string {
   return resolve(expandHome(repository));
+}
+
+function requirePortableWindowsRepositoryPath(path: string): void {
+  if (process.platform !== "win32") return;
+  const ambiguous = windowsUnsafePathComponent(path);
+  if (ambiguous !== undefined) {
+    throw new InvalidTargetError(
+      `Repository paths must not contain Windows-ambiguous components: ${ambiguous}`,
+    );
+  }
 }
 
 export async function enclosingGitWorktreeRoot(
@@ -265,6 +289,14 @@ export async function normalizeTarget(
         `Path target is outside the repository: ${value}`,
       );
     }
+    if (
+      process.platform === "win32" &&
+      relativePath.split(sep).some((part) => part.includes(":"))
+    ) {
+      throw new InvalidTargetError(
+        `Path target contains an unsupported colon component: ${value}`,
+      );
+    }
     const normalized = relativePath.split(sep).join("/") || ".";
     if (!paths.includes(normalized)) {
       paths.push(normalized);
@@ -289,13 +321,7 @@ export async function validateCommittedDiffCheckout(
 
   const status = await gitOutput(
     repository,
-    [
-      "-c",
-      "core.fsmonitor=false",
-      "status",
-      "--porcelain=v1",
-      "--untracked-files=all",
-    ],
+    ["status", "--porcelain=v1", "--untracked-files=all"],
     signal,
   );
   if (status.length !== 0) {
@@ -395,7 +421,7 @@ async function gitOutput(
   throwIfAborted(signal);
   const command = await resolveTrustedExecutable(
     "git",
-    isolatedGitEnvironment(),
+    isolatedGitEnvironment(args[0] === "rev-parse"),
     await outermostGitMarkerRoot(repository, signal),
   );
   if (command === null)
@@ -403,14 +429,15 @@ async function gitOutput(
   throwIfAborted(signal);
   const { stdout } = await execFile(
     command.executable,
-    ["-C", repository, ...args],
+    ["-c", "core.fsmonitor=false", "-C", repository, ...args],
     {
       encoding: "utf8",
       signal,
       env: command.environment,
+      maxBuffer: Infinity,
     },
   );
-  return stdout.trim();
+  return stdout.replace(process.platform === "win32" ? /\r?\n$/u : /\n$/u, "");
 }
 
 async function outermostGitMarkerRoot(
@@ -433,17 +460,25 @@ async function outermostGitMarkerRoot(
   }
 }
 
-function isolatedGitEnvironment(): NodeJS.ProcessEnv {
+function isolatedGitEnvironment(
+  preserveGitConfiguration: boolean,
+): NodeJS.ProcessEnv {
   const environment = { ...process.env };
   for (const name of Object.keys(environment)) {
-    if (name.toUpperCase().startsWith("GIT_")) {
+    const normalized = name.toUpperCase();
+    if (
+      GIT_REPOSITORY_ENVIRONMENT.has(normalized) ||
+      normalized === "GIT_ALLOW_PROTOCOL" ||
+      (!preserveGitConfiguration && normalized.startsWith("GIT_"))
+    ) {
       delete environment[name];
     }
   }
+  environment["GIT_ALLOW_PROTOCOL"] = "";
   return environment;
 }
 
-async function abortable<T>(
+export async function abortable<T>(
   operation: () => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
@@ -452,16 +487,18 @@ async function abortable<T>(
   return await new Promise<T>((resolvePromise, reject) => {
     const onAbort = (): void => reject(abortReason(signal));
     signal.addEventListener("abort", onAbort, { once: true });
-    void operation().then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolvePromise(value);
-      },
-      (error: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
+    void Promise.resolve()
+      .then(operation)
+      .then(
+        (value) => {
+          signal.removeEventListener("abort", onAbort);
+          resolvePromise(value);
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
   });
 }
 

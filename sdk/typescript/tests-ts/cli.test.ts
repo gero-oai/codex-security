@@ -33,7 +33,12 @@ import {
   ScanInterruptedError,
   VERSION,
 } from "../src/index.js";
-import { main, parseCodexOverrides, Progress } from "../src/cli.js";
+import {
+  main,
+  parseCodexOverrides,
+  Progress,
+  resolveCliPath,
+} from "../src/cli.js";
 import { scanPreflightCodexConfig } from "../src/api.js";
 import { CODEX_EXECUTABLE_VERSION, CODEX_SDK_VERSION } from "../src/version.js";
 import {
@@ -85,6 +90,25 @@ async function multiscanInventory(root: string): Promise<void> {
 }
 
 describe("CLI", () => {
+  test("passes the safety identifier as a per-scan option", async () => {
+    let options: unknown;
+    const stderr = capture();
+    expect(
+      await main(
+        ["scan", "--safety-identifier", "synthetic-user", ".", "--json"],
+        capture().stream,
+        stderr.stream,
+        dependencies({
+          onTurn: (_repository, value) => {
+            options = value;
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(options).toMatchObject({ safetyIdentifier: "synthetic-user" });
+    expect(stderr.text()).not.toContain("synthetic-user");
+  });
+
   test("exposes Incur help, schemas, manifests, and completions", async () => {
     const root = capture();
     const stderr = capture();
@@ -120,11 +144,16 @@ describe("CLI", () => {
           maxTimeHours: { type: "number", maximum: 96 },
           model: { type: "string" },
           verbose: { type: "boolean" },
-          effort: { enum: ["minimal", "low", "medium", "high", "xhigh"] },
+          effort: {
+            enum: ["minimal", "low", "medium", "high", "xhigh", "max"],
+          },
           provider: {
             enum: ["openai", "openrouter", "fireworks", "amazon-bedrock"],
           },
           failOnSeverity: { enum: ["critical", "high", "medium", "low"] },
+          patch: { type: "boolean" },
+          patchSeverity: { enum: ["critical", "high", "medium", "low"] },
+          createPr: { type: "boolean" },
           headless: { type: "boolean" },
         },
       },
@@ -190,9 +219,15 @@ describe("CLI", () => {
       "codex-security install-hook [repository]",
     );
     expect(manifest.text()).toContain("codex-security bulk-scan [input]");
-    expect(manifest.text()).toContain("codex-security export <scanDir>");
+    expect(manifest.text()).toContain("codex-security export [scanDir]");
+    expect(manifest.text()).toContain(
+      "codex-security import github <repository>",
+    );
     expect(manifest.text()).toContain("codex-security validate <findings...>");
-    expect(manifest.text()).toContain("codex-security patch <issues...>");
+    expect(manifest.text()).toContain(
+      "codex-security verify-fix [findings...]",
+    );
+    expect(manifest.text()).toContain("codex-security patch [issues...]");
     expect(manifest.text()).toContain(
       "codex-security findings false-positive <occurrenceId>",
     );
@@ -202,12 +237,12 @@ describe("CLI", () => {
     );
     expect(manifest.text()).toContain("codex-security scans list [repository]");
     expect(manifest.text()).toContain("codex-security scans show [scanId]");
-    expect(manifest.text()).toContain("codex-security scans rerun <scanId>");
+    expect(manifest.text()).toContain("codex-security scans rerun [scanId]");
     expect(manifest.text()).toContain(
       "codex-security scans match [beforeId] [afterId]",
     );
     expect(manifest.text()).toContain(
-      "codex-security scans compare <beforeId> <afterId>",
+      "codex-security scans compare [beforeId] [afterId]",
     );
     expect(manifest.text()).toContain("codex-security info");
 
@@ -415,7 +450,7 @@ describe("CLI", () => {
         maxDiscoveryRuns: number;
         maxTimeHours: number;
       };
-      expect(defaults.workers).toBe(6);
+      expect(defaults.workers).toBe(4);
       const documentedDeepScan = documentedConfigs.find(
         (config) =>
           typeof config["deep_scan"] === "object" &&
@@ -424,7 +459,7 @@ describe("CLI", () => {
       );
       expect(documentedDeepScan).toMatchObject({
         deep_scan: {
-          workers: "auto",
+          workers: 4,
           subagents: defaults.subagents,
           stop_after_no_new: defaults.stopAfterNoNew,
           stop_after_consecutive_errors: defaults.stopAfterConsecutiveErrors,
@@ -785,6 +820,55 @@ describe("CLI", () => {
     }
   });
 
+  test("expands home-relative bulk scan paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-cli-home-"));
+    const home = join(root, "home");
+    const currentDirectory = join(root, "current");
+    const previousHome = process.env["HOME"];
+    const previousUserProfile = process.env["USERPROFILE"];
+    try {
+      await mkdir(home);
+      await mkdir(currentDirectory);
+      await multiscanInventory(home);
+      process.env["HOME"] = home;
+      process.env["USERPROFILE"] = home;
+
+      expect(resolveCliPath(currentDirectory, "~/repositories.csv")).toBe(
+        join(home, "repositories.csv"),
+      );
+      expect(resolveCliPath(currentDirectory, "~person/repositories.csv")).toBe(
+        join(currentDirectory, "~person", "repositories.csv"),
+      );
+
+      const stdout = capture();
+      expect(
+        await main(
+          [
+            "bulk-scan",
+            "~/repositories.csv",
+            "--output-dir",
+            "~/results",
+            "--json",
+          ],
+          stdout.stream,
+          capture().stream,
+          dependencies({ currentDirectory }),
+        ),
+      ).toBe(0);
+      expect(JSON.parse(stdout.text())).toMatchObject({
+        completed: 1,
+        failed: 0,
+        resultsPath: join(home, "results", "results.jsonl"),
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = previousHome;
+      if (previousUserProfile === undefined) delete process.env["USERPROFILE"];
+      else process.env["USERPROFILE"] = previousUserProfile;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test.each([
     [
       "OpenRouter",
@@ -908,6 +992,7 @@ describe("CLI", () => {
       ["bulk-scan", "--model=gpt-5.6-terra"],
       ["bulk-scan", "--effort", "high"],
       ["bulk-scan", "--effort=high"],
+      ["bulk-scan", "--effort", "max"],
       ["bulk-scan", "--codex", 'model_reasoning_effort="high"'],
       ["bulk-scan", '--codex=model_reasoning_effort="high"'],
       ["bulk-scan", "--model", "gpt-5.6-terra", "--effort", "high"],
@@ -1115,6 +1200,81 @@ describe("CLI", () => {
     expect(text).not.toContain("juice-shop-remediated");
     expect(text).not.toContain("/private/tmp");
     expect(text).not.toContain("target-internal-id");
+  });
+
+  test("shows the latest completed scan for the current repository by default", async () => {
+    const stdout = capture();
+    const calls: Array<readonly string[]> = [];
+    const responses: JsonObject[] = [
+      { scans: [{ scanId: "latest-scan" }] },
+      { scan: { scanId: "latest-scan" } },
+    ];
+
+    expect(
+      await main(
+        ["scans", "show", "--json"],
+        stdout.stream,
+        capture().stream,
+        dependencies({
+          onWorkbench: (args) => responses[calls.push(args) - 1]!,
+        }),
+      ),
+    ).toBe(0);
+    expect(JSON.parse(stdout.text())).toEqual({ scanId: "latest-scan" });
+    expect(calls).toEqual([
+      [
+        "list-scans",
+        "--repository",
+        "/current/repository",
+        "--status",
+        "complete",
+        "--limit",
+        "1",
+      ],
+      ["get-scan", "--scan-id", "latest-scan"],
+    ]);
+  });
+
+  test("reports when the current repository has no saved scans", async () => {
+    const stderr = capture();
+
+    expect(
+      await main(
+        ["scans", "show"],
+        capture().stream,
+        stderr.stream,
+        dependencies(),
+      ),
+    ).toBe(2);
+    expect(stderr.text()).toContain(
+      "No completed scans found for the current repository.",
+    );
+  });
+
+  test("does not emit an ok: true envelope for a failed structured history command", async () => {
+    for (const argv of [
+      ["scans", "show", "--json"],
+      ["scans", "list", "--json"],
+      ["scans", "compare", "before", "after", "--json"],
+      ["scans", "match", "before", "after", "--json"],
+    ]) {
+      const stdout = capture();
+      const stderr = capture();
+      const result = await main(argv, stdout.stream, stderr.stream, {
+        ...dependencies({
+          onWorkbench: () => {
+            throw new Error(
+              "Scan ID prefixes must be at least eight characters.",
+            );
+          },
+        }),
+      });
+      expect(result).toBe(2);
+      expect(stdout.text()).toBe("");
+      expect(stderr.text()).toContain(
+        "Scan ID prefixes must be at least eight characters.",
+      );
+    }
   });
 
   test("shows finding history and optionally reveals linked findings", async () => {
@@ -1429,6 +1589,180 @@ describe("CLI", () => {
     expect(timers).toBe(0);
   });
 
+  test("keeps later progress redraw failures from stopping the scan", () => {
+    const stderr = capture(true);
+    const write = stderr.stream.write;
+    let redraw: (() => void) | undefined;
+    let failRedraw = false;
+    stderr.stream.write = (chunk) => {
+      if (failRedraw) throw new Error("Progress redraw failed.");
+      return write.call(stderr.stream, chunk);
+    };
+    const progress = new Progress(stderr.stream, {
+      now: () => 0,
+      setInterval: (callback) => {
+        redraw = callback;
+        return {} as NodeJS.Timeout;
+      },
+      clearInterval: () => {},
+    });
+
+    progress.startTimer("Running scan");
+    failRedraw = true;
+
+    expect(() => redraw?.()).not.toThrow();
+
+    failRedraw = false;
+    progress.stopTimer();
+  });
+
+  test("handles asynchronous progress stream failures while a scan is active", async () => {
+    let redraw: (() => void) | undefined;
+    let failRedraw = false;
+    const stream = Object.assign(
+      new Writable({
+        autoDestroy: false,
+        write(_chunk, _encoding, callback) {
+          if (failRedraw) {
+            queueMicrotask(() =>
+              callback(new Error("Progress output failed.")),
+            );
+          } else {
+            callback();
+          }
+        },
+      }),
+      { isTTY: true },
+    );
+    const progress = new Progress(stream, {
+      now: () => 0,
+      setInterval: (callback) => {
+        redraw = callback;
+        return {} as NodeJS.Timeout;
+      },
+      clearInterval: () => {},
+    });
+
+    progress.startTimer("Running scan");
+    expect(stream.listenerCount("error")).toBe(1);
+    const failure = new Promise<Error>((resolve) =>
+      stream.once("error", resolve),
+    );
+    failRedraw = true;
+    redraw?.();
+    progress.stopTimer();
+    expect(stream.listenerCount("error")).toBe(2);
+
+    await expect(failure).resolves.toMatchObject({
+      message: "Progress output failed.",
+    });
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    expect(stream.listenerCount("error")).toBe(0);
+  });
+
+  test("releases progress stream listeners after completed scans and preflight", async () => {
+    for (const command of [
+      ["scan", ".", "--json"],
+      ["scan", ".", "--dry-run", "--json"],
+    ]) {
+      const stream = new Writable({
+        write(_chunk, _encoding, callback) {
+          callback();
+        },
+      });
+
+      expect(
+        await main(command, capture().stream, stream, dependencies()),
+      ).toBe(0);
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+      expect(stream.listenerCount("error")).toBe(0);
+    }
+  });
+
+  test("keeps final scan summary failures isolated until all output settles", async () => {
+    const stream = new Writable({
+      autoDestroy: false,
+      write(chunk, _encoding, callback) {
+        if (chunk.toString().includes("REPORT")) {
+          setImmediate(() => callback(new Error("Scan summary failed.")));
+        } else {
+          callback();
+        }
+      },
+    });
+    let progressListenersDuringFailure = 0;
+    const failure = new Promise<Error>((resolve) => {
+      stream.once("error", (error) => {
+        progressListenersDuringFailure = stream.listenerCount("error");
+        resolve(error);
+      });
+    });
+
+    expect(
+      await main(
+        ["scan", ".", "--json"],
+        capture().stream,
+        stream,
+        dependencies(),
+      ),
+    ).toBe(0);
+    await expect(failure).resolves.toMatchObject({
+      message: "Scan summary failed.",
+    });
+    expect(progressListenersDuringFailure).toBeGreaterThan(0);
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    expect(stream.listenerCount("error")).toBe(0);
+  });
+
+  test.each(["archive", "failure"] as const)(
+    "keeps %s output failures isolated after progress stops",
+    async (scenario) => {
+      const failingMessage =
+        scenario === "archive"
+          ? "Moved existing results to:"
+          : "Synthetic scan failure.";
+      const stream = new Writable({
+        autoDestroy: false,
+        write(chunk, _encoding, callback) {
+          if (chunk.toString().includes(failingMessage)) {
+            setImmediate(() => callback(new Error("Terminal output failed.")));
+          } else {
+            callback();
+          }
+        },
+      });
+      let activeProtection = 0;
+      const failure = new Promise<Error>((resolve) => {
+        stream.once("error", (error) => {
+          activeProtection = stream.listenerCount("error");
+          resolve(error);
+        });
+      });
+      const deps = dependencies();
+      deps.createSecurity = () => ({
+        async run(_repository, options) {
+          if (scenario === "archive") {
+            options?.onOutputArchived?.("/tmp/previous-results");
+            return fakeResult();
+          }
+          throw new CodexSecurityError(failingMessage);
+        },
+        preflight: async () => fakePreflight(),
+        close: async () => {},
+      });
+
+      expect(
+        await main(["scan", ".", "--json"], capture().stream, stream, deps),
+      ).toBe(scenario === "archive" ? 0 : 2);
+      await expect(failure).resolves.toMatchObject({
+        message: "Terminal output failed.",
+      });
+      expect(activeProtection).toBeGreaterThan(0);
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+      expect(stream.listenerCount("error")).toBe(0);
+    },
+  );
+
   test("keeps verbose diagnostics separate from interactive progress", async () => {
     const stdout = capture();
     const stderr = capture(true);
@@ -1541,6 +1875,44 @@ describe("CLI", () => {
       expect(timers).toBe(0);
     }
   });
+
+  test.each([false, true])(
+    "subscribes to session details only with TTY stdin: %p",
+    async (stdinTTY) => {
+      const descriptor = Object.getOwnPropertyDescriptor(
+        process.stdin,
+        "isTTY",
+      );
+      const stderr = capture(true);
+      let subscribed = false;
+      try {
+        Object.defineProperty(process.stdin, "isTTY", {
+          configurable: true,
+          value: stdinTTY,
+        });
+        const code = await main(
+          ["scan", "."],
+          capture().stream,
+          stderr.stream,
+          dependencies({
+            onTurn: (_repository, options) => {
+              subscribed =
+                typeof (options as ScanOptions).onSessionEvent === "function";
+            },
+          }),
+        );
+        expect(code).toBe(0);
+        expect(stderr.text()).toContain("CODEX SECURITY");
+        expect(subscribed).toBe(stdinTTY);
+      } finally {
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(process.stdin, "isTTY");
+        } else {
+          Object.defineProperty(process.stdin, "isTTY", descriptor);
+        }
+      }
+    },
+  );
 
   test("uses plain scan progress in headless, CI, and noninteractive terminals", async () => {
     for (const { options, environment, isTTY } of [
@@ -1656,6 +2028,37 @@ describe("CLI", () => {
     expect(timers).toBe(1);
     expect(stderr.text()).toContain("Preparing scan");
     expect(stderr.text()).toContain("Running scan");
+  });
+
+  test("closes the client when dashboard cleanup cannot restore the terminal", async () => {
+    const stdout = capture();
+    const stderr = capture(true);
+    const write = stderr.stream.write;
+    const signals = new FakeSignals();
+    let closed = 0;
+    stderr.stream.write = (chunk) => {
+      if (chunk.toString().includes("\u001B[?25h\u001B[?1049l")) {
+        throw new Error("Terminal cleanup failed.");
+      }
+      return write.call(stderr.stream, chunk);
+    };
+
+    expect(
+      await main(
+        ["scan", "."],
+        stdout.stream,
+        stderr.stream,
+        dependencies({
+          signals,
+          onClose: () => {
+            closed += 1;
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(closed).toBe(1);
+    expect(signals.listeners.get("SIGINT")?.size).toBe(0);
+    expect(signals.listeners.get("SIGTERM")?.size).toBe(0);
   });
 
   test("keeps terminal scans in one live dashboard", async () => {
@@ -1774,10 +2177,54 @@ describe("CLI", () => {
     expect(text).not.toContain("Estimated cost: $0.0248865 of $2.00 limit");
   });
 
+  test("omits stage and file counts from interactive Deep scan dashboards", async () => {
+    const stdout = capture();
+    const stderr = capture(true);
+    const result = fakeResult([], "complete", {
+      input_tokens: 1_250,
+      cached_input_tokens: 200,
+      output_tokens: 30,
+    });
+
+    expect(
+      await main(
+        ["scan", "/code/juice-shop", "--mode", "deep"],
+        stdout.stream,
+        stderr.stream,
+        dependencies({
+          environment: { NO_COLOR: "1" },
+          result,
+          activities: [
+            {
+              id: "worker-1:read-1",
+              kind: "command",
+              status: "completed",
+              description: "read routes/login.ts",
+              paths: ["routes/login.ts"],
+              worker: 1,
+            },
+          ],
+          costUpdates: [result.cost!],
+          scanProgress: [
+            { phase: "preflight", filesCompleted: 0, filesTotal: 1_258 },
+          ],
+        }),
+      ),
+    ).toBe(0);
+
+    const text = stripVTControlCharacters(stderr.text());
+    expect(text).not.toContain("STAGE");
+    expect(text).not.toContain("FILES");
+    expect(text).not.toContain("0 / 1,258 reviewed");
+    expect(text).toContain("worker 1 · read routes/login.ts");
+    expect(text).toContain("TOKENS");
+    expect(text).toContain("COST");
+    expect(text).toContain("TIME");
+  });
+
   test("rejects structured modes before starting interactive Codex commands", async () => {
     for (const [command, arguments_] of [
       ["validate", ["finding"]],
-      ["patch", ["issue"]],
       ["login", []],
       ["login", ["status"]],
       ["logout", []],
@@ -1850,7 +2297,7 @@ describe("CLI", () => {
     expect(
       await main(["export", "--help"], stdout.stream, stderr.stream, deps),
     ).toBe(0);
-    expect(stdout.text()).toContain("Usage: codex-security export <scanDir>");
+    expect(stdout.text()).toContain("Usage: codex-security export [scanDir]");
     expect(stdout.text()).toContain("--export-format <csv|json|sarif>");
     expect(stdout.text()).toContain("--source-root <string>");
     expect(stdout.text()).not.toContain("--format {sarif}");
@@ -1895,7 +2342,9 @@ describe("CLI", () => {
     expect(help.text()).toContain(
       `OpenAI model to use (default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.model}).`,
     );
-    expect(help.text()).toContain("--effort <minimal|low|medium|high|xhigh>");
+    expect(help.text()).toContain(
+      "--effort <minimal|low|medium|high|xhigh|max>",
+    );
     expect(help.text()).toContain(
       `Model reasoning effort (default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.reasoningEffort}).`,
     );
@@ -1931,7 +2380,9 @@ describe("CLI", () => {
     expect(help.text()).toContain(
       `OpenAI model for each repository (default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.model}).`,
     );
-    expect(help.text()).toContain("--effort <minimal|low|medium|high|xhigh>");
+    expect(help.text()).toContain(
+      "--effort <minimal|low|medium|high|xhigh|max>",
+    );
     expect(help.text()).toContain(
       `Model reasoning effort (default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.reasoningEffort}).`,
     );
@@ -1969,6 +2420,7 @@ describe("CLI", () => {
       [["--model=gpt-5.6-sol"], { model: "gpt-5.6-sol" }],
       [["--effort", "minimal"], { model_reasoning_effort: "minimal" }],
       [["--effort=xhigh"], { model_reasoning_effort: "xhigh" }],
+      [["--effort", "max"], { model_reasoning_effort: "max" }],
       [
         ["--model", "gpt-5.6-terra", "--effort", "high"],
         { model: "gpt-5.6-terra", model_reasoning_effort: "high" },
@@ -2306,7 +2758,7 @@ describe("CLI", () => {
       ],
       [
         ["scan", ".", "--effort", "ultra"],
-        "--effort must be minimal, low, medium, high, or xhigh",
+        "--effort must be minimal, low, medium, high, xhigh, or max",
       ],
       [["scan", ".", "--mode", "bogus"], "Invalid option"],
       [["scan", ".", "--unknown"], "Unknown flag: --unknown"],
@@ -2381,14 +2833,16 @@ describe("CLI", () => {
         ],
         "--effort conflicts with --codex model_reasoning_effort",
       ],
-      [["export"], "scanDir"],
       [["export", "scan", "--unknown"], "Unknown flag: --unknown"],
       [["export", "scan", "--format", "sarif"], "Invalid format"],
       [["export", "scan", "--export-format", "xml"], "Invalid option"],
       [["export", "scan-a", "scan-b"], "Unexpected positional"],
       [["validate"], "findings..."],
       [["validate", ""], "A finding must not be empty"],
-      [["patch"], "issues..."],
+      [
+        ["patch"],
+        "Patch requires an issue, --linear-issue, or --linear-project.",
+      ],
       [["patch", ""], "An issue must not be empty"],
       [
         ["export", "scan", "--output", "--source-root", "repo"],
@@ -4173,6 +4627,29 @@ describe("CLI", () => {
       "Running scan: reviewing files (src, tests)",
     );
     expect(stderr.text()).not.toContain("% complete");
+  });
+
+  test("preserves directory names for absolute scan paths with trailing separators", async () => {
+    const stdout = capture();
+    const stderr = capture();
+
+    expect(
+      await main(
+        [
+          "scan",
+          ".",
+          "--path",
+          "/synthetic-parent/trailing-directory/",
+          "--json",
+        ],
+        stdout.stream,
+        stderr.stream,
+        dependencies(),
+      ),
+    ).toBe(0);
+    expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
+    expect(stderr.text()).toContain("Running scan: trailing-directory");
+    expect(stderr.text()).not.toContain("synthetic-parent");
   });
 
   test("shows live stage, files, workers, tokens, and cost without a budget", async () => {
