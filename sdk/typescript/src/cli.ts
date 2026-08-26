@@ -1288,6 +1288,7 @@ interface PatchReviewWorktreeSnapshot {
   reviewRepository: PatchReviewRepositoryView;
   ancestorInstructions?: readonly PatchReviewAncestorInstruction[];
   assertBaselineUnchanged?(): Promise<void>;
+  prepareReviewEnvironment?(): Promise<void>;
   candidate(): Promise<PatchReviewCandidateDelta>;
   cumulativeCandidate?(
     candidate: PatchReviewCandidateDelta,
@@ -7218,6 +7219,77 @@ async function snapshotPatchReviewWorktree(
   );
   const objectDirectory = join(temporaryDirectory, "objects");
   const reviewDirectory = join(temporaryDirectory, "review");
+  const indexWorktreeDirectory = join(temporaryDirectory, "index-worktree");
+  let reviewEnvironmentState:
+    | {
+        directory: Pick<BigIntStats, "dev" | "ino" | "mode">;
+        gitMarker: Pick<BigIntStats, "dev" | "ino" | "mode">;
+        canonicalDirectory: string;
+      }
+    | undefined;
+  const readReviewEnvironmentState = async () => {
+    const gitMarker = join(reviewDirectory, ".git");
+    const [canonicalDirectory, directory, marker, entries, markerEntries] =
+      await Promise.all([
+        realpath(reviewDirectory),
+        lstat(reviewDirectory, { bigint: true }),
+        lstat(gitMarker, { bigint: true }),
+        readdir(reviewDirectory, { encoding: "buffer" }),
+        readdir(gitMarker, { encoding: "buffer" }),
+      ]);
+    if (
+      !directory.isDirectory() ||
+      !marker.isDirectory() ||
+      entries.length !== 1 ||
+      !Buffer.from(entries[0]!).equals(Buffer.from(".git")) ||
+      markerEntries.length !== 0
+    ) {
+      throw new CodexSecurityError(
+        "The isolated patch reviewer environment changed before review.",
+      );
+    }
+    return {
+      directory,
+      gitMarker: marker,
+      canonicalDirectory,
+    };
+  };
+  const prepareReviewEnvironment = async (): Promise<void> => {
+    if (reviewEnvironmentState === undefined) {
+      try {
+        await mkdir(reviewDirectory);
+        await mkdir(join(reviewDirectory, ".git"));
+        reviewEnvironmentState = await readReviewEnvironmentState();
+      } catch {
+        throw new CodexSecurityError(
+          "The isolated patch reviewer environment changed before review.",
+        );
+      }
+      return;
+    }
+    let current: Awaited<ReturnType<typeof readReviewEnvironmentState>>;
+    try {
+      current = await readReviewEnvironmentState();
+    } catch {
+      throw new CodexSecurityError(
+        "The isolated patch reviewer environment changed before review.",
+      );
+    }
+    const baseline = reviewEnvironmentState;
+    if (
+      current.canonicalDirectory !== baseline.canonicalDirectory ||
+      current.directory.dev !== baseline.directory.dev ||
+      current.directory.ino !== baseline.directory.ino ||
+      current.directory.mode !== baseline.directory.mode ||
+      current.gitMarker.dev !== baseline.gitMarker.dev ||
+      current.gitMarker.ino !== baseline.gitMarker.ino ||
+      current.gitMarker.mode !== baseline.gitMarker.mode
+    ) {
+      throw new CodexSecurityError(
+        "The isolated patch reviewer environment changed before review.",
+      );
+    }
+  };
   const objectEnvironment = {
     GIT_OBJECT_DIRECTORY: objectDirectory,
     GIT_ALTERNATE_OBJECT_DIRECTORIES: JSON.stringify(repositoryObjectDirectory),
@@ -7336,76 +7408,145 @@ async function snapshotPatchReviewWorktree(
       `--git-dir=${nested.gitDirectory}`,
       `--work-tree=${nested.worktree}`,
     ];
-    const [status, changed, untracked, ignoredPaths, indexEntries] =
-      await Promise.all([
-        runPatchReviewGitBytes(
+    const [
+      status,
+      changed,
+      untracked,
+      ignoredPaths,
+      indexEntries,
+      untrackedDirectories,
+      nonemptyUntrackedDirectories,
+      ignoredDirectories,
+      nonemptyIgnoredDirectories,
+    ] = await Promise.all([
+      runPatchReviewGitBytes(
+        nested.worktree,
+        [
+          ...gitPrefix,
+          "status",
+          "--porcelain=v2",
+          "--branch",
+          "-z",
+          "--untracked-files=all",
+          "--ignored=matching",
+          "--ignore-submodules=all",
+        ],
+        { environment: { GIT_OPTIONAL_LOCKS: "0" }, signal },
+      ),
+      runPatchReviewGitBytes(
+        nested.worktree,
+        [
+          ...gitPrefix,
+          "diff",
+          "--ignore-submodules=all",
+          "HEAD",
+          "--name-only",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ).catch(async () => {
+        signal?.throwIfAborted();
+        return runPatchReviewGitBytes(
           nested.worktree,
-          [
-            ...gitPrefix,
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "-z",
-            "--untracked-files=all",
-            "--ignored=matching",
-            "--ignore-submodules=all",
-          ],
-          { environment: { GIT_OPTIONAL_LOCKS: "0" }, signal },
-        ),
-        runPatchReviewGitBytes(
-          nested.worktree,
-          [
-            ...gitPrefix,
-            "diff",
-            "--ignore-submodules=all",
-            "HEAD",
-            "--name-only",
-            "-z",
-            "--",
-            ".",
-          ],
+          [...gitPrefix, "ls-files", "--cached", "-z", "--", "."],
           { signal },
-        ).catch(async () => {
-          signal?.throwIfAborted();
-          return runPatchReviewGitBytes(
-            nested.worktree,
-            [...gitPrefix, "ls-files", "--cached", "-z", "--", "."],
-            { signal },
-          );
-        }),
-        runPatchReviewGitBytes(
-          nested.worktree,
-          [
-            ...gitPrefix,
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-            ".",
-          ],
-          { signal },
-        ),
-        runPatchReviewGitBytes(
-          nested.worktree,
-          [
-            ...gitPrefix,
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "-z",
-            "--",
-            ".",
-          ],
-          { signal },
-        ),
-        runPatchReviewGitBytes(
-          nested.worktree,
-          [...gitPrefix, "ls-files", "--stage", "-z", "--", "."],
-          { signal },
-        ),
-      ]);
+        );
+      }),
+      runPatchReviewGitBytes(
+        nested.worktree,
+        [
+          ...gitPrefix,
+          "ls-files",
+          "--others",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+      runPatchReviewGitBytes(
+        nested.worktree,
+        [
+          ...gitPrefix,
+          "ls-files",
+          "--others",
+          "--ignored",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+      runPatchReviewGitBytes(
+        nested.worktree,
+        [...gitPrefix, "ls-files", "--stage", "-z", "--", "."],
+        { signal },
+      ),
+      runPatchReviewGitBytes(
+        nested.worktree,
+        [
+          ...gitPrefix,
+          "ls-files",
+          "--others",
+          "--directory",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+      runPatchReviewGitBytes(
+        nested.worktree,
+        [
+          ...gitPrefix,
+          "ls-files",
+          "--others",
+          "--directory",
+          "--no-empty-directory",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+      runPatchReviewGitBytes(
+        nested.worktree,
+        [
+          ...gitPrefix,
+          "ls-files",
+          "--others",
+          "--ignored",
+          "--directory",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+      runPatchReviewGitBytes(
+        nested.worktree,
+        [
+          ...gitPrefix,
+          "ls-files",
+          "--others",
+          "--ignored",
+          "--directory",
+          "--no-empty-directory",
+          "--exclude-standard",
+          "-z",
+          "--",
+          ".",
+        ],
+        { signal },
+      ),
+    ]);
     const digest = createHash("sha256").update(status);
     const hashContext = nestedPatchReviewHashContext(
       allowedNestedGitDirectories,
@@ -7440,6 +7581,30 @@ async function snapshotPatchReviewWorktree(
     const directories = new Map<string, Buffer>([
       [patchReviewGitPathKey(Buffer.alloc(0)), Buffer.alloc(0)],
     ]);
+    const nonemptyDirectoryKeys = new Set(
+      [
+        ...splitNulRecords(nonemptyUntrackedDirectories),
+        ...splitNulRecords(nonemptyIgnoredDirectories),
+      ].map((listedPath) =>
+        patchReviewGitPathKey(
+          listedPath.at(-1) === 0x2f ? listedPath.subarray(0, -1) : listedPath,
+        ),
+      ),
+    );
+    for (const output of [untrackedDirectories, ignoredDirectories]) {
+      for (const listedPath of splitNulRecords(output)) {
+        const path =
+          listedPath.at(-1) === 0x2f ? listedPath.subarray(0, -1) : listedPath;
+        const key = patchReviewGitPathKey(path);
+        if (nonemptyDirectoryKeys.has(key)) continue;
+        await validatePatchReviewGitPath(
+          nested.worktree,
+          path,
+          nested.worktree,
+        );
+        directories.set(key, Buffer.from(path));
+      }
+    }
     for (const path of paths.values()) {
       const pathWithoutTrailingSeparator =
         path.at(-1) === 0x2f ? path.subarray(0, -1) : path;
@@ -8083,7 +8248,7 @@ async function snapshotPatchReviewWorktree(
   };
   try {
     signal?.throwIfAborted();
-    await Promise.all([mkdir(objectDirectory), mkdir(reviewDirectory)]);
+    await Promise.all([mkdir(objectDirectory), mkdir(indexWorktreeDirectory)]);
     const reviewerGit = await resolveTrustedExecutable(
       "git",
       patchReviewGitProcessEnvironment(),
@@ -8223,7 +8388,7 @@ async function snapshotPatchReviewWorktree(
           temporaryDirectory,
           `repository-index-${repositoryIndexSnapshot}`,
         ),
-        GIT_WORK_TREE: reviewDirectory,
+        GIT_WORK_TREE: indexWorktreeDirectory,
       };
       const entries = await runPatchReviewGitBytes(
         repository,
@@ -8683,6 +8848,7 @@ async function snapshotPatchReviewWorktree(
         runtimeSource,
         gitExecutable: reviewerGit.executable,
       },
+      prepareReviewEnvironment,
       async assertBaselineUnchanged() {
         await assertRepositoryGitMetadataUnchanged();
         await assertRepositoryHeadUnchanged();
@@ -9810,6 +9976,12 @@ async function runIndependentPatchReview(
           ...riskSnapshot.reviewRepository,
           tree: riskCandidate.base!,
         };
+  const reviewSnapshot =
+    riskCandidate === undefined || riskSnapshot === undefined
+      ? context.snapshot
+      : riskSnapshot;
+  await reviewSnapshot.prepareReviewEnvironment?.();
+  context.options.signal?.throwIfAborted();
   let review: Awaited<ReturnType<typeof captureSkillStage>>;
   try {
     review = await captureSkillStage(context.run, {
