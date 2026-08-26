@@ -28,8 +28,17 @@ import {
   type CodexCommand,
 } from "./runtime.js";
 import { VERSION } from "./version.js";
+import {
+  CODEX_SECURITY_THREAD_SOURCES,
+  type CodexSecurityThreadSource,
+} from "./thread-source.js";
 
 type Finding = { occurrenceId: string } & Record<string, unknown>;
+type ReadOnlyCodexThreadSource = Extract<
+  CodexSecurityThreadSource,
+  | typeof CODEX_SECURITY_THREAD_SOURCES.scan
+  | typeof CODEX_SECURITY_THREAD_SOURCES.scanComparison
+>;
 
 export interface ScanComparisonInput {
   before: readonly Finding[];
@@ -119,7 +128,10 @@ export async function matchScanFindingsInternal(
     comparisonPrompt(input),
     z.toJSONSchema(comparisonSchema, { target: "openapi-3.0" }),
     options,
-    runtimeOptions,
+    {
+      ...runtimeOptions,
+      threadSource: CODEX_SECURITY_THREAD_SOURCES.scanComparison,
+    },
   );
   let response: unknown;
   try {
@@ -140,7 +152,10 @@ export async function runReadOnlyCodex(
   prompt: string,
   outputSchema: unknown,
   options: ReadOnlyCodexOptions,
-  runtimeOptions: { surface: CodexSecuritySurface },
+  runtimeOptions: {
+    surface: CodexSecuritySurface;
+    threadSource: ReadOnlyCodexThreadSource;
+  },
 ): Promise<string> {
   const config =
     options.config === undefined
@@ -199,6 +214,7 @@ export async function runReadOnlyCodex(
       } as NonNullable<CodexOptions["config"]>,
     });
   const thread = codex.startThread({
+    threadSource: runtimeOptions.threadSource,
     ...(model === undefined ? {} : { model }),
     modelReasoningEffort: reasoningEffort,
     sandboxMode: "read-only",
