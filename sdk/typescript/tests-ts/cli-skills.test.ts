@@ -557,6 +557,10 @@ describe("CLI skill commands", () => {
         return 0;
       },
     });
+    current.resolvePluginPython = async (options) => {
+      expect(options?.configuredPath).toBe(pythonPath);
+      return pythonPath;
+    };
     current.validatePatchRiskAssessment = async (_response, options) => {
       configuredPython = options.pythonPath;
       return true;
@@ -619,6 +623,10 @@ describe("CLI skill commands", () => {
         },
       };
     };
+    current.resolvePluginPython = async () => {
+      events.push("resolve-python");
+      return resolve("/synthetic/python");
+    };
     current.validatePatchRiskAssessment = async (_response, options) => {
       events.push("validate");
       expect(options.pluginRoot).toBe(root);
@@ -636,6 +644,7 @@ describe("CLI skill commands", () => {
     ).toBe(0);
     expect(events).toEqual([
       "seal",
+      "resolve-python",
       "author",
       "reviewer",
       "validate",
@@ -645,6 +654,29 @@ describe("CLI skill commands", () => {
     expect(reviewerPrompt).toContain("SYNTHETIC SEALED RUBRIC");
     expect(reviewerPrompt).toContain("SYNTHETIC SEALED SCHEMA");
     expect(reviewerPrompt).toContain("SYNTHETIC SEALED VALIDATOR");
+  });
+
+  test("resolves patch-risk Python before starting the author", async () => {
+    let authorStarted = false;
+    const current = dependencies({
+      onCodex: () => {
+        authorStarted = true;
+        return 0;
+      },
+    });
+    current.resolvePluginPython = async () => {
+      throw new Error("Synthetic Python resolution failure");
+    };
+
+    expect(
+      await main(
+        ["patch", "Synthetic security issue", "--assess-patch-risk"],
+        capture().stream,
+        capture().stream,
+        current,
+      ),
+    ).toBe(2);
+    expect(authorStarted).toBe(false);
   });
 
   test("validates patch-risk output with the bundled contract validator", async () => {
@@ -701,6 +733,10 @@ describe("CLI skill commands", () => {
           "SYNTHETIC-CONTINUED-AUTHORIZATION",
           "API key:",
           "SYNTHETIC-CONTINUED-CREDENTIAL",
+          "- Token:",
+          "SYNTHETIC-BULLETED-CREDENTIAL",
+          "1. API key:",
+          "SYNTHETIC-NUMBERED-CREDENTIAL",
           "",
           "-----BEGIN PRIVATE KEY-----",
           "SYNTHETIC-MULTILINE-KEY-BODY",
@@ -742,6 +778,8 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).not.toContain("dXNlcjpwYXNz");
     expect(stderr.text()).not.toContain("SYNTHETIC_ADVERSE_CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-CREDENTIAL");
+    expect(stderr.text()).not.toContain("SYNTHETIC-BULLETED-CREDENTIAL");
+    expect(stderr.text()).not.toContain("SYNTHETIC-NUMBERED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-AUTHORIZATION");
     expect(stderr.text()).not.toContain("-----END PRIVATE KEY-----");
   });
