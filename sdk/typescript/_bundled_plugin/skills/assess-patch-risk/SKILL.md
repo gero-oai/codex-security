@@ -1,6 +1,6 @@
 ---
 name: assess-patch-risk
-description: "Assess an immutable patch artifact's program impact, regression risk, and auto-merge eligibility. Use for generated patch files, provider pull-request diffs, or commit ranges when reviewers need evidence about affected runtime paths, contracts, tests, and recoverability. This skill never alters the selected checkout or canonical patch. It may apply the exact patch bytes only inside an isolated disposable checkout for inspection, and never generates, edits, pushes, or merges patch content."
+description: "Assess an immutable patch artifact's program impact, regression risk, and auto-merge eligibility. Use for generated patch files, provider pull-request diffs, or commit ranges when reviewers need evidence about affected runtime paths, contracts, tests, and recoverability. This skill is read-only and does not generate, edit, apply, push, or merge the patch."
 ---
 
 # Assess Patch Risk
@@ -23,22 +23,20 @@ Read [references/risk-rubric.md](references/risk-rubric.md) before assigning rat
 4. **Describe the semantic change.** Separate production, test, generated, configuration, dependency, migration, documentation, and build changes. Identify changed behavior, defaults, errors, side effects, state, and contracts.
 5. **Map program impact from source.** Trace changed symbols through direct callers and affected callees to production entrypoints, jobs, routes, registries, package exports, deployment paths, or supported external consumers. Check dynamic dispatch and configuration-selected paths. Do not call code dead from text search alone.
 6. **Inspect material boundaries.** Check authentication and authorization, tenant isolation, parsing, filesystem and network access, sandboxing, public APIs, serialized data, configuration defaults, migrations, persistence, concurrency, retries, performance, and rollout behavior when affected.
-7. **Try to falsify safety.** For each material changed boundary, state one concrete counterexample and one legitimate control grounded in base source, callers, or an authoritative contract. Record `counterexamplePath` and `legitimateControlPath` for the patched source trace of each case. Reclassify redirects, callbacks, embedded URLs, cached authority, and other derived trust decisions at the point of use instead of inheriting trust from their origin. When policy aggregates multiple subjects, bind each decision to the same identity, route, resource, or record rather than transferring one subject's properties to the set. Trace validated values, authority, and state through later mutation or re-resolution to the first sensitive sink. Treat UI, discovery, prompt, instruction, and visibility controls as exposure controls unless they remove the underlying capability or an independent downstream control enforces the same boundary. A changed test or implementation list cannot by itself define the supported contract.
+7. **Try to falsify safety.** For each material changed boundary, state one concrete counterexample and one legitimate control grounded in base source, callers, or an authoritative contract. Trace both through the patched source. Reclassify redirects, callbacks, embedded URLs, cached authority, and other derived trust decisions at the point of use instead of inheriting trust from their origin. When policy aggregates multiple subjects, bind each decision to the same identity, route, resource, or record rather than transferring one subject's properties to the set. Trace validated values, authority, and state through later mutation or re-resolution to the first sensitive sink. Treat UI, discovery, prompt, instruction, and visibility controls as exposure controls unless they remove the underlying capability or an independent downstream control enforces the same boundary. A changed test or implementation list cannot by itself define the supported contract.
 8. **Evaluate regression protection.** Distinguish changed-path, caller, integration, and rollout coverage. Inspect what assertions actually observe, whether the relevant check ran at the exact head, and whether platform or deployment-specific validation is missing. Tests lower likelihood or raise confidence; they never lower the impact if failure occurs.
-9. **Assess applicability and recovery.** Establish that the patch affects an owned runtime or supported consumer. Use `no_op` when evidence proves no live effect, wrong ownership, duplication, or supersession, even if the now-inapplicable patch also has a patch-caused validation failure; preserve that failure evidence in the assessment. Describe rollback, persistent-state effects, migrations, and operational recovery. Report the risk of not merging separately; use `unknown` when motivating context is unavailable.
-10. **Resolve available unknowns now.** Inspect accessible source, exact-head checks, and focused deterministic local tests when safe. Give every unknown and material boundary a unique `id`. Record `failureAttribution` for every failed validation. A failed check is negative evidence but does not by itself prove that the patch caused the failure; when attribution is decision-critical, compare the immutable base or use another bounded action before assigning a defect to the patch. If a failed check remains unattributed, return `hold_for_evidence` only when an evidence-plan item names that validation in `resolvesFailedValidation`, tests patch-caused versus non-patch-caused outcomes, and maps a patch-caused result to `revise` or keeps it on `hold_for_evidence` with another explicit unresolved pivot; use `block` only when that same branch uses `regressionLikelihoodOutcomes` and `materialSafetyFailureOutcomes` to establish critical likelihood and a material safety failure. It may instead map that result to `no_op` only when the same item uses `applicabilityOutcomes` to map that exact outcome to `no_live_effect`, `wrong_owner`, `duplicate`, or `superseded`. When applicability is unknown, every terminal outcome from an item must map that outcome key to the resulting applicability status; a non-applicable status requires `no_op`, and `merge` requires `confirmed`. Every terminal branch must establish a non-unknown regression likelihood, using `regressionLikelihoodOutcomes` when the top-level likelihood is unknown. Every evidence-plan item must name one or more decision-critical unknown IDs in `resolvesUnknowns`, and every decision-critical unknown must be covered by at least one item whose action, evidence, and outcomes resolve that pivot. If a particular outcome leaves a named pivot unresolved, record it under that outcome key in `remainingUnknowns`; only `hold_for_evidence` may retain one unless the same action establishes a non-applicable `no_op` disposition that makes the remaining pivots irrelevant. Name every unresolved material-boundary ID the action resolves in `resolvesBoundaries`, and use `boundaryOutcomes` to map each outcome key to the resulting status of every named boundary. If `patch.changedFiles` is empty, the identity-recovery item must use `changedFilesOutcomes` to record each branch's resulting inventory; a `merge`, `revise`, or `block` branch requires a non-empty inventory. An action may recommend `merge` only when that action resolves every remaining decision-critical unknown, unattributed failed validation, unresolved material boundary, unknown applicability, and unknown impact or regression likelihood, uses `impactOutcomes` or `regressionLikelihoodOutcomes` to record each newly bounded rating, uses `confidenceOutcomes` to establish moderate or high confidence, retains a passed validation and meaningful regression protection for low likelihood, and every resulting boundary is `supported`. A `revise` or `block` branch must itself establish the defect evidence required by that terminal recommendation. Do not wait or poll indefinitely.
+9. **Assess applicability and recovery.** Establish that the patch affects an owned runtime or supported consumer. Use `no_op` when evidence proves no live effect, wrong ownership, duplication, or supersession. Describe rollback, persistent-state effects, migrations, and operational recovery. Report the risk of not merging separately; use `unknown` when motivating context is unavailable.
+10. **Resolve available unknowns now.** Inspect accessible source, exact-head checks, and focused deterministic local tests when safe. If a decision-critical unknown remains, return `hold_for_evidence` with at most three concrete actions, the evidence each action seeks, and how each possible result changes the recommendation. Do not wait or poll indefinitely.
 
 ## Recommendation
 
 Return exactly one recommendation:
 
 - `merge`: source evidence supports the patch and no decision-critical defect or unknown remains;
-- `revise`: affirmative evidence shows that the patch, its tests, or a material documentation contract must change, represented by critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure;
+- `revise`: the patch, its tests, or a material documentation contract must change;
 - `no_op`: evidence shows the patch has no required live effect or belongs elsewhere;
-- `block`: `materialSafetyFailure.established` is true and affirmative evidence establishes critical regression likelihood; or
+- `block`: affirmative evidence establishes a material safety failure; or
 - `hold_for_evidence`: unavailable evidence can still change the decision.
-
-Always return `workflowLabel`. For a non-`merge` recommendation, set `workflowLabel` to the exact recommendation value.
 
 For `merge`, also return one workflow label:
 
@@ -52,30 +50,29 @@ The label is advisory. It never grants permission to merge or overrides reposito
 Return both a concise Markdown report and a JSON object conforming to [`../../schemas/patch-risk-assessment.schema.json`](../../schemas/patch-risk-assessment.schema.json). Include:
 
 1. exact patch identity and analyzed base;
-2. recommendation and required workflow label;
+2. recommendation and workflow label, if applicable;
 3. impact, likelihood, regression protection, recoverability, and confidence ratings with evidence, plus any strict auto-merge exclusions;
 4. affected production roots, important callers, contracts, and state;
-5. strongest counterexample and legitimate control for each material boundary, with each patched source path;
-6. relevant tests and checks, including whether they ran, what they actually protect, and whether each is required for merge;
+5. strongest counterexample and legitimate control for each material boundary;
+6. relevant tests and checks, including whether they ran and what they actually protect;
 7. top risk drivers, protective factors, and status-quo risk; and
 8. unknowns plus the bounded evidence plan when held.
 
-Before returning the result, resolve `<python_command>` to the configured Python interpreter (`"$PYTHON"` in POSIX shells or `& "$env:PYTHON"` in PowerShell). When it is unset, use `python3` on Unix-like hosts; on Windows, discover the first available launcher in the same order as the SDK (`python`, `python3`, then `py`). Resolve `<plugin_dir>` to the absolute root of this loaded plugin: the directory three levels above this `SKILL.md` that contains `.codex-plugin/plugin.json`, `schemas`, and `skills`. Substitute each placeholder using the host shell's quoting rules so paths remain single arguments. Then invoke Python in isolated mode and pass the JSON object on standard input to the validator. The command is written on one line so it works in PowerShell, Command Prompt, and POSIX shells:
+Before returning the result, validate the JSON with:
 
-```text
-<python_command> -I -S -B <plugin_dir>/skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py -
+```bash
+python skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py <assessment.json>
 ```
 
-Use a file path instead of `-` only when the caller requests an artifact. Correct structural or invariant errors by revisiting the evidence; never change a recommendation merely to make validation pass. Return the validated JSON in the response. Write it to disk only when the caller requests an artifact, and keep every assessment-created file outside the subject checkout and its Git directories.
+Correct structural or invariant errors by revisiting the evidence; never change a recommendation merely to make validation pass. Return the validated JSON in the response. Write it to disk only when the caller requests an artifact, and keep every assessment-created file outside the subject checkout and its Git directories.
 
 Keep the explanation evidence-backed. Patch size, caller count, green CI, or test count alone never proves low risk.
 
 ## Hard Rules
 
 - Do not recommend any merge state while a source-visible regression, unsupported control break, parallel bypass, trust-boundary failure, or material documentation contradiction remains.
-- Treat unknown applicability as decision-critical and use `hold_for_evidence` until runtime reachability or ownership is established, even when other evidence establishes a candidate defect; preserve that defect evidence on the hold.
-- Once applicability is established, do not use `hold_for_evidence` for an already established defect; use `revise` or `block`.
+- Do not use `hold_for_evidence` for an already established defect; use `revise` or `block`.
 - Do not treat unavailable evidence as affirmative failure evidence.
 - Do not claim strong regression protection unless tests exercise the changed behavior or affected contract and the relevant checks actually ran.
 - Do not infer compatibility from clean textual application, individual green tests, or a small diff.
-- Do not modify or regenerate the selected checkout or canonical patch, and do not push or merge it. Applying the exact bytes inside an isolated disposable checkout for inspection is permitted only as described above.
+- Do not modify, regenerate, push, or merge the patch.

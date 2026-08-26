@@ -8,7 +8,6 @@ Rate each dimension from evidence, not from diff size or test count.
 - `moderate`: bounded component or consumer impact with a clear containment boundary.
 - `high`: shared runtime, public contract, persistent state, privileged boundary, broad deployment, or difficult operational recovery.
 - `critical`: plausible cross-tenant, major security, irreversible state, fleet-wide, or catastrophic availability impact.
-- `unknown`: available evidence cannot yet bound the consequence. This cannot support `merge`, but it may accompany a terminal non-merge recommendation when another established defect or disposition already determines the decision.
 
 ## Regression likelihood
 
@@ -16,7 +15,6 @@ Rate each dimension from evidence, not from diff size or test count.
 - `moderate`: some coupling, partial protection, or bounded uncertainty remains but no source-visible defect is established.
 - `high`: complex or weakly protected behavior, important untested paths, contract ambiguity, or substantial unresolved coupling.
 - `critical`: evidence already demonstrates a serious regression, bypass, unsupported control break, or failed required safety property.
-- `unknown`: available evidence cannot yet support a likelihood estimate; use only with `hold_for_evidence`.
 
 ## Regression protection
 
@@ -65,7 +63,7 @@ A trigger alone is not a defect. Mark the boundary contradicted only when source
 Use `auto_merge_candidate` only when all of the following are true:
 
 - impact and likelihood are `low`;
-- regression protection is `strong` and every check marked required for merge passes at the exact head;
+- regression protection is `strong` and relevant exact-head checks pass;
 - recovery is `easy` and confidence is `high`;
 - runtime reachability and ownership are established;
 - no privileged boundary, migration, persistent-state change, public contract change, architecture-specific rollout, or broad shared default is materially affected;
@@ -76,6 +74,3 @@ Use `auto_merge_candidate` only when all of the following are true:
 Otherwise use `human_review_required` for a supported `merge`. Strong tests can lower likelihood and raise confidence, but never lower impact.
 
 The validator enforces this gate and the recommendation-to-label mapping. A validation failure means the evidence packet is internally inconsistent; it is not permission to weaken a rating or omit evidence.
-
-Applicability is a decision pivot. If runtime reachability or ownership is unknown, use `hold_for_evidence`, preserve any established defect evidence on that hold, and do not issue a terminal `revise` or `block` verdict until applicability is established. A `revise` verdict also requires affirmative correction evidence: critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure.
-A `block` verdict requires both critical regression likelihood and `materialSafetyFailure.established=true`; an ordinary critical functional regression or contradicted contract or documentation boundary routes to `revise`.
