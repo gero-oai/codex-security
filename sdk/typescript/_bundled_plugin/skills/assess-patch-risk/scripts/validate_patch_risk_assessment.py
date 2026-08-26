@@ -520,6 +520,15 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     if boundary_outcomes is not None
                     else None
                 )
+                effective_unresolved_boundaries = unresolved_boundaries - set(
+                    resolved_boundaries
+                )
+                if outcome_boundaries is not None:
+                    effective_unresolved_boundaries |= {
+                        boundary_id
+                        for boundary_id, result in outcome_boundaries.items()
+                        if result == "unresolved"
+                    }
                 outcome_remaining_unknowns = set(
                     remaining_unknown_outcomes.get(outcome, [])
                     if remaining_unknown_outcomes is not None
@@ -733,6 +742,14 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 if noncritical_unknowns and outcome_confidence == "high":
                     errors.append(
                         f"evidencePlan.{index}: high confidence cannot retain an explicit unknown"
+                    )
+                if outcome_impact == "unknown" and outcome_confidence == "high":
+                    errors.append(
+                        f"evidencePlan.{index}: unknown impact cannot support high confidence"
+                    )
+                if effective_unresolved_boundaries and outcome_confidence == "high":
+                    errors.append(
+                        f"evidencePlan.{index}: an unresolved material boundary cannot support high confidence"
                     )
                 if outcome_recommendation == "merge":
                     if outcome_confidence == "low":
