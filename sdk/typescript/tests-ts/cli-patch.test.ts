@@ -54,6 +54,8 @@ function dependencies(
         mode?: string;
         object?: string;
       }>;
+      base?: string;
+      head?: string;
     }[];
   } = {},
 ) {
@@ -94,10 +96,13 @@ function dependencies(
           publicationUnsafePaths: [...(selected.publicationUnsafePaths ?? [])],
           publicationBaseEntries: [...(selected.publicationBaseEntries ?? [])],
           publicationEntries: [...(selected.publicationEntries ?? [])],
+          base: selected.base ?? "a".repeat(40),
+          head: selected.head ?? "b".repeat(40),
         };
       },
       dispose: async () => {},
     }));
+  current.validatePatchRiskAssessment = async () => true;
   return current;
 }
 
@@ -150,6 +155,26 @@ function completePatches(
     }),
   );
   return findings;
+}
+
+function approvedPatchRiskVerdict(prompt: string) {
+  const lines = prompt.split("\n");
+  const marker = "CLI-owned immutable patch artifact (JSON object):";
+  const index = lines.indexOf(marker);
+  const artifact = JSON.parse(lines[index + 1]!) as {
+    patch: Record<string, unknown>;
+  };
+  return {
+    status: "approved",
+    findings: [],
+    report: "## Patch risk\n\nThe synthetic patch is mergeable.",
+    assessment: {
+      schemaVersion: 1,
+      patch: artifact.patch,
+      recommendation: "merge",
+      workflowLabel: "human_review_required",
+    },
+  };
 }
 
 async function runWorkflow(
@@ -252,7 +277,12 @@ describe("scan and patch workflow", () => {
       const result = resultWithFindings(["high"]);
       const stages: string[] = [];
       const outcome = await runWorkflow(
-        [...arguments_, "--review-style", "--review-minimality"],
+        [
+          ...arguments_,
+          "--assess-patch-risk",
+          "--review-style",
+          "--review-minimality",
+        ],
         {
           result,
           onWorkbench: () => savedScan(result),
@@ -260,15 +290,18 @@ describe("scan and patch workflow", () => {
             const { prompt, sandbox } = output!.appServer!;
             if (sandbox === "read-only") {
               expect(prompt).toContain(JSON.stringify(["src/finding-1.ts"]));
-              const stage = ["minimality", "local-coding-style"].find((value) =>
-                prompt.includes(`only the ${value} review`),
-              )!;
+              const stage = [
+                "minimality",
+                "local-coding-style",
+                "patch-risk-assessment",
+              ].find((value) => prompt.includes(`only the ${value} review`))!;
               stages.push(stage);
               output!.stdout.write(
-                JSON.stringify({
-                  status: "approved",
-                  findings: [],
-                }),
+                JSON.stringify(
+                  stage === "patch-risk-assessment"
+                    ? approvedPatchRiskVerdict(prompt)
+                    : { status: "approved", findings: [] },
+                ),
               );
             } else {
               stages.push("author");
@@ -280,7 +313,12 @@ describe("scan and patch workflow", () => {
       );
 
       expect(outcome.exitCode).toBe(0);
-      expect(stages).toEqual(["author", "minimality", "local-coding-style"]);
+      expect(stages).toEqual([
+        "author",
+        "minimality",
+        "local-coding-style",
+        "patch-risk-assessment",
+      ]);
     }
   });
 
@@ -3101,6 +3139,7 @@ describe("scan and patch workflow", () => {
       ["--create-pr"],
       ["--review-minimality"],
       ["--review-style"],
+      ["--assess-patch-risk"],
       ["--max-review-revisions", "5"],
       ["occ_1"],
     ]) {
@@ -3660,7 +3699,11 @@ describe("scan and patch workflow", () => {
   });
 
   test("rejects optional patch reviews without an explicit patch request", async () => {
-    for (const flag of ["--review-minimality", "--review-style"]) {
+    for (const flag of [
+      "--review-minimality",
+      "--review-style",
+      "--assess-patch-risk",
+    ]) {
       let started = false;
       const outcome = await runWorkflow(["scan", flag], {
         onCodex: () => {
@@ -3688,7 +3731,7 @@ describe("scan and patch workflow", () => {
       });
       expect(outcome.exitCode).toBe(2);
       expect(outcome.stderr).toContain(
-        "--max-review-revisions requires --review-minimality or --review-style",
+        "--max-review-revisions requires a selected patch review",
       );
       expect(started).toBe(false);
     }

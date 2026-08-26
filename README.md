@@ -16,17 +16,18 @@ Requires Node.js 22.13.0 or later and Python 3.10 or later.
 npm install @openai/codex-security
 codex-security login
 codex-security scan /path/to/directory
-codex-security scan /path/to/directory --patch --review-minimality --review-style
+codex-security scan /path/to/directory --patch --review-minimality --review-style --assess-patch-risk
 ```
 
 For CI, set `OPENAI_API_KEY` instead of signing in.
 
-Add `--review-minimality` or `--review-style` to `scan --patch` or `patch`
-to trigger a deterministic review workflow. The CLI runs each selected review
-as a separate, independent, read-only model invocation: minimality first, then
-local coding style. Review scope comes from the Git delta observed after the
-author run, excluding pre-existing worktree changes. Both reviews are optional
-and disabled by default.
+Add `--review-minimality`, `--review-style`, or `--assess-patch-risk` to
+`scan --patch` or `patch` to trigger a deterministic review workflow. The CLI
+runs each selected review as a separate, independent, read-only model
+invocation: minimality first, then local coding style, then patch-risk
+assessment. Review scope comes from the Git delta observed after the author run,
+excluding pre-existing worktree changes. Every review is optional and disabled
+by default.
 Set `--max-review-revisions 5` to allow up to five author revisions across
 actionable review findings; later-stage revisions restart earlier reviews, and
 blocked reviews still stop immediately. The revision limit requires at least

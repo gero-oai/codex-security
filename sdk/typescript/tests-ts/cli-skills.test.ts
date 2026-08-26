@@ -41,10 +41,173 @@ function dependencies(options: Parameters<typeof fixtureDependencies>[0] = {}) {
     candidate: async () => ({
       paths: ["src/finding-1.ts"],
       diff: "diff --git a/src/finding-1.ts b/src/finding-1.ts\n",
+      base: "a".repeat(40),
+      head: "b".repeat(40),
     }),
     dispose: async () => {},
   });
+  current.validatePatchRiskAssessment = async () => true;
   return current;
+}
+
+function patchRiskArtifact(prompt: string) {
+  const marker = "CLI-owned immutable patch artifact (JSON object):";
+  const lines = prompt.split("\n");
+  const index = lines.indexOf(marker);
+  expect(index).toBeGreaterThanOrEqual(0);
+  return JSON.parse(lines[index + 1]!) as {
+    path: string;
+    patch: {
+      repository: string;
+      sourceType: "patch_file";
+      base: string;
+      head: string;
+      changedFiles: string[];
+      sha256: string;
+    };
+  };
+}
+
+function patchRiskAssessment(
+  prompt: string,
+  recommendation:
+    | "merge"
+    | "revise"
+    | "no_op"
+    | "block"
+    | "hold_for_evidence" = "merge",
+) {
+  const { patch } = patchRiskArtifact(prompt);
+  const assessment = {
+    schemaVersion: 1,
+    patch,
+    recommendation,
+    workflowLabel:
+      recommendation === "merge" ? "human_review_required" : recommendation,
+    impact: {
+      rating: "moderate",
+      rationale: "A bounded supported caller can fail.",
+    },
+    regressionLikelihood: {
+      rating: "low",
+      rationale: "The changed path and its caller are covered.",
+    },
+    regressionProtection: {
+      rating: "strong",
+      rationale: "Focused checks exercise the changed behavior.",
+      exactHeadChecksPassed: true,
+    },
+    recoverability: {
+      rating: "easy",
+      rationale: "The isolated patch can be reverted.",
+    },
+    confidence: {
+      rating: "high",
+      rationale: "The runtime path and contract are established.",
+    },
+    applicability: {
+      status: "confirmed",
+      rationale: "The changed path reaches a supported runtime.",
+    },
+    statusQuoRisk: {
+      rating: "moderate",
+      rationale: "The reported defect otherwise remains.",
+    },
+    autoMergeExclusions: ["public_contract"],
+    affectedRuntimeRoots: ["service.request"],
+    materialBoundaries: [
+      {
+        id: "request-contract",
+        invariant: "Supported requests retain their contract.",
+        runtimeRoot: "service.request",
+        counterexample: "A supported request takes the changed branch.",
+        legitimateControl: "The same request succeeds at the base tree.",
+        result: "supported",
+      },
+    ],
+    validation: [
+      {
+        name: "focused request tests",
+        status: "passed",
+        protects: "The changed behavior through its production caller.",
+      },
+    ],
+    unknowns: [] as Array<{
+      summary: string;
+      decisionCritical: boolean;
+    }>,
+    evidencePlan: [] as Array<{
+      question: string;
+      action: string;
+      outcomes: Record<string, string>;
+    }>,
+  };
+  if (recommendation === "revise") {
+    assessment.regressionLikelihood.rating = "high";
+    assessment.materialBoundaries[0]!.result = "contradicted";
+    assessment.validation[0]!.status = "failed";
+  } else if (recommendation === "no_op") {
+    assessment.applicability = {
+      status: "superseded",
+      rationale: "A narrower patch already provides the behavior.",
+    };
+  } else if (recommendation === "block") {
+    assessment.regressionLikelihood.rating = "critical";
+    assessment.materialBoundaries[0]!.result = "contradicted";
+    assessment.validation[0]!.status = "failed";
+  } else if (recommendation === "hold_for_evidence") {
+    assessment.impact.rating = "unknown";
+    assessment.regressionLikelihood.rating = "unknown";
+    assessment.regressionProtection.rating = "unknown";
+    assessment.regressionProtection.exactHeadChecksPassed = false;
+    assessment.confidence.rating = "low";
+    assessment.applicability = {
+      status: "unknown",
+      rationale: "The supported runtime owner is unresolved.",
+    };
+    assessment.materialBoundaries[0]!.result = "unresolved";
+    assessment.validation[0]!.status = "unavailable";
+    assessment.unknowns = [
+      {
+        summary: "The rollout target is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    assessment.evidencePlan = [
+      {
+        question: "Does the changed path own the rollout target?",
+        action: "Inspect the checked-in deployment mapping.",
+        outcomes: { supported: "merge", contradicted: "no_op" },
+      },
+    ];
+  }
+  return assessment;
+}
+
+function patchRiskVerdict(
+  prompt: string,
+  recommendation:
+    | "merge"
+    | "revise"
+    | "no_op"
+    | "block"
+    | "hold_for_evidence" = "merge",
+) {
+  const status =
+    recommendation === "merge"
+      ? "approved"
+      : recommendation === "revise"
+        ? "revise"
+        : "blocked";
+  return {
+    status,
+    findings:
+      status === "approved"
+        ? []
+        : [`Patch-risk recommendation: ${recommendation}.`],
+    report: `## Patch risk\n\nRecommendation: ${recommendation}.`,
+    assessment: patchRiskAssessment(prompt, recommendation),
+  };
 }
 
 function linearIssue(identifier: string, comments: string[] = []) {
@@ -188,6 +351,15 @@ describe("CLI skill commands", () => {
         ["--review-style", "--review-minimality"],
         ["minimality", "local-coding-style"],
       ],
+      [["--assess-patch-risk"], ["patch-risk-assessment"]],
+      [
+        ["--assess-patch-risk", "--review-minimality"],
+        ["minimality", "patch-risk-assessment"],
+      ],
+      [
+        ["--assess-patch-risk", "--review-style", "--review-minimality"],
+        ["minimality", "local-coding-style", "patch-risk-assessment"],
+      ],
     ] as const) {
       const invocations: Array<{
         prompt: string;
@@ -212,10 +384,13 @@ describe("CLI skill commands", () => {
               });
               output!.stdout.write(
                 server.sandbox === "read-only"
-                  ? JSON.stringify({
-                      status: "approved",
-                      findings: [],
-                    })
+                  ? JSON.stringify(
+                      server.prompt.includes(
+                        "only the patch-risk-assessment review",
+                      )
+                        ? patchRiskVerdict(server.prompt)
+                        : { status: "approved", findings: [] },
+                    )
                   : "Verified synthetic patch.\n",
               );
               return 0;
@@ -264,11 +439,16 @@ describe("CLI skill commands", () => {
           expect(prompt).not.toContain(
             "nearest applicable repository instructions",
           );
-        } else {
+        } else if (prompt.includes("only the local-coding-style review")) {
           expect(prompt).toContain(
             "nearest applicable repository instructions",
           );
           expect(prompt).not.toContain("each changed file, production change");
+          expect(prompt).not.toContain("candidate.patch");
+        } else {
+          expect(prompt).toContain("$codex-security:assess-patch-risk");
+          expect(prompt).toContain("candidate.patch");
+          expect(prompt).not.toContain("diff --git");
         }
       }
       expect(stdout.text()).toBe("Verified synthetic patch.\n");
@@ -285,8 +465,228 @@ describe("CLI skill commands", () => {
     ).toBe(0);
     expect(help.text()).toContain("--review-minimality");
     expect(help.text()).toContain("--review-style");
+    expect(help.text()).toContain("--assess-patch-risk");
     expect(help.text()).toContain("--max-review-revisions <number>");
   });
+
+  test("binds patch-risk review to an immutable artifact and validates the assessment", async () => {
+    const stderr = capture();
+    let artifactPath = "";
+    let validated: ReturnType<typeof patchRiskAssessment> | undefined;
+    const current = dependencies({
+      onCodex: async (_args, output) => {
+        const { prompt, sandbox } = output!.appServer!;
+        if (sandbox !== "read-only") {
+          output!.stdout.write("Verified synthetic patch.\n");
+          return 0;
+        }
+        const artifact = patchRiskArtifact(prompt);
+        artifactPath = artifact.path;
+        expect(artifact.patch).toMatchObject({
+          repository: "/current/repository",
+          sourceType: "patch_file",
+          base: "a".repeat(40),
+          head: "b".repeat(40),
+          changedFiles: ["src/finding-1.ts"],
+        });
+        expect(await filesystem.readFile(artifact.path, "utf8")).toBe(
+          "diff --git a/src/finding-1.ts b/src/finding-1.ts\n",
+        );
+        if (process.platform !== "win32") {
+          expect((await filesystem.stat(artifact.path)).mode & 0o222).toBe(0);
+        }
+        output!.stdout.write(JSON.stringify(patchRiskVerdict(prompt)));
+        return 0;
+      },
+    });
+    current.validatePatchRiskAssessment = async (assessment) => {
+      validated = assessment as ReturnType<typeof patchRiskAssessment>;
+      return true;
+    };
+
+    expect(
+      await main(
+        ["patch", "Synthetic security issue", "--assess-patch-risk"],
+        capture().stream,
+        stderr.stream,
+        current,
+      ),
+    ).toBe(0);
+    expect(validated?.recommendation).toBe("merge");
+    expect(stderr.text()).toContain('"recommendation":"merge"');
+    expect(stderr.text()).toContain("## Patch risk");
+    await expect(filesystem.access(artifactPath)).rejects.toThrow();
+  });
+
+  test("validates patch-risk output with the bundled contract validator", async () => {
+    const current = dependencies({
+      environment: process.env,
+      onCodex: (_args, output) => {
+        const { prompt, sandbox } = output!.appServer!;
+        output!.stdout.write(
+          sandbox === "read-only"
+            ? JSON.stringify(patchRiskVerdict(prompt))
+            : "Verified synthetic patch.",
+        );
+        return 0;
+      },
+    });
+    delete current.validatePatchRiskAssessment;
+
+    expect(
+      await main(
+        ["patch", "Synthetic security issue", "--assess-patch-risk"],
+        capture().stream,
+        capture().stream,
+        current,
+      ),
+    ).toBe(0);
+  });
+
+  test("fails closed on invalid or unvalidated patch-risk results", async () => {
+    for (const failure of [
+      "identity",
+      "mapping",
+      "missing-report",
+      "validation",
+      "artifact",
+    ] as const) {
+      let invocations = 0;
+      const current = dependencies({
+        onCodex: async (_args, output) => {
+          invocations += 1;
+          const { prompt, sandbox } = output!.appServer!;
+          if (sandbox !== "read-only") {
+            output!.stdout.write("Verified synthetic patch.");
+            return 0;
+          }
+          const verdict = patchRiskVerdict(prompt);
+          if (failure === "identity") {
+            verdict.assessment.patch.sha256 = "0".repeat(64);
+          } else if (failure === "mapping") {
+            verdict.status = "blocked";
+            verdict.findings = ["Mismatched status."];
+          } else if (failure === "missing-report") {
+            output!.stdout.write(
+              JSON.stringify({
+                status: verdict.status,
+                findings: verdict.findings,
+                assessment: verdict.assessment,
+              }),
+            );
+            return 0;
+          } else if (failure === "artifact") {
+            const artifact = patchRiskArtifact(prompt);
+            await filesystem.chmod(artifact.path, 0o600);
+            await filesystem.writeFile(artifact.path, "changed");
+          }
+          output!.stdout.write(JSON.stringify(verdict));
+          return 0;
+        },
+      });
+      current.validatePatchRiskAssessment = async () =>
+        failure !== "validation";
+
+      expect(
+        await main(
+          ["patch", "Synthetic security issue", "--assess-patch-risk"],
+          capture().stream,
+          capture().stream,
+          current,
+        ),
+      ).toBe(2);
+      expect(invocations).toBe(2);
+    }
+  });
+
+  test("requires an explicit budget before revising for patch risk", async () => {
+    for (const maximum of [undefined, 1] as const) {
+      const stages: string[] = [];
+      let riskReviews = 0;
+      const arguments_ = [
+        "patch",
+        "Synthetic security issue",
+        "--review-minimality",
+        "--assess-patch-risk",
+        ...(maximum === undefined
+          ? []
+          : ["--max-review-revisions", String(maximum)]),
+      ];
+      expect(
+        await main(
+          arguments_,
+          capture().stream,
+          capture().stream,
+          dependencies({
+            onCodex: (_args, output) => {
+              const { prompt, sandbox } = output!.appServer!;
+              if (sandbox !== "read-only") {
+                stages.push(stages.length === 0 ? "author" : "revision");
+                output!.stdout.write("Verified patch.");
+                return 0;
+              }
+              if (prompt.includes("only the minimality review")) {
+                stages.push("minimality");
+                output!.stdout.write(
+                  JSON.stringify({ status: "approved", findings: [] }),
+                );
+                return 0;
+              }
+              stages.push("patch-risk-assessment");
+              riskReviews += 1;
+              output!.stdout.write(
+                JSON.stringify(
+                  patchRiskVerdict(
+                    prompt,
+                    riskReviews === 1 ? "revise" : "merge",
+                  ),
+                ),
+              );
+              return 0;
+            },
+          }),
+        ),
+      ).toBe(maximum === undefined ? 2 : 0);
+      expect(stages).toEqual(
+        maximum === undefined
+          ? ["author", "minimality", "patch-risk-assessment"]
+          : [
+              "author",
+              "minimality",
+              "patch-risk-assessment",
+              "revision",
+              "minimality",
+              "patch-risk-assessment",
+            ],
+      );
+    }
+  });
+
+  test.each(["no_op", "block", "hold_for_evidence"] as const)(
+    "blocks publication for a %s patch-risk recommendation",
+    async (recommendation) => {
+      const stderr = capture();
+      expect(
+        await main(
+          ["patch", "Synthetic security issue", "--assess-patch-risk"],
+          capture().stream,
+          stderr.stream,
+          dependencies({
+            onCodex: (_args, output) => {
+              const { prompt, sandbox } = output!.appServer!;
+              output!.stdout.write(
+                sandbox === "read-only"
+                  ? JSON.stringify(patchRiskVerdict(prompt, recommendation))
+                  : "Verified patch.",
+              );
+              return 0;
+            },
+          }),
+        ),
+      ).toBe(2);
+      expect(stderr.text()).toContain(`"recommendation":"${recommendation}"`);
+    },
+  );
 
   test("revises a rejected patch once before independently reviewing it again", async () => {
     const stages: string[] = [];
