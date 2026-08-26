@@ -245,6 +245,13 @@ describe("patch risk assessment contract", () => {
     );
   });
 
+  test("requires fresh authorization decisions to reclassify every input and result", async () => {
+    const skill = await readFile(skillPath, "utf8");
+    expect(skill).toContain(
+      "either reclassify every authorization-relevant principal attribute, resource attribute, policy input, entity binding, and resulting decision from current state",
+    );
+  });
+
   test.each(["\u001C", "\u0085"])(
     "matches ECMAScript non-whitespace handling for %p",
     async (control) => {
