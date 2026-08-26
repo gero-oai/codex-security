@@ -5722,6 +5722,65 @@ async function hashNestedPatchReviewPath(
   }
 }
 
+async function validatePatchReviewObjectAlternates(
+  objectDirectory: string,
+  allowedDirectories: readonly string[],
+  signal?: AbortSignal,
+  visited = new Set<string>(),
+): Promise<void> {
+  signal?.throwIfAborted();
+  const canonicalObjectDirectory = await realpath(objectDirectory);
+  if (visited.has(canonicalObjectDirectory)) return;
+  visited.add(canonicalObjectDirectory);
+  if (
+    !allowedDirectories.some(
+      (directory) =>
+        !isOutsidePath(relative(directory, canonicalObjectDirectory)),
+    )
+  ) {
+    throw new CodexSecurityError(
+      "Git object alternates must remain inside the selected repository and its Git directories.",
+    );
+  }
+
+  const relativeAlternatesPath = join("info", "alternates");
+  await validatePatchReviewPath(
+    canonicalObjectDirectory,
+    relativeAlternatesPath,
+    canonicalObjectDirectory,
+  );
+  let contents: Buffer;
+  try {
+    contents = await readFile(
+      join(canonicalObjectDirectory, relativeAlternatesPath),
+    );
+  } catch (error) {
+    if (missingPatchReviewPath(error)) return;
+    throw error;
+  }
+  const text = contents.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(contents)) {
+    throw new CodexSecurityError(
+      "Git object alternates must use confined UTF-8 paths.",
+    );
+  }
+  for (const path of text.split(/\r?\n/u).filter(Boolean)) {
+    const alternate = await realpath(
+      resolve(canonicalObjectDirectory, path),
+    ).catch(() => {
+      throw new CodexSecurityError(
+        "Git object alternates must remain inside the selected repository and its Git directories.",
+      );
+    });
+    await validatePatchReviewObjectAlternates(
+      alternate,
+      allowedDirectories,
+      signal,
+      visited,
+    );
+  }
+}
+
 async function readPatchReviewBlob(
   worktree: string,
   path: Buffer,
@@ -6082,6 +6141,11 @@ async function snapshotPatchReviewWorktree(
     ),
   );
   const allowedNestedGitDirectories = [repository, ...repositoryGitDirectories];
+  await validatePatchReviewObjectAlternates(
+    repositoryObjectDirectory,
+    allowedNestedGitDirectories,
+    signal,
+  );
 
   const temporaryRoot = await realpath(tmpdir());
   if (!isOutsidePath(relative(repository, temporaryRoot))) {
@@ -6265,6 +6329,11 @@ async function snapshotPatchReviewWorktree(
     }
   };
   const stageWorktree = async (): Promise<void> => {
+    await validatePatchReviewObjectAlternates(
+      repositoryObjectDirectory,
+      allowedNestedGitDirectories,
+      signal,
+    );
     if (!capturingBaseline) await assertNestedRepositoriesUnchanged();
     const [sparseEntries, listed, currentIgnored] = await Promise.all([
       runPatchReviewGitBytes(repository, ["ls-files", "-v", "-z", "--", "."], {
@@ -6571,17 +6640,44 @@ async function snapshotPatchReviewWorktree(
             ["rev-parse", `${headCommit}^{tree}`],
             { environment: objectEnvironment, signal },
           );
-    const indexTree = await runPatchReviewGit(repository, ["write-tree"], {
-      environment: objectEnvironment,
-      signal,
-    });
+    const repositoryIndexState = async (): Promise<Buffer> => {
+      const [assumeAndSparse, fsMonitor] = await Promise.all([
+        runPatchReviewGitBytes(
+          repository,
+          ["ls-files", "-v", "-z", "--", "."],
+          { environment: objectEnvironment, signal },
+        ),
+        runPatchReviewGitBytes(
+          repository,
+          ["ls-files", "-f", "-z", "--", "."],
+          { environment: objectEnvironment, signal },
+        ),
+      ]);
+      return createHash("sha256")
+        .update(assumeAndSparse)
+        .update(Buffer.from([0]))
+        .update(fsMonitor)
+        .digest();
+    };
+    const [indexTree, indexState] = await Promise.all([
+      runPatchReviewGit(repository, ["write-tree"], {
+        environment: objectEnvironment,
+        signal,
+      }),
+      repositoryIndexState(),
+    ]);
     const assertRepositoryIndexUnchanged = async (): Promise<void> => {
-      const currentIndexTree = await runPatchReviewGit(
-        repository,
-        ["write-tree"],
-        { environment: objectEnvironment, signal },
-      );
-      if (currentIndexTree !== indexTree) {
+      const [currentIndexTree, currentIndexState] = await Promise.all([
+        runPatchReviewGit(repository, ["write-tree"], {
+          environment: objectEnvironment,
+          signal,
+        }),
+        repositoryIndexState(),
+      ]);
+      if (
+        currentIndexTree !== indexTree ||
+        !currentIndexState.equals(indexState)
+      ) {
         throw new CodexSecurityError(
           "The Git index changed after patch review started. Preserve staged user changes and retry.",
         );
