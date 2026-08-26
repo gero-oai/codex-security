@@ -83,6 +83,7 @@ function dependencies(
     >;
     patchReviewDeltas?: readonly PatchReviewDeltaFixture[];
     cumulativePatchReviewDeltas?: readonly PatchReviewDeltaFixture[];
+    cumulativePatchReviewComposedDeltas?: readonly PatchReviewDeltaFixture[];
     onPatchReviewPublicationCandidate?: () => void;
   } = {},
 ) {
@@ -90,6 +91,7 @@ function dependencies(
     onPatchReviewSnapshot,
     patchReviewDeltas,
     cumulativePatchReviewDeltas,
+    cumulativePatchReviewComposedDeltas,
     onPatchReviewPublicationCandidate,
     ...fixtureOptions
   } = options;
@@ -153,6 +155,8 @@ function dependencies(
     }));
   if (cumulativePatchReviewDeltas !== undefined) {
     let cumulativeDelta = 0;
+    let cumulativeComposedDelta = 0;
+    let observedCumulativeDelta: PatchReviewDeltaFixture | undefined;
     current.snapshotCumulativePatchReviewWorktree = async (directory) => ({
       directory,
       reviewRepository: {
@@ -173,12 +177,55 @@ function dependencies(
         if (selected === undefined) {
           throw new Error("A cumulative patch review delta is required.");
         }
+        observedCumulativeDelta = selected;
         return {
           ...selected,
           paths: [...selected.paths],
           diffBytes: Buffer.from(selected.diffBytes ?? selected.diff),
           base: selected.base ?? "c".repeat(40),
           head: selected.head ?? "b".repeat(40),
+        };
+      },
+      cumulativeCandidate: async () => {
+        const selected =
+          cumulativePatchReviewComposedDeltas?.[
+            Math.min(
+              cumulativeComposedDelta,
+              cumulativePatchReviewComposedDeltas.length - 1,
+            )
+          ] ?? observedCumulativeDelta;
+        cumulativeComposedDelta += 1;
+        if (selected === undefined) {
+          throw new Error("A composed patch review delta is required.");
+        }
+        return {
+          ...selected,
+          paths: [...selected.paths],
+          diffBytes: Buffer.from(selected.diffBytes ?? selected.diff),
+          base: selected.base ?? "c".repeat(40),
+          head: selected.head ?? "b".repeat(40),
+          entries: [],
+        };
+      },
+      publicationCandidate: async () => {
+        const selected =
+          cumulativePatchReviewComposedDeltas?.[
+            Math.min(
+              cumulativeComposedDelta,
+              cumulativePatchReviewComposedDeltas.length - 1,
+            )
+          ] ?? observedCumulativeDelta;
+        cumulativeComposedDelta += 1;
+        if (selected === undefined) {
+          throw new Error("A composed patch review delta is required.");
+        }
+        return {
+          ...selected,
+          paths: [...selected.paths],
+          diffBytes: Buffer.from(selected.diffBytes ?? selected.diff),
+          base: selected.base ?? "c".repeat(40),
+          head: selected.head ?? "b".repeat(40),
+          publicationEntries: [...(selected.publicationEntries ?? [])],
         };
       },
       dispose: async () => {},
@@ -803,6 +850,180 @@ describe("scan and patch workflow", () => {
 
     expect(outcome.exitCode, outcome.stderr).toBe(0);
     expect(assessedPaths).toEqual([[firstPath], [firstPath, thirdPath]]);
+  });
+
+  test("preserves cumulative risk assessment across an unchanged blocked finding", async () => {
+    const result = resultWithFindings(["high", "high", "high"]);
+    const firstPath = "src/finding-1.ts";
+    const thirdPath = "src/finding-3.ts";
+    const assessedPaths: string[][] = [];
+    let author = 0;
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--assess-patch-risk", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          { paths: [], diff: "" },
+          {
+            paths: [thirdPath],
+            diff: `diff --git a/${thirdPath} b/${thirdPath}\n`,
+          },
+          {
+            paths: [thirdPath],
+            diff: `diff --git a/${thirdPath} b/${thirdPath}\n`,
+          },
+        ],
+        cumulativePatchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath, thirdPath],
+            diff: [firstPath, thirdPath]
+              .map((path) => `diff --git a/${path} b/${path}\n`)
+              .join(""),
+          },
+        ],
+        onCodex: (_args, output) => {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_3"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
+            const prompt = output!.appServer!.prompt;
+            assessedPaths.push(patchRiskArtifact(prompt).patch.changedFiles);
+            output!.stdout.write(
+              JSON.stringify(approvedPatchRiskVerdict(prompt)),
+            );
+          } else {
+            const occurrenceId = `occ_${author + 1}`;
+            output!.stdout.write(
+              JSON.stringify({
+                patches: [
+                  author === 1
+                    ? {
+                        occurrenceId,
+                        status: "blocked",
+                        files: [],
+                        reason: "The synthetic dependency is unavailable.",
+                      }
+                    : {
+                        occurrenceId,
+                        status: "verified",
+                        files: [`src/finding-${author + 1}.ts`],
+                        verification: "The synthetic issue is fixed.",
+                      },
+                ],
+              }),
+            );
+            author += 1;
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(1);
+    expect(assessedPaths).toEqual([[firstPath], [firstPath, thirdPath]]);
+  });
+
+  test("excludes edits between findings from cumulative risk assessment", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    const firstPath = "src/finding-1.ts";
+    const secondPath = "src/finding-2.ts";
+    const unrelatedPath = "src/unrelated.ts";
+    const assessedPaths: string[][] = [];
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--assess-patch-risk", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        patchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [secondPath],
+            diff: `diff --git a/${secondPath} b/${secondPath}\n`,
+          },
+          {
+            paths: [secondPath],
+            diff: `diff --git a/${secondPath} b/${secondPath}\n`,
+          },
+        ],
+        cumulativePatchReviewDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath, unrelatedPath, secondPath],
+            diff: [firstPath, unrelatedPath, secondPath]
+              .map((path) => `diff --git a/${path} b/${path}\n`)
+              .join(""),
+          },
+        ],
+        cumulativePatchReviewComposedDeltas: [
+          {
+            paths: [firstPath],
+            diff: `diff --git a/${firstPath} b/${firstPath}\n`,
+          },
+          {
+            paths: [firstPath, secondPath],
+            diff: [firstPath, secondPath]
+              .map((path) => `diff --git a/${path} b/${path}\n`)
+              .join(""),
+          },
+        ],
+        onCodex: (args, output) => {
+          if (output!.command === "verify-fix") {
+            output!.stdout.write(
+              JSON.stringify({
+                results: ["occ_1", "occ_2"].map((id) => ({
+                  id,
+                  status: "fixed",
+                  evidence: "The complete synthetic patch preserves the fix.",
+                })),
+              }),
+            );
+          } else if (output!.appServer!.sandbox === "read-only") {
+            const prompt = output!.appServer!.prompt;
+            assessedPaths.push(patchRiskArtifact(prompt).patch.changedFiles);
+            output!.stdout.write(
+              JSON.stringify(approvedPatchRiskVerdict(prompt)),
+            );
+          } else {
+            completePatches(args, output);
+          }
+          return 0;
+        },
+      },
+    );
+
+    expect(outcome.exitCode, outcome.stderr).toBe(0);
+    expect(assessedPaths).toEqual([[firstPath], [firstPath, secondPath]]);
+    expect(assessedPaths.flat()).not.toContain(unrelatedPath);
   });
 
   test("reverifies all accepted findings after the final reviewed patch", async () => {

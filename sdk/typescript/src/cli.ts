@@ -1187,9 +1187,13 @@ interface SkillRunOptions extends PatchReviewOptions {
   onReviewRepository?: (repository: string) => void;
   onReviewCandidate?: (candidate: PatchReviewCandidateDelta) => void;
   reviewPublicationCandidate?: PatchReviewPublicationCandidate;
+  reviewCumulativeCandidate?: PatchReviewCumulativeCandidate;
   patchRiskSnapshot?: PatchReviewWorktreeSnapshot;
   onReviewPublicationCandidate?: (
     candidate: PatchReviewPublicationCandidate,
+  ) => void;
+  onReviewCumulativeCandidate?: (
+    candidate: PatchReviewCumulativeCandidate,
   ) => void;
   patchRiskArtifact?: PatchRiskReviewArtifactDescription;
   patchRiskContract?: PatchRiskReviewContract;
@@ -1245,6 +1249,13 @@ interface PatchReviewPublicationCandidate extends PatchReviewCandidateDelta {
   diffBytes: Buffer;
 }
 
+interface PatchReviewCumulativeCandidate extends PatchReviewCandidateDelta {
+  base: string;
+  head: string;
+  diffBytes: Buffer;
+  entries: PatchReviewTreeEntry[];
+}
+
 interface PatchRiskReviewArtifactDescription {
   path: string;
   patch: {
@@ -1278,6 +1289,10 @@ interface PatchReviewWorktreeSnapshot {
   ancestorInstructions?: readonly PatchReviewAncestorInstruction[];
   assertBaselineUnchanged?(): Promise<void>;
   candidate(): Promise<PatchReviewCandidateDelta>;
+  cumulativeCandidate?(
+    candidate: PatchReviewCandidateDelta,
+    previous?: PatchReviewCumulativeCandidate,
+  ): Promise<PatchReviewCumulativeCandidate>;
   publicationCandidate?(
     candidate: PatchReviewCandidateDelta,
     previous?: PatchReviewPublicationCandidate,
@@ -7506,6 +7521,10 @@ async function snapshotPatchReviewWorktree(
     ...objectEnvironment,
     GIT_INDEX_FILE: join(temporaryDirectory, "publication-index"),
   };
+  const cumulativeEnvironment = {
+    ...objectEnvironment,
+    GIT_INDEX_FILE: join(temporaryDirectory, "cumulative-index"),
+  };
   const stageWorktree = async (): Promise<void> => {
     await assertAncestorInstructionsUnchanged();
     await assertRepositoryGitMetadataUnchanged();
@@ -8505,6 +8524,152 @@ async function snapshotPatchReviewWorktree(
       ...(await pathsChangedFromHead(indexTree)),
       ...(await pathsChangedFromHead(normalizedBaseline.tree)),
     ]);
+    const composeCandidateTree = async (
+      baseTree: string,
+      compositionEnvironment: NodeJS.ProcessEnv,
+      candidatePaths: readonly string[],
+      previousPaths: readonly string[],
+      previousEntries: readonly PatchReviewTreeEntry[],
+      candidateEntries: readonly PatchReviewTreeEntry[],
+    ): Promise<{
+      paths: string[];
+      diff: string;
+      diffBytes: Buffer;
+      entries: PatchReviewTreeEntry[];
+      head: string;
+    }> => {
+      const cumulativePaths = [
+        ...new Set([...previousPaths, ...candidatePaths]),
+      ];
+      for (const path of cumulativePaths) {
+        await validatePatchReviewPath(repository, path);
+      }
+      const entries = new Map<string, PatchReviewTreeEntry>();
+      for (const entry of previousEntries) {
+        if (entry.mode !== undefined && entry.object !== undefined) {
+          entries.set(entry.path, entry);
+        }
+      }
+      const currentEntries = new Map(
+        candidateEntries.map((entry) => [entry.path, entry]),
+      );
+      for (const path of candidatePaths) {
+        const entry = currentEntries.get(path);
+        if (entry?.mode === undefined || entry.object === undefined) {
+          entries.delete(path);
+        } else {
+          entries.set(path, entry);
+        }
+      }
+
+      await runPatchReviewGit(repository, ["read-tree", baseTree], {
+        environment: compositionEnvironment,
+        signal,
+      });
+      if (cumulativePaths.length > 0) {
+        const pathspecs = Buffer.concat(
+          cumulativePaths.flatMap((path) => [
+            Buffer.from(path),
+            Buffer.from([0]),
+          ]),
+        );
+        await runPatchReviewGit(
+          repository,
+          ["update-index", "--force-remove", "-z", "--stdin"],
+          {
+            environment: compositionEnvironment,
+            input: pathspecs,
+            signal,
+          },
+        );
+        const indexInfo = cumulativePaths.flatMap((path) => {
+          const entry = entries.get(path);
+          return entry?.mode === undefined || entry.object === undefined
+            ? []
+            : [
+                Buffer.from(`${entry.mode} ${entry.object}\t`, "ascii"),
+                Buffer.from(path),
+                Buffer.from([0]),
+              ];
+        });
+        if (indexInfo.length > 0) {
+          await runPatchReviewGit(
+            repository,
+            ["update-index", "-z", "--index-info"],
+            {
+              environment: compositionEnvironment,
+              input: Buffer.concat(indexInfo),
+              signal,
+            },
+          );
+        }
+      }
+      const projectedHead = await runPatchReviewGit(
+        repository,
+        ["write-tree"],
+        { environment: compositionEnvironment, signal },
+      );
+      const names = await runPatchReviewGitBytes(
+        repository,
+        [
+          "--no-pager",
+          "diff",
+          "--no-color",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--no-renames",
+          "--name-only",
+          "-z",
+          "--relative",
+          baseTree,
+          projectedHead,
+          "--",
+          ".",
+        ],
+        { environment: compositionEnvironment, signal },
+      );
+      const paths = [
+        ...new Set(
+          splitNulRecords(names).map((path) => {
+            const decoded = decodePatchReviewGitPath(path);
+            if (decoded === undefined) {
+              throw new CodexSecurityError(
+                "Patch reviews cannot represent a changed path that is not UTF-8.",
+              );
+            }
+            return decoded;
+          }),
+        ),
+      ];
+      const diffBytes =
+        paths.length === 0
+          ? Buffer.alloc(0)
+          : await runPatchReviewGitBytes(
+              repository,
+              [
+                "--no-pager",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--binary",
+                "--relative",
+                baseTree,
+                projectedHead,
+                "--",
+                ".",
+              ],
+              { environment: compositionEnvironment, signal },
+            );
+      return {
+        paths,
+        diff: diffBytes.toString("utf8"),
+        diffBytes,
+        entries: selectedPatchReviewTreeEntries(paths, entries),
+        head: projectedHead,
+      };
+    };
     let disposed = false;
     return {
       directory: repository,
@@ -8631,6 +8796,48 @@ async function snapshotPatchReviewWorktree(
           head: candidateTree,
         };
       },
+      async cumulativeCandidate(candidate, previous) {
+        signal?.throwIfAborted();
+        if (disposed) {
+          throw new CodexSecurityError(
+            "The patch review snapshot is no longer available.",
+          );
+        }
+        if (previous !== undefined && previous.base !== baselineTree) {
+          throw new CodexSecurityError(
+            "The reviewed patches do not share one cumulative baseline.",
+          );
+        }
+        if (candidate.head === undefined) {
+          throw new CodexSecurityError(
+            "The reviewed patch has no candidate tree for cumulative assessment.",
+          );
+        }
+        await runPatchReviewGit(repository, ["read-tree", candidate.head], {
+          environment: cumulativeEnvironment,
+          signal,
+        });
+        const candidateEntries = parsePatchReviewIndexEntries(
+          await runPatchReviewGitBytes(
+            repository,
+            ["ls-files", "--stage", "-z", "--", "."],
+            { environment: cumulativeEnvironment, signal },
+          ),
+        );
+        const projected = await composeCandidateTree(
+          baselineTree,
+          cumulativeEnvironment,
+          candidate.paths,
+          previous?.paths ?? [],
+          previous?.entries ?? [],
+          selectedPatchReviewTreeEntries(candidate.paths, candidateEntries),
+        );
+        return {
+          ...projected,
+          entries: projected.entries,
+          base: baselineTree,
+        };
+      },
       async publicationCandidate(candidate, previous) {
         signal?.throwIfAborted();
         if (disposed) {
@@ -8648,131 +8855,26 @@ async function snapshotPatchReviewWorktree(
             "The reviewed patch has no candidate tree for publication.",
           );
         }
-
-        await runPatchReviewGit(
-          repository,
-          ["read-tree", publicationBaseTree],
-          { environment: publicationEnvironment, signal },
-        );
-        const cumulativePaths = [
-          ...new Set([...(previous?.paths ?? []), ...candidate.paths]),
-        ];
-        for (const path of cumulativePaths) {
-          await validatePatchReviewPath(repository, path);
-        }
-        if (cumulativePaths.length > 0) {
-          const normalizedCandidate =
-            await normalizedPublicationTree(cumulativePaths);
-          await runPatchReviewGit(
-            repository,
-            ["update-index", "--force-remove", "-z", "--stdin"],
-            {
-              environment: publicationEnvironment,
-              input: `${cumulativePaths.join("\0")}\0`,
-              signal,
-            },
+        if (candidate.publicationEntries === undefined) {
+          throw new CodexSecurityError(
+            "The reviewed patch has no normalized entries for publication.",
           );
-          const entries = selectedPatchReviewTreeEntries(
-            cumulativePaths,
-            normalizedCandidate.entries,
-          );
-          for (const entry of entries) {
-            await validatePatchReviewPath(repository, entry.path);
-            if (entry.mode === undefined || entry.object === undefined) {
-              continue;
-            }
-            await runPatchReviewGit(
-              repository,
-              [
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                entry.mode,
-                entry.object,
-                entry.path,
-              ],
-              { environment: publicationEnvironment, signal },
-            );
-          }
         }
-        const projectedHead = await runPatchReviewGit(
-          repository,
-          ["write-tree"],
-          { environment: publicationEnvironment, signal },
-        );
-        const names = await runPatchReviewGit(
-          repository,
-          [
-            "--no-pager",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--name-only",
-            "-z",
-            "--relative",
-            publicationBaseTree,
-            projectedHead,
-            "--",
-            ".",
-          ],
-          { environment: publicationEnvironment, signal, trim: false },
-        );
-        const parts = names.split("\0");
-        if (parts.at(-1) === "") parts.pop();
-        const paths = [...new Set(parts)];
-        const diffBytes =
-          paths.length === 0
-            ? Buffer.alloc(0)
-            : await runPatchReviewGitBytes(
-                repository,
-                [
-                  "--no-pager",
-                  "diff",
-                  "--no-color",
-                  "--no-ext-diff",
-                  "--no-textconv",
-                  "--no-renames",
-                  "--binary",
-                  "--relative",
-                  publicationBaseTree,
-                  projectedHead,
-                  "--",
-                  ".",
-                ],
-                { environment: publicationEnvironment, signal },
-              );
-        const publicationEntries = await Promise.all(
-          paths.map(async (path) =>
-            parsePatchReviewTreeEntry(
-              path,
-              await runPatchReviewGit(
-                repository,
-                [
-                  "ls-tree",
-                  "--full-tree",
-                  "-z",
-                  projectedHead,
-                  "--",
-                  `:(top,literal)${path}`,
-                ],
-                {
-                  environment: publicationEnvironment,
-                  signal,
-                  trim: false,
-                },
-              ),
-            ),
-          ),
+        const projected = await composeCandidateTree(
+          publicationBaseTree,
+          publicationEnvironment,
+          candidate.paths,
+          previous?.paths ?? [],
+          previous?.publicationEntries ?? [],
+          candidate.publicationEntries,
         );
         return {
-          paths,
-          diff: diffBytes.toString("utf8"),
-          diffBytes,
-          publicationEntries,
+          paths: projected.paths,
+          diff: projected.diff,
+          diffBytes: projected.diffBytes,
+          publicationEntries: projected.entries,
           base: publicationBaseTree,
-          head: projectedHead,
+          head: projected.head,
         };
       },
       async dispose() {
@@ -9079,6 +9181,7 @@ async function runFindingPatchesWithRiskSnapshot(
   const reviewPublicationBaseEntries = new Map<string, PatchReviewTreeEntry>();
   const reviewPublicationEntries = new Map<string, PatchReviewTreeEntry>();
   let reviewPublicationCandidate: PatchReviewPublicationCandidate | undefined;
+  let reviewCumulativeCandidate: PatchReviewCumulativeCandidate | undefined;
   let reviewBaseCommit: string | null | undefined;
   for (const finding of selected.findings) {
     const interruptedBeforeFinding = interruptedPatchExitCode(options.signal);
@@ -9110,6 +9213,7 @@ async function runFindingPatchesWithRiskSnapshot(
         {
           ...options,
           reviewPublicationCandidate,
+          reviewCumulativeCandidate,
           ...(patchRiskSnapshot === undefined ? {} : { patchRiskSnapshot }),
           ...(options.assessPatchRisk === true
             ? {
@@ -9191,6 +9295,9 @@ async function runFindingPatchesWithRiskSnapshot(
           onReviewPublicationCandidate: (candidate) => {
             reviewPublicationCandidate = candidate;
           },
+          onReviewCumulativeCandidate: (candidate) => {
+            reviewCumulativeCandidate = candidate;
+          },
           findingInstructions: instruction?.trim()
             ? { [finding.occurrenceId]: instruction }
             : undefined,
@@ -9265,9 +9372,6 @@ async function runFindingPatchesWithRiskSnapshot(
       if (instruction?.trim()) {
         acceptedPatchRiskInstructions[finding.occurrenceId] = instruction;
       }
-    }
-    if (patch.status !== "verified" && patch.status !== "no_change") {
-      patchRiskSnapshot = undefined;
     }
   }
   const verifiedPatchIds = new Set(
@@ -9434,6 +9538,7 @@ interface PatchReviewWorkflowContext {
   patchRiskSnapshot?: PatchReviewWorktreeSnapshot;
   candidate?: PatchReviewCandidateDelta;
   publicationCandidate?: PatchReviewPublicationCandidate;
+  cumulativeCandidate?: PatchReviewCumulativeCandidate;
 }
 
 async function captureSkillStage(
@@ -9615,6 +9720,7 @@ async function runIndependentPatchReview(
   let riskCandidate: PatchReviewCandidateDelta | undefined;
   let riskSnapshot: PatchReviewWorktreeSnapshot | undefined;
   let publicationCandidate: PatchReviewPublicationCandidate | undefined;
+  let cumulativeCandidate: PatchReviewCumulativeCandidate | undefined;
   if (stage === "patch-risk-assessment") {
     if (context.options.patchRiskContract === undefined) {
       return {
@@ -9630,7 +9736,50 @@ async function runIndependentPatchReview(
         reason: "patch-risk-assessment review has no observed candidate delta.",
       };
     }
-    if (context.options.createPr === true) {
+    riskSnapshot = context.patchRiskSnapshot ?? context.snapshot;
+    if (riskSnapshot !== context.snapshot) {
+      const observedCandidate = await riskSnapshot.candidate();
+      if (
+        candidate.head === undefined ||
+        candidate.head !== observedCandidate.head
+      ) {
+        return {
+          status: "failed",
+          exitCode: PATCH_REVIEW_EXIT_CODE.failure,
+          reason:
+            "patch-risk-assessment review cannot bind the current patch tree into the cumulative candidate.",
+        };
+      }
+      if (context.options.createPr === true) {
+        if (riskSnapshot.publicationCandidate === undefined) {
+          return {
+            status: "failed",
+            exitCode: PATCH_REVIEW_EXIT_CODE.failure,
+            reason:
+              "patch-risk-assessment review cannot project the cumulative patch tree.",
+          };
+        }
+        publicationCandidate = await riskSnapshot.publicationCandidate(
+          candidate,
+          context.options.reviewPublicationCandidate,
+        );
+        riskCandidate = publicationCandidate;
+      } else {
+        if (riskSnapshot.cumulativeCandidate === undefined) {
+          return {
+            status: "failed",
+            exitCode: PATCH_REVIEW_EXIT_CODE.failure,
+            reason:
+              "patch-risk-assessment review cannot compose accepted patch deltas.",
+          };
+        }
+        cumulativeCandidate = await riskSnapshot.cumulativeCandidate(
+          candidate,
+          context.options.reviewCumulativeCandidate,
+        );
+        riskCandidate = cumulativeCandidate;
+      }
+    } else if (context.options.createPr === true) {
       if (context.snapshot.publicationCandidate === undefined) {
         return {
           status: "failed",
@@ -9643,25 +9792,9 @@ async function runIndependentPatchReview(
         candidate,
         context.options.reviewPublicationCandidate,
       );
-    }
-    riskSnapshot = context.patchRiskSnapshot ?? context.snapshot;
-    riskCandidate =
-      context.options.createPr === true
-        ? publicationCandidate!
-        : riskSnapshot === context.snapshot
-          ? candidate
-          : await riskSnapshot.candidate();
-    if (
-      context.options.createPr !== true &&
-      riskSnapshot !== context.snapshot &&
-      (candidate.head === undefined || candidate.head !== riskCandidate.head)
-    ) {
-      return {
-        status: "failed",
-        exitCode: PATCH_REVIEW_EXIT_CODE.failure,
-        reason:
-          "patch-risk-assessment review cannot bind the current patch tree into the cumulative candidate.",
-      };
+      riskCandidate = publicationCandidate;
+    } else {
+      riskCandidate = candidate;
     }
     artifact = await createPatchRiskReviewArtifact(
       riskSnapshot,
@@ -9759,6 +9892,7 @@ async function runIndependentPatchReview(
       };
     }
     context.publicationCandidate = publicationCandidate;
+    context.cumulativeCandidate = cumulativeCandidate;
   }
 
   context.stderr.write(
@@ -10019,6 +10153,9 @@ async function runPatchReviewWorkflow(
     context.options.onReviewPublicationCandidate?.(
       context.publicationCandidate,
     );
+  }
+  if (context.cumulativeCandidate !== undefined) {
+    context.options.onReviewCumulativeCandidate?.(context.cumulativeCandidate);
   }
   stdout.write(
     subject.response === undefined
