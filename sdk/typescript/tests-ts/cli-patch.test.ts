@@ -981,12 +981,17 @@ describe("scan and patch workflow", () => {
         'model_instructions_file = "baseline.md"\n',
       );
       await writeFile(join(repository, "baseline.md"), "Baseline guidance.\n");
+      await writeFile(join(repository, ".gitignore"), "AGENTS.md\n");
+      await writeFile(
+        join(repository, "AGENTS.md"),
+        "Local ignored instruction.\n",
+      );
       await writeFile(join(repository, "src", "value.ts"), "unsafe\n");
       git("add", "--", ".");
       git("commit", "-m", "Initial synthetic checkout");
 
       const outcome = await runWorkflow(
-        ["patch", "Synthetic security issue", "--review-minimality"],
+        ["patch", "Synthetic security issue", "--review-style"],
         {
           currentDirectory: repository,
           onCodex: async (_args, output) => {
@@ -1076,6 +1081,15 @@ describe("scan and patch workflow", () => {
                   arguments: { query: "Baseline guidance.", path: "." },
                 },
               },
+              {
+                jsonrpc: "2.0",
+                id: 8,
+                method: "tools/call",
+                params: {
+                  name: "read_file",
+                  arguments: { path: "AGENTS.md" },
+                },
+              },
             ];
             const execution = spawnSync(
               process.execPath,
@@ -1124,6 +1138,10 @@ describe("scan and patch workflow", () => {
               responses.find((response) => response.id === 7).result.content[0]
                 .text,
             ).toContain("baseline.md:1:Baseline guidance.");
+            expect(
+              responses.find((response) => response.id === 8).result.content[0]
+                .text,
+            ).toBe("Local ignored instruction.\n");
             inspected = true;
             output!.stdout.write(
               JSON.stringify({ status: "approved", findings: [] }),
