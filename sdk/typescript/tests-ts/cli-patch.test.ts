@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import type { Finding, JsonObject, SeverityLevel } from "../src/index.js";
 import { main } from "../src/cli.js";
 import { capture, dependencies, fakeResult } from "./cli-fixtures.js";
@@ -382,25 +383,27 @@ describe("scan and patch workflow", () => {
       let failOnce = true;
       let publishedUrl = "";
       await mkdir(join(repository, "src"), { recursive: true });
-      const git = (...args: string[]) =>
-        execFileSync("git", args, {
+      const executeFile = promisify(execFile);
+      const git = async (...args: string[]) => {
+        const { stdout } = await executeFile("git", args, {
           cwd: repository,
           encoding: "utf8",
-          stdio: ["ignore", "pipe", "pipe"],
-        }).trim();
+        });
+        return stdout.trim();
+      };
 
       try {
-        git("init", "--initial-branch=main");
-        git("config", "user.name", "Synthetic User");
-        git("config", "user.email", "synthetic@example.test");
-        git("config", "commit.gpgsign", "false");
+        await git("init", "--initial-branch=main");
+        await git("config", "user.name", "Synthetic User");
+        await git("config", "user.email", "synthetic@example.test");
+        await git("config", "commit.gpgsign", "false");
         await writeFile(join(repository, "src", "finding-1.ts"), "unsafe\n");
         await writeFile(join(repository, "unrelated.ts"), "original\n");
-        git("add", ".");
-        git("commit", "-m", "Initial synthetic checkout");
-        git("init", "--bare", remote);
-        git("remote", "add", "origin", remote);
-        git("push", "--set-upstream", "origin", "main");
+        await git("add", ".");
+        await git("commit", "-m", "Initial synthetic checkout");
+        await git("init", "--bare", remote);
+        await git("remote", "add", "origin", remote);
+        await git("push", "--set-upstream", "origin", "main");
 
         const fixtures: Parameters<typeof dependencies>[0] = {
           currentDirectory: repository,
@@ -446,12 +449,16 @@ describe("scan and patch workflow", () => {
         );
         expect(first.exitCode).toBe(2);
         expect(first.stderr).toContain(`patch --resume-pr ${branch}`);
-        const commit = git("rev-parse", "HEAD");
+        const commit = await git("rev-parse", "HEAD");
         expect(
-          git("config", "--get", `branch.${branch}.codexSecurityPatchCommit`),
+          await git(
+            "config",
+            "--get",
+            `branch.${branch}.codexSecurityPatchCommit`,
+          ),
         ).toBe(commit);
         if (failure === "create") {
-          expect(git("rev-parse", `origin/${branch}`)).toBe(commit);
+          expect(await git("rev-parse", `origin/${branch}`)).toBe(commit);
         }
         await writeFile(join(repository, "unrelated.ts"), "later local work\n");
 
@@ -465,9 +472,9 @@ describe("scan and patch workflow", () => {
         });
         expect(modelCalls).toBe(1);
         expect(created).toBe(1);
-        expect(git("rev-parse", "HEAD")).toBe(commit);
-        expect(git("rev-parse", `origin/${branch}`)).toBe(commit);
-        expect(git("diff", "--name-only")).toBe("unrelated.ts");
+        expect(await git("rev-parse", "HEAD")).toBe(commit);
+        expect(await git("rev-parse", `origin/${branch}`)).toBe(commit);
+        expect(await git("diff", "--name-only")).toBe("unrelated.ts");
 
         const pushes = pushCalls;
         const repeated = await runWorkflow(

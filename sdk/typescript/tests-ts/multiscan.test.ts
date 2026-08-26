@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import {
   access,
   appendFile,
@@ -19,6 +19,7 @@ import * as filesystem from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { main } from "../src/cli.js";
 import { ScanCostLimitExceededError } from "../src/errors.js";
@@ -33,6 +34,7 @@ type SecurityClient = ReturnType<MultiscanOptions["createSecurity"]>;
 
 const temporaryDirectories: string[] = [];
 const testPosix = process.platform === "win32" ? test.skip : test;
+const executeFile = promisify(execFile);
 
 afterEach(async () => {
   await Promise.all(
@@ -58,11 +60,11 @@ async function fixture(): Promise<{
   };
 }
 
-function git(repository: string, ...args: string[]): string {
-  return execFileSync("git", ["-C", repository, ...args], {
+async function git(repository: string, ...args: string[]): Promise<string> {
+  const { stdout } = await executeFile("git", ["-C", repository, ...args], {
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+  });
+  return stdout.trim();
 }
 
 async function repository(
@@ -75,9 +77,9 @@ async function repository(
     join(path, "src", "app.ts"),
     `export const name = "${name}";\n`,
   );
-  git(path, "init", "-q");
-  git(path, "add", ".");
-  git(
+  await git(path, "init", "-q");
+  await git(path, "add", ".");
+  await git(
     path,
     "-c",
     "user.name=Multiscan Test",
@@ -87,7 +89,7 @@ async function repository(
     "-qm",
     "initial",
   );
-  return { path, revision: git(path, "rev-parse", "HEAD") };
+  return { path, revision: await git(path, "rev-parse", "HEAD") };
 }
 
 async function completedScan(
@@ -867,8 +869,8 @@ describe("multiscan", () => {
       join(source.path, "src", "app.ts"),
       "export const changed = true;\n",
     );
-    git(source.path, "add", ".");
-    git(
+    await git(source.path, "add", ".");
+    await git(
       source.path,
       "-c",
       "user.name=Multiscan Test",
@@ -891,7 +893,7 @@ describe("multiscan", () => {
         client(
           async (path, scanOptions = {}) => {
             checkout = path;
-            expect(git(path, "rev-parse", "HEAD")).toBe(source.revision);
+            expect(await git(path, "rev-parse", "HEAD")).toBe(source.revision);
             expect(
               await readFile(join(path, "src", "app.ts"), "utf8"),
             ).toContain('name = "payments"');
