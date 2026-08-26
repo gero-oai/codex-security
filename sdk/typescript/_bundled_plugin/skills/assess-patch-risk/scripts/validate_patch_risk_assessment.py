@@ -281,6 +281,8 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("hold_for_evidence requires a bounded evidence plan")
         if value["regressionLikelihood"]["rating"] == "critical":
             errors.append("hold_for_evidence cannot have critical regression likelihood")
+        if any(item["status"] == "failed" for item in value["validation"]):
+            errors.append("hold_for_evidence cannot include failed validation")
         if any(item["result"] == "contradicted" for item in boundaries):
             errors.append("hold_for_evidence cannot retain a contradicted material boundary")
         for index, item in enumerate(evidence_plan):

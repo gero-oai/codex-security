@@ -454,6 +454,16 @@ describe("patch risk assessment contract", () => {
     );
 
     payload.materialBoundaries[0]!.result = "unresolved";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    const failedValidation = await validate(payload);
+    expect(failedValidation.status).not.toBe(0);
+    expect(failedValidation.stderr).toContain(
+      "hold_for_evidence cannot include failed validation",
+    );
+
+    payload.validation[0]!.status = "unavailable";
     const unresolved = await validate(payload);
     expect(unresolved.status, unresolved.stderr).toBe(0);
   });
