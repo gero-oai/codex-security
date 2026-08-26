@@ -3177,6 +3177,7 @@ describe("scan and patch workflow", () => {
     "hook",
     "index lock",
     "merge state",
+    "rerere state",
     "sparse checkout",
   ] as const)(
     "fails closed when the author changes top-level Git %s",
@@ -3203,6 +3204,18 @@ describe("scan and patch workflow", () => {
           await writeFile(
             join(repository, ".git", "info", "sparse-checkout"),
             "/*\n",
+          );
+        } else if (kind === "rerere state") {
+          await mkdir(join(repository, ".git", "rr-cache", "synthetic"), {
+            recursive: true,
+          });
+          await writeFile(
+            join(repository, ".git", "MERGE_RR"),
+            "synthetic\tvalue.ts\0",
+          );
+          await writeFile(
+            join(repository, ".git", "rr-cache", "synthetic", "preimage"),
+            "synthetic conflict\n",
           );
         }
 
@@ -3234,6 +3247,11 @@ describe("scan and patch workflow", () => {
                     join(repository, ".git", "MERGE_HEAD"),
                     `${"a".repeat(40)}\n`,
                   );
+                } else if (kind === "rerere state") {
+                  await rm(join(repository, ".git", "MERGE_RR"));
+                  await rm(join(repository, ".git", "rr-cache", "synthetic"), {
+                    recursive: true,
+                  });
                 } else if (kind === "sparse checkout") {
                   await writeFile(
                     join(repository, ".git", "info", "sparse-checkout"),
@@ -5855,6 +5873,52 @@ describe("scan and patch workflow", () => {
             currentDirectory: repository,
             onCodex: async (_args, output) => {
               if (output!.appServer!.sandbox === "read-only") {
+                const view = output!.appServer!.reviewRepository!;
+                const runView = (message: object) =>
+                  spawnSync(
+                    process.execPath,
+                    [
+                      "--input-type=module",
+                      "--eval",
+                      view.runtimeSource,
+                      view.gitExecutable,
+                      view.repository,
+                      view.tree,
+                      view.objectDirectory,
+                    ],
+                    {
+                      encoding: "utf8",
+                      input: `${JSON.stringify(message)}\n`,
+                      timeout: 30_000,
+                    },
+                  );
+                const listing = runView({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  method: "tools/call",
+                  params: { name: "list_directory", arguments: {} },
+                });
+                expect(listing.status, listing.stderr).toBe(0);
+                const entries = JSON.parse(
+                  JSON.parse(listing.stdout).result.content[0].text,
+                ) as Array<{ path: string }>;
+                const encodedPath = entries.find(({ path }) =>
+                  path.startsWith("$git-path-base64:"),
+                )?.path;
+                expect(encodedPath).toBeDefined();
+                const read = runView({
+                  jsonrpc: "2.0",
+                  id: 2,
+                  method: "tools/call",
+                  params: {
+                    name: "read_file",
+                    arguments: { path: encodedPath },
+                  },
+                });
+                expect(read.status, read.stderr).toBe(0);
+                expect(JSON.parse(read.stdout).result.content[0].text).toBe(
+                  "preserve\n",
+                );
                 const lines = output!.appServer!.prompt.split("\n");
                 const marker = lines.findIndex((line) =>
                   line.startsWith("Review scope is exactly"),
