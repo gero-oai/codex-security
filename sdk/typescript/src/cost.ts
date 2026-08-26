@@ -1,44 +1,32 @@
 import { open, readdir, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { join } from "node:path";
+import {
+  estimateScanCost,
+  tokenUsage,
+  type ScanCost,
+  type ScanTokenUsage,
+} from "./cost-model.js";
 import {
   scanActivityFromSessionEvent,
   type ScanActivity,
 } from "./scan-activity.js";
 import {
+  isScanArtifactDirectory,
+  sessionParentThreadId,
+  sessionStartedAt,
+} from "./scan-sessions.js";
+import {
   scanProgressUpdatesFromEvent,
   type ScanProgress,
 } from "./worker-progress.js";
 
-export interface ScanCost {
-  model: string;
-  inputTokens: number;
-  cachedInputTokens: number;
-  cacheWriteInputTokens: number;
-  outputTokens: number;
-  estimatedUsd: number;
-}
+export { estimateScanCost, formatUsd, type ScanCost } from "./cost-model.js";
 
 export interface ScanSessionEvent {
   threadId: string;
   parentThreadId: string | null;
   worker?: number;
   event: Record<string, unknown>;
-}
-
-type ModelPricing = readonly [
-  input: number,
-  cachedInput: number,
-  cacheWriteInput: number,
-  output: number,
-];
-
-interface ScanTokenUsage {
-  input_tokens: number;
-  cached_input_tokens: number;
-  cache_write_input_tokens: number;
-  output_tokens: number;
-  reasoning_output_tokens: number;
-  total_tokens: number;
 }
 
 interface SessionReasoning {
@@ -107,14 +95,6 @@ interface ObservedSessionUsage {
   unidentifiedSessions: Set<string>;
   accountedSessions: Set<string>;
 }
-
-const MODEL_PRICING_NANODOLLARS: Readonly<Record<string, ModelPricing>> = {
-  "gpt-5.6": [5_000, 500, 6_250, 30_000],
-  "gpt-5.6-sol": [5_000, 500, 6_250, 30_000],
-  "gpt-5.6-terra": [2_000, 200, 2_500, 12_000],
-  "gpt-5.6-luna": [200, 20, 250, 1_200],
-};
-
 const COST_POLL_INTERVAL_MS = 100;
 const SESSION_READ_SIZE = 64 * 1_024;
 
@@ -398,12 +378,6 @@ export class ScanCostTracker {
         [...this.#sessions.values()].find(
           (session) => session.threadId === rootThreadId,
         )?.startedAt ?? null;
-      const artifactsDirectory = join(this.#options.scanDirectory, "artifacts");
-      const workersDirectory = join(
-        artifactsDirectory,
-        "deep_discovery",
-        "workers",
-      );
       for (const session of this.#sessions.values()) {
         if (
           session.threadId === null ||
@@ -412,22 +386,11 @@ export class ScanCostTracker {
         ) {
           continue;
         }
-        const workerDirectory = relative(
-          workersDirectory,
-          session.workingDirectory,
-        );
-        const components = workerDirectory.split(sep);
-        const isWorkerDirectory =
-          !isAbsolute(workerDirectory) &&
-          components.length === 2 &&
-          components[0] !== ".." &&
-          relative(
-            join(workersDirectory, components[0]!, "output"),
-            session.workingDirectory,
-          ) === "";
         if (
-          relative(artifactsDirectory, session.workingDirectory) !== "" &&
-          !isWorkerDirectory
+          !isScanArtifactDirectory(
+            this.#options.scanDirectory,
+            session.workingDirectory,
+          )
         ) {
           continue;
         }
@@ -835,25 +798,8 @@ function readSessionEvent(
     if (typeof payload["cwd"] === "string") {
       session.workingDirectory = payload["cwd"];
     }
-    if (typeof payload["timestamp"] === "string") {
-      const startedAt = Date.parse(payload["timestamp"]);
-      session.startedAt = Number.isFinite(startedAt)
-        ? Math.floor(startedAt / 1_000)
-        : null;
-    }
-    const source = payload["source"];
-    const subagent = isRecord(source) ? source["subagent"] : undefined;
-    const spawn = isRecord(subagent) ? subagent["thread_spawn"] : undefined;
-    for (const parent of [
-      isRecord(spawn) ? spawn["parent_thread_id"] : undefined,
-      payload["parent_thread_id"],
-      payload["forked_from_id"],
-    ]) {
-      if (typeof parent === "string" && parent.length > 0) {
-        session.parentThreadId = parent;
-        break;
-      }
-    }
+    session.startedAt = sessionStartedAt(payload["timestamp"]);
+    session.parentThreadId = sessionParentThreadId(payload);
     const forkedFrom = payload["forked_from_id"];
     session.replaying = typeof forkedFrom === "string" && forkedFrom.length > 0;
     session.events?.push(event);
@@ -875,7 +821,7 @@ function readSessionEvent(
         threadOrder === null
           ? typeof payload["started_at"] === "number" &&
             session.startedAt !== null &&
-            payload["started_at"] >= session.startedAt
+            payload["started_at"] >= Math.floor(session.startedAt / 1_000)
           : turnOrder !== null && turnOrder >= threadOrder;
       if (owned) {
         session.replaying = false;
@@ -1205,44 +1151,6 @@ function sessionContentText(
     .join("\n");
 }
 
-function tokenUsage(value: unknown): ScanTokenUsage | null {
-  if (!isRecord(value)) return null;
-  const input = value["input_tokens"];
-  const cached = value["cached_input_tokens"] ?? 0;
-  const canonicalCacheWrite = value["cache_write_input_tokens"];
-  const legacyCacheWrite = value["cache_write_tokens"];
-  const cacheWrite =
-    canonicalCacheWrite === 0 &&
-    isTokenCount(input) &&
-    isTokenCount(cached) &&
-    isTokenCount(legacyCacheWrite) &&
-    legacyCacheWrite > 0 &&
-    cached + legacyCacheWrite <= input
-      ? legacyCacheWrite
-      : canonicalCacheWrite ?? legacyCacheWrite ?? 0;
-  const output = value["output_tokens"];
-  const reasoning = value["reasoning_output_tokens"] ?? 0;
-  if (
-    !isTokenCount(input) ||
-    !isTokenCount(cached) ||
-    !isTokenCount(cacheWrite) ||
-    !isTokenCount(output) ||
-    !isTokenCount(reasoning) ||
-    cached + cacheWrite > input ||
-    reasoning > output
-  ) {
-    return null;
-  }
-  return {
-    input_tokens: input,
-    cached_input_tokens: cached,
-    cache_write_input_tokens: cacheWrite,
-    output_tokens: output,
-    reasoning_output_tokens: reasoning,
-    total_tokens: input + output,
-  };
-}
-
 function higherCostUsage(
   model: string,
   previous: ScanTokenUsage | null,
@@ -1319,7 +1227,6 @@ function accumulateTokenUsage(
     ? null
     : tokenUsage(usage);
 }
-
 function addTokenUsage(
   previous: ScanTokenUsage | null,
   next: ScanTokenUsage,
@@ -1336,6 +1243,13 @@ function addTokenUsage(
       previous.reasoning_output_tokens + next.reasoning_output_tokens,
     total_tokens: previous.total_tokens + next.total_tokens,
   };
+}
+
+/** @internal Sum complete turn receipts when session usage is unavailable. */
+export function sumTokenUsage(first: unknown, second: unknown): unknown {
+  const left = tokenUsage(first);
+  const right = tokenUsage(second);
+  return left === null || right === null ? null : addTokenUsage(left, right);
 }
 
 function subtractTokenUsage(
@@ -1366,53 +1280,4 @@ function isSessionAccessDenied(error: unknown): boolean {
   return (
     isRecord(error) && (error["code"] === "EACCES" || error["code"] === "EPERM")
   );
-}
-
-export function estimateScanCost(
-  model: string | undefined,
-  usage: unknown,
-): ScanCost | null {
-  if (model === undefined) return null;
-  const pricingModel = model.startsWith("openai.")
-    ? model.slice("openai.".length)
-    : model;
-  const pricing = MODEL_PRICING_NANODOLLARS[pricingModel];
-  const normalized = tokenUsage(usage);
-  if (pricing === undefined || normalized === null) return null;
-  const [inputRate, cachedInputRate, cacheWriteInputRate, outputRate] = pricing;
-  const {
-    input_tokens: inputTokens,
-    cached_input_tokens: cachedInputTokens,
-    cache_write_input_tokens: cacheWriteInputTokens,
-    output_tokens: outputTokens,
-  } = normalized;
-
-  const nanodollars =
-    (inputTokens - cachedInputTokens - cacheWriteInputTokens) * inputRate +
-    cachedInputTokens * cachedInputRate +
-    cacheWriteInputTokens * cacheWriteInputRate +
-    outputTokens * outputRate;
-  if (!Number.isSafeInteger(nanodollars)) return null;
-
-  return {
-    model,
-    inputTokens,
-    cachedInputTokens,
-    cacheWriteInputTokens,
-    outputTokens,
-    estimatedUsd: nanodollars / 1_000_000_000,
-  };
-}
-
-export function formatUsd(value: number): string {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 9,
-  }).format(value);
-}
-
-function isTokenCount(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
