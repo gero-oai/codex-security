@@ -69,7 +69,8 @@ a strict NodeNext TypeScript consumer and the actual installed CLI. Failed
 tests block CI; a failed diagnostic upload does not.
 
 `scripts/run-ci-tests.mjs` discovers the test files and balances them using
-rounded timings in `scripts/test-shards.mjs`. Unix jobs run four processes;
+rounded timings in `scripts/test-shards.mjs`. Unix estimates average measured
+Linux and macOS file timings. Unix jobs run four processes;
 Windows runs seven separate jobs with `node scripts/run-ci-tests.mjs 1/7`
 (substitute the shard number), each using up to two Bun processes with separate
 reports such as `junit-1-1.xml` and `junit-1-2.xml`. Each file runs once. New files
@@ -84,8 +85,10 @@ failures do not suppress installation failures. Unix keeps its pinned pnpm
 setup action. Windows package inspection enables npm's native phase timings to
 diagnose installation delays without changing its failure or timeout behavior.
 It also logs npm cache/fetch activity and uses a 16-thread libuv pool for
-filesystem-heavy package extraction. These settings apply only to Windows
-package inspection; the fresh consumer install and its assertions are unchanged.
+filesystem-heavy package extraction. Its `TEMP` and `TMP` point to the runner's
+job temporary directory, keeping the fresh npm consumer outside the checkout.
+These settings apply only to Windows package inspection; the install arguments,
+assertions, and timeouts are unchanged.
 
 When forwarding `--test-name-pattern` to a sharded run, also pass Bun's
 `--pass-with-no-tests` if some workers may have no matching tests. Normal CI

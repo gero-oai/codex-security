@@ -356,6 +356,8 @@ jobs:
         working-directory: sdk/typescript
         shell: bash
         env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
           npm_config_timing: "true"
           npm_config_loglevel: http
           UV_THREADPOOL_SIZE: "16"
