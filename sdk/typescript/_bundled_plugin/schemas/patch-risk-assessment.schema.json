@@ -188,8 +188,9 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["summary", "decisionCritical"],
+        "required": ["id", "summary", "decisionCritical"],
         "properties": {
+          "id": { "$ref": "#/$defs/identifier" },
           "summary": { "$ref": "#/$defs/nonEmptyString" },
           "decisionCritical": { "type": "boolean" }
         }
@@ -200,10 +201,14 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["question", "action", "outcomes"],
+        "required": ["question", "action", "resolvesUnknowns", "outcomes"],
         "properties": {
           "question": { "$ref": "#/$defs/nonEmptyString" },
           "action": { "$ref": "#/$defs/nonEmptyString" },
+          "resolvesUnknowns": {
+            "$ref": "#/$defs/stringList",
+            "minItems": 1
+          },
           "resolvesFailedValidation": { "$ref": "#/$defs/stringList" },
           "outcomes": {
             "type": "object",

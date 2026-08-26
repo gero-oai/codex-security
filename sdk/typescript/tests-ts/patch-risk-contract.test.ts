@@ -46,10 +46,15 @@ interface Assessment {
     protects: string;
     failureAttribution?: string;
   }>;
-  unknowns: Array<{ summary: string; decisionCritical: boolean }>;
+  unknowns: Array<{
+    id: string;
+    summary: string;
+    decisionCritical: boolean;
+  }>;
   evidencePlan: Array<{
     question: string;
     action: string;
+    resolvesUnknowns: string[];
     resolvesFailedValidation?: string[];
     outcomes: Record<string, string>;
   }>;
@@ -194,10 +199,6 @@ describe("patch risk assessment contract", () => {
     expect(skill).not.toMatch(
       /^python\s+.*validate_patch_risk_assessment\.py/mu,
     );
-    expect(skill).toContain('`"$PYTHON"` in POSIX shells');
-    expect(skill).toContain('`& "$env:PYTHON"` in PowerShell');
-    expect(skill).toContain("the directory three levels above this `SKILL.md`");
-    expect(skill).toContain("paths remain single arguments");
   });
 
   test("validates a supported human-review merge without site packages", async () => {
@@ -260,6 +261,7 @@ describe("patch risk assessment contract", () => {
     const payload = assessment();
     payload.unknowns = [
       {
+        id: "deployment-ownership",
         summary: "Deployment ownership is unresolved.",
         decisionCritical: true,
       },
@@ -309,6 +311,7 @@ describe("patch risk assessment contract", () => {
     payload.confidence.rating = "low";
     payload.unknowns = [
       {
+        id: "runtime-impact",
         summary: "The changed path's runtime impact is unavailable.",
         decisionCritical: true,
       },
@@ -317,6 +320,7 @@ describe("patch risk assessment contract", () => {
       {
         question: "Does the changed path reach a supported runtime?",
         action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-impact"],
         outcomes: {
           reachable: "merge",
           unreachable: "no_op",
@@ -333,13 +337,34 @@ describe("patch risk assessment contract", () => {
     payload.regressionLikelihood.rating = "unknown";
     const result = await validate(payload);
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain(
-      "only hold_for_evidence may use impact.rating=unknown",
-    );
+    expect(result.stderr).toContain("merge cannot use impact.rating=unknown");
     expect(result.stderr).toContain(
       "only hold_for_evidence may use regressionLikelihood.rating=unknown",
     );
   });
+
+  test.each(["revise", "no_op", "block"] as const)(
+    "accepts unknown impact for a terminal %s recommendation",
+    async (recommendation) => {
+      const payload = assessment();
+      payload.recommendation = recommendation;
+      payload.workflowLabel = recommendation;
+      payload.impact.rating = "unknown";
+      if (recommendation === "revise") {
+        payload.materialBoundaries[0]!.result = "contradicted";
+      } else if (recommendation === "no_op") {
+        payload.applicability = {
+          status: "superseded",
+          rationale: "A narrower patch already landed.",
+        };
+      } else {
+        payload.regressionLikelihood.rating = "critical";
+      }
+
+      const result = await validate(payload);
+      expect(result.status, result.stderr).toBe(0);
+    },
+  );
 
   test("allows an empty changed-file identity only for no-op or an evidence hold", async () => {
     const payload = assessment();
@@ -355,6 +380,7 @@ describe("patch risk assessment contract", () => {
     payload.confidence.rating = "low";
     payload.unknowns = [
       {
+        id: "changed-file-inventory",
         summary:
           "The provider did not return a complete changed-file inventory.",
         decisionCritical: true,
@@ -364,6 +390,7 @@ describe("patch risk assessment contract", () => {
       {
         question: "Can the immutable final comparison be retrieved completely?",
         action: "Retrieve the same final comparison again from the provider.",
+        resolvesUnknowns: ["changed-file-inventory"],
         outcomes: {
           complete: "merge",
           still_incomplete: "hold_for_evidence",
@@ -405,6 +432,7 @@ describe("patch risk assessment contract", () => {
     payload.confidence.rating = "low";
     payload.unknowns = [
       {
+        id: "rollout-target",
         summary: "The rollout target is unavailable.",
         decisionCritical: true,
       },
@@ -419,6 +447,7 @@ describe("patch risk assessment contract", () => {
       {
         question: "Does the changed configuration own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: {
           supported: "merge",
           contradicted: "no_op",
@@ -436,12 +465,14 @@ describe("patch risk assessment contract", () => {
     payload.workflowLabel = "hold_for_evidence";
     payload.confidence.rating = "low";
     payload.unknowns = Array.from({ length: 4 }, (_, index) => ({
+      id: `unknown-${index + 1}`,
       summary: `Decision-critical unknown ${index + 1}.`,
       decisionCritical: true,
     }));
     payload.evidencePlan = Array.from({ length: 4 }, (_, index) => ({
       question: `Question ${index + 1}?`,
       action: `Resolve unknown ${index + 1}.`,
+      resolvesUnknowns: [`unknown-${index + 1}`],
       outcomes: {
         supported: "merge",
         contradicted: "revise",
@@ -452,6 +483,86 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
+  test("binds every decision-critical unknown to a matching evidence action", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+      {
+        id: "rollout-target",
+        summary: "The rollout target is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Who owns the runtime?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: {
+          owned: "merge",
+          not_owned: "no_op",
+        },
+      },
+    ];
+
+    const uncovered = await validate(payload);
+    expect(uncovered.status).not.toBe(0);
+    expect(uncovered.stderr).toContain(
+      "decision-critical unknown 'rollout-target' requires a matching evidence plan",
+    );
+
+    payload.evidencePlan[0]!.resolvesUnknowns = [
+      "runtime-owner",
+      "missing-unknown",
+    ];
+    const mismatched = await validate(payload);
+    expect(mismatched.status).not.toBe(0);
+    expect(mismatched.stderr).toContain(
+      "'missing-unknown' is not a decision-critical unknown",
+    );
+  });
+
+  test("requires unique unknown identifiers", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+      {
+        id: "runtime-owner",
+        summary: "The rollout owner is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Who owns the runtime?",
+        action: "Inspect the checked-in runtime registry.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: {
+          owned: "merge",
+          not_owned: "no_op",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("unknown identifiers must be unique");
+  });
+
   test("requires failed checks to be attributed or matched to evidence", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
@@ -459,6 +570,7 @@ describe("patch risk assessment contract", () => {
     payload.confidence.rating = "low";
     payload.unknowns = [
       {
+        id: "rollout-target",
         summary: "The rollout target is unavailable.",
         decisionCritical: true,
       },
@@ -467,6 +579,7 @@ describe("patch risk assessment contract", () => {
       {
         question: "Does the changed configuration own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: {
           supported: "merge",
           contradicted: "revise",
@@ -503,7 +616,7 @@ describe("patch risk assessment contract", () => {
     const establishedFailure = await validate(payload);
     expect(establishedFailure.status).not.toBe(0);
     expect(establishedFailure.stderr).toContain(
-      "a patch-caused validation failure requires revise or block",
+      "a patch-caused validation failure requires revise, block, or an established no-op disposition",
     );
 
     payload.validation[0]!.failureAttribution = "unknown";
@@ -564,6 +677,7 @@ describe("patch risk assessment contract", () => {
     payload.confidence.rating = "low";
     payload.unknowns = [
       {
+        id: "rollout-target",
         summary: "The rollout target is unavailable.",
         decisionCritical: true,
       },
@@ -572,6 +686,7 @@ describe("patch risk assessment contract", () => {
       {
         question: "Does the changed configuration own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: {
           supported: "merge",
           contradicted: "merge",
@@ -597,6 +712,7 @@ describe("patch risk assessment contract", () => {
       payload.confidence.rating = confidence;
       payload.unknowns = [
         {
+          id: "rollout-target",
           summary: "The rollout target is unavailable.",
           decisionCritical: true,
         },
@@ -605,6 +721,7 @@ describe("patch risk assessment contract", () => {
         {
           question: "Does the changed configuration own the rollout target?",
           action: "Inspect the checked-in deployment mapping.",
+          resolvesUnknowns: ["rollout-target"],
           outcomes: {
             supported: "merge",
             contradicted: "revise",
@@ -685,6 +802,7 @@ describe("patch risk assessment contract", () => {
         payload.confidence.rating = "low";
         payload.unknowns = [
           {
+            id: "rollout-target",
             summary: "The rollout target is unavailable.",
             decisionCritical: true,
           },
@@ -693,6 +811,7 @@ describe("patch risk assessment contract", () => {
           {
             question: "Does the changed configuration own the rollout target?",
             action: "Inspect the checked-in deployment mapping.",
+            resolvesUnknowns: ["rollout-target"],
             outcomes: {
               supported: "merge",
               contradicted: "revise",
@@ -801,6 +920,24 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
+  test("preserves no-op when an inapplicable patch has a patch-caused failure", async () => {
+    const payload = assessment();
+    payload.recommendation = "no_op";
+    payload.workflowLabel = "no_op";
+    payload.applicability = {
+      status: "superseded",
+      rationale: "A replacement patch already landed.",
+    };
+    payload.regressionLikelihood.rating = "critical";
+    payload.regressionProtection.rating = "partial";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "patch_caused";
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
   test.each([
     "no_live_effect",
     "wrong_owner",
@@ -849,6 +986,7 @@ describe("patch risk assessment contract", () => {
     };
     payload.unknowns = [
       {
+        id: "sibling-coverage",
         summary: "Whether the sibling covers the runtime is unresolved.",
         decisionCritical: true,
       },

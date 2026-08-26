@@ -8,7 +8,7 @@ Rate each dimension from evidence, not from diff size or test count.
 - `moderate`: bounded component or consumer impact with a clear containment boundary.
 - `high`: shared runtime, public contract, persistent state, privileged boundary, broad deployment, or difficult operational recovery.
 - `critical`: plausible cross-tenant, major security, irreversible state, fleet-wide, or catastrophic availability impact.
-- `unknown`: available evidence cannot yet bound the consequence; use only with `hold_for_evidence`.
+- `unknown`: available evidence cannot yet bound the consequence. This cannot support `merge`, but it may accompany a terminal non-merge recommendation when another established defect or disposition already determines the decision.
 
 ## Regression likelihood
 

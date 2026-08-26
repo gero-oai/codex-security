@@ -236,6 +236,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     if len(set(validation_names)) != len(validation_names):
         errors.append("validation names must be unique")
 
+    unknown_ids = [item["id"] for item in unknowns]
+    if len(set(unknown_ids)) != len(unknown_ids):
+        errors.append("unknown identifiers must be unique")
+
     unknown_failed_validations: set[str] = set()
     for index, item in enumerate(validations):
         attribution = item.get("failureAttribution")
@@ -246,12 +250,16 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 )
             elif attribution == "unknown":
                 unknown_failed_validations.add(item["name"])
-            elif attribution == "patch_caused" and recommendation not in {
-                "revise",
-                "block",
-            }:
+            elif (
+                attribution == "patch_caused"
+                and recommendation not in {"revise", "block"}
+                and not (
+                    recommendation == "no_op"
+                    and value["applicability"]["status"] in NON_APPLICABLE
+                )
+            ):
                 errors.append(
-                    "a patch-caused validation failure requires revise or block"
+                    "a patch-caused validation failure requires revise, block, or an established no-op disposition"
                 )
         elif attribution is not None:
             errors.append(
@@ -265,9 +273,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             "patch.changedFiles must be non-empty unless recommendation is no_op or hold_for_evidence"
         )
 
+    if recommendation == "merge" and value["impact"]["rating"] == "unknown":
+        errors.append("merge cannot use impact.rating=unknown")
     if recommendation != "hold_for_evidence":
-        if value["impact"]["rating"] == "unknown":
-            errors.append("only hold_for_evidence may use impact.rating=unknown")
         if value["regressionLikelihood"]["rating"] == "unknown":
             errors.append(
                 "only hold_for_evidence may use regressionLikelihood.rating=unknown"
@@ -304,7 +312,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         errors.append("an established non-applicable disposition requires no_op")
 
     if recommendation == "hold_for_evidence":
-        if not any(item["decisionCritical"] for item in unknowns):
+        decision_critical_unknowns = {
+            item["id"] for item in unknowns if item["decisionCritical"]
+        }
+        if not decision_critical_unknowns:
             errors.append("hold_for_evidence requires a decision-critical unknown")
         if value["confidence"]["rating"] != "low":
             errors.append("hold_for_evidence requires low confidence")
@@ -315,11 +326,19 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         if any(item["result"] == "contradicted" for item in boundaries):
             errors.append("hold_for_evidence cannot retain a contradicted material boundary")
         planned_failed_validations: set[str] = set()
+        planned_unknowns: set[str] = set()
         for index, item in enumerate(evidence_plan):
             if len(set(item["outcomes"].values())) < 2:
                 errors.append(
                     f"evidencePlan.{index}: requires at least two distinct outcome recommendations"
                 )
+            for unknown_id in item["resolvesUnknowns"]:
+                if unknown_id not in decision_critical_unknowns:
+                    errors.append(
+                        f"evidencePlan.{index}: {unknown_id!r} is not a decision-critical unknown"
+                    )
+                    continue
+                planned_unknowns.add(unknown_id)
             for name in item.get("resolvesFailedValidation", []):
                 if name not in unknown_failed_validations:
                     errors.append(
@@ -343,6 +362,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         for name in sorted(unknown_failed_validations - planned_failed_validations):
             errors.append(
                 f"failed validation {name!r} with unknown attribution requires a matching evidence plan"
+            )
+        for unknown_id in sorted(decision_critical_unknowns - planned_unknowns):
+            errors.append(
+                f"decision-critical unknown {unknown_id!r} requires a matching evidence plan"
             )
     elif evidence_plan:
         errors.append("only hold_for_evidence may include an evidence plan")
