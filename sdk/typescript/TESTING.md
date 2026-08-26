@@ -74,8 +74,10 @@ Windows runs seven separate jobs with `node scripts/run-ci-tests.mjs 1/7`
 (substitute the shard number). Each file runs once. New files are included
 automatically; stale timing estimates can affect balance, but not coverage.
 The machine-wide Windows policy test still runs separately and serially.
-Windows dependency installation uses the same pinned pnpm action and store
-cache as Unix.
+Windows installs the pnpm version from `packageManager` directly, reuses the
+npm download cache, and caches the resolved pnpm store separately. Cache
+failures do not suppress installation failures. Unix keeps its pinned pnpm
+setup action.
 
 To compare the serial and CI runners on the same machine, commit, and seed:
 

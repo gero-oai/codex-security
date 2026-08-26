@@ -1420,6 +1420,8 @@ lines.on("line", (line) => {
         join(tmpdir(), "codex-security-skill-signal-"),
       );
       const ready = join(directory, "ready");
+      const wrapperReady = join(directory, "wrapper-ready");
+      const ignoredSignal = join(directory, "ignored-signal");
       const child = join(directory, "child.mjs");
       const wrapper = join(directory, "wrapper.mjs");
       await writeFile(
@@ -1427,6 +1429,7 @@ lines.on("line", (line) => {
         `
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
+process.on("SIGTERM", () => writeFileSync(${JSON.stringify(ignoredSignal)}, "ignored"));
 const descendant = spawn(
   process.execPath,
   ["-e", "setInterval(() => {}, 1000)"],
@@ -1436,20 +1439,21 @@ writeFileSync(${JSON.stringify(ready)}, JSON.stringify({
   child: process.pid,
   descendant: descendant.pid,
 }));
-process.on("SIGTERM", () => {});
 setInterval(() => {}, 1000);
 `,
       );
       await writeFile(
         wrapper,
         `
+import { writeFileSync } from "node:fs";
 import { runCodexSkillCommand } from ${JSON.stringify(new URL("../src/cli.ts", import.meta.url).href)};
-const status = await runCodexSkillCommand(
+const completion = runCodexSkillCommand(
   [${JSON.stringify(child)}],
   { command: "validate", stdout: process.stdout, stderr: process.stderr },
   { command: process.execPath },
 );
-process.exit(status);
+writeFileSync(${JSON.stringify(wrapperReady)}, "ready");
+process.exit(await completion);
 `,
       );
 
@@ -1467,6 +1471,7 @@ process.exit(status);
               descendant: number;
             };
             childPids = [marker.child, marker.descendant];
+            await Bun.file(wrapperReady).text();
             break;
           } catch (error) {
             if (Date.now() >= deadline) throw error;
@@ -1474,16 +1479,22 @@ process.exit(status);
           }
         }
         invocation.kill("SIGTERM");
-        const status = await Promise.race([
-          new Promise<number | null>((resolve, reject) => {
+        const result = await Promise.race([
+          new Promise<{
+            code: number | null;
+            signal: NodeJS.Signals | null;
+          }>((resolve, reject) => {
             invocation.once("error", reject);
-            invocation.once("close", resolve);
+            invocation.once("close", (code, signal) =>
+              resolve({ code, signal }),
+            );
           }),
           delay(5_000).then(() => {
             throw new Error("CLI skill cancellation did not settle.");
           }),
         ]);
-        expect(status).toBe(143);
+        expect(result).toEqual({ code: 143, signal: null });
+        expect(await Bun.file(ignoredSignal).text()).toBe("ignored");
       } finally {
         invocation.kill("SIGKILL");
         for (const childPid of childPids) {
