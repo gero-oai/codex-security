@@ -6091,11 +6091,41 @@ interface RawPatchReviewIndexEntry {
   object: string;
 }
 
+function stageZeroPatchReviewIndexEntries(output: Buffer): Buffer {
+  const retained: Buffer[] = [];
+  const entries = new Set<string>();
+  for (const record of splitNulRecords(output)) {
+    const separator = record.indexOf(0x09);
+    const metadata =
+      separator < 0
+        ? undefined
+        : record.subarray(0, separator).toString("ascii");
+    const match = /^([0-7]{6}) ([0-9a-f]+) ([0-3])$/u.exec(metadata ?? "");
+    const path = separator < 0 ? undefined : record.subarray(separator + 1);
+    if (path === undefined || match === null) {
+      throw new CodexSecurityError(
+        "The reviewed patch contains an unreadable Git index entry.",
+      );
+    }
+    const entry = `${patchReviewGitPathKey(path)}:${match[3]}`;
+    if (entries.has(entry)) {
+      throw new CodexSecurityError(
+        "The reviewed patch contains an unreadable Git index entry.",
+      );
+    }
+    entries.add(entry);
+    if (match[3] === "0") retained.push(record, Buffer.from([0]));
+  }
+  return Buffer.concat(retained);
+}
+
 function parseRawPatchReviewIndexEntries(
   output: Buffer,
 ): Map<string, RawPatchReviewIndexEntry> {
   const entries = new Map<string, RawPatchReviewIndexEntry>();
-  for (const record of splitNulRecords(output)) {
+  for (const record of splitNulRecords(
+    stageZeroPatchReviewIndexEntries(output),
+  )) {
     const separator = record.indexOf(0x09);
     const metadata =
       separator < 0
@@ -7122,16 +7152,22 @@ async function snapshotPatchReviewWorktree(
           const tag = String.fromCharCode(record[0]!);
           const path = record.subarray(2);
           const key = patchReviewGitPathKey(path);
-          if (entries.has(key)) {
+          const parsed = {
+            path,
+            status: tag.toUpperCase(),
+            special: tag !== tag.toUpperCase(),
+          };
+          const existing = entries.get(key);
+          if (
+            existing !== undefined &&
+            (existing.status !== parsed.status ||
+              existing.special !== parsed.special)
+          ) {
             throw new CodexSecurityError(
               "The selected repository contains an unreadable Git index entry.",
             );
           }
-          entries.set(key, {
-            path,
-            status: tag.toUpperCase(),
-            special: tag !== tag.toUpperCase(),
-          });
+          entries.set(key, parsed);
         }
         return entries;
       };
@@ -7171,7 +7207,10 @@ async function snapshotPatchReviewWorktree(
       return entries;
     };
     let repositoryIndexSnapshot = 0;
-    const repositoryIndexTree = async (): Promise<string> => {
+    const repositoryIndexTree = async (): Promise<{
+      entries: Buffer;
+      tree: string;
+    }> => {
       repositoryIndexSnapshot += 1;
       const indexEnvironment = {
         ...objectEnvironment,
@@ -7190,29 +7229,35 @@ async function snapshotPatchReviewWorktree(
         environment: indexEnvironment,
         signal,
       });
-      if (entries.length > 0) {
+      const stageZeroEntries = stageZeroPatchReviewIndexEntries(entries);
+      if (stageZeroEntries.length > 0) {
         await runPatchReviewGit(
           repository,
           ["update-index", "-z", "--index-info"],
-          { environment: indexEnvironment, input: entries, signal },
+          { environment: indexEnvironment, input: stageZeroEntries, signal },
         );
       }
-      return runPatchReviewGit(repository, ["write-tree"], {
-        environment: indexEnvironment,
-        signal,
-      });
+      return {
+        entries,
+        tree: await runPatchReviewGit(repository, ["write-tree"], {
+          environment: indexEnvironment,
+          signal,
+        }),
+      };
     };
-    const [indexTree, indexState] = await Promise.all([
+    const [indexSnapshot, indexState] = await Promise.all([
       repositoryIndexTree(),
       repositoryIndexState(),
     ]);
+    const indexTree = indexSnapshot.tree;
     const assertRepositoryIndexUnchanged = async (): Promise<void> => {
-      const [currentIndexTree, currentIndexState] = await Promise.all([
+      const [currentIndexSnapshot, currentIndexState] = await Promise.all([
         repositoryIndexTree(),
         repositoryIndexState(),
       ]);
       let unchanged =
-        currentIndexTree === indexTree &&
+        currentIndexSnapshot.tree === indexTree &&
+        currentIndexSnapshot.entries.equals(indexSnapshot.entries) &&
         currentIndexState.size === indexState.size;
       if (unchanged) {
         for (const [key, baseline] of indexState) {
@@ -7382,9 +7427,7 @@ async function snapshotPatchReviewWorktree(
       );
       const trackedPathspecs = Buffer.concat(
         pathsToAdd
-          .filter((path) =>
-            indexState.has(patchReviewGitPathKey(Buffer.from(path))),
-          )
+          .filter((path) => indexEntries.has(path))
           .flatMap((path) => [Buffer.from(path), Buffer.from([0])]),
       );
       const filterArguments = await disabledPatchReviewFilterArguments(
