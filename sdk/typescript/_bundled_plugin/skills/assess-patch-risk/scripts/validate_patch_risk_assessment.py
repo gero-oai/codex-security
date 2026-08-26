@@ -651,6 +651,13 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"evidencePlan.{index}: critical regression likelihood with an established material safety failure requires block"
                     )
+                if (
+                    outcome_safety_failure is True
+                    and outcome_likelihood != "critical"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: an established material safety failure requires critical regression likelihood"
+                    )
                 if outcome_recommendation == "block" and not (
                     outcome_likelihood == "critical"
                     and outcome_safety_failure is True
@@ -678,6 +685,13 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                 ):
                     errors.append(
                         f"evidencePlan.{index}: a hold outcome requires low confidence"
+                    )
+                if (
+                    value["regressionProtection"]["rating"] == "unknown"
+                    and outcome_confidence == "high"
+                ):
+                    errors.append(
+                        f"evidencePlan.{index}: unknown regression protection cannot support high confidence"
                     )
                 if outcome_recommendation == "merge":
                     if outcome_confidence == "low":
