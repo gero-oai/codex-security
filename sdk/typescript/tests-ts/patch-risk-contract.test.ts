@@ -2050,6 +2050,105 @@ describe("patch risk assessment contract", () => {
     );
   });
 
+  test("rejects high-confidence branches with unknown effective impact", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.impact.rating = "unknown";
+    payload.confidence.rating = "low";
+    payload.unknowns = [
+      {
+        id: "branch-result",
+        summary: "The branch result is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the patch establish a defect?",
+        action: "Exercise the changed branch at the immutable patch.",
+        resolvesUnknowns: ["branch-result"],
+        outcomes: { unsafe: "revise", unavailable: "hold_for_evidence" },
+        regressionLikelihoodOutcomes: {
+          unsafe: "critical",
+          unavailable: "moderate",
+        },
+        confidenceOutcomes: { unsafe: "high", unavailable: "low" },
+        remainingUnknowns: {
+          unsafe: [],
+          unavailable: ["branch-result"],
+        },
+      },
+      {
+        question: "What is the bounded impact?",
+        action: "Exercise the supported callers at the immutable patch.",
+        resolvesUnknowns: ["branch-result"],
+        outcomes: { local: "merge", bounded: "merge" },
+        impactOutcomes: { local: "low", bounded: "moderate" },
+        confidenceOutcomes: { local: "moderate", bounded: "moderate" },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "unknown impact cannot support high confidence",
+    );
+  });
+
+  test("rejects high-confidence branches with unresolved effective boundaries", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "branch-result",
+        summary: "The branch result is unknown.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the patch establish a defect?",
+        action: "Exercise the changed branch at the immutable patch.",
+        resolvesUnknowns: ["branch-result"],
+        outcomes: { unsafe: "revise", unavailable: "hold_for_evidence" },
+        regressionLikelihoodOutcomes: {
+          unsafe: "critical",
+          unavailable: "moderate",
+        },
+        confidenceOutcomes: { unsafe: "high", unavailable: "low" },
+        remainingUnknowns: {
+          unsafe: [],
+          unavailable: ["branch-result"],
+        },
+      },
+      {
+        question: "Does the boundary preserve the supported control?",
+        action: "Trace both paths through the immutable patch.",
+        resolvesUnknowns: ["branch-result"],
+        resolvesBoundaries: ["request-contract"],
+        boundaryOutcomes: {
+          supported: { "request-contract": "supported" },
+          contradicted: { "request-contract": "contradicted" },
+        },
+        outcomes: { supported: "merge", contradicted: "revise" },
+        confidenceOutcomes: {
+          supported: "moderate",
+          contradicted: "moderate",
+        },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "an unresolved material boundary cannot support high confidence",
+    );
+  });
+
   test("requires evidence plans for unknown risk ratings", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
