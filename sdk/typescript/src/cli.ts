@@ -1345,7 +1345,11 @@ interface CliDependencies {
   planComponents?: typeof planComponents;
   linearClient?: LinearClientFactory;
   importGitHubAlerts?: typeof importGitHubCodeScanningAlerts;
-  runWorkbench(args: readonly string[], input?: string): Promise<JsonObject>;
+  runWorkbench(
+    args: readonly string[],
+    input?: string,
+    pythonPath?: string,
+  ): Promise<JsonObject>;
   matchFindings: typeof matchScanFindings;
   checkForUpdate(signal: AbortSignal): Promise<UpdateNotice | undefined>;
 }
@@ -1501,12 +1505,15 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
     }
     return undefined;
   },
-  runWorkbench: async (args, input) => {
+  runWorkbench: async (args, input, pythonPath) => {
     const environment = {
       ...exportEnvironment(),
       CODEX_SECURITY_STATE_DIR: codexSecurityStateDirectory(),
     };
-    const python = await resolvePluginPython({ environment });
+    const python = await resolvePluginPython({
+      configuredPath: pythonPath,
+      environment,
+    });
     return await runWorkbench(
       {
         python,
@@ -4186,6 +4193,7 @@ export async function main(
               options.scan,
               options.severity,
               dependencies,
+              options.python,
             );
             addSignalListeners();
             const patchRun = await runFindingPatches(
@@ -4963,13 +4971,18 @@ function meetsSeverity(finding: Finding, threshold: FailureSeverity): boolean {
 async function* workbenchFindings(
   arguments_: readonly string[],
   dependencies: CliDependencies,
+  pythonPath?: string,
 ): AsyncGenerator<Finding & { scanId?: string }> {
   let offset: number | undefined;
   do {
-    const response = await dependencies.runWorkbench([
-      ...arguments_,
-      ...(offset === undefined ? [] : ["--offset", String(offset)]),
-    ]);
+    const response = await dependencies.runWorkbench(
+      [
+        ...arguments_,
+        ...(offset === undefined ? [] : ["--offset", String(offset)]),
+      ],
+      undefined,
+      pythonPath,
+    );
     const page = (response["findingsPage"] ?? response) as {
       findings?: (Finding & { scanId?: string })[];
       nextOffset?: unknown;
@@ -5052,6 +5065,7 @@ async function selectSavedFindings(
   requestedScanId: string | undefined,
   severity: FailureSeverity | undefined,
   dependencies: CliDependencies,
+  pythonPath?: string,
 ): Promise<SelectedFindings> {
   if (identifiers.some((identifier) => !isFindingIdentifier(identifier))) {
     throw new CodexSecurityError(
@@ -5062,13 +5076,11 @@ async function selectSavedFindings(
   let scanId = requestedScanId;
   if (scanId === "latest") {
     const repository = resolve(dependencies.currentDirectory());
-    const history = await dependencies.runWorkbench([
-      "list-scans",
-      "--repository",
-      repository,
-      "--status",
-      "complete",
-    ]);
+    const history = await dependencies.runWorkbench(
+      ["list-scans", "--repository", repository, "--status", "complete"],
+      undefined,
+      pythonPath,
+    );
     const latest = (history["scans"] as { scanId?: string }[] | undefined)?.[0]
       ?.scanId;
     if (typeof latest !== "string") {
@@ -5085,6 +5097,7 @@ async function selectSavedFindings(
     for await (const finding of workbenchFindings(
       ["list-global-findings", "--status", "open"],
       dependencies,
+      pythonPath,
     )) {
       for (const identifier of [finding.occurrenceId, finding.findingId]) {
         if (remaining.delete(identifier)) scanIds.add(finding.scanId);
@@ -5102,14 +5115,18 @@ async function selectSavedFindings(
     }
   }
 
-  const context = await dependencies.runWorkbench([
-    "get-scan",
-    "--scan-id",
-    scanId,
-    ...(identifiers.length === 1 && identifiers[0]?.startsWith("occ_")
-      ? ["--occurrence-id", identifiers[0]]
-      : []),
-  ]);
+  const context = await dependencies.runWorkbench(
+    [
+      "get-scan",
+      "--scan-id",
+      scanId,
+      ...(identifiers.length === 1 && identifiers[0]?.startsWith("occ_")
+        ? ["--occurrence-id", identifiers[0]]
+        : []),
+    ],
+    undefined,
+    pythonPath,
+  );
   const scan = context["scan"] as
     | {
         scanId: string;
@@ -5134,6 +5151,7 @@ async function selectSavedFindings(
     for await (const finding of workbenchFindings(
       ["list-findings", "--scan-id", scan.scanId, "--status", "open"],
       dependencies,
+      pythonPath,
     )) {
       findings.push(finding);
     }
@@ -7210,6 +7228,13 @@ async function snapshotPatchReviewWorktree(
         baselineUntrackedDirectoryModes.set(key, state);
       }
     } else {
+      for (const key of untrackedDirectories.keys()) {
+        if (!baselineUntrackedDirectoryModes.has(key)) {
+          throw new CodexSecurityError(
+            "An untracked directory changed after patch review started. Preserve unrelated filesystem state and retry.",
+          );
+        }
+      }
       for (const baseline of baselineUntrackedDirectoryModes.values()) {
         let current: BigIntStats | undefined;
         try {
