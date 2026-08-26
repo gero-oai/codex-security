@@ -394,6 +394,28 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
+  test("allows an evidence action for every decision-critical unknown", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.unknowns = Array.from({ length: 4 }, (_, index) => ({
+      summary: `Decision-critical unknown ${index + 1}.`,
+      decisionCritical: true,
+    }));
+    payload.evidencePlan = Array.from({ length: 4 }, (_, index) => ({
+      question: `Question ${index + 1}?`,
+      action: `Resolve unknown ${index + 1}.`,
+      outcomes: {
+        supported: "merge",
+        contradicted: "revise",
+      },
+    }));
+
+    const result = await validate(payload);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
   test("rejects established defects when holding for evidence", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
@@ -634,6 +656,30 @@ describe("patch risk assessment contract", () => {
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
   });
+
+  test.each([
+    "no_live_effect",
+    "wrong_owner",
+    "duplicate",
+    "superseded",
+  ] as const)(
+    "requires no-op for the established %s disposition",
+    async (status) => {
+      const payload = assessment();
+      payload.recommendation = "revise";
+      payload.workflowLabel = "revise";
+      payload.applicability = {
+        status,
+        rationale: "The applicability disposition is established.",
+      };
+
+      const result = await validate(payload);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        "an established non-applicable disposition requires no_op",
+      );
+    },
+  );
 
   test("rejects low confidence for no-op", async () => {
     const payload = assessment();

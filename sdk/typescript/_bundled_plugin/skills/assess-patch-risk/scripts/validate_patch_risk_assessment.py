@@ -236,6 +236,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     elif workflow_label != recommendation:
         errors.append("non-merge workflow label must match the recommendation")
 
+    if value["applicability"]["status"] in NON_APPLICABLE and recommendation != "no_op":
+        errors.append("an established non-applicable disposition requires no_op")
+
     if recommendation == "hold_for_evidence":
         if not any(item["decisionCritical"] for item in unknowns):
             errors.append("hold_for_evidence requires a decision-critical unknown")
