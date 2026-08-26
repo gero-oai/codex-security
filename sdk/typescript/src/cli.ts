@@ -6874,6 +6874,7 @@ const PATCH_REVIEW_PROTECTED_GIT_METADATA_PATHS = [
   "sequencer",
   "shallow",
   "shallow.lock",
+  "worktrees",
 ] as const;
 
 async function readPatchReviewAncestorInstructions(
