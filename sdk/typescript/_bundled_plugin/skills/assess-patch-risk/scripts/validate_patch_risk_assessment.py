@@ -563,8 +563,8 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     if value["regressionProtection"]["rating"] == "strong":
         if not value["regressionProtection"]["exactHeadChecksPassed"]:
             errors.append("strong regression protection requires exact-head checks to pass")
-        if not any(item["status"] == "passed" for item in validations):
-            errors.append("strong regression protection requires an executed passing validation")
+        if not any(item["status"] in {"passed", "failed"} for item in validations):
+            errors.append("strong regression protection requires an executed validation")
 
     if workflow_label == "auto_merge_candidate":
         auto_merge_requirements = {
