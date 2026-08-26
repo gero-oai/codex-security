@@ -320,6 +320,9 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     elif workflow_label != recommendation:
         errors.append("non-merge workflow label must match the recommendation")
 
+    if value["applicability"]["status"] == "unknown" and recommendation != "hold_for_evidence":
+        errors.append("unknown applicability requires hold_for_evidence")
+
     if value["applicability"]["status"] in NON_APPLICABLE and recommendation != "no_op":
         errors.append("an established non-applicable disposition requires no_op")
 
@@ -392,6 +395,20 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("no_op requires an established non-applicable disposition")
         if value["confidence"]["rating"] == "low":
             errors.append("no_op cannot have low confidence")
+
+    if (
+        recommendation == "revise"
+        and value["regressionLikelihood"]["rating"] != "critical"
+        and not any(item["result"] == "contradicted" for item in boundaries)
+        and not any(
+            item["status"] == "failed"
+            and item.get("failureAttribution") == "patch_caused"
+            for item in value["validation"]
+        )
+    ):
+        errors.append(
+            "revise requires critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure"
+        )
 
     if (
         recommendation == "block"

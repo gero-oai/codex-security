@@ -33,7 +33,7 @@ Read [references/risk-rubric.md](references/risk-rubric.md) before assigning rat
 Return exactly one recommendation:
 
 - `merge`: source evidence supports the patch and no decision-critical defect or unknown remains;
-- `revise`: the patch, its tests, or a material documentation contract must change;
+- `revise`: affirmative evidence shows that the patch, its tests, or a material documentation contract must change, represented by critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure;
 - `no_op`: evidence shows the patch has no required live effect or belongs elsewhere;
 - `block`: affirmative evidence establishes a material safety failure; or
 - `hold_for_evidence`: unavailable evidence can still change the decision.
@@ -73,6 +73,7 @@ Keep the explanation evidence-backed. Patch size, caller count, green CI, or tes
 ## Hard Rules
 
 - Do not recommend any merge state while a source-visible regression, unsupported control break, parallel bypass, trust-boundary failure, or material documentation contradiction remains.
+- Treat unknown applicability as decision-critical and use `hold_for_evidence` until runtime reachability or ownership is established, even when candidate behavior is contradicted.
 - Do not use `hold_for_evidence` for an already established defect; use `revise` or `block`.
 - Do not treat unavailable evidence as affirmative failure evidence.
 - Do not claim strong regression protection unless tests exercise the changed behavior or affected contract and the relevant checks actually ran.

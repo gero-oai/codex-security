@@ -949,6 +949,8 @@ describe("patch risk assessment contract", () => {
       (payload: Assessment) => {
         payload.recommendation = "revise";
         payload.workflowLabel = "revise";
+        payload.validation[0]!.status = "failed";
+        payload.validation[0]!.failureAttribution = "patch_caused";
       },
     ],
     [
@@ -1086,6 +1088,67 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
+  test.each(["revise", "block"])(
+    "requires an evidence hold when applicability is unknown before %s",
+    async (recommendation) => {
+      const payload = assessment();
+      payload.recommendation = recommendation;
+      payload.workflowLabel = recommendation;
+      payload.applicability = {
+        status: "unknown",
+        rationale: "Runtime ownership has not been established.",
+      };
+      if (recommendation === "revise") {
+        payload.validation[0]!.status = "failed";
+        payload.validation[0]!.failureAttribution = "patch_caused";
+      } else {
+        payload.regressionLikelihood.rating = "critical";
+      }
+
+      const result = await validate(payload);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        "unknown applicability requires hold_for_evidence",
+      );
+    },
+  );
+
+  test("rejects revise without affirmative correction evidence", async () => {
+    const payload = assessment();
+    payload.recommendation = "revise";
+    payload.workflowLabel = "revise";
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toBe(
+      "revise requires critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure\n",
+    );
+  });
+
+  test("accepts each affirmative correction signal for revise", async () => {
+    const critical = assessment();
+    critical.recommendation = "revise";
+    critical.workflowLabel = "revise";
+    critical.regressionLikelihood.rating = "critical";
+    const criticalResult = await validate(critical);
+    expect(criticalResult.status, criticalResult.stderr).toBe(0);
+
+    const contradicted = assessment();
+    contradicted.recommendation = "revise";
+    contradicted.workflowLabel = "revise";
+    contradicted.materialBoundaries[0]!.result = "contradicted";
+    const contradictedResult = await validate(contradicted);
+    expect(contradictedResult.status, contradictedResult.stderr).toBe(0);
+
+    const failed = assessment();
+    failed.recommendation = "revise";
+    failed.workflowLabel = "revise";
+    failed.validation[0]!.status = "failed";
+    failed.validation[0]!.failureAttribution = "patch_caused";
+    const failedResult = await validate(failed);
+    expect(failedResult.status, failedResult.stderr).toBe(0);
+  });
+
   test("requires an established non-applicable no-op disposition", async () => {
     const payload = assessment();
     payload.recommendation = "no_op";
@@ -1202,6 +1265,8 @@ describe("patch risk assessment contract", () => {
     );
 
     payload.workflowLabel = "revise";
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "patch_caused";
     const result = await validate(payload);
     expect(result.status, result.stderr).toBe(0);
   });
