@@ -685,6 +685,20 @@ MIGRATIONS = (
     ),
     (
         31,
+        "freeze stopped scan source digests",
+        """
+        ALTER TABLE scans ADD COLUMN retained_source_digests_json TEXT;
+        """,
+    ),
+    (
+        32,
+        "separate deep scan publication failures",
+        """
+        ALTER TABLE deep_scan_runs ADD COLUMN publication_error_message TEXT;
+        """,
+    ),
+    (
+        33,
         "persist repository identities",
         """
         ALTER TABLE security_targets
@@ -790,6 +804,20 @@ def apply_migrations(
                         "REAL NOT NULL DEFAULT 96",
                     )
                 elif version == 31:
+                    add_column_if_missing(
+                        connection,
+                        "scans",
+                        "retained_source_digests_json",
+                        "TEXT",
+                    )
+                elif version == 32:
+                    add_column_if_missing(
+                        connection,
+                        "deep_scan_runs",
+                        "publication_error_message",
+                        "TEXT",
+                    )
+                elif version == 33:
                     should_backfill_targets = (
                         repair_repository_identity_migration(connection)
                         or should_backfill_targets
@@ -799,7 +827,7 @@ def apply_migrations(
                 repair_thread_scoped_workspaces_migration(connection)
             elif version == 16:
                 should_backfill_targets = repair_stable_targets_migration(connection)
-            elif version == 31:
+            elif version == 33:
                 repair_repository_identity_migration(connection)
                 should_backfill_targets = True
             else:
@@ -936,17 +964,11 @@ def normalize_pre_release_execution_profile_migrations(
 
 
 def normalize_pre_release_migrations(connection: sqlite3.Connection, timestamp: str) -> None:
-    repository_identity_migration = connection.execute(
-        "SELECT name FROM schema_migrations WHERE version = 30"
-    ).fetchone()
-    if (
-        repository_identity_migration is not None
-        and repository_identity_migration["name"] == "persist repository identities"
-    ):
-        connection.execute(
-            "UPDATE schema_migrations SET version = 31 WHERE version = 30 AND name = ?",
-            ("persist repository identities",),
-        )
+    connection.execute(
+        "UPDATE schema_migrations SET version = 33 "
+        "WHERE version IN (30, 31) AND name = ?",
+        ("persist repository identities",),
+    )
 
     completion_warning_migration = connection.execute(
         "SELECT name FROM schema_migrations WHERE version = 25"
@@ -1335,7 +1357,7 @@ def repair_repository_identity_migration(connection: sqlite3.Connection) -> bool
     if (
         "repository_identity" in columns
         and connection.execute(
-            "SELECT 1 FROM schema_migrations WHERE version = 31 AND name = ?",
+            "SELECT 1 FROM schema_migrations WHERE version = 33 AND name = ?",
             ("persist repository identities",),
         ).fetchone() is not None
         and not any(
@@ -1346,7 +1368,7 @@ def repair_repository_identity_migration(connection: sqlite3.Connection) -> bool
         from workbench_target_state import normalize_pre_release_repository_identities
 
         normalize_pre_release_repository_identities(connection)
-    migration_sql = next(sql for version, _, sql in MIGRATIONS if version == 31)
+    migration_sql = next(sql for version, _, sql in MIGRATIONS if version == 33)
     for statement in sql_statements(migration_sql):
         if statement.startswith("ALTER TABLE security_targets"):
             add_column_if_missing(connection, "security_targets", "repository_identity", "TEXT")

@@ -161,7 +161,10 @@ legacy_identity_migration = (
     "CREATE INDEX security_targets_by_repository_identity ON security_targets(repository_identity);\n",
 )
 historical = tuple(migration for migration in MIGRATIONS if migration[0] <= 28)
-published = tuple(migration for migration in MIGRATIONS if migration[0] < identity_version)
+published = tuple(
+    migration for migration in MIGRATIONS
+    if migration[0] < (31 if scenario == "pre-release-identity-version31" else identity_version)
+)
 apply_migrations(
     connection,
     historical if scenario in (
@@ -207,7 +210,7 @@ elif scenario in ("pre-release-identity-version", "pre-release-identity-version3
         connection.executescript(legacy_identity_migration[2])
         connection.execute(
             "INSERT INTO schema_migrations VALUES (?, ?, ?)",
-            (identity_version, legacy_identity_migration[1], timestamp),
+            (31, legacy_identity_migration[1], timestamp),
         )
     connection.execute(
         "UPDATE security_targets SET repository_identity = 'synthetic-identity'"
@@ -434,7 +437,7 @@ describe("stable workbench target migration", () => {
         : 1,
       hasRepositoryIdentityColumn: true,
       hasRepositoryIdentityIndex: true,
-      identityVersion: 31,
+      identityVersion: 33,
       migrationName: "persist repository identities",
       publicationMigrations: {
         "29": "persist finding publication associations",

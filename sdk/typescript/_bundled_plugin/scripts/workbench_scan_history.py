@@ -23,6 +23,10 @@ from workbench_target_state import (
 )
 
 
+def _windows_path_key(value: str) -> str:
+    return os.path.normcase(os.path.realpath(value))
+
+
 def _same_repository(
     connection: sqlite3.Connection,
     before: sqlite3.Row,
@@ -69,6 +73,8 @@ def _same_repository(
 def list_scans(
     connection: sqlite3.Connection, args: argparse.Namespace | None = None
 ) -> dict[str, Any]:
+    if os.name == "nt":
+        connection.create_function("codex_security_path_key", 1, _windows_path_key)
     clauses: list[str] = []
     values: list[Any] = []
     if args is not None and args.repository:
@@ -82,7 +88,15 @@ def list_scans(
     if args is not None and args.scan_root:
         scan_root = str(Path(args.scan_root).expanduser().resolve())
         prefix = scan_root.rstrip(os.sep) + os.sep
-        clauses.append("(scans.scan_dir = ? OR substr(scans.scan_dir, 1, ?) = ?)")
+        if os.name == "nt":
+            scan_root = _windows_path_key(scan_root)
+            prefix = scan_root.rstrip(os.sep) + os.sep
+            clauses.append(
+                "(codex_security_path_key(scans.scan_dir) = ? "
+                "OR substr(codex_security_path_key(scans.scan_dir), 1, ?) = ?)"
+            )
+        else:
+            clauses.append("(scans.scan_dir = ? OR substr(scans.scan_dir, 1, ?) = ?)")
         values.extend((scan_root, len(prefix), prefix))
     if args is not None and args.target_id:
         clauses.append("scans.target_id = ?")
@@ -455,8 +469,9 @@ def save_scan_comparison(
     read_coverage(after)
     before_findings = _scan_findings(connection, before["id"])
     after_findings = _scan_findings(connection, after["id"])
+    matches_json = sys.stdin.read() if args.matches_json_stdin else args.matches_json
     try:
-        payload = json.loads(args.matches_json)
+        payload = json.loads(matches_json)
     except (TypeError, ValueError) as exc:
         raise SystemExit("Scan comparison matches must be a valid JSON object.") from exc
     if not isinstance(payload, dict) or set(payload) != {"matches", "uncertain"}:

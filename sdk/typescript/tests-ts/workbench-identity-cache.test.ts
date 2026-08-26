@@ -927,7 +927,7 @@ with ExitStack() as stack:
                 mocks.enter_context(patch.object(Path, "iterdir", entries))
                 try:
                     workbench.register_cli_scan(connection, argparse.Namespace(
-                        repository=str(target), scan_dir=str(scan_dir), recipe_json="{}", parent_scan_id="parent",
+                        repository=str(target), scan_dir=str(scan_dir), recipe_json="{}", parent_scan_id="parent", registration_json_stdin=False, recipe_json_stdin=False,
                     ))
                 except ReadyToInsert:
                     accepted = True
@@ -1207,6 +1207,7 @@ with ExitStack() as stack:
             args = argparse.Namespace(
                 repository=paths["requested"], scan_dir=str(scan_dir), parent_scan_id=name + "-scan",
                 recipe_json=json.dumps({"repository": paths["requested"], "mode": "standard", "config": {}, "target": {"kind": "repository", "paths": []}}),
+                registration_json_stdin=False, recipe_json_stdin=False,
             )
             try:
                 workbench.register_cli_scan(connection, args)
@@ -1372,7 +1373,7 @@ with ExitStack() as stack:
         accepted = []
         with patch.object(state, "_inspect_repository_target", side_effect=AssertionError("Sealed comparison inspected the live target")):
             for before, after in (("legacy-before", "legacy-after"), ("first-scan", "second-scan")):
-                args = argparse.Namespace(before_scan_id=before, after_scan_id=after, matches_json='{"matches":[],"uncertain":[]}')
+                args = argparse.Namespace(before_scan_id=before, after_scan_id=after, matches_json='{"matches":[],"uncertain":[]}', matches_json_stdin=False)
                 compared = history.compare_scans(connection, args, require_scan=require_scan, read_coverage=coverage)
                 saved = history.save_scan_comparison(connection, args, now=lambda: timestamp, require_scan=require_scan, read_coverage=coverage)
                 accepted.append(compared["afterScanId"] == after and saved["beforeScanId"] == before)
@@ -1906,7 +1907,7 @@ test.each(["migration", "migration-recorded31"])(
     expect(result["currentScopesDistinct"]).toBe(true);
     expect(result["targetCount"]).toBe(12);
     expect(result["migrations"]).toEqual(
-      Array.from({ length: 31 }, (_, index) => index + 1),
+      Array.from({ length: 33 }, (_, index) => index + 1),
     );
   },
 );
