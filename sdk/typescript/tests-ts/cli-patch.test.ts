@@ -840,6 +840,11 @@ describe("scan and patch workflow", () => {
               );
             } else {
               await writeFile(join(repository, "keep", "value.ts"), "fixed\n");
+              await mkdir(join(repository, "omit"), { recursive: true });
+              await writeFile(
+                join(repository, "omit", "value.ts"),
+                "materialized\n",
+              );
               output!.stdout.write("Verified synthetic patch.");
             }
             return 0;
@@ -853,9 +858,11 @@ describe("scan and patch workflow", () => {
       );
 
       expect(outcome.exitCode, outcome.stderr).toBe(0);
-      expect(observed?.paths).toEqual(["keep/value.ts"]);
+      expect(observed?.paths).toEqual(["keep/value.ts", "omit/value.ts"]);
       expect(observed?.diff).toContain("-unsafe");
       expect(observed?.diff).toContain("+fixed");
+      expect(observed?.diff).toContain("-preserved");
+      expect(observed?.diff).toContain("+materialized");
       expect(observed?.diff).not.toContain("\u001B[");
       expect(git("show", "HEAD:omit/value.ts")).toBe("preserved");
     } finally {
@@ -1649,6 +1656,83 @@ describe("scan and patch workflow", () => {
         "Reviewed patch files with pre-existing changes cannot be published automatically",
       );
       expect(outcome.stdout).toBe("");
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves staged changes hidden by matching worktree content", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-staged-review-pr-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    const result = resultWithFindings(["high"]);
+    const saved = savedScan(result);
+    (saved["scan"] as JsonObject)["targetPath"] = repository;
+    const path = join(repository, "src", "finding-1.ts");
+    let commandStarted = false;
+    try {
+      await mkdir(join(repository, "src"));
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(path, "base\nunsafe\n");
+      git("add", "--", ".");
+      git("commit", "-m", "Initial synthetic checkout");
+      await writeFile(path, "base\nstaged user change\nunsafe\n");
+      git("add", "--", "src/finding-1.ts");
+      await writeFile(path, "base\nunsafe\n");
+
+      const outcome = await runWorkflow(
+        [
+          "patch",
+          "--scan",
+          "scan-1",
+          "--review-minimality",
+          "--create-pr",
+          "--json",
+        ],
+        {
+          currentDirectory: repository,
+          result,
+          onWorkbench: () => saved,
+          onCodex: async (args, output) => {
+            if (output!.appServer!.sandbox === "read-only") {
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(path, "base\nfixed\n");
+              completePatches(args, output);
+            }
+            return 0;
+          },
+          onRepositoryCommand: () => {
+            commandStarted = true;
+            return "";
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode).toBe(2);
+      expect(commandStarted).toBe(false);
+      expect(outcome.stderr).toContain(
+        "Reviewed patch files with pre-existing changes cannot be published automatically",
+      );
+      expect(git("show", ":src/finding-1.ts")).toBe(
+        "base\nstaged user change\nunsafe",
+      );
     } finally {
       await rm(repository, { recursive: true, force: true });
     }

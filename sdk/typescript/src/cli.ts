@@ -5330,9 +5330,19 @@ async function snapshotPatchReviewWorktree(
     );
     const paths = listed.split("\0");
     if (paths.at(-1) === "") paths.pop();
-    const included = paths.filter(
-      (path) => !ignoredPathSet.has(path) && !skipWorktreePaths.has(path),
-    );
+    const included: string[] = [];
+    for (const path of paths) {
+      if (ignoredPathSet.has(path)) continue;
+      if (skipWorktreePaths.has(path)) {
+        try {
+          await lstat(join(repository, path));
+        } catch (error) {
+          if (missingPatchReviewPath(error)) continue;
+          throw error;
+        }
+      }
+      included.push(path);
+    }
     if (included.length === 0) return;
     await writeFile(
       pathspecFile,
@@ -5375,30 +5385,36 @@ async function snapshotPatchReviewWorktree(
       environment,
       signal,
     });
-    const preexisting = await runPatchReviewGit(
-      repository,
-      headTree === undefined
-        ? ["ls-tree", "-r", "--name-only", "-z", baselineTree]
-        : [
-            "--no-pager",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--name-only",
-            "-z",
-            "--relative",
-            headTree,
-            baselineTree,
-            "--",
-            ".",
-          ],
-      { environment, signal, trim: false },
-    );
-    const preexistingPaths = preexisting.split("\0");
-    if (preexistingPaths.at(-1) === "") preexistingPaths.pop();
-    const preexistingPathSet = new Set(preexistingPaths);
+    const pathsChangedFromHead = async (tree: string): Promise<string[]> => {
+      const output = await runPatchReviewGit(
+        repository,
+        headTree === undefined
+          ? ["ls-tree", "-r", "--name-only", "-z", tree]
+          : [
+              "--no-pager",
+              "diff",
+              "--no-color",
+              "--no-ext-diff",
+              "--no-textconv",
+              "--no-renames",
+              "--name-only",
+              "-z",
+              "--relative",
+              headTree,
+              tree,
+              "--",
+              ".",
+            ],
+        { environment, signal, trim: false },
+      );
+      const changed = output.split("\0");
+      if (changed.at(-1) === "") changed.pop();
+      return changed;
+    };
+    const preexistingPathSet = new Set([
+      ...(await pathsChangedFromHead(indexTree)),
+      ...(await pathsChangedFromHead(baselineTree)),
+    ]);
     let disposed = false;
     return {
       directory: repository,
