@@ -1,8 +1,8 @@
-import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
+import { runCodexCommand } from "../src/runtime.js";
 import { loadBundledRuntime, PLUGIN_ROOT } from "./plugin-root.js";
 
 function bundledFunction(runtime: string, name: string): string {
@@ -66,18 +66,19 @@ test("keeps every advertised Deep worker tool within Codex's name limit", async 
       );
       expect(Object.keys(servers)).toEqual(["cs_artifacts"]);
       const server = servers["cs_artifacts"]!;
-      const result = spawnSync(node!, server.args, {
-        encoding: "utf8",
-        env: { ...process.env, ...server.env },
-        input: [
+      const result = await runCodexCommand(
+        { command: node! },
+        server.args,
+        { ...process.env, ...server.env },
+        [
           '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"codex-security-test","version":"1.0.0"}}}',
           '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}',
           '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
           "",
         ].join("\n"),
-        timeout: 30_000,
-      });
-      expect(result.status, result.stderr).toBe(0);
+        AbortSignal.timeout(30_000),
+      );
+      expect(result.exitCode, result.stderr).toBe(0);
       const response = result.stdout
         .trim()
         .split("\n")
