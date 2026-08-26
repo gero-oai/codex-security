@@ -727,6 +727,7 @@ describe("CLI skill commands", () => {
           "Authorization: contradicted",
           "Token handling: changed",
           "Authorization: contradicted because Bearer SYNTHETIC_ADVERSE_CREDENTIAL",
+          "Authorization: changed because dXNlcjpwYXNz",
           "Authorization: Bearer SYNTHETIC_REPORT_CREDENTIAL",
           "Authorization: dXNlcjpwYXNz",
           "Authorization:",
@@ -746,6 +747,14 @@ describe("CLI skill commands", () => {
           "SYNTHETIC-FENCED-CREDENTIAL",
           "SYNTHETIC-FENCED-CREDENTIAL-CONTINUED",
           "```",
+          "API key:",
+          "````text",
+          "SYNTHETIC-LONG-FENCE-CREDENTIAL",
+          "```",
+          "SYNTHETIC-AFTER-SHORT-FENCE",
+          "````not-a-close",
+          "SYNTHETIC-AFTER-SUFFIXED-FENCE",
+          "````",
           "",
           "-----BEGIN PRIVATE KEY-----",
           "SYNTHETIC-MULTILINE-KEY-BODY",
@@ -790,6 +799,9 @@ describe("CLI skill commands", () => {
     expect(stderr.text()).not.toContain("SYNTHETIC-BULLETED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-NUMBERED-CREDENTIAL");
     expect(stderr.text()).not.toContain("SYNTHETIC-FENCED-CREDENTIAL");
+    expect(stderr.text()).not.toContain("SYNTHETIC-LONG-FENCE-CREDENTIAL");
+    expect(stderr.text()).not.toContain("SYNTHETIC-AFTER-SHORT-FENCE");
+    expect(stderr.text()).not.toContain("SYNTHETIC-AFTER-SUFFIXED-FENCE");
     expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-AUTHORIZATION");
     expect(stderr.text()).not.toContain("-----END PRIVATE KEY-----");
   });
@@ -826,7 +838,7 @@ describe("CLI skill commands", () => {
   });
 
   test.skipIf(process.platform === "win32")(
-    "surfaces patch-risk validator launch failures",
+    "fails closed when the preflighted patch-risk interpreter disappears",
     async () => {
       const root = await mkdtemp(
         join(tmpdir(), "codex-security-patch-risk-python-"),
@@ -870,7 +882,7 @@ describe("CLI skill commands", () => {
             current,
           ),
         ).toBe(2);
-        expect(stderr.text()).toContain("ENOENT");
+        expect(stderr.text()).toContain("unavailable or unusable");
         expect(stderr.text()).not.toContain(
           "patch-risk-assessment review returned an invalid assessment",
         );
