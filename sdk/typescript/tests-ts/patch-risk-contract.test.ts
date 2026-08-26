@@ -56,6 +56,7 @@ interface Assessment {
     action: string;
     resolvesUnknowns: string[];
     resolvesBoundaries?: string[];
+    boundaryOutcomes?: Record<string, Record<string, string>>;
     applicabilityOutcomes?: Record<string, string>;
     resolvesFailedValidation?: string[];
     outcomes: Record<string, string>;
@@ -206,6 +207,12 @@ describe("patch risk assessment contract", () => {
     const byteOrderMarkOnly = assessment();
     byteOrderMarkOnly.patch.repository = "\uFEFF";
     expect(validateSchema(byteOrderMarkOnly)).toBe(false);
+
+    for (const control of ["\u001C", "\u0085"]) {
+      const ecmaNonWhitespace = assessment();
+      ecmaNonWhitespace.patch.repository = control;
+      expect(validateSchema(ecmaNonWhitespace)).toBe(true);
+    }
   });
 
   test("documents the configured validator command over stdin", async () => {
@@ -223,6 +230,17 @@ describe("patch risk assessment contract", () => {
       /^python\s+.*validate_patch_risk_assessment\.py/mu,
     );
   });
+
+  test.each(["\u001C", "\u0085"])(
+    "matches ECMAScript non-whitespace handling for %p",
+    async (control) => {
+      const payload = assessment();
+      payload.patch.repository = control;
+
+      const result = await validate(payload);
+      expect(result.status, result.stderr).toBe(0);
+    },
+  );
 
   test("isolates validator imports from the subject environment", async () => {
     const root = await mkdtemp(
@@ -825,8 +843,69 @@ describe("patch risk assessment contract", () => {
     );
 
     payload.evidencePlan[0]!.resolvesBoundaries = ["request-contract"];
+    payload.evidencePlan[0]!.boundaryOutcomes = {
+      supported: { "request-contract": "supported" },
+      contradicted: { "request-contract": "contradicted" },
+    };
     const covered = await validate(payload);
     expect(covered.status, covered.stderr).toBe(0);
+  });
+
+  test("requires unique material boundary identifiers", async () => {
+    const payload = assessment();
+    payload.materialBoundaries.push({ ...payload.materialBoundaries[0]! });
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "material boundary identifiers must be unique",
+    );
+  });
+
+  test("binds resolved boundaries to each evidence outcome", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.materialBoundaries[0]!.result = "unresolved";
+    payload.unknowns = [
+      {
+        id: "request-contract-evidence",
+        summary: "The request contract evidence is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the request contract remain supported?",
+        action: "Exercise the contract through its production caller.",
+        resolvesUnknowns: ["request-contract-evidence"],
+        resolvesBoundaries: ["request-contract"],
+        outcomes: { supported: "merge", contradicted: "revise" },
+      },
+    ];
+
+    const missing = await validate(payload);
+    expect(missing.status).not.toBe(0);
+    expect(missing.stderr).toContain(
+      "resolvesBoundaries requires boundaryOutcomes",
+    );
+
+    payload.evidencePlan[0]!.boundaryOutcomes = {
+      supported: { "request-contract": "supported" },
+      contradicted: { "request-contract": "contradicted" },
+    };
+    const valid = await validate(payload);
+    expect(valid.status, valid.stderr).toBe(0);
+
+    payload.evidencePlan[0]!.boundaryOutcomes!["supported"]![
+      "request-contract"
+    ] = "contradicted";
+    const unsafeMerge = await validate(payload);
+    expect(unsafeMerge.status).not.toBe(0);
+    expect(unsafeMerge.stderr).toContain(
+      "a merge outcome requires every resolved material boundary to be supported",
+    );
   });
 
   test("requires unique unknown identifiers", async () => {
@@ -902,8 +981,7 @@ describe("patch risk assessment contract", () => {
       "hold_for_evidence cannot retain a contradicted material boundary",
     );
 
-    payload.materialBoundaries[0]!.result = "unresolved";
-    payload.evidencePlan[0]!.resolvesBoundaries = ["request-contract"];
+    payload.materialBoundaries[0]!.result = "supported";
     payload.regressionProtection.rating = "partial";
     payload.regressionProtection.exactHeadChecksPassed = false;
     payload.validation[0]!.status = "failed";
@@ -1127,6 +1205,38 @@ describe("patch risk assessment contract", () => {
     expect(complete.status, complete.stderr).toBe(0);
   });
 
+  test("keeps terminal defect outcomes on hold until applicability resolves", async () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.confidence.rating = "low";
+    payload.applicability = {
+      status: "unknown",
+      rationale: "Runtime ownership remains unresolved.",
+    };
+    payload.unknowns = [
+      {
+        id: "runtime-owner",
+        summary: "The runtime owner is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Does the changed runtime expose the defect?",
+        action: "Exercise the changed path through the runtime entry point.",
+        resolvesUnknowns: ["runtime-owner"],
+        outcomes: { defective: "revise", unavailable: "hold_for_evidence" },
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "a terminal outcome must resolve unknown applicability",
+    );
+  });
+
   test.each(["high", "moderate"] as const)(
     "rejects %s confidence when holding for evidence",
     async (confidence) => {
@@ -1290,6 +1400,24 @@ describe("patch risk assessment contract", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
       "unknown regression protection cannot support high confidence",
+    );
+  });
+
+  test("rejects high confidence while an explicit bounded unknown remains", async () => {
+    const payload = assessment();
+    payload.regressionLikelihood.rating = "moderate";
+    payload.unknowns = [
+      {
+        id: "bounded-observability-gap",
+        summary: "A non-decision-critical observability detail is unavailable.",
+        decisionCritical: false,
+      },
+    ];
+
+    const result = await validate(payload);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "high confidence cannot retain an explicit unknown",
     );
   });
 

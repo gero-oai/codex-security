@@ -201,6 +201,14 @@
             "minItems": 1
           },
           "resolvesBoundaries": { "$ref": "#/$defs/stringList" },
+          "boundaryOutcomes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/boundaryResult" }
+            },
+            "minProperties": 2
+          },
           "applicabilityOutcomes": {
             "type": "object",
             "additionalProperties": {
@@ -225,7 +233,7 @@
     },
     "nonBlankString": {
       "type": "string",
-      "pattern": "[^\\s\\uFEFF]"
+      "pattern": "[^\\u0009-\\u000D\\u0020\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]"
     },
     "identifier": {
       "type": "string",
@@ -240,6 +248,9 @@
         "superseded",
         "unknown"
       ]
+    },
+    "boundaryResult": {
+      "enum": ["supported", "contradicted", "unresolved"]
     },
     "stringList": {
       "type": "array",
