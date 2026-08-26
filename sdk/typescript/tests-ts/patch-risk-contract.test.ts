@@ -601,7 +601,7 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
-  test("holds a known defect while its applicability remains unknown", async () => {
+  test("preserves known defect evidence while applicability remains unknown", async () => {
     const payload = assessment();
     payload.recommendation = "hold_for_evidence";
     payload.workflowLabel = "hold_for_evidence";
@@ -631,8 +631,19 @@ describe("patch risk assessment contract", () => {
       },
     ];
 
-    const result = await validate(payload);
-    expect(result.status, result.stderr).toBe(0);
+    const contradicted = await validate(payload);
+    expect(contradicted.status, contradicted.stderr).toBe(0);
+
+    payload.materialBoundaries[0]!.result = "supported";
+    payload.regressionLikelihood.rating = "critical";
+    const critical = await validate(payload);
+    expect(critical.status, critical.stderr).toBe(0);
+
+    payload.regressionLikelihood.rating = "high";
+    payload.validation[0]!.status = "failed";
+    payload.validation[0]!.failureAttribution = "patch_caused";
+    const failed = await validate(payload);
+    expect(failed.status, failed.stderr).toBe(0);
   });
 
   test("allows an evidence action for every decision-critical unknown", async () => {

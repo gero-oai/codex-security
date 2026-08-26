@@ -260,6 +260,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
                     recommendation == "no_op"
                     and value["applicability"]["status"] in NON_APPLICABLE
                 )
+                and not (
+                    recommendation == "hold_for_evidence"
+                    and value["applicability"]["status"] == "unknown"
+                )
             ):
                 errors.append(
                     "a patch-caused validation failure requires revise, block, or an established no-op disposition"
@@ -338,7 +342,10 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("hold_for_evidence requires low confidence")
         if not evidence_plan:
             errors.append("hold_for_evidence requires a bounded evidence plan")
-        if value["regressionLikelihood"]["rating"] == "critical":
+        if (
+            value["regressionLikelihood"]["rating"] == "critical"
+            and value["applicability"]["status"] != "unknown"
+        ):
             errors.append("hold_for_evidence cannot have critical regression likelihood")
         if (
             any(item["result"] == "contradicted" for item in boundaries)

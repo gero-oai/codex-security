@@ -73,8 +73,8 @@ Keep the explanation evidence-backed. Patch size, caller count, green CI, or tes
 ## Hard Rules
 
 - Do not recommend any merge state while a source-visible regression, unsupported control break, parallel bypass, trust-boundary failure, or material documentation contradiction remains.
-- Treat unknown applicability as decision-critical and use `hold_for_evidence` until runtime reachability or ownership is established, even when candidate behavior is contradicted.
-- Do not use `hold_for_evidence` for an already established defect; use `revise` or `block`.
+- Treat unknown applicability as decision-critical and use `hold_for_evidence` until runtime reachability or ownership is established, even when other evidence establishes a candidate defect; preserve that defect evidence on the hold.
+- Once applicability is established, do not use `hold_for_evidence` for an already established defect; use `revise` or `block`.
 - Do not treat unavailable evidence as affirmative failure evidence.
 - Do not claim strong regression protection unless tests exercise the changed behavior or affected contract and the relevant checks actually ran.
 - Do not infer compatibility from clean textual application, individual green tests, or a small diff.
