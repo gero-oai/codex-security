@@ -1323,6 +1323,7 @@ interface CliDependencies {
     repository: string,
     signal?: AbortSignal,
   ) => Promise<PatchRiskReviewContract>;
+  resolvePluginPython?: typeof resolvePluginPython;
   validatePatchRiskAssessment?: (
     reviewResponse: string,
     options: {
@@ -5436,7 +5437,7 @@ const PRIVATE_KEY_BLOCK_START =
   /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PRIVATE_KEY_BLOCK_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/iu;
 const PATCH_REPORT_EMPTY_SENSITIVE_FIELD =
-  /^\s*(?:(?:[-*+]\s+)?(?:api|access|private)[ _-]?key|authorization|auth|token|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
+  /^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:(?:api|access|private)[ _-]?key|authorization|auth|token|secret|credential|signature|password|passwd)\s*[:=]\s*$/iu;
 
 function safePatchBoundaryClassification(value: string): string | undefined {
   const classification = PATCH_REPORT_BOUNDARY_CLASSIFICATION.exec(value);
@@ -8518,6 +8519,7 @@ async function runSkill(
     dependencies.snapshotPatchReviewWorktree ?? snapshotPatchReviewWorktree
   )(directory, options.signal);
   let patchRiskContract: PatchRiskReviewContract | undefined;
+  let patchRiskPythonPath: string | undefined;
   try {
     options.signal?.throwIfAborted();
     options.onReviewRepository?.(snapshot.directory);
@@ -8525,10 +8527,21 @@ async function runSkill(
       patchRiskContract = await (
         dependencies.sealPatchRiskReviewContract ?? sealPatchRiskReviewContract
       )(snapshot.directory, options.signal);
+      patchRiskPythonPath = await (
+        dependencies.resolvePluginPython ?? resolvePluginPython
+      )({
+        configuredPath: options.pythonPath,
+        environment: exportEnvironment(
+          options.environment ?? dependencies.environment,
+        ),
+      });
     }
     const workflowOptions: SkillRunOptions = {
       ...options,
       ...(patchRiskContract === undefined ? {} : { patchRiskContract }),
+      ...(patchRiskPythonPath === undefined
+        ? {}
+        : { pythonPath: patchRiskPythonPath }),
     };
     return await runPatchReviewWorkflow(stages, stdout, {
       run,
