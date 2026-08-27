@@ -953,6 +953,8 @@ From `sdk/typescript`, install dependencies, build, and start:
 
 ```bash
 pnpm install --frozen-lockfile
+npm ci --prefix ../../plugins/codex-security/mcp-app --no-audit --no-fund
+pnpm run build:plugin
 pnpm run build
 pnpm run start:server
 ```
