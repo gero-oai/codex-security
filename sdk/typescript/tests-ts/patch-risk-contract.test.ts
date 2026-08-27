@@ -40,21 +40,26 @@ interface Assessment {
     invariant: string;
     runtimeRoot: string;
     counterexample: string;
+    counterexampleSource: string;
     legitimateControl: string;
+    legitimateControlSource: string;
     result: string;
   }>;
   validation: Array<{
     name: string;
     status: string;
     protects: string;
+    relevant: boolean;
   }>;
   unknowns: Array<{
+    id: string;
     summary: string;
     decisionCritical: boolean;
   }>;
   evidencePlan: Array<{
     question: string;
     action: string;
+    resolvesUnknowns: string[];
     outcomes: Record<string, string>;
   }>;
 }
@@ -122,7 +127,9 @@ function assessment(): Assessment {
           "Supported requests retain their existing response contract.",
         runtimeRoot: "service.request",
         counterexample: "A supported request takes the changed branch.",
+        counterexampleSource: "src/request.ts:20",
         legitimateControl: "A supported request takes the unchanged branch.",
+        legitimateControlSource: "src/request.ts:12",
         result: "supported",
       },
     ],
@@ -131,6 +138,7 @@ function assessment(): Assessment {
         name: "focused request tests",
         status: "passed",
         protects: "Changed behavior through the production caller.",
+        relevant: true,
       },
     ],
     unknowns: [],
@@ -253,6 +261,7 @@ describe("patch risk assessment contract", () => {
       (_, index) => ({
         question: `Question ${index}`,
         action: "Inspect the corresponding evidence.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: { supported: "merge", contradicted: "revise" },
       }),
     );
@@ -263,6 +272,7 @@ describe("patch risk assessment contract", () => {
       {
         question: "Is the boundary protected?",
         action: "Inspect the corresponding evidence.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: { supported: "merge" },
       },
     ];
@@ -273,10 +283,22 @@ describe("patch risk assessment contract", () => {
       {
         question: "Is the boundary protected?",
         action: "Inspect the corresponding evidence.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: { supported: "", contradicted: "revise" },
       },
     ];
     expect(validateWithSharedSchema(emptyOutcome).status).not.toBe(0);
+
+    const emptyOutcomeName = assessment();
+    emptyOutcomeName.evidencePlan = [
+      {
+        question: "Is the boundary protected?",
+        action: "Inspect the corresponding evidence.",
+        resolvesUnknowns: ["rollout-target"],
+        outcomes: { "": "merge", " ": "revise" },
+      },
+    ];
+    expect(validateWithSharedSchema(emptyOutcomeName).status).not.toBe(0);
 
     const largeChangedFileList = assessment();
     largeChangedFileList.patch.changedFiles = Array.from(
@@ -315,10 +337,6 @@ describe("patch risk assessment contract", () => {
     const trailingNewlineDigest = assessment();
     trailingNewlineDigest.patch.sha256 = `${"c".repeat(64)}\n`;
     invalidAssessments.push(trailingNewlineDigest);
-
-    const emptyValidation = assessment();
-    emptyValidation.validation = [];
-    invalidAssessments.push(emptyValidation);
 
     const duplicateItems = assessment();
     duplicateItems["autoMergeExclusions"] = ["migration", "migration"];
@@ -376,6 +394,7 @@ describe("patch risk assessment contract", () => {
     payload.workflowLabel = "hold_for_evidence";
     payload.unknowns = [
       {
+        id: "rollout-target",
         summary: "The rollout target is unavailable.",
         decisionCritical: true,
       },
@@ -387,6 +406,7 @@ describe("patch risk assessment contract", () => {
       {
         question: "Does the changed configuration own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: {
           unavailable: "hold_for_evidence",
           inaccessible: "hold_for_evidence",
@@ -399,6 +419,7 @@ describe("patch risk assessment contract", () => {
       {
         question: "Does the changed configuration own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: {
           supported: "merge",
           contradicted: "no_op",
@@ -421,6 +442,10 @@ describe("patch risk assessment contract", () => {
       status: "superseded",
       rationale: "A narrower patch already landed.",
     };
+    payload.regressionLikelihood.rating = "moderate";
+    payload.regressionProtection.rating = "none";
+    payload.regressionProtection.exactHeadChecksPassed = false;
+    payload.validation = [];
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
   });
@@ -437,6 +462,7 @@ describe("patch risk assessment contract", () => {
 
     payload.materialBoundaries[0]!.result = "contradicted";
     payload.regressionLikelihood.rating = "critical";
+    payload.regressionProtection.rating = "partial";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
   });
@@ -450,6 +476,7 @@ describe("patch risk assessment contract", () => {
 
     payload.validation[0]!.status = "failed";
     payload.regressionLikelihood.rating = "high";
+    payload.regressionProtection.rating = "partial";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
   });
@@ -476,6 +503,10 @@ describe("patch risk assessment contract", () => {
     strongWithoutExactHead.regressionProtection.exactHeadChecksPassed = false;
     expect(validate(strongWithoutExactHead).status).not.toBe(0);
 
+    const strongWithoutPassedValidation = assessment();
+    strongWithoutPassedValidation.validation[0]!.status = "skipped";
+    expect(validate(strongWithoutPassedValidation).status).not.toBe(0);
+
     const unknownProtectionWithHighConfidence = assessment();
     unknownProtectionWithHighConfidence.regressionProtection.rating = "unknown";
     expect(validate(unknownProtectionWithHighConfidence).status).not.toBe(0);
@@ -486,6 +517,42 @@ describe("patch risk assessment contract", () => {
       false;
     lowLikelihoodWithoutPassingProtection.validation[0]!.status = "skipped";
     expect(validate(lowLikelihoodWithoutPassingProtection).status).not.toBe(0);
+
+    const lowLikelihoodWithOnlyIrrelevantPassingProtection = assessment();
+    lowLikelihoodWithOnlyIrrelevantPassingProtection.regressionProtection.rating =
+      "partial";
+    lowLikelihoodWithOnlyIrrelevantPassingProtection.regressionProtection.exactHeadChecksPassed =
+      false;
+    lowLikelihoodWithOnlyIrrelevantPassingProtection.validation = [
+      {
+        name: "formatting",
+        status: "passed",
+        protects: "Formatting only.",
+        relevant: false,
+      },
+      {
+        name: "request regression",
+        status: "skipped",
+        protects: "Changed behavior through the production caller.",
+        relevant: true,
+      },
+    ];
+    expect(
+      validate(lowLikelihoodWithOnlyIrrelevantPassingProtection).status,
+    ).not.toBe(0);
+
+    const privilegedLowImpact = assessment();
+    privilegedLowImpact.impact.rating = "low";
+    privilegedLowImpact.autoMergeExclusions = ["privileged_boundary"];
+    expect(validate(privilegedLowImpact).status).not.toBe(0);
+
+    const publicContractModerateImpact = assessment();
+    publicContractModerateImpact.autoMergeExclusions = ["public_contract"];
+    expect(validate(publicContractModerateImpact).status).not.toBe(0);
+
+    const criticalRegression = assessment();
+    criticalRegression.regressionLikelihood.rating = "critical";
+    expect(validate(criticalRegression).status).not.toBe(0);
   });
 
   test("keeps failed validation and established defects out of merge and hold", () => {
@@ -499,6 +566,7 @@ describe("patch risk assessment contract", () => {
     hold.materialBoundaries[0]!.result = "contradicted";
     hold.unknowns = [
       {
+        id: "rollout-target",
         summary: "A separate rollout detail is unavailable.",
         decisionCritical: true,
       },
@@ -507,6 +575,7 @@ describe("patch risk assessment contract", () => {
       {
         question: "Which rollout target is selected?",
         action: "Inspect the checked-in deployment mapping.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: { found: "revise", unavailable: "hold_for_evidence" },
       },
     ];
@@ -515,6 +584,34 @@ describe("patch risk assessment contract", () => {
     hold.materialBoundaries[0]!.result = "supported";
     hold.validation[0]!.status = "failed";
     expect(validate(hold).status).not.toBe(0);
+  });
+
+  test("binds terminal evidence outcomes to every critical unknown", () => {
+    const payload = assessment();
+    payload.recommendation = "hold_for_evidence";
+    payload.workflowLabel = "hold_for_evidence";
+    payload.unknowns = [
+      {
+        id: "rollout-target",
+        summary: "The rollout target is unavailable.",
+        decisionCritical: true,
+      },
+      {
+        id: "request-contract",
+        summary: "The supported request contract is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    payload.evidencePlan = [
+      {
+        question: "Which rollout target is selected?",
+        action: "Inspect the checked-in deployment mapping.",
+        resolvesUnknowns: ["rollout-target"],
+        outcomes: { found: "merge", unavailable: "hold_for_evidence" },
+      },
+    ];
+
+    expect(validate(payload).status).not.toBe(0);
   });
 
   test("requires no-op for an established non-applicable disposition", () => {

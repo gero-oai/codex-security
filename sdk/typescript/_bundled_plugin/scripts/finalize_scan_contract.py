@@ -1625,6 +1625,15 @@ def _validate_schema_node(
                 raise ContractError(f"{context}.{key}: missing required schema property")
         if "minProperties" in schema and len(value) < schema["minProperties"]:
             raise ContractError(f"{context}: object has too few properties")
+        property_names = schema.get("propertyNames")
+        if isinstance(property_names, dict):
+            for key in value:
+                _validate_schema_node(
+                    key,
+                    property_names,
+                    f"{context} property name",
+                    root_schema,
+                )
         properties = schema.get("properties", {})
         additional_properties = schema.get("additionalProperties", True)
         for key, item in value.items():
