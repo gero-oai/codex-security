@@ -1,4 +1,4 @@
-import type { CoverageCompleteness, CoverageDocument } from "./models.js";
+import type { CoverageDocument } from "./models.js";
 
 export type CoverageSummary = Pick<
   CoverageDocument,
@@ -65,10 +65,4 @@ export function formatCoverageScope(
   coverage: Omit<CoverageSummary, "completeness">,
 ): string {
   return formatCoverageScopeParts(coverage).join(" ");
-}
-
-export function formatCoverageCompleteness(
-  completeness: CoverageCompleteness,
-): string {
-  return `${completeness} for requested scope`;
 }

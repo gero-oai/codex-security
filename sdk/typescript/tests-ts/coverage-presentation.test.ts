@@ -3,15 +3,15 @@ import {
   formatCoverageScope,
   formatScopePath,
 } from "../src/coverage-presentation.js";
+import { resolvePluginPython } from "../src/runtime.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
-function projectScope(scope: {
+async function projectScope(scope: {
   includePaths: string[];
   excludePaths: string[];
   explicitExclusions: Array<{ pattern: string; reason: string }>;
-}): string {
-  const python = Bun.which("python3") ?? Bun.which("python");
-  expect(python).not.toBeNull();
+}): Promise<string> {
+  const python = await resolvePluginPython();
   const script = [
     "import json, pathlib, runpy, sys, unicodedata",
     "plugin = pathlib.Path(sys.argv[1])",
@@ -28,7 +28,17 @@ function projectScope(scope: {
     "sys.stdout.buffer.write(projection['generate_report_markdown'](manifest, findings, coverage))",
   ].join("\n");
   const result = Bun.spawnSync(
-    [python!, "-I", "-B", "-c", script, PLUGIN_ROOT, JSON.stringify(scope)],
+    [
+      python,
+      "-I",
+      "-X",
+      "utf8",
+      "-B",
+      "-c",
+      script,
+      PLUGIN_ROOT,
+      JSON.stringify(scope),
+    ],
     { stdout: "pipe", stderr: "pipe" },
   );
   expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
@@ -109,7 +119,7 @@ describe("coverage scope presentation", () => {
     }
   });
 
-  test("escapes invisible Unicode controls independently of Python's Unicode database", () => {
+  test("escapes invisible Unicode controls independently of Python's Unicode database", async () => {
     // Unicode 17 DerivedGeneralCategory.txt, General_Category=Format.
     const formatControls = (
       [
@@ -154,7 +164,7 @@ describe("coverage scope presentation", () => {
       expect(encoded).not.toMatch(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/u);
       expect(JSON.parse(encoded)).toBe(path);
     }
-    const report = projectScope({
+    const report = await projectScope({
       includePaths: paths,
       excludePaths: [],
       explicitExclusions: [],
@@ -168,7 +178,7 @@ describe("coverage scope presentation", () => {
     );
   });
 
-  test("preserves exact paths in Markdown scope and deferred work", () => {
+  test("preserves exact paths in Markdown scope and deferred work", async () => {
     const included = [
       ["src/a b.ts", '`"src/a b.ts"`'],
       ["src/a  b.ts", '`"src/a  b.ts"`'],
@@ -195,7 +205,7 @@ describe("coverage scope presentation", () => {
       ["vendor,tests", '`"vendor,tests"`'],
     ] as const;
     const pattern = "generated/\u2066[omitted]*`";
-    const report = projectScope({
+    const report = await projectScope({
       includePaths: included.map(([path]) => path),
       excludePaths: excluded.map(([path]) => path),
       explicitExclusions: [{ pattern, reason: "Synthetic exclusion." }],

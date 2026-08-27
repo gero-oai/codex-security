@@ -80,7 +80,6 @@ import {
 } from "./config.js";
 import { formatUsd, type ScanCost } from "./cost.js";
 import {
-  formatCoverageCompleteness,
   formatCoverageScope,
   formatScopePath,
 } from "./coverage-presentation.js";
@@ -6793,7 +6792,7 @@ function printScanSummary(
     `\n  ${paint("REPORT", "1;36")}    ${paint(errorMessage(result.reportPath), 4)}\n\n` +
       `  ${paint("FINDINGS", 1)}  ${paint(`${findingCount}${findingSummary === "" ? "" : ` (${findingSummary})`}`, findingColor)}\n` +
       `  ${paint("SCOPE", 1)}     ${formatCoverageScope(result.coverage)}\n` +
-      `  ${paint("COVERAGE", 1)}  ${formatCoverageCompleteness(result.coverage.completeness)}\n` +
+      `  ${paint("COVERAGE", 1)}  ${result.coverage.completeness} for requested scope\n` +
       (deepScanStop === undefined
         ? ""
         : `  ${paint("STOPPED", 1)}   ${deepScanStop.reason}\n`) +

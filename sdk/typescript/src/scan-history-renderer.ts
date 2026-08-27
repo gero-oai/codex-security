@@ -1,7 +1,6 @@
 import { basename, relative } from "node:path";
 import type { JsonObject } from "./config.js";
 import {
-  formatCoverageCompleteness,
   formatCoverageScopeParts,
   type CoverageSummary,
 } from "./coverage-presentation.js";
@@ -249,7 +248,7 @@ export function renderScanHistory(
         `  ${strong("SCOPE")}  `,
       );
       lines.push(
-        `  ${strong("COVERAGE")}  ${formatCoverageCompleteness(canonicalCoverage.completeness)}`,
+        `  ${strong("COVERAGE")}  ${canonicalCoverage.completeness} for requested scope`,
       );
     } else if (status === "complete") {
       lines.push(`  ${strong("COVERAGE")}  not available`);
