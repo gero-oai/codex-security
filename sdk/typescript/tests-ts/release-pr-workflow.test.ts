@@ -1,4 +1,13 @@
-import { readFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 
 const workflow = readFileSync(
@@ -111,6 +120,12 @@ describe("patch release PR workflow", () => {
   });
 
   test("creates a one-line manifest commit with create-only branch semantics", () => {
+    const create = script
+      .replaceAll("\\\n", "")
+      .split("\n")
+      .find((line) => /^\s*gh pr create\b/u.test(line));
+    expect(create).toMatch(/(?:^|\s)--draft(?:\s|$)/u);
+    expect(script).toContain(".isDraft == true");
     expect(script).toContain("git diff --numstat");
     expect(script).toContain("git diff --check");
     expect(script).toContain('git commit -m "release: bump');
@@ -119,7 +134,7 @@ describe("patch release PR workflow", () => {
     expect(script).toContain(
       "Main changed before the release branch was pushed",
     );
-    expect(script).toContain("does not match the expected release commit");
+    expect(script).toContain(".headRefOid == $sha");
   });
 
   test("distinguishes an absent release from an API failure", () => {
@@ -127,6 +142,30 @@ describe("patch release PR workflow", () => {
     expect(script).toContain(".data.repository.release == null");
     expect(script).toContain(".data.repository.release |");
     expect(script).not.toContain("gh release view");
+  });
+
+  test("validates proposal manifests through the workflow's stdin reader", () => {
+    const reader = script.match(
+      /package_version\(\)\s*\{\s*node --input-type=module --eval '([^']+)'/u,
+    )?.[1];
+    expect(reader).toBeDefined();
+    for (const [name, version, valid] of [
+      ["@openai/codex-security", "1.2.3", true],
+      ["example-package", "1.2.3", false],
+      ["@openai/codex-security", "1.2.3-rc.1", false],
+    ] as const) {
+      const result = Bun.spawnSync(
+        ["node", "--input-type=module", "--eval", reader!],
+        {
+          cwd: fileURLToPath(new URL("../../../", import.meta.url)),
+          stdin: Buffer.from(JSON.stringify({ name, version })),
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      expect(result.exitCode === 0).toBe(valid);
+      if (valid) expect(new TextDecoder().decode(result.stdout)).toBe(version);
+    }
   });
 
   test("renders the canonical unchecked template and cannot publish", () => {
@@ -140,5 +179,53 @@ describe("patch release PR workflow", () => {
     expect(script).not.toMatch(/\bgh\s+(?:release\s+create|workflow\s+run)\b/u);
     expect(script).not.toMatch(/\bgit\s+tag\b/u);
     expect(script).not.toMatch(/\bgh\s+pr\s+merge\b/u);
+  });
+
+  test("generates only the version edit and an unchecked draft body", () => {
+    const program = script.match(
+      /node --input-type=module <<'NODE'\n([\s\S]*?)\nNODE/u,
+    )?.[1];
+    expect(program).toBeDefined();
+    const root = mkdtempSync(join(tmpdir(), "release-proposal-"));
+    const source =
+      JSON.stringify(
+        { name: "@openai/codex-security", version: "1.2.3" },
+        null,
+        2,
+      ) + "\n";
+    try {
+      mkdirSync(join(root, ".github"));
+      writeFileSync(
+        join(root, ".github/PULL_REQUEST_TEMPLATE.md"),
+        readFileSync(
+          new URL("../../../.github/PULL_REQUEST_TEMPLATE.md", import.meta.url),
+        ),
+      );
+      writeFileSync(join(root, "package.json"), source);
+      const result = Bun.spawnSync(["node", "--input-type=module"], {
+        cwd: root,
+        env: {
+          ...process.env,
+          CURRENT_VERSION: "1.2.3",
+          NEXT_VERSION: "1.2.4",
+          PR_BODY: "body.md",
+          PACKAGE_PATH: "package.json",
+        },
+        stdin: Buffer.from(program!),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
+      expect(readFileSync(join(root, "package.json"), "utf8")).toBe(
+        source.replace('"version": "1.2.3"', '"version": "1.2.4"'),
+      );
+      const body = readFileSync(join(root, "body.md"), "utf8");
+      expect(body).toContain(".github/release-notes.md");
+      expect(body).toContain("`<!-- release-version: 1.2.4 -->`");
+      expect(body.match(/^- \[ \]/gm)).toHaveLength(3);
+      expect(body).not.toContain("- [x]");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

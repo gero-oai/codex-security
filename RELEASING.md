@@ -56,6 +56,13 @@ That manual label takes precedence over the title category.
    pull request. Do not merge until required CI, review, and public disclosure
    checks pass on the current commit.
 
+Automated patch-version proposals start as drafts. Add the reviewed notes before
+marking them ready, and validate the version/header pairing from the repository root:
+
+```bash
+node sdk/typescript/scripts/release-automation.mjs validate-release-notes X.Y.Z .github/release-notes.md
+```
+
 Review the summary with the same standard as product documentation. Keep it
 specific, describe behavior before implementation, and do not include private
 repositories, systems, people, findings, links, or issue identifiers.

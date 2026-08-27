@@ -78,14 +78,8 @@ jobs:
           package_version() {
             node --input-type=module --eval '
               import { readFileSync } from "node:fs";
-              const manifest = JSON.parse(readFileSync(0, "utf8"));
-              const version = manifest.version;
-              if (manifest.name !== "@openai/codex-security" ||
-                  typeof version !== "string" ||
-                  !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u.test(version)) {
-                throw new Error("The release package must have its expected name and a stable X.Y.Z version.");
-              }
-              process.stdout.write(version);
+              import { releaseVersion } from "./sdk/typescript/scripts/release-automation.mjs";
+              process.stdout.write(releaseVersion(JSON.parse(readFileSync(0, "utf8"))));
             '
           }
 
@@ -266,7 +260,7 @@ jobs:
 
           pr_body="$RUNNER_TEMP/patch-release-pr.md"
           CURRENT_VERSION="$current_version" NEXT_VERSION="$next_version" \
-            PR_BODY="$pr_body" node --input-type=module <<'NODE'
+            PR_BODY="$pr_body" PACKAGE_PATH="$package_path" node --input-type=module <<'NODE'
           import { readFileSync, writeFileSync } from "node:fs";
 
           const current = process.env.CURRENT_VERSION;
@@ -286,7 +280,7 @@ jobs:
             ],
             [
               "<!-- Describe compatibility, security, operational, or release considerations. -->",
-              "This PR does not publish or tag a release. It still requires public-disclosure review, approval, and the normal required checks before merge.",
+              `This is a draft version proposal, not a release-ready change. Add a reviewed summary to .github/release-notes.md with the header \`<!-- release-version: ${next} -->\` before marking it ready. Run the release-notes validator described in RELEASING.md, then complete public-disclosure review, approval, and required CI. This PR does not publish or tag a release.`,
             ],
           ];
           let body = readFileSync(".github/PULL_REQUEST_TEMPLATE.md", "utf8");
@@ -295,15 +289,8 @@ jobs:
             body = body.replace(marker, value);
           }
           writeFileSync(process.env.PR_BODY, body);
-          NODE
-
-          CURRENT_VERSION="$current_version" NEXT_VERSION="$next_version" \
-            PACKAGE_PATH="$package_path" node --input-type=module <<'NODE'
-          import { readFileSync, writeFileSync } from "node:fs";
 
           const path = process.env.PACKAGE_PATH;
-          const current = process.env.CURRENT_VERSION;
-          const next = process.env.NEXT_VERSION;
           const source = readFileSync(path, "utf8");
           const expected = `"version": "${current}"`;
           if (source.indexOf(expected) < 0 || source.indexOf(expected) !== source.lastIndexOf(expected)) {
@@ -345,16 +332,17 @@ jobs:
           pr_url="$(
             gh pr create \
               --repo "$GITHUB_REPOSITORY" \
+              --draft \
               --base main \
               --head "$branch" \
               --title "release: bump Codex Security to $next_version" \
               --body-file "$pr_body"
           )"
-          pr="$(gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json number,headRefOid,baseRefName,state)"
+          pr="$(gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json number,headRefOid,baseRefName,state,isDraft)"
           if ! jq -e --arg sha "$release_commit" \
-            '.headRefOid == $sha and .baseRefName == "main" and .state == "OPEN"' \
+            '.headRefOid == $sha and .baseRefName == "main" and .state == "OPEN" and .isDraft == true' \
             <<< "$pr" >/dev/null; then
-            echo "The created PR does not match the expected release commit." >&2
+            echo "Created PR is not the expected draft release proposal." >&2
             exit 1
           fi
           pr_number="$(jq -r .number <<< "$pr")"

@@ -52,9 +52,10 @@ The `node-release-pr` workflow can propose the next patch version after `main`
 passes `node-ci` and the current npm and GitHub releases are complete. It
 preserves any same-repository pull request that already proposes a newer stable
 version. Otherwise, when package files changed after the current release, it
-creates a one-line version commit and a pull request with an unchecked public
-disclosure checklist. It does not merge, tag, publish, or dispatch another
-workflow.
+creates a one-line version commit and a draft pull request with an unchecked
+public disclosure checklist. Add reviewed notes in `.github/release-notes.md`
+for the proposed version before marking it ready, following [RELEASING.md](RELEASING.md).
+The workflow does not merge, tag, publish, or dispatch another workflow.
 
 The workflow requires a GitHub App installation with access to this repository
 and Actions read, Contents write, and Pull requests write permissions. Its token
