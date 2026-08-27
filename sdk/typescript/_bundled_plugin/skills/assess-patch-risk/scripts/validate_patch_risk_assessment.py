@@ -79,7 +79,26 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     revision_evidence = material_failure or any(
         item["status"] == "failed" for item in value["validation"]
     )
+    passed_validation = any(
+        item["status"] == "passed" for item in value["validation"]
+    )
     errors: list[str] = []
+
+    if (
+        value["regressionProtection"]["rating"] == "strong"
+        and not value["regressionProtection"]["exactHeadChecksPassed"]
+    ):
+        errors.append("strong regression protection requires exact-head checks")
+    if (
+        value["regressionProtection"]["rating"] == "unknown"
+        and value["confidence"]["rating"] == "high"
+    ):
+        errors.append("high confidence requires known regression protection")
+    if value["regressionLikelihood"]["rating"] == "low" and (
+        value["regressionProtection"]["rating"] not in {"strong", "partial"}
+        or not passed_validation
+    ):
+        errors.append("low regression likelihood requires passing protection")
 
     if recommendation == "merge":
         if workflow_label not in {"auto_merge_candidate", "human_review_required"}:
@@ -119,7 +138,7 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             for outcome in item["outcomes"].values()
         ):
             errors.append("hold_for_evidence requires a terminal evidence outcome")
-        if material_failure:
+        if revision_evidence:
             errors.append("hold_for_evidence cannot defer an established defect")
     elif evidence_plan:
         errors.append("only hold_for_evidence may include an evidence plan")

@@ -32,6 +32,9 @@ interface Assessment {
   statusQuoRisk: { rating: string; rationale: string };
   autoMergeExclusions: string[];
   affectedRuntimeRoots: string[];
+  importantCallers: string[];
+  riskDrivers: string[];
+  protectiveFactors: string[];
   materialBoundaries: Array<{
     id: string;
     invariant: string;
@@ -109,6 +112,9 @@ function assessment(): Assessment {
     },
     autoMergeExclusions: [],
     affectedRuntimeRoots: ["service.request"],
+    importantCallers: ["request handler"],
+    riskDrivers: ["changed request behavior"],
+    protectiveFactors: ["focused request coverage"],
     materialBoundaries: [
       {
         id: "request-contract",
@@ -165,6 +171,22 @@ function validateWithSharedSchema(payload: Assessment) {
   );
 }
 
+function validateUniqueValues(input: string) {
+  expect(python).toBeDefined();
+  expect(python).not.toBeNull();
+  const program = [
+    "import json, sys",
+    "sys.path.insert(0, sys.argv[1])",
+    "import finalize_scan_contract as finalizer",
+    'finalizer._validate_schema_node(json.load(sys.stdin), {"type": "array", "uniqueItems": True}, "value")',
+  ].join("\n");
+  return spawnSync(
+    python!,
+    ["-I", "-B", "-S", "-c", program, join(PLUGIN_ROOT, "scripts")],
+    { encoding: "utf8", input },
+  );
+}
+
 describe("patch risk assessment contract", () => {
   test("resolves the validator from the installed skill", async () => {
     const outside = await mkdtemp(join(tmpdir(), "patch-risk-contract-"));
@@ -217,6 +239,10 @@ describe("patch risk assessment contract", () => {
     emptyRationale.impact.rationale = "";
     expect(validateWithSharedSchema(emptyRationale).status).not.toBe(0);
 
+    const whitespaceRationale = assessment();
+    whitespaceRationale.impact.rationale = " \t\n";
+    expect(validateWithSharedSchema(whitespaceRationale).status).not.toBe(0);
+
     const duplicateItems = assessment();
     duplicateItems.autoMergeExclusions = ["migration", "migration"];
     expect(validateWithSharedSchema(duplicateItems).status).not.toBe(0);
@@ -251,6 +277,13 @@ describe("patch risk assessment contract", () => {
       },
     ];
     expect(validateWithSharedSchema(emptyOutcome).status).not.toBe(0);
+
+    const largeChangedFileList = assessment();
+    largeChangedFileList.patch.changedFiles = Array.from(
+      { length: 5_000 },
+      (_, index) => `generated/file-${index}.ts`,
+    );
+    expect(validateWithSharedSchema(largeChangedFileList).status).toBe(0);
   });
 
   test("enforces the published schema without site packages", async () => {
@@ -268,6 +301,12 @@ describe("patch risk assessment contract", () => {
     const additionalProperty = assessment();
     additionalProperty["unexpected"] = true;
     invalidAssessments.push(additionalProperty);
+
+    const missingEvidenceCollection = assessment();
+    delete (missingEvidenceCollection as Record<string, unknown>)[
+      "importantCallers"
+    ];
+    invalidAssessments.push(missingEvidenceCollection);
 
     const invalidPattern = assessment();
     invalidPattern.patch.sha256 = "g".repeat(64);
@@ -308,6 +347,15 @@ describe("patch risk assessment contract", () => {
 
     const result = validateText(serialized);
     expect(result.status, result.stderr).toBe(0);
+  });
+
+  test("compares unique JSON values by schema equality", () => {
+    expect(validateUniqueValues("[true, 1]").status).toBe(0);
+    expect(validateUniqueValues("[1, 1.0]").status).not.toBe(0);
+    expect(
+      validateUniqueValues('[{"a": 1, "b": [2]}, {"b": [2.0], "a": 1.0}]')
+        .status,
+    ).not.toBe(0);
   });
 
   test("enforces strict auto-merge gates", () => {
@@ -388,6 +436,7 @@ describe("patch risk assessment contract", () => {
     expect(validate(payload).status).not.toBe(0);
 
     payload.materialBoundaries[0]!.result = "contradicted";
+    payload.regressionLikelihood.rating = "critical";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
   });
@@ -400,6 +449,7 @@ describe("patch risk assessment contract", () => {
     expect(validate(payload).status).not.toBe(0);
 
     payload.validation[0]!.status = "failed";
+    payload.regressionLikelihood.rating = "high";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
   });
@@ -421,6 +471,21 @@ describe("patch risk assessment contract", () => {
     descriptiveBoundaryId.materialBoundaries[0]!.id = "Request.Contract.v2";
     const accepted = validate(descriptiveBoundaryId);
     expect(accepted.status, accepted.stderr).toBe(0);
+
+    const strongWithoutExactHead = assessment();
+    strongWithoutExactHead.regressionProtection.exactHeadChecksPassed = false;
+    expect(validate(strongWithoutExactHead).status).not.toBe(0);
+
+    const unknownProtectionWithHighConfidence = assessment();
+    unknownProtectionWithHighConfidence.regressionProtection.rating = "unknown";
+    expect(validate(unknownProtectionWithHighConfidence).status).not.toBe(0);
+
+    const lowLikelihoodWithoutPassingProtection = assessment();
+    lowLikelihoodWithoutPassingProtection.regressionProtection.rating = "none";
+    lowLikelihoodWithoutPassingProtection.regressionProtection.exactHeadChecksPassed =
+      false;
+    lowLikelihoodWithoutPassingProtection.validation[0]!.status = "skipped";
+    expect(validate(lowLikelihoodWithoutPassingProtection).status).not.toBe(0);
   });
 
   test("keeps failed validation and established defects out of merge and hold", () => {
@@ -445,6 +510,10 @@ describe("patch risk assessment contract", () => {
         outcomes: { found: "revise", unavailable: "hold_for_evidence" },
       },
     ];
+    expect(validate(hold).status).not.toBe(0);
+
+    hold.materialBoundaries[0]!.result = "supported";
+    hold.validation[0]!.status = "failed";
     expect(validate(hold).status).not.toBe(0);
   });
 
