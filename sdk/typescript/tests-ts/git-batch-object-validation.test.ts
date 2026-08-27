@@ -14,7 +14,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { BUNDLED_PLUGIN_VERSION, bootstrapPlugin } from "../src/index.js";
+import {
+  BUNDLED_PLUGIN_VERSION,
+  bootstrapPlugin,
+  resolveCodexCommand,
+} from "../src/index.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryRoots: string[] = [];
@@ -125,60 +129,50 @@ function createRepository(): {
   };
 }
 
-async function upgradeBundledPlugin(root: string): Promise<string> {
+async function upgradeBundledPlugin(
+  root: string,
+  previousVersion: string,
+): Promise<string> {
   const previous = join(root, "previous-plugin");
   cpSync(PLUGIN_ROOT, previous, { recursive: true });
   const previousManifestPath = join(previous, ".codex-plugin", "plugin.json");
   const previousManifest = JSON.parse(
     readFileSync(previousManifestPath, "utf8"),
   ) as { version: string };
-  previousManifest.version = "0.1.22";
+  previousManifest.version = previousVersion;
   writeFileSync(previousManifestPath, JSON.stringify(previousManifest));
-  const previousMcpPath = join(previous, ".mcp.json");
-  const previousMcp = JSON.parse(readFileSync(previousMcpPath, "utf8")) as {
-    mcpServers: Record<string, { env_vars?: string[] }>;
-  };
-  for (const server of Object.values(previousMcp.mcpServers)) {
-    server.env_vars = server.env_vars?.filter(
-      (name) => name !== "CODEX_SAFETY_IDENTIFIER",
-    );
-  }
-  writeFileSync(previousMcpPath, JSON.stringify(previousMcp));
+  writeFileSync(
+    join(previous, ".mcp.json"),
+    JSON.stringify({ mcpServers: { "codex-security": { env_vars: [] } } }),
+  );
 
   const home = join(root, "codex-home");
-  const marketplace = join(home, "sdk-marketplace");
   mkdirSync(home, { mode: 0o700 });
-  const runCodex = async (_command: unknown, args: readonly string[]) => {
-    if (args[1] === "marketplace") {
-      writeFileSync(
-        join(home, "config.toml"),
-        `[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(marketplace)}\n`,
-      );
-      return "";
-    }
-    const selected = join(marketplace, "plugins", "codex-security");
-    const manifest = JSON.parse(
-      readFileSync(join(selected, ".codex-plugin", "plugin.json"), "utf8"),
-    ) as { version: string };
-    const installed = join(home, "installed", manifest.version);
-    rmSync(installed, { recursive: true, force: true });
-    mkdirSync(join(home, "installed"), { recursive: true });
-    cpSync(selected, installed, { recursive: true });
-    return JSON.stringify({
-      installedPath: installed,
-      version: manifest.version,
-    });
+  writeFileSync(
+    join(home, "config.toml"),
+    'cli_auth_credentials_store = "file"\n\n[features]\nplugins = true\n',
+  );
+  const command = resolveCodexCommand();
+  const environment = {
+    ...process.env,
+    CODEX_HOME: home,
+    OPENAI_API_KEY: undefined,
+    CODEX_API_KEY: undefined,
   };
-  const options = {
-    codexCommand: { command: "/synthetic-codex" },
-    runCodex,
-  };
+  const login = spawnSync(command.command, ["login", "--with-api-key"], {
+    env: environment,
+    input: "synthetic-key\n",
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  expect(login.status, login.stderr).toBe(0);
+  const options = { codexCommand: command, environment };
 
   expect((await bootstrapPlugin(home, previous, options)).version).toBe(
-    "0.1.22",
+    previousVersion,
   );
   const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
-  expect(upgraded.version).not.toBe("0.1.22");
+  expect(upgraded.version).not.toBe(previousVersion);
   expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
   const installedMcp = JSON.parse(
     readFileSync(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
@@ -2121,84 +2115,87 @@ describe("committed diff Git batch validation", () => {
     },
   );
 
-  test("rejects a status-zero missing blob from an upgraded cache before insertion", async () => {
-    expect(python).not.toBeNull();
-    const { base, head, repository, root, state } = createRepository();
-    const installedRoot = await upgradeBundledPlugin(root);
-    const blob = git(repository, "rev-parse", `${head}:fixture.txt`);
-    const objectPath = join(
-      repository,
-      ".git",
-      "objects",
-      blob.slice(0, 2),
-      blob.slice(2),
-    );
-    const backupPath = `${objectPath}.backup`;
-    const scanDirectory = join(root, "scan");
-    mkdirSync(scanDirectory, { mode: 0o700 });
-    renameSync(objectPath, backupPath);
-    try {
-      const missing = spawnSync("git", ["cat-file", "--batch", "-z"], {
-        cwd: repository,
-        input: Buffer.from(`${blob}\0`),
+  test.each(["0.1.60", "0.1.74"])(
+    "rejects a status-zero missing blob after upgrading %s before insertion",
+    async (previousVersion) => {
+      expect(python).not.toBeNull();
+      const { base, head, repository, root, state } = createRepository();
+      const installedRoot = await upgradeBundledPlugin(root, previousVersion);
+      const blob = git(repository, "rev-parse", `${head}:fixture.txt`);
+      const objectPath = join(
+        repository,
+        ".git",
+        "objects",
+        blob.slice(0, 2),
+        blob.slice(2),
+      );
+      const backupPath = `${objectPath}.backup`;
+      const scanDirectory = join(root, "scan");
+      mkdirSync(scanDirectory, { mode: 0o700 });
+      renameSync(objectPath, backupPath);
+      try {
+        const missing = spawnSync("git", ["cat-file", "--batch", "-z"], {
+          cwd: repository,
+          input: Buffer.from(`${blob}\0`),
+        });
+        expect(missing.status, missing.stderr.toString()).toBe(0);
+        expect(missing.stdout).toEqual(Buffer.from(`${blob} missing\n`));
+      } finally {
+        renameSync(backupPath, objectPath);
+      }
+
+      const probe = runPythonJson<{
+        digestTransactions: boolean[];
+        error: string | null;
+        inserted: { scans: number; workspaces: number };
+      }>(
+        [
+          "import argparse, json",
+          "from pathlib import Path",
+          "import workbench_db as workbench",
+          "repository, scan_directory, base, head = sys.argv[2:6]",
+          "object_path, backup_path = Path(sys.argv[6]), Path(sys.argv[7])",
+          "recipe = {'config': {}, 'mode': 'standard', 'repository': repository, 'target': {'kind': 'refs', 'paths': [], 'base': base, 'head': head}}",
+          "arguments = argparse.Namespace(repository=repository, scan_dir=scan_directory, registration_json_stdin=False, recipe_json_stdin=False, recipe_json=json.dumps(recipe), archive_existing=False, archived_scan_dir=None, parent_scan_id=None)",
+          "original_digest = workbench.committed_diff_content_snapshot",
+          "digest_transactions = []",
+          "def tracked_digest(*args):",
+          "    digest_transactions.append(connection.in_transaction)",
+          "    return original_digest(*args)",
+          "workbench.committed_diff_content_snapshot = tracked_digest",
+          "original_count = workbench.directory_snapshot_regular_file_count",
+          "def remove_blob_during_count(path):",
+          "    count = original_count(path)",
+          "    object_path.rename(backup_path)",
+          "    return count",
+          "workbench.directory_snapshot_regular_file_count = remove_blob_during_count",
+          "with workbench.connect() as connection:",
+          "    before = {table: connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in ('workspaces', 'scans')}",
+          "    try:",
+          "        workbench.register_cli_scan(connection, arguments)",
+          "    except SystemExit as error:",
+          "        message = str(error)",
+          "    else:",
+          "        message = None",
+          "    finally:",
+          "        if backup_path.exists():",
+          "            backup_path.rename(object_path)",
+          "    after = {table: connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in ('workspaces', 'scans')}",
+          "print(json.dumps({'digestTransactions': digest_transactions, 'error': message, 'inserted': {table: after[table] - before[table] for table in before}}))",
+        ],
+        [repository, scanDirectory, base, head, objectPath, backupPath],
+        state,
+        {},
+        join(installedRoot, "scripts"),
+      );
+
+      expect(probe).toEqual({
+        digestTransactions: [false, false],
+        error: "Could not snapshot the selected committed changes.",
+        inserted: { scans: 0, workspaces: 0 },
       });
-      expect(missing.status, missing.stderr.toString()).toBe(0);
-      expect(missing.stdout).toEqual(Buffer.from(`${blob} missing\n`));
-    } finally {
-      renameSync(backupPath, objectPath);
-    }
-
-    const probe = runPythonJson<{
-      digestTransactions: boolean[];
-      error: string | null;
-      inserted: { scans: number; workspaces: number };
-    }>(
-      [
-        "import argparse, json",
-        "from pathlib import Path",
-        "import workbench_db as workbench",
-        "repository, scan_directory, base, head = sys.argv[2:6]",
-        "object_path, backup_path = Path(sys.argv[6]), Path(sys.argv[7])",
-        "recipe = {'config': {}, 'mode': 'standard', 'repository': repository, 'target': {'kind': 'refs', 'paths': [], 'base': base, 'head': head}}",
-        "arguments = argparse.Namespace(repository=repository, scan_dir=scan_directory, registration_json_stdin=False, recipe_json_stdin=False, recipe_json=json.dumps(recipe), archive_existing=False, archived_scan_dir=None, parent_scan_id=None)",
-        "original_digest = workbench.committed_diff_content_snapshot",
-        "digest_transactions = []",
-        "def tracked_digest(*args):",
-        "    digest_transactions.append(connection.in_transaction)",
-        "    return original_digest(*args)",
-        "workbench.committed_diff_content_snapshot = tracked_digest",
-        "original_count = workbench.directory_snapshot_regular_file_count",
-        "def remove_blob_during_count(path):",
-        "    count = original_count(path)",
-        "    object_path.rename(backup_path)",
-        "    return count",
-        "workbench.directory_snapshot_regular_file_count = remove_blob_during_count",
-        "with workbench.connect() as connection:",
-        "    before = {table: connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in ('workspaces', 'scans')}",
-        "    try:",
-        "        workbench.register_cli_scan(connection, arguments)",
-        "    except SystemExit as error:",
-        "        message = str(error)",
-        "    else:",
-        "        message = None",
-        "    finally:",
-        "        if backup_path.exists():",
-        "            backup_path.rename(object_path)",
-        "    after = {table: connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in ('workspaces', 'scans')}",
-        "print(json.dumps({'digestTransactions': digest_transactions, 'error': message, 'inserted': {table: after[table] - before[table] for table in before}}))",
-      ],
-      [repository, scanDirectory, base, head, objectPath, backupPath],
-      state,
-      {},
-      join(installedRoot, "scripts"),
-    );
-
-    expect(probe).toEqual({
-      digestTransactions: [false, false],
-      error: "Could not snapshot the selected committed changes.",
-      inserted: { scans: 0, workspaces: 0 },
-    });
-  });
+    },
+  );
 
   test("rejects substituted committed blob bytes during reselection", () => {
     const { base, head, repository, state } = createRepository();

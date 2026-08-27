@@ -452,21 +452,18 @@ def committed_diff_content_snapshot(
     """Return a digest and identity from one frozen replacement view."""
     repository, pathspec = git_worktree_context(target)
     configured_state = os.environ.get("CODEX_SECURITY_STATE_DIR")
+    state_directory = None
     if configured_state:
         state_directory = Path(configured_state).expanduser().resolve()
         state_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix="codex-security-committed-view-",
-            dir=state_directory,
-        ) as directory:
-            return _committed_diff_content_snapshot(
-                repository,
-                pathspec,
-                base,
-                head,
-                Path(directory),
-            )
-    with tempfile.TemporaryDirectory(prefix="codex-security-committed-diff-") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix=(
+            "codex-security-committed-view-"
+            if configured_state
+            else "codex-security-committed-diff-"
+        ),
+        dir=state_directory,
+    ) as directory:
         return _committed_diff_content_snapshot(
             repository,
             pathspec,

@@ -516,6 +516,7 @@ def _is_owned_task_start(
     turn_id = payload.get("turn_id")
     if not isinstance(turn_id, str) or not turn_id:
         return False
+    # Fresh Codex worker thread/turn IDs use a same-process monotonic UUIDv7 generator.
     thread_order = _uuid7_order(thread_id)
     turn_order = _uuid7_order(turn_id)
     if thread_order is None:
