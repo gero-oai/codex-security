@@ -89,6 +89,13 @@ describe("bundled finding previews", () => {
     });
   }, 30_000);
 
+  test("requires distinct filesystem witnesses for colliding descendants", () => {
+    expect(sourceScopeProbe("descendant_aliases")).toEqual({
+      fileAndDirectoryCollisionsChecked: true,
+      missingWitnessesOmitted: true,
+    });
+  }, 30_000);
+
   test("keeps saved immutable objects readable after replacement refs change", () => {
     expect(sourceScopeProbe("replacements")).toEqual({
       savedObjectsUnchanged: true,

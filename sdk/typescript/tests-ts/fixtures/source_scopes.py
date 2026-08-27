@@ -682,6 +682,44 @@ def aliases(repository: Path) -> dict:
     return result
 
 
+def descendant_aliases(repository: Path) -> dict:
+    pairs = [("foo.py", "FOO.py"), ("nested/public.py", "NESTED/public.py")]
+    for lower, _ in pairs:
+        write(repository, f"selected/{lower}", "lower source\n")
+    revision = commit(repository)
+    upper_blob = git(
+        repository, "hash-object", "-w", "--stdin", input_data=b"upper source\n"
+    )
+    for _, upper in pairs:
+        git(
+            repository, "update-index", "--add", "--cacheinfo",
+            f"100644,{upper_blob},selected/{upper}",
+        )
+    tree = git(repository, "write-tree")
+    collision = git(
+        repository, "commit-tree", tree, "-p", revision,
+        input_data=b"Synthetic descendant collision\n",
+    )
+    for lower, upper in pairs:
+        lower_path = repository / "selected" / lower
+        upper_path = repository / "selected" / upper
+        if not upper_path.exists():
+            write(repository, f"selected/{upper}", "upper source\n")
+        aliases = lower_path.samefile(upper_path)
+        record = scan(repository, collision, ["selected"])
+        assert len(json.loads(record["source_scopes_json"])["scopes"]) == 1
+        for saved in (record, {**record, "source_scopes_json": None}):
+            for path, content in ((lower, "lower"), (upper, "upper")):
+                expected = None if aliases else f"1  {content} source"
+                actual = excerpt(saved, repository, f"selected/{path}", ["selected"])
+                assert actual == expected, (path, actual, expected)
+    shutil.rmtree(repository / "selected")
+    for lower, upper in pairs:
+        for path in (lower, upper):
+            assert excerpt(record, repository, f"selected/{path}", ["selected"]) is None
+    return {"fileAndDirectoryCollisionsChecked": True, "missingWitnessesOmitted": True}
+
+
 def alias_evidence(_: Path) -> dict:
     selected, candidate = Path("/synthetic/SECRET.py"), Path("/synthetic/secret.py")
     result = {}
@@ -994,6 +1032,7 @@ with tempfile.TemporaryDirectory(prefix="codex-security-source-scopes-") as temp
             "selected_redirects": selected_redirects,
             "unsafe_locations": unsafe_locations,
             "aliases": aliases,
+            "descendant_aliases": descendant_aliases,
             "alias_evidence": alias_evidence,
             "worktrees": worktrees,
             "migration": migration,

@@ -60,12 +60,8 @@ def finding_source_excerpt(
             )
             indexed.setdefault(parts, []).append(record)
     lengths = sorted({len(parts) for parts in indexed})
-    objects: dict[str, str | None] = {}
 
     def source_object(path: str) -> str | None:
-        if path in objects:
-            return objects[path]
-        objects[path] = None
         parsed = relative_path(path)
         if parsed is None:
             return None
@@ -79,35 +75,24 @@ def finding_source_excerpt(
                         repository, tree, target, path, record
                     )
                     if object_id is not None:
-                        objects[path] = object_id
                         return object_id
         except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
             pass
         return None
 
-    location = None
-    object_id = None
-    for priority in range(3):
-        for candidate in locations:
-            path, role = candidate.get("path"), candidate.get("role")
-            if not isinstance(path, str) or (
-                priority == 0
-                and role != "root_control"
-                or priority == 1
-                and "root_control" not in str(role or "").lower()
-            ):
-                continue
-            object_id = source_object(path)
-            if object_id is not None:
-                location = candidate
-                break
-        if location is not None:
+    locations.sort(
+        key=lambda location: (
+            location.get("role") != "root_control",
+            "root_control" not in str(location.get("role") or "").lower(),
+        )
+    )
+    for location in locations:
+        object_id = source_object(location["path"])
+        if object_id is not None:
             break
-    if location is None or object_id is None:
+    else:
         return None
-    start_line, end_line = location.get("startLine"), location.get("endLine")
-    if not isinstance(start_line, int):
-        return None
+    start_line, end_line = location["startLine"], location.get("endLine")
     source = scanned_source_text(repository, object_id)
     if not source or "\0" in source:
         return None

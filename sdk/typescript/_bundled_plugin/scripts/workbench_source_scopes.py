@@ -355,7 +355,9 @@ def source_object_for_path(
     if scope["kind"] == "file":
         return scope["objectId"] if not suffix else None
     relative = PurePosixPath(*suffix).as_posix()
-    entry = exact_tree_path(repository, scope["objectId"], relative)
+    entry = exact_tree_path(
+        repository, scope["objectId"], relative, require_unambiguous=True
+    )
     if entry is None:
         selected = safe_source_path(target, scope["canonicalPath"])
         if selected is not None:
