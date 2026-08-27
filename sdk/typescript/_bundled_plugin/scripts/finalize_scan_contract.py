@@ -1539,6 +1539,8 @@ def _validate_schema_node(
     if isinstance(value, str):
         if schema.get("minLength", 0) and len(value) < schema["minLength"]:
             raise ContractError(f"{context}: string is too short")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            raise ContractError(f"{context}: string is too long")
         if "pattern" in schema and not re.fullmatch(schema["pattern"], value):
             raise ContractError(f"{context}: string does not match schema pattern")
         if schema.get("format") == "date-time":

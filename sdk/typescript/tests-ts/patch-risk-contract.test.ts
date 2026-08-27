@@ -157,8 +157,11 @@ function validateWithSharedSchema(payload: Assessment) {
   ].join("\n");
   return spawnSync(
     python!,
-    ["-I", "-S", "-c", program, join(PLUGIN_ROOT, "scripts"), schemaPath],
-    { encoding: "utf8", input: JSON.stringify(payload) },
+    ["-I", "-B", "-S", "-c", program, join(PLUGIN_ROOT, "scripts"), schemaPath],
+    {
+      encoding: "utf8",
+      input: JSON.stringify(payload),
+    },
   );
 }
 
@@ -189,6 +192,14 @@ describe("patch risk assessment contract", () => {
     const rawWorktree = assessment();
     rawWorktree.patch.sourceType = "raw_worktree";
     expect(validateSchema(rawWorktree)).toBe(false);
+
+    const uppercaseDigest = assessment();
+    uppercaseDigest.patch.sha256 = "A".repeat(64);
+    expect(
+      validateSchema(uppercaseDigest),
+      JSON.stringify(validateSchema.errors),
+    ).toBe(true);
+    expect(validate(uppercaseDigest).status).toBe(0);
   });
 
   test("enforces the patch-risk schema through the shared validator", () => {
@@ -329,6 +340,18 @@ describe("patch risk assessment contract", () => {
         question: "Does the changed configuration own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
         outcomes: {
+          unavailable: "hold_for_evidence",
+          inaccessible: "hold_for_evidence",
+        },
+      },
+    ];
+    expect(validate(payload).status).not.toBe(0);
+
+    payload.evidencePlan = [
+      {
+        question: "Does the changed configuration own the rollout target?",
+        action: "Inspect the checked-in deployment mapping.",
+        outcomes: {
           supported: "merge",
           contradicted: "no_op",
           unavailable: "hold_for_evidence",
@@ -361,6 +384,9 @@ describe("patch risk assessment contract", () => {
 
     expect(validate(payload).status).not.toBe(0);
 
+    payload.validation[0]!.status = "failed";
+    expect(validate(payload).status).not.toBe(0);
+
     payload.materialBoundaries[0]!.result = "contradicted";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
@@ -375,6 +401,25 @@ describe("patch risk assessment contract", () => {
 
     payload.validation[0]!.status = "failed";
     const accepted = validate(payload);
+    expect(accepted.status, accepted.stderr).toBe(0);
+  });
+
+  test("requires complete merge evidence", () => {
+    const lowConfidence = assessment();
+    lowConfidence.confidence.rating = "low";
+    expect(validate(lowConfidence).status).not.toBe(0);
+
+    const emptyChangedFiles = assessment();
+    emptyChangedFiles.patch.changedFiles = [];
+    expect(validate(emptyChangedFiles).status).not.toBe(0);
+
+    const unrelatedRuntimeRoot = assessment();
+    unrelatedRuntimeRoot.materialBoundaries[0]!.runtimeRoot = "worker.request";
+    expect(validate(unrelatedRuntimeRoot).status).not.toBe(0);
+
+    const descriptiveBoundaryId = assessment();
+    descriptiveBoundaryId.materialBoundaries[0]!.id = "Request.Contract.v2";
+    const accepted = validate(descriptiveBoundaryId);
     expect(accepted.status, accepted.stderr).toBe(0);
   });
 
