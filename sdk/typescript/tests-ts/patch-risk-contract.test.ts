@@ -13,6 +13,7 @@ interface Assessment {
     sourceType: string;
     base: string;
     head: string;
+    changedFiles: string[];
     sha256: string;
   };
   recommendation: string;
@@ -81,6 +82,7 @@ function assessment(): Assessment {
       sourceType: "pull_request_diff",
       base: "a".repeat(40),
       head: "b".repeat(40),
+      changedFiles: ["src/request.ts"],
       sha256: "c".repeat(64),
     },
     recommendation: "merge",
@@ -130,14 +132,18 @@ function assessment(): Assessment {
   };
 }
 
-function validate(payload: Assessment) {
+function validateText(input: string) {
   expect(python).toBeDefined();
   expect(python).not.toBeNull();
   return spawnSync(python!, ["-I", "-S", validatorPath, "-"], {
     cwd: PLUGIN_ROOT,
     encoding: "utf8",
-    input: JSON.stringify(payload),
+    input,
   });
+}
+
+function validate(payload: Assessment) {
+  return validateText(JSON.stringify(payload));
 }
 
 describe("patch risk assessment contract", () => {
@@ -285,5 +291,18 @@ describe("patch risk assessment contract", () => {
     payload.materialBoundaries[0]!.result = "contradicted";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
+  });
+
+  test("rejects duplicate JSON object keys", () => {
+    const serialized = JSON.stringify(assessment()).replace(
+      '"recommendation":"merge"',
+      '"recommendation":"block","recommendation":"merge"',
+    );
+
+    const rejected = validateText(serialized);
+    expect(rejected.status).not.toBe(0);
+    expect(rejected.stderr).toContain(
+      "duplicate JSON object key: recommendation",
+    );
   });
 });
