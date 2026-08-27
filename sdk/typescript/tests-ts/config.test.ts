@@ -23,6 +23,7 @@ import {
   writeCodexConfig,
 } from "../src/index.js";
 import {
+  pluginPythonReadRoots,
   prepareCodexSecurityCredentialHome,
   requireSecureCredentialHome,
 } from "../src/runtime.js";
@@ -508,8 +509,25 @@ describe("Codex configuration", () => {
     async () => {
       const { root, codexHome, workspace, stateDirectory, environment } =
         await scanSandboxFixture();
-      const node = Bun.which("node");
-      expect(node).not.toBeNull();
+      const python =
+        Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
+      expect(python).not.toBeNull();
+      const readRoots = await pluginPythonReadRoots(python!, {
+        protectedPaths: [root],
+      });
+      const config = scanRuntimeCodexConfig(
+        await mergedCodexConfig({}),
+        codexHome,
+      );
+      const permissions = config["permissions"] as Record<
+        string,
+        { filesystem: Record<string, string> }
+      >;
+      Object.assign(
+        permissions["codex_security_policy"]!.filesystem,
+        Object.fromEntries(readRoots.map((path) => [path, "read"])),
+      );
+      await writeCodexConfig(join(codexHome, "config.toml"), config);
       const sandbox = (arguments_: readonly string[]) =>
         runPinnedCodex(
           codexHome,
@@ -521,7 +539,9 @@ describe("Codex configuration", () => {
             "codex_security_policy",
             "--cd",
             workspace,
-            node!,
+            python!,
+            "-I",
+            "-B",
             ...arguments_,
           ],
           environment,
@@ -529,17 +549,21 @@ describe("Codex configuration", () => {
       const evidence = join(workspace, "previous-SECURITY.md");
       await writeFile(evidence, "original");
       const read = sandbox([
-        "-e",
-        "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))",
+        "-c",
+        "import sys;from pathlib import Path;sys.stdout.write(Path(sys.argv[1]).read_text())",
         evidence,
       ]);
       if (read.exitCode !== 0) {
         const details = new TextDecoder().decode(read.stderr);
         if (
-          process.platform === "linux" &&
-          /bwrap: (?:setting up uid map: Permission denied|loopback: Failed RTM_NEWADDR: Operation not permitted)/u.test(
-            details,
-          )
+          (process.platform === "linux" &&
+            /bwrap: (?:setting up uid map: Permission denied|loopback: Failed RTM_NEWADDR: Operation not permitted)/u.test(
+              details,
+            )) ||
+          (process.platform === "win32" &&
+            details.includes(
+              "Restricted read-only access requires the elevated Windows sandbox backend",
+            ))
         ) {
           expect(runPinnedCodex(codexHome, ["features", "list"]).exitCode).toBe(
             0,
@@ -559,8 +583,8 @@ describe("Codex configuration", () => {
         evidence,
       ]) {
         const write = sandbox([
-          "-e",
-          "require('node:fs').writeFileSync(process.argv[1], 'probe')",
+          "-c",
+          "import sys;from pathlib import Path;Path(sys.argv[1]).write_text('probe')",
           path,
         ]);
         expect(write.exitCode).not.toBe(0);

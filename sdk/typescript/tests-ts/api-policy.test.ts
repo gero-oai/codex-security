@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  realpath,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -880,7 +881,7 @@ describe("CodexSecurity policy API", () => {
     const readRoots = f.threads[0]!.additionalDirectories;
     expect(readRoots).toContain(f.repository);
     expect(readRoots).toContain(PLUGIN_ROOT);
-    expect(readRoots).toContain(dirname(PYTHON));
+    expect(readRoots).toContain(await realpath(dirname(PYTHON)));
     expect(readRoots).not.toContain(f.runtime.codexHome);
     expect(readRoots).not.toContain(join(f.root, "state"));
     for (const thread of f.threads) {
