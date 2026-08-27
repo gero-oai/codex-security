@@ -9778,6 +9778,17 @@ async function runFindingPatchesWithRiskSnapshot(
   const patches: FindingPatch[] = [];
   const acceptedPatchRiskFindings: Finding[] = [];
   const acceptedPatchRiskInstructions: Record<string, string> = {};
+  const invalidateVerifiedPatches = (reason: string): void => {
+    for (const [index, patch] of patches.entries()) {
+      if (patch.status !== "verified") continue;
+      patches[index] = {
+        occurrenceId: patch.occurrenceId,
+        status: "failed",
+        files: patch.files,
+        reason,
+      };
+    }
+  };
   let reviewRepository: string | undefined;
   const reviewUnsafePublicationPaths = new Set<string>();
   const reviewPublicationPaths = new Set<string>();
@@ -9914,15 +9925,24 @@ async function runFindingPatchesWithRiskSnapshot(
     } catch (error) {
       const interrupted = interruptedPatchExitCode(options.signal);
       if (interrupted !== undefined) {
+        invalidateVerifiedPatches(
+          "A later interrupted patch turn may have changed the worktree, so this fix requires verification again.",
+        );
         return { patches, interruptedExitCode: interrupted };
       }
       throw error;
     }
     if (status === 130 || status === 143) {
+      invalidateVerifiedPatches(
+        "A later interrupted patch turn may have changed the worktree, so this fix requires verification again.",
+      );
       return { patches, interruptedExitCode: status };
     }
     const interruptedAfterFinding = interruptedPatchExitCode(options.signal);
     if (interruptedAfterFinding !== undefined) {
+      invalidateVerifiedPatches(
+        "A later interrupted patch turn may have changed the worktree, so this fix requires verification again.",
+      );
       return { patches, interruptedExitCode: interruptedAfterFinding };
     }
 
@@ -10053,6 +10073,9 @@ async function runFindingPatchesWithRiskSnapshot(
         review.status === "failed" &&
         isInterruptedPatchReview(review.exitCode)
       ) {
+        invalidateVerifiedPatches(
+          "Final combined review was interrupted, so the complete patch no longer has verified results.",
+        );
         return { patches, interruptedExitCode: review.exitCode };
       }
       if (review.status === "failed" || review.verdict.status !== "approved") {
@@ -10118,6 +10141,9 @@ async function runFindingPatchesWithRiskSnapshot(
       },
     );
     if (isInterruptedPatchReview(status)) {
+      invalidateVerifiedPatches(
+        "Final combined verification was interrupted, so the complete patch no longer has verified results.",
+      );
       return { patches, interruptedExitCode: status };
     }
     let results: FindingVerification[] | undefined;
