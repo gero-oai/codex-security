@@ -2031,173 +2031,84 @@ test("preserves the complete accepted order of attack-path steps", async () => {
     { ...original, attackPath: { steps: [input, bypass, input] } },
     { ...original, attackPath: { steps: [input, bypass, bypass, bypass] } },
   ];
-  for (const order of [
-    [0, 1, 2],
-    [0, 2, 1],
-    [1, 0, 2],
-    [1, 2, 0],
-    [2, 0, 1],
-    [2, 1, 0],
-  ]) {
-    const discoveries = order.map((index, position) => ({
-      workerId: `repeat-${position}`,
-      result: reducerDraft([repeatedGlobally[index]!]),
-    }));
-    for (const source of repeatedGlobally) {
-      const reconciled = reconcileDeepReduction(
-        reducerDraft([
-          reducedFinding(source.attackPath.steps, [
-            "repeat-0:0",
-            "repeat-1:0",
-            "repeat-2:0",
-          ]),
-        ]),
-        discoveries,
-        null,
-      ).findings[0]?.attackPath?.["steps"] as string[];
-
-      expect(reconciled).toHaveLength(5);
-      expect(reconciled.filter((step) => step === input)).toHaveLength(2);
-      expect(reconciled.filter((step) => step === bypass)).toHaveLength(3);
-      for (const { attackPath } of repeatedGlobally) {
-        let index = 0;
-        for (const step of reconciled) {
-          if (attackPath.steps[index] === step) index += 1;
-        }
-        expect(index).toBe(attackPath.steps.length);
-      }
-    }
-  }
-
-  const repeatedBeyondSeeds = [
-    { ...original, attackPath: { steps: [input, input] } },
-    { ...original, attackPath: { steps: [bypass, input, bypass, bypass] } },
-    { ...original, attackPath: { steps: [bypass, bypass, input, bypass] } },
-  ];
-  for (const order of [
-    [0, 1, 2],
-    [0, 2, 1],
-    [1, 0, 2],
-    [1, 2, 0],
-    [2, 0, 1],
-    [2, 1, 0],
-  ]) {
-    const discoveries = order.map((index, position) => ({
-      workerId: `complex-${position}`,
-      result: reducerDraft([repeatedBeyondSeeds[index]!]),
-    }));
-    for (const source of repeatedBeyondSeeds) {
-      const reconciled = reconcileDeepReduction(
-        reducerDraft([
-          reducedFinding(source.attackPath.steps, [
-            "complex-0:0",
-            "complex-1:0",
-            "complex-2:0",
-          ]),
-        ]),
-        discoveries,
-        null,
-      ).findings[0]?.attackPath?.["steps"] as string[];
-
-      expect(reconciled).toHaveLength(5);
-      expect(reconciled.filter((step) => step === input)).toHaveLength(2);
-      expect(reconciled.filter((step) => step === bypass)).toHaveLength(3);
-      for (const { attackPath } of repeatedBeyondSeeds) {
-        let index = 0;
-        for (const step of reconciled) {
-          if (attackPath.steps[index] === step) index += 1;
-        }
-        expect(index).toBe(attackPath.steps.length);
-      }
-    }
-  }
-
-  const repeatedBeyondUniformTies = [
-    { ...original, attackPath: { steps: [input, bypass, input] } },
-    { ...original, attackPath: { steps: [bypass, input, input, bypass] } },
-    { ...original, attackPath: { steps: [bypass, bypass, bypass, bypass] } },
-  ];
-  for (const order of [
-    [0, 1, 2],
-    [0, 2, 1],
-    [1, 0, 2],
-    [1, 2, 0],
-    [2, 0, 1],
-    [2, 1, 0],
-  ]) {
-    const discoveries = order.map((index, position) => ({
-      workerId: `pivot-${position}`,
-      result: reducerDraft([repeatedBeyondUniformTies[index]!]),
-    }));
-    for (const source of repeatedBeyondUniformTies) {
-      const reconciled = reconcileDeepReduction(
-        reducerDraft([
-          reducedFinding(source.attackPath.steps, [
-            "pivot-0:0",
-            "pivot-1:0",
-            "pivot-2:0",
-          ]),
-        ]),
-        discoveries,
-        null,
-      ).findings[0]?.attackPath?.["steps"] as string[];
-      expect(reconciled).toHaveLength(6);
-      expect(reconciled.filter((step) => step === input)).toHaveLength(2);
-      expect(reconciled.filter((step) => step === bypass)).toHaveLength(4);
-      for (const { attackPath } of repeatedBeyondUniformTies) {
-        let index = 0;
-        for (const step of reconciled) {
-          if (attackPath.steps[index] === step) index += 1;
-        }
-        expect(index).toBe(attackPath.steps.length);
-      }
-    }
-  }
-
-  const repeatedBeyondSingleSwitches = [
-    { ...original, attackPath: { steps: [input, input, input, input] } },
+  for (const { findings, inputCount, bypassCount } of [
+    { findings: repeatedGlobally, inputCount: 2, bypassCount: 3 },
     {
-      ...original,
-      attackPath: { steps: [bypass, input, bypass, bypass, input] },
+      findings: [
+        { ...original, attackPath: { steps: [input, input] } },
+        { ...original, attackPath: { steps: [bypass, input, bypass, bypass] } },
+        { ...original, attackPath: { steps: [bypass, bypass, input, bypass] } },
+      ],
+      inputCount: 2,
+      bypassCount: 3,
     },
     {
-      ...original,
-      attackPath: { steps: [input, bypass, bypass, input, bypass] },
+      findings: [
+        { ...original, attackPath: { steps: [input, bypass, input] } },
+        { ...original, attackPath: { steps: [bypass, input, input, bypass] } },
+        {
+          ...original,
+          attackPath: { steps: [bypass, bypass, bypass, bypass] },
+        },
+      ],
+      inputCount: 2,
+      bypassCount: 4,
     },
-  ];
-  for (const order of [
-    [0, 1, 2],
-    [0, 2, 1],
-    [1, 0, 2],
-    [1, 2, 0],
-    [2, 0, 1],
-    [2, 1, 0],
+    {
+      findings: [
+        { ...original, attackPath: { steps: [input, input, input, input] } },
+        {
+          ...original,
+          attackPath: { steps: [bypass, input, bypass, bypass, input] },
+        },
+        {
+          ...original,
+          attackPath: { steps: [input, bypass, bypass, input, bypass] },
+        },
+      ],
+      inputCount: 4,
+      bypassCount: 3,
+    },
   ]) {
-    const discoveries = order.map((index, position) => ({
-      workerId: `cursor-${position}`,
-      result: reducerDraft([repeatedBeyondSingleSwitches[index]!]),
-    }));
-    for (const source of repeatedBeyondSingleSwitches) {
-      const reconciled = reconcileDeepReduction(
-        reducerDraft([
-          reducedFinding(source.attackPath.steps, [
-            "cursor-0:0",
-            "cursor-1:0",
-            "cursor-2:0",
+    for (const order of [
+      [0, 1, 2],
+      [0, 2, 1],
+      [1, 0, 2],
+      [1, 2, 0],
+      [2, 0, 1],
+      [2, 1, 0],
+    ]) {
+      const discoveries = order.map((index, position) => ({
+        workerId: `repeat-${position}`,
+        result: reducerDraft([findings[index]!]),
+      }));
+      for (const source of findings) {
+        const reconciled = reconcileDeepReduction(
+          reducerDraft([
+            reducedFinding(source.attackPath.steps, [
+              "repeat-0:0",
+              "repeat-1:0",
+              "repeat-2:0",
+            ]),
           ]),
-        ]),
-        discoveries,
-        null,
-      ).findings[0]?.attackPath?.["steps"] as string[];
-      expect(reconciled).toHaveLength(7);
-      expect(reconciled.filter((step) => step === input)).toHaveLength(4);
-      expect(reconciled.filter((step) => step === bypass)).toHaveLength(3);
-      for (const { attackPath } of repeatedBeyondSingleSwitches) {
-        let index = 0;
-        for (const step of reconciled) {
-          if (attackPath.steps[index] === step) index += 1;
+          discoveries,
+          null,
+        ).findings[0]?.attackPath?.["steps"] as string[];
+
+        expect(reconciled).toHaveLength(inputCount + bypassCount);
+        expect(reconciled.filter((step) => step === input)).toHaveLength(
+          inputCount,
+        );
+        expect(reconciled.filter((step) => step === bypass)).toHaveLength(
+          bypassCount,
+        );
+        for (const { attackPath } of findings) {
+          let index = 0;
+          for (const step of reconciled) {
+            if (attackPath.steps[index] === step) index += 1;
+          }
+          expect(index).toBe(attackPath.steps.length);
         }
-        expect(index).toBe(attackPath.steps.length);
       }
     }
   }
