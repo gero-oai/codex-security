@@ -9476,12 +9476,19 @@ async function sealPatchRiskReviewContract(
     "scripts",
     "validate_patch_risk_assessment.py",
   );
-  const [skill, rubric, schema, validatorSource] = await Promise.all([
-    readFile(skillPath, "utf8"),
-    readFile(rubricPath, "utf8"),
-    readFile(schemaPath, "utf8"),
-    readFile(validatorSourcePath, "utf8"),
-  ]);
+  const sharedValidatorSourcePath = join(
+    plugin,
+    "scripts",
+    "finalize_scan_contract.py",
+  );
+  const [skill, rubric, schema, validatorSource, sharedValidatorSource] =
+    await Promise.all([
+      readFile(skillPath, "utf8"),
+      readFile(rubricPath, "utf8"),
+      readFile(schemaPath, "utf8"),
+      readFile(validatorSourcePath, "utf8"),
+      readFile(sharedValidatorSourcePath, "utf8"),
+    ]);
   signal?.throwIfAborted();
 
   const temporaryRoot = await realpath(tmpdir());
@@ -9508,6 +9515,11 @@ async function sealPatchRiskReviewContract(
     "scripts",
     "validate_patch_risk_assessment.py",
   );
+  const sharedValidatorPath = join(
+    root,
+    "scripts",
+    "finalize_scan_contract.py",
+  );
   const sealedSchemaPath = join(
     root,
     "schemas",
@@ -9519,6 +9531,7 @@ async function sealPatchRiskReviewContract(
       mkdir(dirname(sealedSkillPath), { recursive: true, mode: 0o700 }),
       mkdir(dirname(sealedRubricPath), { recursive: true, mode: 0o700 }),
       mkdir(dirname(validatorPath), { recursive: true, mode: 0o700 }),
+      mkdir(dirname(sharedValidatorPath), { recursive: true, mode: 0o700 }),
       mkdir(dirname(sealedSchemaPath), { recursive: true, mode: 0o700 }),
     ]);
     await Promise.all([
@@ -9526,6 +9539,10 @@ async function sealPatchRiskReviewContract(
       writeFile(sealedRubricPath, rubric, { flag: "wx", mode: 0o400 }),
       writeFile(sealedSchemaPath, schema, { flag: "wx", mode: 0o400 }),
       writeFile(validatorPath, validatorSource, {
+        flag: "wx",
+        mode: 0o400,
+      }),
+      writeFile(sharedValidatorPath, sharedValidatorSource, {
         flag: "wx",
         mode: 0o400,
       }),
