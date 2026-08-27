@@ -44,10 +44,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
+
+
 def read_object(path: str) -> dict[str, Any]:
     try:
         text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
-        value = json.loads(text)
+        value = json.loads(text, object_pairs_hook=reject_duplicate_keys)
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"cannot read assessment: {error}") from error
     if not isinstance(value, dict):
