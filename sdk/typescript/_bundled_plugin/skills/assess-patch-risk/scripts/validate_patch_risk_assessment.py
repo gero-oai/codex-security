@@ -217,6 +217,12 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
     unknowns = value["unknowns"]
     evidence_plan = value["evidencePlan"]
     boundaries = value["materialBoundaries"]
+    applicability_status = value["applicability"]["status"]
+    affirmative_failure = (
+        value["regressionLikelihood"]["rating"] == "critical"
+        or any(item["result"] == "contradicted" for item in boundaries)
+        or any(item["status"] == "failed" for item in value["validation"])
+    )
     errors: list[str] = []
 
     if recommendation == "merge":
@@ -228,6 +234,8 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("merge cannot retain a decision-critical unknown")
         if any(item["result"] != "supported" for item in boundaries):
             errors.append("merge requires every material boundary to be supported")
+        if any(item["status"] == "failed" for item in value["validation"]):
+            errors.append("merge cannot retain a failed validation")
         if evidence_plan:
             errors.append("merge cannot retain an evidence plan")
     elif workflow_label != recommendation:
@@ -238,23 +246,22 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("hold_for_evidence requires a decision-critical unknown")
         if not evidence_plan:
             errors.append("hold_for_evidence requires a bounded evidence plan")
+        if affirmative_failure:
+            errors.append("hold_for_evidence cannot defer an established defect")
     elif evidence_plan:
         errors.append("only hold_for_evidence may include an evidence plan")
 
     if recommendation == "no_op":
-        if value["applicability"]["status"] not in NON_APPLICABLE:
+        if applicability_status not in NON_APPLICABLE:
             errors.append("no_op requires an established non-applicable disposition")
         if any(item["decisionCritical"] for item in unknowns):
             errors.append("no_op cannot retain a decision-critical unknown")
+    elif applicability_status in NON_APPLICABLE:
+        errors.append("an established non-applicable disposition requires no_op")
 
-    if recommendation == "block":
-        affirmative_failure = (
-            value["regressionLikelihood"]["rating"] == "critical"
-            or any(item["result"] == "contradicted" for item in boundaries)
-            or any(item["status"] == "failed" for item in value["validation"])
-        )
+    if recommendation in {"revise", "block"}:
         if not affirmative_failure:
-            errors.append("block requires affirmative failure evidence")
+            errors.append(f"{recommendation} requires affirmative failure evidence")
 
     if workflow_label == "auto_merge_candidate":
         auto_merge_requirements = {
