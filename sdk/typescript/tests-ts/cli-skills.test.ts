@@ -96,7 +96,7 @@ function patchRiskAssessment(
 ) {
   const { patch } = patchRiskArtifact(prompt);
   const assessment = {
-    schemaVersion: 2,
+    schemaVersion: 1,
     patch,
     recommendation,
     workflowLabel:

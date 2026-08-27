@@ -8,15 +8,13 @@ Rate each dimension from evidence, not from diff size or test count.
 - `moderate`: bounded component or consumer impact with a clear containment boundary.
 - `high`: shared runtime, public contract, persistent state, privileged boundary, broad deployment, or difficult operational recovery.
 - `critical`: plausible cross-tenant, major security, irreversible state, fleet-wide, or catastrophic availability impact.
-- `unknown`: available evidence cannot yet bound the consequence. This cannot support `merge`, but it may accompany a terminal non-merge recommendation when another established defect or disposition already determines the decision.
 
 ## Regression likelihood
 
-- `low`: narrow semantics, supported controls preserved or authoritative retirement evidence establishes that no positive control remains, material counterexamples rejected, and directly relevant protection passes.
+- `low`: narrow semantics, supported controls preserved, material counterexamples rejected, and directly relevant protection passes.
 - `moderate`: some coupling, partial protection, or bounded uncertainty remains but no source-visible defect is established.
 - `high`: complex or weakly protected behavior, important untested paths, contract ambiguity, or substantial unresolved coupling.
 - `critical`: evidence already demonstrates a serious regression, bypass, unsupported control break, or failed required safety property.
-- `unknown`: available evidence cannot yet support a likelihood estimate; use only with `hold_for_evidence`.
 
 ## Regression protection
 
@@ -33,7 +31,7 @@ Rate each dimension from evidence, not from diff size or test count.
 
 ## Confidence
 
-- `high`: exact patch identity, affected roots and callers, material boundaries, counterexamples, and relevant validation are all evidenced, together with supported controls or authoritative retirement evidence that no positive control remains.
+- `high`: exact patch identity, affected roots and callers, material boundaries, controls, counterexamples, and relevant validation are all evidenced.
 - `moderate`: the main path is traced but a bounded non-decision-critical gap remains.
 - `low`: patch identity, applicability, runtime reachability, contract, or a decision-critical behavior remains uncertain.
 
@@ -44,17 +42,17 @@ For each material changed boundary, record:
 - the invariant that must hold;
 - the affected runtime root or supported consumer;
 - the strongest concrete counterexample;
-- either a legitimate control from base source, callers, or an authoritative contract, or authoritative retirement evidence when no positive control remains;
-- the source path for the counterexample and selected control or retirement evidence; and
+- a legitimate control from base source, callers, or an authoritative contract;
+- the patched source path for both cases; and
 - whether the result is supported, contradicted, or unresolved.
 
 When a decision depends on a complete enum, allowlist, routing table, protocol matrix, identity class, state transition, or similar bounded domain, derive the partitions from an independent contract or an exhaustive self-contained new contract. Representative tests are not proof of completeness.
 
-When a patch newly rejects inputs or narrows an existing contract and the governing contract retains supported behavior, derive at least one legitimate control from exact-base source, callers outside the patch's own tests, or an authoritative replacement contract that governs the patched behavior. When an authoritative replacement retires the behavior entirely, use `retirementEvidence` and `retirementEvidencePath` to record the contract and source that establish why no positive control remains; do not invent a legitimate control. Prior base support is a counterexample, not by itself proof that support must remain. Mark the boundary contradicted only when a current governing contract or required caller establishes that the control must remain supported; if authorization to narrow is unresolved, keep the boundary unresolved, and if authoritative evidence permits the narrowing, assess compatibility and migration impact without calling the boundary contradicted solely because the base accepted the control.
+When a patch newly rejects inputs or narrows an existing contract, derive at least one legitimate control from exact-base source or callers outside the patch's own tests. Mark the boundary contradicted when the head rejects an independently evidenced supported control.
 
 When behavior derives a new target or reuses saved authority, independently classify the derived URL, callback, nested resource, cached principal, historical object, retry, replay, or re-execution at the consuming policy decision. Inherited trust is not evidence of safety.
 
-When an authentication or authorization patch claims complete or unconditional enforcement, trace saved, cached, historical, and versioned authority through every applicable refresh, reconnect, replay, retry, and re-execution. At each consuming decision, reclassify every authorization-relevant principal attribute, resource attribute, policy input, entity binding, and resulting decision from current state; prove that an authoritative contract defines a recorded or versioned authority snapshot as the governing decision context, fixes every authorization-relevant input and resulting decision used at the sink, and is bound to the operation by source; or prove from source that every authorization-relevant principal attribute, resource attribute, policy input, entity binding, and resulting decision cannot change before consumption.
+When an authentication or authorization patch claims complete or unconditional enforcement, trace saved, cached, historical, and versioned authority through every applicable refresh, reconnect, replay, retry, and re-execution. At each consuming decision, reclassify the current principal, resource, and policy or prove from source that their binding cannot change.
 
 Apply these challenges when the patch contains the corresponding structure:
 
@@ -62,14 +60,14 @@ Apply these challenges when the patch contains the corresponding structure:
 - after validation, trace mutation, interpretation, callbacks, retries, lazy initialization, and re-resolution to the first sensitive sink; and
 - for UI, discovery, prompt, instruction, or visibility changes, require capability removal or independent downstream enforcement before assigning authorization or isolation impact.
 
-A trigger alone is not a defect. Mark the boundary contradicted only when a current governing contract or required caller establishes that a newly rejected control must remain supported, or when source or an authoritative contract establishes a concrete cross-subject decision, post-validation bypass, or capability-preserving enforcement gap.
+A trigger alone is not a defect. Mark the boundary contradicted only when source or an authoritative contract establishes a concrete cross-subject decision, post-validation bypass, or capability-preserving enforcement gap.
 
 ## Strict auto-merge gate
 
 Use `auto_merge_candidate` only when all of the following are true:
 
 - impact and likelihood are `low`;
-- regression protection is `strong` and every check marked required for merge passes at the exact head;
+- regression protection is `strong` and relevant exact-head checks pass;
 - recovery is `easy` and confidence is `high`;
 - runtime reachability and ownership are established;
 - no privileged boundary, migration, persistent-state change, public contract change, architecture-specific rollout, or broad shared default is materially affected;
@@ -80,6 +78,3 @@ Use `auto_merge_candidate` only when all of the following are true:
 Otherwise use `human_review_required` for a supported `merge`. Strong tests can lower likelihood and raise confidence, but never lower impact.
 
 The validator enforces this gate and the recommendation-to-label mapping. A validation failure means the evidence packet is internally inconsistent; it is not permission to weaken a rating or omit evidence.
-
-Applicability is a decision pivot. If runtime reachability or ownership is unknown, use `hold_for_evidence`, preserve any established defect evidence on that hold, and do not issue a terminal `revise` or `block` verdict until applicability is established. A `revise` verdict also requires affirmative correction evidence: critical regression likelihood, a contradicted material boundary, or a patch-caused validation failure.
-A `block` verdict requires both critical regression likelihood and `materialSafetyFailure.established=true`; an ordinary critical functional regression or contradicted contract or documentation boundary routes to `revise`.
