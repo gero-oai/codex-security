@@ -2091,7 +2091,7 @@ describe("GitHub release workflow safeguards", () => {
     },
   ])(
     "handles $errorCode during $workflow npm-history validation for $version",
-    ({ workflow, version, errorCode, status }) => {
+    async ({ workflow, version, errorCode, status }) => {
       const cutting = workflow === "release cut";
       const script = workflowStepShell(
         cutting ? releaseCutWorkflow : protectedReleaseWorkflow,
@@ -2120,9 +2120,12 @@ describe("GitHub release workflow safeguards", () => {
         "  return 1",
         "}",
       ].join("\n");
-      const result = spawnSync(bash, ["-c", `${mocks}\n${script}`], {
+      const child = Bun.spawn({
+        cmd: [bash, "-c", `${mocks}\n${script}`],
         cwd: fileURLToPath(new URL("../../../", import.meta.url)),
-        encoding: "utf8",
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
         env: {
           ...process.env,
           BEFORE_SHA: "",
@@ -2139,11 +2142,14 @@ describe("GitHub release workflow safeguards", () => {
         },
         timeout: 10_000,
       });
+      const [exitCode, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stderr).text(),
+      ]);
 
-      expect(result.error).toBeUndefined();
-      expect(result.status).toBe(status);
+      expect(exitCode, stderr).toBe(status);
       if (status !== 0) {
-        expect(result.stderr).toContain(
+        expect(stderr).toContain(
           "Unable to verify published npm release history.",
         );
       }
