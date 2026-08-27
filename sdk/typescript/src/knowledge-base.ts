@@ -33,98 +33,95 @@ export async function prepareKnowledgeBase(
   signal?: AbortSignal,
 ): Promise<PreparedKnowledgeBase> {
   try {
-    return await stageKnowledgeBase(paths, signal);
+    const sources = new Set<string>();
+    const documents = new Set<string>();
+
+    for (const requested of paths) {
+      signal?.throwIfAborted();
+      if (!requested.trim())
+        throw new Error("Knowledge base paths cannot be empty.");
+      const path = resolve(expandHome(requested));
+      const metadata = await lstat(path);
+      if (metadata.isSymbolicLink()) {
+        throw new Error(
+          `Knowledge base paths cannot be symbolic links: ${path}`,
+        );
+      }
+      if (!metadata.isFile() && !metadata.isDirectory()) {
+        throw new Error(
+          `Knowledge base path is not a file or directory: ${path}`,
+        );
+      }
+
+      const source = await realpath(path);
+      const selected = metadata.isDirectory()
+        ? await discover(source, signal)
+        : [source];
+      if (selected.length === 0) {
+        throw new Error(
+          `Knowledge base directory contains no supported documents: ${path}`,
+        );
+      }
+      for (const document of selected) {
+        if (!SUPPORTED_EXTENSIONS.has(extname(document).toLowerCase())) {
+          throw new Error(`Unsupported knowledge base document: ${document}`);
+        }
+        documents.add(document);
+      }
+      sources.add(source);
+    }
+
+    const path = await mkdtemp(join(tmpdir(), "codex-security-knowledge-"));
+    try {
+      let index = 0;
+      for (const document of documents) {
+        signal?.throwIfAborted();
+        const metadata = await lstat(document);
+        if (process.platform !== "win32" && (metadata.mode & 0o444) === 0) {
+          throw new Error(
+            `Knowledge base document is not readable: ${document}`,
+          );
+        }
+        const bytes = await readFile(document, {
+          flag: constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+          signal,
+        });
+        const extension = extname(document).toLowerCase();
+        const text =
+          extension === ".pdf"
+            ? await extractPdf(document, bytes)
+            : extension === ".docx"
+              ? extractDocx(document, bytes)
+              : decodeText(document, bytes);
+        if ((extension === ".pdf" || extension === ".docx") && !text.trim()) {
+          throw new Error(
+            `Knowledge base document contains no extractable text: ${document}`,
+          );
+        }
+        await writeFile(
+          join(path, `${index++}-${basename(document)}.txt`),
+          text,
+          {
+            encoding: "utf8",
+            mode: 0o600,
+            signal,
+          },
+        );
+      }
+    } catch (error) {
+      await rm(path, { recursive: true, force: true });
+      throw error;
+    }
+
+    return {
+      path,
+      sources: [...sources],
+      cleanup: () => rm(path, { recursive: true, force: true }),
+    };
   } catch (error) {
     if (signal?.aborted) throw error;
     throw new ConfigurationError(errorMessage(error), { cause: error });
   }
-}
-
-async function stageKnowledgeBase(
-  paths: readonly string[],
-  signal?: AbortSignal,
-): Promise<PreparedKnowledgeBase> {
-  const sources = new Set<string>();
-  const documents = new Set<string>();
-
-  for (const requested of paths) {
-    signal?.throwIfAborted();
-    if (!requested.trim())
-      throw new Error("Knowledge base paths cannot be empty.");
-    const path = resolve(expandHome(requested));
-    const metadata = await lstat(path);
-    if (metadata.isSymbolicLink()) {
-      throw new Error(`Knowledge base paths cannot be symbolic links: ${path}`);
-    }
-    if (!metadata.isFile() && !metadata.isDirectory()) {
-      throw new Error(
-        `Knowledge base path is not a file or directory: ${path}`,
-      );
-    }
-
-    const source = await realpath(path);
-    const selected = metadata.isDirectory()
-      ? await discover(source, signal)
-      : [source];
-    if (selected.length === 0) {
-      throw new Error(
-        `Knowledge base directory contains no supported documents: ${path}`,
-      );
-    }
-    for (const document of selected) {
-      if (!SUPPORTED_EXTENSIONS.has(extname(document).toLowerCase())) {
-        throw new Error(`Unsupported knowledge base document: ${document}`);
-      }
-      documents.add(document);
-    }
-    sources.add(source);
-  }
-
-  const path = await mkdtemp(join(tmpdir(), "codex-security-knowledge-"));
-  try {
-    let index = 0;
-    for (const document of documents) {
-      signal?.throwIfAborted();
-      const metadata = await lstat(document);
-      if (process.platform !== "win32" && (metadata.mode & 0o444) === 0) {
-        throw new Error(`Knowledge base document is not readable: ${document}`);
-      }
-      const bytes = await readFile(document, {
-        flag: constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-        signal,
-      });
-      const extension = extname(document).toLowerCase();
-      const text =
-        extension === ".pdf"
-          ? await extractPdf(document, bytes)
-          : extension === ".docx"
-            ? extractDocx(document, bytes)
-            : decodeText(document, bytes);
-      if ((extension === ".pdf" || extension === ".docx") && !text.trim()) {
-        throw new Error(
-          `Knowledge base document contains no extractable text: ${document}`,
-        );
-      }
-      await writeFile(
-        join(path, `${index++}-${basename(document)}.txt`),
-        text,
-        {
-          encoding: "utf8",
-          mode: 0o600,
-          signal,
-        },
-      );
-    }
-  } catch (error) {
-    await rm(path, { recursive: true, force: true });
-    throw error;
-  }
-
-  return {
-    path,
-    sources: [...sources],
-    cleanup: () => rm(path, { recursive: true, force: true }),
-  };
 }
 
 async function discover(
