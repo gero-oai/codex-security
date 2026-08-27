@@ -63,11 +63,10 @@ export function unionFindingGroups(
   for (const [first, ...rest] of groups) {
     if (first === undefined) continue;
     if (!parents.has(first)) parents.set(first, first);
+    const firstRoot = representative(first);
     for (const identity of rest) {
       if (!parents.has(identity)) parents.set(identity, identity);
-      const firstRoot = representative(first);
-      const identityRoot = representative(identity);
-      if (firstRoot !== identityRoot) parents.set(identityRoot, firstRoot);
+      parents.set(representative(identity), firstRoot);
     }
   }
 

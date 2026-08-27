@@ -646,6 +646,45 @@ print(json.dumps({
   expect(observed["batchedQueries"]).toBe(observed["expectedBatchedQueries"]);
 });
 
+test("returns every linked finding in a confirmed history chain", async () => {
+  const observed = await runPythonProbe(`
+import json, sqlite3, sys
+sys.path.insert(0, sys.argv[1])
+from workbench_scan_history import finding_matches
+connection = sqlite3.connect(':memory:')
+connection.row_factory = sqlite3.Row
+connection.executescript('''
+CREATE TABLE scans (id TEXT PRIMARY KEY, started_at TEXT);
+CREATE TABLE finding_occurrences (id TEXT PRIMARY KEY, finding_id TEXT, scan_id TEXT, title TEXT);
+CREATE TABLE scan_comparison_matches (
+    before_scan_id TEXT, after_scan_id TEXT, before_occurrence_id TEXT, after_occurrence_id TEXT, reason TEXT
+);
+''')
+for index, scan in enumerate(('a', 'b', 'c', 'unlinked')):
+    connection.execute('INSERT INTO scans VALUES (?, ?)', (scan, str(index)))
+    connection.execute('INSERT INTO finding_occurrences VALUES (?, ?, ?, ?)', (scan, scan, scan, scan))
+connection.executemany('INSERT INTO scan_comparison_matches VALUES (?, ?, ?, ?, ?)', [
+    ('a', 'b', 'a', 'b', 'First confirmed link.'),
+    ('b', 'c', 'b', 'c', 'Second confirmed link.')
+])
+result = {}
+for index, scan in enumerate(('a', 'b', 'c', 'unlinked')):
+    matches, first, bounds = finding_matches(connection, scan, scan, str(index))
+    result[scan] = {'linked': [match['occurrenceId'] for match in matches], 'first': first, 'bounds': bounds}
+    for match in matches:
+        assert match['reason']
+        if scan == 'a' and match['occurrenceId'] == 'b':
+            assert match['reason'] == 'First confirmed link.'
+print(json.dumps(result))
+`);
+  expect(observed).toEqual({
+    a: { linked: ["b", "c"], first: "0", bounds: ["a", "c"] },
+    b: { linked: ["a", "c"], first: "0", bounds: ["a", "c"] },
+    c: { linked: ["a", "b"], first: "0", bounds: ["a", "c"] },
+    unlinked: { linked: [], first: "3", bounds: ["unlinked"] },
+  });
+});
+
 test("loads oversized comparison matches from stdin", async () => {
   const python = await resolvePluginPython();
 
