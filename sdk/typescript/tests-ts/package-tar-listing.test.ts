@@ -23,13 +23,21 @@ const { regularTarListingLines } = (await import(
 const { packageDistFiles } = (await import(
   new URL("../scripts/package-dist-files.mjs", import.meta.url).href
 )) as { packageDistFiles: readonly string[] };
+const pluginContract = {
+  externalOwnedExact: [".codex-plugin/plugin.json"],
+  shippedExact: ["scripts/launch_codex_security_mcp"],
+};
 
 function packageTar(trailingZeroBytes = 0, sizeTerminator = " "): Buffer {
+  const executablePaths = [
+    "package/bin/codex-security.mjs",
+    "package/_bundled_plugin/scripts/launch_codex_security_mcp",
+  ];
   const paths = [
     "package/package.json",
     "package/README.md",
     "package/LICENSE",
-    "package/bin/codex-security.mjs",
+    ...executablePaths,
     ...packageDistFiles,
     "package/_bundled_plugin/.codex-plugin/plugin.json",
   ];
@@ -47,7 +55,7 @@ function packageTar(trailingZeroBytes = 0, sizeTerminator = " "): Buffer {
           : Buffer.from("fixture\n");
     return tarRecord(contents, {
       name: path,
-      mode: path === "package/bin/codex-security.mjs" ? 0o755 : 0o644,
+      mode: executablePaths.includes(path) ? 0o755 : 0o644,
       sizeField: octal(contents.length, 12, sizeTerminator),
     });
   });
@@ -102,13 +110,7 @@ describe("npm package tar listings", () => {
       expect(archives[1][1].length).toBeGreaterThan(31 * 1024 * 1024);
 
       const contractPath = join(root, "plugin contract.json");
-      writeFileSync(
-        contractPath,
-        JSON.stringify({
-          externalOwnedExact: [".codex-plugin/plugin.json"],
-          shippedExact: [],
-        }),
-      );
+      writeFileSync(contractPath, JSON.stringify(pluginContract));
       const environment: NodeJS.ProcessEnv = { ...process.env };
       delete environment["CODEX_SECURITY_EXPECTED_GIT_HEAD"];
       for (const [representation, contents] of archives) {
@@ -162,13 +164,7 @@ describe("npm package tar listings", () => {
       const tarBytes = packageTar();
       const archiveContents = gzipSync(tarBytes, { level: 0 });
       writeFileSync(archivePath, archiveContents);
-      writeFileSync(
-        contractPath,
-        JSON.stringify({
-          externalOwnedExact: [".codex-plugin/plugin.json"],
-          shippedExact: [],
-        }),
-      );
+      writeFileSync(contractPath, JSON.stringify(pluginContract));
 
       const nodePath = commandPath("node");
       const environment: NodeJS.ProcessEnv = { ...process.env };

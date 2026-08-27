@@ -156,13 +156,15 @@ if (
 ) {
   invalidTarEntry();
 }
-const launcherPermissions =
-  listingLines[entries.indexOf("package/bin/codex-security.mjs")]?.split(
-    /\s/u,
-    1,
-  )[0] ?? "";
-if ([3, 6, 9].some((index) => launcherPermissions[index] !== "x")) {
-  throw new Error("npm package CLI launcher is not executable.");
+for (const [path, name] of [
+  ["package/bin/codex-security.mjs", "CLI"],
+  ["package/_bundled_plugin/scripts/launch_codex_security_mcp", "MCP"],
+]) {
+  const permissions =
+    listingLines[entries.indexOf(path)]?.split(/\s/u, 1)[0] ?? "";
+  if ([3, 6, 9].some((index) => permissions[index] !== "x")) {
+    throw new Error(`npm package ${name} launcher is not executable.`);
+  }
 }
 
 function extractedArchiveFiles() {
