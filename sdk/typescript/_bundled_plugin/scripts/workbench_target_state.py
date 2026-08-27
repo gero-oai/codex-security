@@ -610,23 +610,6 @@ class RepositoryIdentityCache:
             exact_target=requested.missing,
         )
 
-    def target_ids(self, target_id: str) -> set[str]:
-        return self._target_ids_for_scope(self.scope(target_id))
-
-    def target_ids_for_path(self, target_path: str) -> set[str]:
-        return self._target_ids_for_scope(self.scope_for_path(target_path))
-
-    def _target_ids_for_scope(self, scope: RepositoryScanScope) -> set[str]:
-        clause, values = scope.sql(supports_generation=self.supports_generation)
-        result = {
-            row[0] for row in self.connection.execute(
-                f"SELECT DISTINCT target_id FROM scans WHERE {clause}", values
-            ) if row[0] is not None
-        }
-        if scope.available and scope.target_id:
-            result.add(scope.target_id)
-        return result
-
     def origin(self, state: RepositoryTargetState) -> tuple[str, str] | None:
         if state.target_path not in self._origins:
             self._origins[state.target_path] = repository_origin(Path(state.target_path))

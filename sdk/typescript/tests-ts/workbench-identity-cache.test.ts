@@ -350,7 +350,7 @@ with ExitStack() as stack:
         feedback = get_scan_feedback(connection, connection.execute("SELECT * FROM scans WHERE id = 'requested-new'").fetchone())
         indexed = findings("requested")
         with patch.object(state, "repository_origin", return_value=("example.test", "same-repository")):
-            rows = {row["id"]: history._scan_with_repository_identity(connection, row) for row in connection.execute("SELECT * FROM scans")}
+            rows = {row["id"]: row for row in connection.execute("SELECT * FROM scans")}
             explicit_clones = history._same_repository(connection, rows["requested-new"], rows["clone-scan"])
             explicit_legacy = history._same_repository(connection, rows["alias-old-client"], rows["clone-scan"])
             contradictory = dict(rows["clone-scan"], repository_generation="different-snapshot")
@@ -755,7 +755,6 @@ with ExitStack() as stack:
             "scans": scans,
             "removedExact": listed("removed"),
             "matchingCount": matching["scanCount"],
-            "aliases": sorted(indexes.repository_target_ids(connection, "requested")),
             "findings": indexed,
             "feedback": [row["findingId"] for row in feedback["falsePositives"]],
             "feedbackScope": feedback_scope,
@@ -1049,7 +1048,6 @@ with ExitStack() as stack:
         print(json.dumps({
             "scans": scans,
             "replacementRequest": listed("reused"),
-            "aliases": sorted(indexes.repository_target_ids(connection, "requested")),
             "findings": sorted(row["findingId"] for row in findings("requested")),
             "freshFindings": sorted(row["findingId"] for row in fresh_findings["findings"]),
             "emptyFindings": empty_findings["findings"],
@@ -1170,7 +1168,6 @@ with ExitStack() as stack:
             )},
             "recordsPreserved": retained == retained_records(),
             "targetIdsPreserved": target_ids == sorted(row["id"] for row in connection.execute("SELECT id FROM security_targets")),
-            "aliases": sorted(indexes.repository_target_ids(connection, "current-owner")),
             "removedExact": listed("removed-old"),
             "visibleFindings": sorted(row["findingId"] for row in findings("current-owner")),
             "oldRegistrationRejected": old_registration_rejected,
@@ -1239,7 +1236,7 @@ with ExitStack() as stack:
                 "SELECT id, repository_identity FROM security_targets"
             )},
             "registrationErrors": sorted(errors),
-            "aliases": sorted(indexes.repository_target_ids(connection, "replacement-alias")),
+            "scans": listed("replacement-alias"),
             "sameCheckoutMetadata": connection.execute(
                 "SELECT target_inode FROM scans WHERE id = 'newer-scan'"
             ).fetchone()[0] == metadata[paths["newer"]].st_ino,
@@ -1278,7 +1275,6 @@ with ExitStack() as stack:
             "selectedRegistrationId": selected_id,
             "selectedGuarded": selected_guard,
             "historicalRegistrationId": historical_id,
-            "aliases": sorted(indexes.repository_target_ids(connection, "requested")),
             "scans": listed("requested"),
             "historicalExact": listed("historical"),
             "feedback": get_scan_feedback(
@@ -1693,12 +1689,6 @@ test("reuses established aliases and probes each saved target once per request",
   ]);
   expect(result["removedExact"]).toEqual(["removed-scan"]);
   expect(result["matchingCount"]).toBe(5);
-  expect(result["aliases"]).toEqual([
-    "legacy",
-    "persisted",
-    "removed",
-    "requested",
-  ]);
   const findings = result["findings"] as Array<Record<string, unknown>>;
   expect(
     findings.find((finding) => finding["status"] === "closed"),
@@ -1710,7 +1700,12 @@ test("reuses established aliases and probes each saved target once per request",
     findings.find((finding) => finding["findingId"] === "legacy-open"),
   ).toBeDefined();
   expect(result["feedback"]).toEqual(["after-review"]);
-  expect(result["feedbackScope"]).toEqual(result["aliases"]);
+  expect(result["feedbackScope"]).toEqual([
+    "legacy",
+    "persisted",
+    "removed",
+    "requested",
+  ]);
   expect(result["feedbackIndexQueriesScoped"]).toBe(true);
   expect(result["listingRequestedProbes"]).toBe(1);
   expect(result["matchingRequestedProbes"]).toBe(1);
@@ -1865,7 +1860,6 @@ test("keeps authenticated historical aliases visible without trusting a replacem
     "reused-scan",
   ]);
   expect(result["replacementRequest"]).toEqual([]);
-  expect(result["aliases"]).toEqual(["legacy", "requested", "reused"]);
   expect(result["findings"]).toEqual(["current-finding", "historical-finding"]);
   expect(result["freshFindings"]).toEqual([
     "current-finding",
@@ -1924,7 +1918,7 @@ test("keeps unproved legacy history unbound and rejects newer or indeterminate o
     "replacement-alias": "current-newer",
   });
   expect(result["registrationErrors"]).toEqual(["invalid-time", "newer"]);
-  expect(result["aliases"]).toEqual(["replacement-alias"]);
+  expect(result["scans"]).toEqual(["replacement-alias-scan"]);
 });
 
 test("binds late NULL identities only when the selected target is registered", () => {
@@ -1952,7 +1946,6 @@ test("binds late NULL identities only when the selected target is registered", (
   expect(result["selectedRegistrationId"]).toBe("unscanned");
   expect(result["selectedGuarded"]).toBe(true);
   expect(result["historicalRegistrationId"]).toBe("historical");
-  expect(result["aliases"]).toEqual(["requested", "unscanned"]);
   expect(result["scans"]).toEqual(["established-scan", "requested-scan"]);
   expect(result["historicalExact"]).toEqual(["historical-scan"]);
   expect(result["feedback"]).toEqual([]);
@@ -2081,7 +2074,6 @@ test("quarantines unproved public-v30 bindings without discarding historical rec
   });
   expect(result["recordsPreserved"]).toBe(true);
   expect(result["targetIdsPreserved"]).toBe(true);
-  expect(result["aliases"]).toEqual(["current-owner"]);
   expect(result["removedExact"]).toEqual(["removed-old-scan"]);
   expect(result["visibleFindings"]).toEqual(["current-owner-finding"]);
   expect(result["oldRegistrationRejected"]).toBe(true);

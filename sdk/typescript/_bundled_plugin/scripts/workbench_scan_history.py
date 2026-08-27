@@ -19,7 +19,6 @@ from workbench_target_state import (
     _timestamp_ns,
     scan_repository_generation,
     scan_repository_group,
-    supports_repository_identity,
 )
 
 
@@ -310,12 +309,8 @@ def compare_scans(
     include_matching_inputs: bool = False,
     require_matches: bool = False,
 ) -> dict[str, Any]:
-    before = _scan_with_repository_identity(
-        connection, require_scan(connection, args.before_scan_id)
-    )
-    after = _scan_with_repository_identity(
-        connection, require_scan(connection, args.after_scan_id)
-    )
+    before = require_scan(connection, args.before_scan_id)
+    after = require_scan(connection, args.after_scan_id)
     if before["id"] == after["id"]:
         raise SystemExit("Select two different scans to compare.")
     if before["status"] != "complete" or after["status"] != "complete":
@@ -454,12 +449,8 @@ def save_scan_comparison(
     require_scan: Callable[[sqlite3.Connection, str], sqlite3.Row],
     read_coverage: Callable[[sqlite3.Row], dict[str, Any]],
 ) -> dict[str, Any]:
-    before = _scan_with_repository_identity(
-        connection, require_scan(connection, args.before_scan_id)
-    )
-    after = _scan_with_repository_identity(
-        connection, require_scan(connection, args.after_scan_id)
-    )
+    before = require_scan(connection, args.before_scan_id)
+    after = require_scan(connection, args.after_scan_id)
     if before["id"] == after["id"]:
         raise SystemExit("Select two different scans to compare.")
     if before["status"] != "complete" or after["status"] != "complete":
@@ -540,25 +531,6 @@ def save_scan_comparison(
             ),
         )
     return compare_scans(connection, args, require_scan=require_scan, read_coverage=read_coverage)
-
-
-def _scan_with_repository_identity(
-    connection: sqlite3.Connection, scan: sqlite3.Row
-) -> sqlite3.Row:
-    if "repository_identity" in scan.keys():
-        return scan
-    if not supports_repository_identity(connection):
-        return scan
-    enriched = connection.execute(
-        """
-        SELECT scans.*, targets.repository_identity
-        FROM scans
-        LEFT JOIN security_targets AS targets ON targets.id = scans.target_id
-        WHERE scans.id = ?
-        """,
-        (scan["id"],),
-    ).fetchone()
-    return enriched if enriched is not None else scan
 
 
 def finding_matches(

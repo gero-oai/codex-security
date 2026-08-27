@@ -54,7 +54,18 @@ describe("repository findings across linked worktrees", () => {
       confirmedInLatestScan: true,
       knownScanIds: [linkedFinding.scanId, currentFinding.scanId],
     };
-    const commands: Array<readonly string[]> = [];
+    const commands: Array<{ args: readonly string[]; input?: string }> = [];
+    const comparison = {
+      matches: [
+        {
+          beforeOccurrenceIds: [linkedFinding.occurrenceId],
+          afterOccurrenceIds: [currentFinding.occurrenceId],
+          confidence: "high",
+          reason: "The linked worktree has the same root cause.",
+        },
+      ],
+      uncertain: [],
+    };
     const matchedInputs: Array<{
       before: readonly Record<string, unknown>[];
       after: readonly Record<string, unknown>[];
@@ -68,8 +79,12 @@ describe("repository findings across linked worktrees", () => {
         resolvePluginPython: async () => "/managed/python",
         prepareOutputDir: async () => scanDir,
         repositoryRevision: async () => "deadbeef",
-        runWorkbench: async (_options: unknown, args: readonly string[]) => {
-          commands.push(args);
+        runWorkbench: async (
+          _options: unknown,
+          args: readonly string[],
+          input?: string,
+        ) => {
+          commands.push({ args, input });
           if (args[0] === "register-cli-scan") {
             return {
               scanId: currentFinding.scanId,
@@ -119,17 +134,7 @@ describe("repository findings across linked worktrees", () => {
         },
         async matchFindings(input: (typeof matchedInputs)[number]) {
           matchedInputs.push(input);
-          return {
-            matches: [
-              {
-                beforeOccurrenceIds: [linkedFinding.occurrenceId],
-                afterOccurrenceIds: [currentFinding.occurrenceId],
-                confidence: "high",
-                reason: "The linked worktree has the same root cause.",
-              },
-            ],
-            uncertain: [],
-          };
+          return comparison;
         },
         createCodex: () => ({
           startThread: () => ({
@@ -149,27 +154,19 @@ describe("repository findings across linked worktrees", () => {
       { before: [linkedFinding], after: [currentFinding] },
     ]);
     expect(
-      commands.filter(([command]) => command === "save-scan-comparison"),
+      commands.filter(({ args }) => args[0] === "save-scan-comparison"),
     ).toEqual([
-      [
-        "save-scan-comparison",
-        "--before-scan-id",
-        linkedFinding.scanId,
-        "--after-scan-id",
-        currentFinding.scanId,
-        "--matches-json",
-        JSON.stringify({
-          matches: [
-            {
-              beforeOccurrenceIds: [linkedFinding.occurrenceId],
-              afterOccurrenceIds: [currentFinding.occurrenceId],
-              confidence: "high",
-              reason: "The linked worktree has the same root cause.",
-            },
-          ],
-          uncertain: [],
-        }),
-      ],
+      {
+        args: [
+          "save-scan-comparison",
+          "--before-scan-id",
+          linkedFinding.scanId,
+          "--after-scan-id",
+          currentFinding.scanId,
+          "--matches-json-stdin",
+        ],
+        input: JSON.stringify(comparison),
+      },
     ]);
     expect(result.repositoryFindings).toEqual([mergedFinding]);
     await client.close();

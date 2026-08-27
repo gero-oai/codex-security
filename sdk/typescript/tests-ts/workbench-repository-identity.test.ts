@@ -83,7 +83,6 @@ sys.path.insert(0, sys.argv[1])
 
 import workbench_scan_history as history
 from filesystem_identity import serialize_filesystem_identity
-from workbench_native_indexes import repository_target_ids
 from workbench_schema import MIGRATIONS, apply_migrations
 from workbench_target_state import (
     _repository_birth_time_ns,
@@ -340,6 +339,7 @@ elif scenario == "history":
     comparison_args = argparse.Namespace(
         before_scan_id="canonical-root",
         after_scan_id="linked-root",
+        matches_json_stdin=False,
         matches_json=json.dumps({"matches": [], "uncertain": []}),
     )
     compared = history.compare_scans(
@@ -486,7 +486,7 @@ elif scenario == "recreated-directory":
     target = repository / "service-a"
     linked = worktree / "service-a"
     target_id = add_scan("before-recreation", target)
-    linked_id = add_scan("linked-scope", linked)
+    add_scan("linked-scope", linked)
     original_metadata = target.stat()
     original_identity = repository_identity(target)
     original_scan = connection.execute(
@@ -498,11 +498,9 @@ elif scenario == "recreated-directory":
     (target / "service.py").write_text("value = 2\n")
     recreated_metadata = target.stat()
     before_rescan = listed(target)
-    before_aliases = repository_target_ids(connection, target_id)
     recreated_id = add_scan("after-recreation", target)
     repeated_id = add_scan("repeated-rescan", target)
     after_rescan = listed(target)
-    after_aliases = repository_target_ids(connection, target_id)
 
     malformed_target = repository / "service-b"
     add_scan("malformed-owner", malformed_target, "malformed")
@@ -525,7 +523,7 @@ elif scenario == "recreated-directory":
     else:
         nongit_owner_error = None
 
-    root_target_id = add_scan("linked-root-before", worktree)
+    add_scan("linked-root-before", worktree)
     add_scan("canonical-root-alias", repository)
     root_identity = repository_identity(worktree)
     root_metadata = worktree.stat()
@@ -556,16 +554,12 @@ elif scenario == "recreated-directory":
         ),
         "beforeRescan": before_rescan,
         "afterRescan": after_rescan,
-        "beforeAliases": sorted(before_aliases),
-        "afterAliases": sorted(after_aliases),
-        "expectedAliases": sorted((target_id, linked_id)),
         "malformedOwnerError": malformed_owner_error,
         "nongitOwnerError": nongit_owner_error,
         "rootOwnerChanged": root_metadata.st_ino != worktree.stat().st_ino,
         "rootIdentityPreserved": repository_identity(worktree) == root_identity,
         "recreatedRootError": recreated_root_error,
         "recreatedRootScans": listed(worktree),
-        "recreatedRootAliases": sorted(repository_target_ids(connection, root_target_id)),
     }))
 
 elif scenario == "candidate-generation":
@@ -868,8 +862,6 @@ describe("durable workbench repository identities", () => {
       "linked-scope",
       "repeated-rescan",
     ]);
-    expect(result["beforeAliases"]).toEqual(result["expectedAliases"]);
-    expect(result["afterAliases"]).toEqual(result["expectedAliases"]);
     expect(result["malformedOwnerError"]).toContain(
       "refusing to reuse its target",
     );
@@ -882,7 +874,6 @@ describe("durable workbench repository identities", () => {
       "refusing to reuse its target",
     );
     expect(result["recreatedRootScans"]).toEqual([]);
-    expect(result["recreatedRootAliases"]).toEqual([]);
   }, 30_000);
 
   test("does not expand trusted aliases when historical checkout ownership is unverified", () => {

@@ -21,15 +21,6 @@ from workbench_target_state import (
 from workbench_validation import bounded_output_text
 
 
-def repository_target_ids(
-    connection: sqlite3.Connection,
-    target_id: str,
-    *,
-    identities: RepositoryIdentityCache | None = None,
-) -> set[str]:
-    return (identities or RepositoryIdentityCache(connection)).target_ids(target_id)
-
-
 def list_global_findings(
     connection: sqlite3.Connection,
     args: argparse.Namespace,
