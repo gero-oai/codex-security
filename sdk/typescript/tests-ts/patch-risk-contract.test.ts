@@ -386,6 +386,18 @@ describe("patch risk assessment contract", () => {
     payload.impact.rating = "low";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
+
+    payload.validation.push({
+      name: "optional formatting check",
+      status: "skipped",
+      protects: "Formatting only.",
+      relevant: false,
+    });
+    const acceptedWithIrrelevantSkip = validate(payload);
+    expect(
+      acceptedWithIrrelevantSkip.status,
+      acceptedWithIrrelevantSkip.stderr,
+    ).toBe(0);
   });
 
   test("requires a bounded evidence plan for an evidence hold", () => {
@@ -549,6 +561,11 @@ describe("patch risk assessment contract", () => {
     const publicContractModerateImpact = assessment();
     publicContractModerateImpact.autoMergeExclusions = ["public_contract"];
     expect(validate(publicContractModerateImpact).status).not.toBe(0);
+
+    const hardRecoveryLowImpact = assessment();
+    hardRecoveryLowImpact.impact.rating = "low";
+    hardRecoveryLowImpact.recoverability.rating = "hard";
+    expect(validate(hardRecoveryLowImpact).status).not.toBe(0);
 
     const criticalRegression = assessment();
     criticalRegression.regressionLikelihood.rating = "critical";
