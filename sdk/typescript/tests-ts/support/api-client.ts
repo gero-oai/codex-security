@@ -79,7 +79,7 @@ export class TestClient extends CodexSecurity {
       );
       environment = {
         ...environment,
-        CODEX_SECURITY_STATE_DIR: temporaryStateDirectory,
+        CODEX_SECURITY_STATE_DIR: join(temporaryStateDirectory, "state"),
       };
     }
     super(

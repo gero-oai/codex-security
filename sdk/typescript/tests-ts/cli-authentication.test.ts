@@ -26,15 +26,17 @@ import {
 } from "./cli-fixtures.js";
 
 let stateDirectory: string;
+let temporaryRoot: string;
 
 beforeEach(async () => {
-  stateDirectory = await realpath(
+  temporaryRoot = await realpath(
     await mkdtemp(join(tmpdir(), "codex-security-cli-authentication-")),
   );
+  stateDirectory = join(temporaryRoot, "state");
 });
 
 afterEach(async () => {
-  await rm(stateDirectory, { recursive: true, force: true });
+  await rm(temporaryRoot, { recursive: true, force: true });
 });
 
 function dependencies(

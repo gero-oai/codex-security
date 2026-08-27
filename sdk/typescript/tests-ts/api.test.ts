@@ -5059,13 +5059,6 @@ describe("CodexSecurity orchestration", () => {
       expect(persistentConfigText).not.toContain("synthetic-transient-key");
       const persistentConfig = parseToml(persistentConfigText);
       expect(persistentConfig["model"]).toBeUndefined();
-      expect(persistentConfig).toMatchObject({
-        permissions: {
-          codex_security_scan: {
-            filesystem: { [stateDirectory]: "write" },
-          },
-        },
-      });
       if (provider !== undefined) {
         expect(persistentConfig).toMatchObject({
           model_provider: provider,

@@ -215,6 +215,103 @@ test("Windows state creation ACLs distinguish metadata from directory writes", (
   });
 });
 
+test("Windows state ACLs combine separate directory and inherited grants", () => {
+  const result = runPython("", [
+    "-c",
+    [
+      "import json, sys",
+      "sys.path.insert(0, sys.argv[1])",
+      "import workbench_db as workbench",
+      "user = 'S-1-5-21-1-2-3-1001'",
+      "results = []",
+      "for flags in ((3,), (0, 11), (3, 0), (0, 9), (11,)):",
+      "    record = {'owner': user, 'control': 0x1004, 'rules': [{'type': 0, 'flags': flag, 'mask': 0x1f01ff, 'sid': user} for flag in flags]}",
+      "    try:",
+      "        workbench.require_windows_state_acl(record, user, 'root')",
+      "    except RuntimeError:",
+      "        results.append(False)",
+      "    else:",
+      "        results.append(True)",
+      "print(json.dumps(results))",
+    ].join("\n"),
+    join(PLUGIN_ROOT, "scripts"),
+  ]);
+  expect(result.status).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(JSON.parse(result.stdout)).toEqual([true, true, true, false, false]);
+});
+
+test("Windows state ACLs reject only deny rules applying to the current token", () => {
+  const result = runPython("", [
+    "-c",
+    [
+      "import json, sys",
+      "sys.path.insert(0, sys.argv[1])",
+      "import workbench_db as workbench",
+      "user = 'S-1-5-21-1-2-3-1001'",
+      "group = 'S-1-5-21-1-2-3-2001'",
+      "principals = {user, group, 'S-1-1-0'}",
+      "results = {}",
+      "for denied in (user, group, 'S-1-1-0', 'S-1-5-32-546'):",
+      "    record = {'owner': user, 'control': workbench.WINDOWS_DACL_PRESENT | workbench.WINDOWS_DACL_PROTECTED, 'rules': [{'type': 1, 'flags': 3, 'mask': 0x1f01ff, 'sid': denied}, {'type': 0, 'flags': 3, 'mask': 0x1f01ff, 'sid': user}]}",
+      "    try:",
+      "        workbench.require_windows_state_acl(record, user, 'root', principals)",
+      "    except RuntimeError:",
+      "        results[denied] = 'rejected'",
+      "    else:",
+      "        results[denied] = 'accepted'",
+      "print(json.dumps(results))",
+    ].join("\n"),
+    join(PLUGIN_ROOT, "scripts"),
+  ]);
+  expect(result.status).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(JSON.parse(result.stdout)).toEqual({
+    "S-1-5-21-1-2-3-1001": "rejected",
+    "S-1-5-21-1-2-3-2001": "rejected",
+    "S-1-1-0": "rejected",
+    "S-1-5-32-546": "accepted",
+  });
+});
+
+testPosix.each(["missing", "shared", "unsafe-parent"])(
+  "publication inspection rejects %s state without opening SQLite or creating directories",
+  async (kind) => {
+    const root = await temporaryDirectory();
+    const state = join(root, "state");
+    if (kind !== "missing") await mkdir(state, { mode: 0o700 });
+    if (kind === "shared") await chmod(state, 0o755);
+    if (kind === "unsafe-parent") await chmod(root, 0o775);
+    const result = runPython(state, [
+      "-c",
+      [
+        "import argparse, sys",
+        "from pathlib import Path",
+        "from unittest.mock import patch",
+        "sys.path.insert(0, sys.argv[1])",
+        "import workbench_db as workbench",
+        "with (",
+        "    patch.object(workbench, 'linear_publication_input', return_value=({}, {}, [])),",
+        "    patch.object(workbench.sqlite3, 'connect', side_effect=AssertionError('unexpected database access')),",
+        "    patch.object(Path, 'mkdir', side_effect=AssertionError('unexpected directory creation')),",
+        "):",
+        "    try:",
+        "        workbench.inspect_linear_publication(argparse.Namespace())",
+        "    except SystemExit as error:",
+        "        print(error)",
+        "    else:",
+        "        raise AssertionError('unsafe state accepted')",
+      ].join("\n"),
+      join(PLUGIN_ROOT, "scripts"),
+    ]);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("state directory is unsafe");
+    expect(existsSync(state)).toBe(kind !== "missing");
+    if (kind !== "missing") expect(await readdir(state)).toEqual([]);
+  },
+);
+
 test("Windows state inspection tolerates both missing Get-Acl sidecar errors", () => {
   const result = runPython("", [
     "-c",
@@ -228,7 +325,7 @@ test("Windows state inspection tolerates both missing Get-Acl sidecar errors", (
       "def inspect(command, arguments, environment):",
       "    scripts.append(arguments[-1])",
       "    return json.dumps({'kind': 'root'})",
-      "context = (Path('powershell.exe'), Path('icacls.exe'), 'S-1-5-21-1-2-3-1001', {})",
+      "context = (Path('powershell.exe'), Path('icacls.exe'), 'S-1-5-21-1-2-3-1001', {}, set())",
       "with patch.object(workbench, 'run_windows_state_acl_command', side_effect=inspect):",
       "    workbench.windows_state_acl_records(Path('state'), context, workbench_files=True)",
       "print(json.dumps({'missing': 'GetAcl_PathNotFound*' in scripts[0], 'narrow': 'GetAcl_PathNotFound,*' in scripts[0]}))",

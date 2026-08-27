@@ -167,7 +167,7 @@ WINDOWS_WORKBENCH_FILES = (
     "workbench.sqlite3-shm",
     "workbench.sqlite3-wal",
 )
-windows_acl_context: tuple[Path, Path, str, dict[str, str]] | None = None
+windows_acl_context: tuple[Path, Path, str, dict[str, str], set[str]] | None = None
 
 
 def now() -> str:
@@ -228,7 +228,7 @@ def run_windows_state_acl_command(
     return result.stdout
 
 
-def windows_state_acl_context() -> tuple[Path, Path, str, dict[str, str]]:
+def windows_state_acl_context() -> tuple[Path, Path, str, dict[str, str], set[str]]:
     global windows_acl_context
     if windows_acl_context is not None:
         return windows_acl_context
@@ -244,26 +244,28 @@ def windows_state_acl_context() -> tuple[Path, Path, str, dict[str, str]]:
     )
     identity = run_windows_state_acl_command(
         system_directory / "whoami.exe",
-        ["/user", "/fo", "csv", "/nh"],
+        ["/user", "/groups", "/fo", "csv", "/nh"],
         environment,
     )
     try:
-        sid = next(csv.reader([identity.strip()]))[-1]
+        rows = list(csv.reader(identity.splitlines()))
+        sid = next(row[1] for row in rows if len(row) == 2)
     except (IndexError, StopIteration) as exc:
         raise RuntimeError("Unable to identify the current Windows user SID.") from exc
     if WINDOWS_SID.fullmatch(sid) is None:
         raise RuntimeError("Unable to identify the current Windows user SID.")
-    windows_acl_context = powershell, system_directory / "icacls.exe", sid, environment
+    principals = {value for row in rows for value in row if WINDOWS_SID.fullmatch(value)}
+    windows_acl_context = powershell, system_directory / "icacls.exe", sid, environment, principals
     return windows_acl_context
 
 
 def windows_state_acl_records(
     path: Path,
-    context: tuple[Path, Path, str, dict[str, str]],
+    context: tuple[Path, Path, str, dict[str, str], set[str]],
     *,
     workbench_files: bool = False,
 ) -> list[dict[str, Any]]:
-    powershell, _, _, base_environment = context
+    powershell, _, _, base_environment, _ = context
     script = [
         "$ErrorActionPreference = 'Stop'",
         "function Write-CodexSecurityAcl {",
@@ -318,6 +320,7 @@ def require_windows_state_acl(
     record: dict[str, Any],
     current_user_sid: str,
     scope: str,
+    current_user_principals: set[str] | None = None,
 ) -> None:
     owner = record.get("owner")
     control = record.get("control")
@@ -338,7 +341,9 @@ def require_windows_state_acl(
     if owner not in trusted:
         raise RuntimeError(f"Windows state ACL owner is not trusted: {owner}.")
 
-    grants_current_user = False
+    grants_current_directory = False
+    grants_current_files = False
+    grants_current_containers = False
     foreign_access = False
     denied_access = False
     for rule in rules:
@@ -361,7 +366,8 @@ def require_windows_state_acl(
             raise RuntimeError("Windows state ACL contains an unsupported access rule.")
         mask &= 0xFFFFFFFF
         if ace_type in WINDOWS_DENY_ACE_TYPES:
-            denied_access = True
+            if current_user_principals is None or principal in current_user_principals:
+                denied_access = True
             continue
         if principal not in trusted:
             if scope in {"root", "entry"}:
@@ -378,17 +384,18 @@ def require_windows_state_acl(
         if (
             principal == current_user_sid
             and ace_type == 0
-            and flags & WINDOWS_ACE_INHERIT_ONLY == 0
             and (
                 mask & WINDOWS_FULL_CONTROL == WINDOWS_FULL_CONTROL
                 or mask & WINDOWS_GENERIC_ALL
             )
         ):
-            grants_current_user = scope != "root" or (
-                flags & WINDOWS_ACE_OBJECT_INHERIT
-                and flags & WINDOWS_ACE_CONTAINER_INHERIT
-                and flags & WINDOWS_ACE_NO_PROPAGATE == 0
-            )
+            if flags & WINDOWS_ACE_INHERIT_ONLY == 0:
+                grants_current_directory = True
+            if flags & WINDOWS_ACE_NO_PROPAGATE == 0:
+                if flags & WINDOWS_ACE_OBJECT_INHERIT:
+                    grants_current_files = True
+                if flags & WINDOWS_ACE_CONTAINER_INHERIT:
+                    grants_current_containers = True
 
     if scope in {"ancestor", "creation-parent"}:
         if foreign_access:
@@ -398,7 +405,9 @@ def require_windows_state_acl(
         return
     if scope == "root" and control & WINDOWS_DACL_PROTECTED == 0:
         raise RuntimeError("Windows state ACL must be protected from inheritance.")
-    if not grants_current_user:
+    if not grants_current_directory or (
+        scope == "root" and not (grants_current_files and grants_current_containers)
+    ):
         raise RuntimeError("Windows state ACL does not grant the current user access.")
     if foreign_access:
         raise RuntimeError("Windows state ACL grants access to another identity.")
@@ -421,7 +430,7 @@ def existing_windows_state_ancestor(path: Path) -> Path:
 
 def require_secure_windows_state_ancestry(
     path: Path,
-    context: tuple[Path, Path, str, dict[str, str]],
+    context: tuple[Path, Path, str, dict[str, str], set[str]],
     *,
     allow_state_creation: bool = False,
 ) -> None:
@@ -433,19 +442,20 @@ def require_secure_windows_state_ancestry(
             record,
             context[2],
             "creation-parent" if allow_state_creation and index == 0 else "ancestor",
+            context[4],
         )
 
 
 def require_private_windows_state_path(
     path: Path,
-    context: tuple[Path, Path, str, dict[str, str]],
+    context: tuple[Path, Path, str, dict[str, str], set[str]],
 ) -> None:
     records = windows_state_acl_records(path, context)
     if any(record.get("kind") != "ancestor" for record in records):
         raise RuntimeError("Windows state path ACL could not be verified.")
-    require_windows_state_acl(records[0], context[2], "entry")
+    require_windows_state_acl(records[0], context[2], "entry", context[4])
     for record in records[1:]:
-        require_windows_state_acl(record, context[2], "ancestor")
+        require_windows_state_acl(record, context[2], "ancestor", context[4])
 
 
 def require_regular_windows_state_file(path: Path) -> bool:
@@ -464,16 +474,12 @@ def require_regular_windows_state_file(path: Path) -> bool:
     return True
 
 
-def require_regular_windows_workbench_files(root: Path) -> None:
-    for name in WINDOWS_WORKBENCH_FILES:
-        require_regular_windows_state_file(root / name)
-
-
 def require_private_windows_state_directory(
     root: Path,
-    context: tuple[Path, Path, str, dict[str, str]],
+    context: tuple[Path, Path, str, dict[str, str], set[str]],
 ) -> None:
-    require_regular_windows_workbench_files(root)
+    for name in WINDOWS_WORKBENCH_FILES:
+        require_regular_windows_state_file(root / name)
     records = windows_state_acl_records(root, context, workbench_files=True)
     ancestors = [record for record in records if record.get("kind") == "ancestor"]
     roots = [record for record in records if record.get("kind") == "root"]
@@ -481,17 +487,17 @@ def require_private_windows_state_directory(
     if len(roots) != 1 or len(ancestors) + len(roots) + len(entries) != len(records):
         raise RuntimeError("Windows state ACL snapshot could not be verified.")
     for record in ancestors:
-        require_windows_state_acl(record, context[2], "ancestor")
-    require_windows_state_acl(roots[0], context[2], "root")
+        require_windows_state_acl(record, context[2], "ancestor", context[4])
+    require_windows_state_acl(roots[0], context[2], "root", context[4])
     for record in entries:
-        require_windows_state_acl(record, context[2], "entry")
+        require_windows_state_acl(record, context[2], "entry", context[4])
 
 
 def install_private_windows_state_acl(
     path: Path,
-    context: tuple[Path, Path, str, dict[str, str]],
+    context: tuple[Path, Path, str, dict[str, str], set[str]],
 ) -> None:
-    _, icacls, current_user_sid, environment = context
+    _, icacls, current_user_sid, environment, _ = context
     run_windows_state_acl_command(
         icacls,
         [
@@ -616,7 +622,7 @@ def release_completion_file_lock(descriptor: int) -> None:
     windows_file_lock.locking(descriptor, windows_file_lock.LK_UNLCK, 1)
 
 
-def connect() -> sqlite3.Connection:
+def prepare_state_directory(*, create: bool = True) -> Path:
     requested = requested_state_dir()
     root = Path(requested)
     try:
@@ -641,6 +647,8 @@ def connect() -> sqlite3.Connection:
                 existing = parent
         if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
             raise SystemExit("State path must use real directories.")
+        if missing and not create:
+            raise SystemExit("State directory does not exist.")
         if windows_acl is not None:
             if missing or lexical_existing is None or os.path.normcase(
                 str(lexical_existing)
@@ -680,6 +688,11 @@ def connect() -> sqlite3.Connection:
             f"Codex Security state directory is unsafe: {root}. {exc}"
         ) from exc
     os.environ["CODEX_SECURITY_STATE_DIR"] = str(root)
+    return root
+
+
+def connect() -> sqlite3.Connection:
+    root = prepare_state_directory()
     path = root / "workbench.sqlite3"
     for attempt in range(SQLITE_RETRY_ATTEMPTS):
         connection = sqlite3.connect(path, timeout=5)
@@ -2975,7 +2988,8 @@ def verify_linear_publication_scan(
 
 def inspect_linear_publication(args: argparse.Namespace) -> dict[str, Any]:
     payload, destination, findings = linear_publication_input(args, recording=False)
-    database_uri = f"file:{quote(str(database_path()), safe='')}?mode=ro"
+    root = prepare_state_directory(create=False)
+    database_uri = f"file:{quote(str(root / 'workbench.sqlite3'), safe='')}?mode=ro"
     with closing(sqlite3.connect(database_uri, uri=True, timeout=5)) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("BEGIN")

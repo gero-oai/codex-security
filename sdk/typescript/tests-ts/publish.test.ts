@@ -22,6 +22,7 @@ import {
   UnknownLinearError,
 } from "@linear/sdk";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { prepareCodexSecurityStateDirectory } from "../src/runtime.js";
 import {
   forceTerminatePublicationProcesses,
   publishScanInternal,
@@ -491,7 +492,7 @@ describe("private publication state", () => {
     const selected = join(root, "selected");
     const other = join(root, "other");
     const alias = join(root, "state-alias");
-    await mkdir(selected, { mode: 0o700 });
+    await prepareCodexSecurityStateDirectory(selected);
     await mkdir(other, { mode: 0o700 });
     const linkType = process.platform === "win32" ? "junction" : "dir";
     await symlink(selected, alias, linkType);
@@ -1557,11 +1558,13 @@ describe("connected Linear publication", () => {
 
   test("reuses ambient Codex configuration and loads exact issue data from a private file", async () => {
     const publication = preparedPublication();
-    const stateDirectory = await mkdtemp(
+    const temporaryRoot = await mkdtemp(
       join(tmpdir(), "codex-security-publication-environment-"),
     );
-    temporaryDirectories.push(stateDirectory);
-    const canonicalState = await realpath(stateDirectory);
+    temporaryDirectories.push(temporaryRoot);
+    const stateDirectory = join(temporaryRoot, "state");
+    const canonicalState =
+      await prepareCodexSecurityStateDirectory(stateDirectory);
     const environment = {
       CODEX_HOME: "/existing/connected-codex-home",
       CODEX_SECURITY_STATE_DIR: stateDirectory,
