@@ -18,6 +18,7 @@ const shardSeeds = [
   ["scan-recovery.test.ts"],
   [],
   [],
+  ["cli-patch.test.ts"],
 ];
 const assigned = new Set(shardSeeds.flat());
 for (const file of assigned) {
@@ -51,7 +52,7 @@ if (
     requestedShard < 1 ||
     requestedShard > shardSeeds.length)
 ) {
-  throw new Error("Usage: node scripts/run-windows-ci-tests.mjs [1-7]");
+  throw new Error("Usage: node scripts/run-windows-ci-tests.mjs [1-8]");
 }
 const selectedShards =
   requestedShard === undefined
@@ -72,7 +73,7 @@ const results = await Promise.all(
             paths.join(" "),
         );
         // Native Windows credential and document checks can exceed 30 seconds.
-        // The workflow still bounds each complete shard to ten minutes.
+        // The workflow bounds each complete shard to fifteen minutes.
         const child = spawn("bun", ["test", "--timeout", "120000", ...paths], {
           cwd: packageDirectory,
           stdio: "inherit",

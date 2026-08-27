@@ -175,36 +175,6 @@ function gitEnvironment(
   };
 }
 
-async function runGit(
-  executable: string,
-  repository: string,
-  args: readonly string[],
-  environment: Readonly<Record<string, string>>,
-  trim = true,
-): Promise<string> {
-  const { stdout } = await execFile(
-    executable,
-    [
-      "-c",
-      "core.fsmonitor=false",
-      "-c",
-      "credential.helper=",
-      "-c",
-      "credential.interactive=never",
-      ...args,
-    ],
-    {
-      cwd: repository,
-      encoding: "utf8",
-      env: gitEnvironment(environment),
-      maxBuffer: Number.POSITIVE_INFINITY,
-      windowsHide: true,
-    },
-  );
-  const value = String(stdout);
-  return trim ? value.replace(/\r?\n$/u, "") : value;
-}
-
 async function runGitBytes(
   executable: string,
   repository: string,
@@ -254,7 +224,7 @@ export async function runPatchReviewRepositoryMcp(
   const environment = {
     GIT_OBJECT_DIRECTORY: objectDirectory,
   };
-  await runGit(
+  await runGitBytes(
     canonicalGit,
     canonicalRepository,
     ["cat-file", "-e", `${tree}^{tree}`],
@@ -288,12 +258,9 @@ export async function runPatchReviewRepositoryMcp(
     directory: string,
   ): Promise<{ prefix: Buffer; entries: GitTreeEntry[] }> => {
     const path = rawTreePath(directory, true);
-    const parts = splitRawTreePath(path, true);
     let object = tree;
-    for (const part of parts) {
-      const entry = (await readTree(object)).find((candidate) =>
-        candidate.rawPath.equals(part),
-      );
+    if (path.length > 0) {
+      const entry = await treeEntry(path);
       if (entry?.type !== "tree") {
         throw new Error("The requested baseline path is not a directory.");
       }
@@ -321,7 +288,7 @@ export async function runPatchReviewRepositoryMcp(
     {
       name: "read_file",
       description:
-        "Read one text file from the immutable review baseline tree.",
+        "Read one file from the immutable review baseline tree. Non-UTF-8 bytes are returned as base64 JSON.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -447,12 +414,19 @@ export async function runPatchReviewRepositoryMcp(
           ["cat-file", "blob", entry.object],
           environment,
         );
+        const decoded = contents.toString("utf8");
+        const text = Buffer.from(decoded, "utf8").equals(contents)
+          ? decoded
+          : JSON.stringify({
+              encoding: "base64",
+              data: contents.toString("base64"),
+            });
         send(
           result(
             id,
             entry.mode === "120000"
-              ? `Symbolic link target (not followed):\n${contents.toString("utf8")}`
-              : contents.toString("utf8"),
+              ? `Symbolic link target (not followed):\n${text}`
+              : text,
           ),
         );
         continue;
