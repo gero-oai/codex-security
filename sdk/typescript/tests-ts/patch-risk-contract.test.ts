@@ -193,6 +193,10 @@ describe("patch risk assessment contract", () => {
     invalidPattern.patch.sha256 = "g".repeat(64);
     invalidAssessments.push(invalidPattern);
 
+    const trailingNewlineDigest = assessment();
+    trailingNewlineDigest.patch.sha256 = `${"c".repeat(64)}\n`;
+    invalidAssessments.push(trailingNewlineDigest);
+
     const emptyValidation = assessment();
     emptyValidation.validation = [];
     invalidAssessments.push(emptyValidation);
@@ -267,6 +271,18 @@ describe("patch risk assessment contract", () => {
       status: "superseded",
       rationale: "A narrower patch already landed.",
     };
+    const accepted = validate(payload);
+    expect(accepted.status, accepted.stderr).toBe(0);
+  });
+
+  test("requires affirmative failure evidence for a block", () => {
+    const payload = assessment();
+    payload.recommendation = "block";
+    payload.workflowLabel = "block";
+
+    expect(validate(payload).status).not.toBe(0);
+
+    payload.materialBoundaries[0]!.result = "contradicted";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
   });
