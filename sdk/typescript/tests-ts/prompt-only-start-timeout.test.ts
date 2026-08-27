@@ -124,14 +124,8 @@ test("a rejected pending fallback pin does not fail state-free inspection", asyn
   expect(fsModule).toBeDefined();
 
   let mkdirCalls = 0;
-  let rejectFirstMkdir: ((reason: Error) => void) | undefined;
-  let resolveMkdirStarted: (() => void) | undefined;
-  const firstMkdir = new Promise<void>((_resolve, reject) => {
-    rejectFirstMkdir = reject;
-  });
-  const mkdirStarted = new Promise<void>((resolve) => {
-    resolveMkdirStarted = resolve;
-  });
+  const firstMkdir = Promise.withResolvers<void>();
+  const mkdirStarted = Promise.withResolvers<void>();
   const bundled = new Function(
     pathModule!,
     fsModule!,
@@ -152,8 +146,8 @@ test("a rejected pending fallback pin does not fail state-free inspection", asyn
         mkdir: async () => {
           mkdirCalls += 1;
           if (mkdirCalls === 1) {
-            resolveMkdirStarted!();
-            await firstMkdir;
+            mkdirStarted.resolve();
+            await firstMkdir.promise;
           }
         },
       },
@@ -178,12 +172,12 @@ test("a rejected pending fallback pin does not fail state-free inspection", asyn
   };
 
   const pin = bundled.pinFallbackWorkbenchStateDir();
-  await mkdirStarted;
+  await mkdirStarted.promise;
   const inspection = bundled.executeWorkbenchWithStateSelection("python", [
     "inspect-setup",
   ]);
   const outcomes = Promise.allSettled([pin, inspection]);
-  rejectFirstMkdir!(new Error("synthetic fallback failure"));
+  firstMkdir.reject(new Error("synthetic fallback failure"));
   const [pinOutcome, inspectionOutcome] = await outcomes;
   expect(pinOutcome).toMatchObject({
     status: "rejected",

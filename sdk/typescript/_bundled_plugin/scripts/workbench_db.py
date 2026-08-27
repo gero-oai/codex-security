@@ -383,15 +383,6 @@ def is_canonical_git_object_id(value: Any, object_id_length: int) -> bool:
     )
 
 
-def require_committed_diff_digest(
-    target: Path,
-    base: str,
-    head: str,
-    selected_digest: str | None,
-) -> str:
-    return require_committed_diff_snapshot(target, base, head, selected_digest)[0]
-
-
 def require_committed_diff_snapshot(
     target: Path,
     base: str,
@@ -420,25 +411,6 @@ class ResolvedDiffTargetError(SystemExit):
         self.kind = kind
         self.base_revision = base_revision
         self.head_revision = head_revision
-
-
-def require_resolved_committed_diff_target(
-    target: Path,
-    kind: str,
-    base: str,
-    head: str,
-    content_digest: str | None,
-    *,
-    persisted_base: str | None,
-) -> dict[str, str]:
-    return require_resolved_committed_diff_snapshot(
-        target,
-        kind,
-        base,
-        head,
-        content_digest,
-        persisted_base=persisted_base,
-    )[0]
 
 
 def require_resolved_committed_diff_snapshot(
@@ -695,13 +667,6 @@ def require_diff_target_snapshot(
         content_digest,
         persisted_base=persisted_base,
     )
-
-
-def require_registered_diff_target(
-    target: Path,
-    diff_target: dict[str, str],
-) -> dict[str, str]:
-    return require_registered_diff_target_snapshot(target, diff_target)[0]
 
 
 def require_registered_diff_target_snapshot(
@@ -1190,10 +1155,7 @@ def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> 
                 "diff. Select the changes to review again."
             )
     same_committed_identity = (
-        diff_target is not None
-        and diff_target["kind"] != "working_tree"
-        and workspace["target_path"] == target_path
-        and workspace["diff_target_kind"] == diff_target["kind"]
+        stored_committed_selection
         and workspace["diff_head_revision"] == diff_target["headRevision"]
         and (
             diff_target["kind"] == "commit"

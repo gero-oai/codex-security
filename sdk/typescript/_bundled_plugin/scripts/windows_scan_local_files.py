@@ -11,8 +11,8 @@ already-validated ancestor from being renamed or replaced during a read,
 write, or delete.  Writes rename the exact temporary-file handle into place so
 an attacker cannot substitute another file at the temporary name.
 
-Importing this module is safe on non-Windows hosts.  Its public operations
-raise ``WindowsScanLocalFileError`` when called anywhere other than Windows.
+Importing this module and comparing streams work on every platform. Filesystem
+operations raise ``WindowsScanLocalFileError`` outside Windows.
 """
 
 from __future__ import annotations
