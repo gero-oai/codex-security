@@ -17,7 +17,7 @@ import type {
   JsonObject,
   ScanManifest,
 } from "../src/index.js";
-import { runWorkbench } from "../src/runtime.js";
+import { resolvePluginPython, runWorkbench } from "../src/runtime.js";
 import {
   matchScanFindings,
   type ScanComparisonInput,
@@ -52,9 +52,7 @@ test("matches sealed scan history end to end without merging related findings", 
     await mkdtemp(join(tmpdir(), "codex-security-matching-")),
   );
   try {
-    const python =
-      Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
-    if (python === null) throw new Error("A Python interpreter is required.");
+    const python = await resolvePluginPython();
     const repository = join(root, "repository");
     const state = join(root, "state");
     await mkdir(join(repository, "src"), { recursive: true });

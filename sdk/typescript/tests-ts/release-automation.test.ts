@@ -2140,6 +2140,7 @@ describe("GitHub release workflow safeguards", () => {
         timeout: 10_000,
       });
 
+      expect(result.error).toBeUndefined();
       expect(result.status).toBe(status);
       if (status !== 0) {
         expect(result.stderr).toContain(

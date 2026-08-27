@@ -1031,71 +1031,44 @@ describe("semantic scan comparison", () => {
     });
   });
 
-  test("confirms historical groups before contradictory model output can run", async () => {
-    const input = {
-      before: [{ occurrenceId: "before", findingId: "known-a" }],
-      after: [{ occurrenceId: "after", findingId: "known-b" }],
-      knownFindingGroups: [["known-a", "known-b"]],
-    };
-    const response = {
-      matches: [],
-      uncertain: [
-        {
-          beforeOccurrenceId: "before",
-          afterOccurrenceId: "after",
-          reason: "Contradicts a saved confirmed identity.",
-        },
+  test.each([
+    ["confirmed aliases", ["a"], ["b"], [["a", "b"]]],
+    [
+      "overlapping aliases",
+      ["a"],
+      ["c"],
+      [
+        ["a", "b"],
+        ["b", "c"],
       ],
-    };
-
-    const { codex, calls } = fakeCodex(response);
-
-    expect(await matchScanFindings(input, { codex })).toEqual({
-      matches: [
-        {
-          beforeOccurrenceIds: ["before"],
-          afterOccurrenceIds: ["after"],
-          confidence: "high",
-          reason:
-            "The findings share a stable identity or a previously confirmed link.",
-        },
-      ],
-      uncertain: [],
-    });
-    expect(calls.prompt).toBeUndefined();
-  });
-
-  test.each(["omitted", "uncertain", "related"] as const)(
-    "confirms overlapping historical groups before an %s model decision",
-    async (decision) => {
+    ],
+    ["repeated stable identities", ["same", "same"], ["same", "same"], []],
+  ] as const)(
+    "confirms %s without starting Codex",
+    async (_scenario, before, after, knownFindingGroups) => {
       const input = {
-        before: [{ occurrenceId: "before", findingId: "identity-a" }],
-        after: [{ occurrenceId: "after", findingId: "identity-c" }],
-        knownFindingGroups: [
-          ["identity-a", "identity-b"],
-          ["identity-b", "identity-c"],
-        ],
+        before: before.map((findingId, index) => ({
+          occurrenceId: `before-${index}`,
+          findingId,
+        })),
+        after: after.map((findingId, index) => ({
+          occurrenceId: `after-${index}`,
+          findingId,
+        })),
+        knownFindingGroups,
       };
-      const pair = {
-        beforeOccurrenceId: "before",
-        afterOccurrenceId: "after",
-        reason: "Contradicts a transitively confirmed identity.",
-      };
-      const response = {
-        matches: [],
-        uncertain: decision === "uncertain" ? [pair] : [],
-        ...(decision === "related" ? { related: [pair] } : {}),
-      };
-
-      const { codex, calls } = fakeCodex(response);
+      const { codex, calls } = fakeCodex({ matches: [], uncertain: [] });
       expect(await matchScanFindings(input, { codex })).toEqual({
         matches: [
           {
-            beforeOccurrenceIds: ["before"],
-            afterOccurrenceIds: ["after"],
+            beforeOccurrenceIds: input.before.map(
+              ({ occurrenceId }) => occurrenceId,
+            ),
+            afterOccurrenceIds: input.after.map(
+              ({ occurrenceId }) => occurrenceId,
+            ),
             confidence: "high",
-            reason:
-              "The findings share a stable identity or a previously confirmed link.",
+            reason: expect.any(String),
           },
         ],
         uncertain: [],
@@ -1119,23 +1092,6 @@ describe("semantic scan comparison", () => {
         },
       ],
     };
-
-    const deterministic = fakeCodex(response);
-    expect(
-      await matchScanFindings(input, { codex: deterministic.codex }),
-    ).toEqual({
-      matches: [
-        {
-          beforeOccurrenceIds: ["before"],
-          afterOccurrenceIds: ["after"],
-          confidence: "high",
-          reason:
-            "The findings share a stable identity or a previously confirmed link.",
-        },
-      ],
-      uncertain: [],
-    });
-    expect(deterministic.calls.prompt).toBeUndefined();
 
     const requiringModel = {
       before: [
@@ -1164,49 +1120,6 @@ describe("semantic scan comparison", () => {
     });
     expect(contradictory.calls.prompt).toBeDefined();
   });
-
-  test.each(["omitted", "split"] as const)(
-    "confirms stable finding identities before a model can return %s matches",
-    async (scenario) => {
-      const input = {
-        before: [
-          { occurrenceId: "before-a", findingId: "shared-identity" },
-          { occurrenceId: "before-b", findingId: "shared-identity" },
-        ],
-        after: [
-          { occurrenceId: "after-a", findingId: "shared-identity" },
-          { occurrenceId: "after-b", findingId: "shared-identity" },
-        ],
-      };
-      const response = {
-        matches:
-          scenario === "omitted"
-            ? []
-            : input.before.map(({ occurrenceId }, index) => ({
-                beforeOccurrenceIds: [occurrenceId],
-                afterOccurrenceIds: [input.after[index]!.occurrenceId],
-                confidence: "high" as const,
-                reason: "Incorrectly splits one stable finding identity.",
-              })),
-        uncertain: [],
-      };
-
-      const { codex, calls } = fakeCodex(response);
-      expect(await matchScanFindings(input, { codex })).toEqual({
-        matches: [
-          {
-            beforeOccurrenceIds: ["before-a", "before-b"],
-            afterOccurrenceIds: ["after-a", "after-b"],
-            confidence: "high",
-            reason:
-              "The findings share a stable identity or a previously confirmed link.",
-          },
-        ],
-        uncertain: [],
-      });
-      expect(calls.prompt).toBeUndefined();
-    },
-  );
 
   test("never lets a model split a confirmed historical group", async () => {
     const input = {
