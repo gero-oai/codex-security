@@ -5331,7 +5331,10 @@ describe("scan and patch workflow", () => {
           filter,
           [
             'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
-            `if (existsSync(${JSON.stringify(armed)})) writeFileSync(${JSON.stringify(invoked)}, "invoked");`,
+            'const commandLine = (pid) => readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\\0", " ").trim();',
+            'let invocation = "invoked";',
+            'try { const status = readFileSync(`/proc/${process.ppid}/status`, "utf8"); const parent = status.match(/^PPid:\\s+(\\d+)/m)?.[1]; invocation = `${commandLine(process.ppid)}${parent ? ` <- ${commandLine(Number(parent))}` : ""}` || invocation; } catch {}',
+            `if (existsSync(${JSON.stringify(armed)})) writeFileSync(${JSON.stringify(invoked)}, invocation);`,
             "process.stdout.write(readFileSync(0));",
           ].join("\n"),
         );
