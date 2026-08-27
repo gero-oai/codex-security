@@ -12,7 +12,11 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
-import { BUNDLED_PLUGIN_VERSION, bootstrapPlugin } from "../src/index.js";
+import {
+  BUNDLED_PLUGIN_VERSION,
+  bootstrapPlugin,
+  resolveCodexCommand,
+} from "../src/index.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryRoots: string[] = [];
@@ -66,65 +70,52 @@ function git(repository: string, ...args: string[]): string {
   ).trim();
 }
 
-async function upgradeBundledPlugin(root: string): Promise<string> {
+async function upgradeBundledPlugin(
+  root: string,
+  previousVersion: string,
+): Promise<string> {
   const previous = join(root, "previous-plugin");
   cpSync(PLUGIN_ROOT, previous, { recursive: true });
   const previousManifestPath = join(previous, ".codex-plugin", "plugin.json");
   const previousManifest = JSON.parse(
     readFileSync(previousManifestPath, "utf8"),
   ) as { version: string };
-  previousManifest.version = "0.1.38";
+  previousManifest.version = previousVersion;
   writeFileSync(previousManifestPath, JSON.stringify(previousManifest));
   writeFileSync(
     join(previous, "scripts", "generate_rank_input.py"),
     "# synthetic previous plugin\n",
   );
-  const previousMcpPath = join(previous, ".mcp.json");
-  const previousMcp = JSON.parse(readFileSync(previousMcpPath, "utf8")) as {
-    mcpServers: Record<string, { env_vars?: string[] }>;
-  };
-  const previousEnvironment =
-    previousMcp.mcpServers["codex-security"]?.env_vars ?? [];
-  previousMcp.mcpServers["codex-security"] = {
-    ...previousMcp.mcpServers["codex-security"],
-    env_vars: previousEnvironment.filter(
-      (name) => name !== "CODEX_SAFETY_IDENTIFIER",
-    ),
-  };
-  writeFileSync(previousMcpPath, JSON.stringify(previousMcp));
+  writeFileSync(
+    join(previous, ".mcp.json"),
+    JSON.stringify({ mcpServers: { "codex-security": { env_vars: [] } } }),
+  );
 
   const home = join(root, "codex-home");
-  const marketplace = join(home, "sdk-marketplace");
   mkdirSync(home, { mode: 0o700 });
-  const runCodex = async (_command: unknown, args: readonly string[]) => {
-    if (args[1] === "marketplace") {
-      writeFileSync(
-        join(home, "config.toml"),
-        `[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(marketplace)}\n`,
-      );
-      return "";
-    }
-    const selected = join(marketplace, "plugins", "codex-security");
-    const manifest = JSON.parse(
-      readFileSync(join(selected, ".codex-plugin", "plugin.json"), "utf8"),
-    ) as { version: string };
-    const installed = join(home, "installed", manifest.version);
-    rmSync(installed, { recursive: true, force: true });
-    mkdirSync(join(home, "installed"), { recursive: true });
-    cpSync(selected, installed, { recursive: true });
-    return JSON.stringify({
-      installedPath: installed,
-      version: manifest.version,
-    });
+  writeFileSync(
+    join(home, "config.toml"),
+    'cli_auth_credentials_store = "file"\n\n[features]\nplugins = true\n',
+  );
+  const command = resolveCodexCommand();
+  const environment = {
+    ...process.env,
+    CODEX_HOME: home,
+    OPENAI_API_KEY: undefined,
+    CODEX_API_KEY: undefined,
   };
-  const options = {
-    codexCommand: { command: "/synthetic-codex" },
-    runCodex,
-  };
+  const login = spawnSync(command.command, ["login", "--with-api-key"], {
+    env: environment,
+    input: "synthetic-key\n",
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  expect(login.status, login.stderr).toBe(0);
+  const options = { codexCommand: command, environment };
 
   const predecessor = await bootstrapPlugin(home, previous, options);
   const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
-  expect(predecessor.version).toBe("0.1.38");
+  expect(predecessor.version).toBe(previousVersion);
   expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
   expect(upgraded.installedRoot).not.toBe(predecessor.installedRoot);
   const installedMcp = JSON.parse(
@@ -219,130 +210,139 @@ for (const kind of ["staged", "untracked"] as const) {
   );
 }
 
-test("diff inventory and previews stay inside the selected repository", async () => {
-  const root = realpathSync(
-    mkdtempSync(join(tmpdir(), "codex-security-diff-rank-")),
-  );
-  temporaryRoots.push(root);
-  const installedPluginRoot = await upgradeBundledPlugin(root);
-  const repository = join(root, "repository");
-  const nested = join(repository, "src", "nested");
-  mkdirSync(nested, { recursive: true });
-  mkdirSync(join(repository, "removed"));
-  git(repository, "init", "-q");
-  writeFileSync(join(repository, "src", "handler.py"), "value = 1\n");
-  writeFileSync(join(repository, "removed", "deleted.py"), "removed = True\n");
-  writeFileSync(join(repository, "src", "entry.py"), "handler.py");
-  writeFileSync(join(nested, "linked.py"), "value = 1\n");
-  git(repository, "add", ".");
-  const originalLink = git(repository, "hash-object", "src/entry.py");
-  git(
-    repository,
-    "update-index",
-    "--cacheinfo",
-    `120000,${originalLink},src/entry.py`,
-  );
-  git(repository, "commit", "-qm", "base");
-  const base = git(repository, "rev-parse", "HEAD");
+test.each(["0.1.60", "0.1.62"])(
+  "diff inventory and previews stay in target after upgrading %s",
+  async (previousVersion) => {
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), "codex-security-diff-rank-")),
+    );
+    temporaryRoots.push(root);
+    const installedPluginRoot = await upgradeBundledPlugin(
+      root,
+      previousVersion,
+    );
+    const repository = join(root, "repository");
+    const nested = join(repository, "src", "nested");
+    mkdirSync(nested, { recursive: true });
+    mkdirSync(join(repository, "removed"));
+    git(repository, "init", "-q");
+    writeFileSync(join(repository, "src", "handler.py"), "value = 1\n");
+    writeFileSync(
+      join(repository, "removed", "deleted.py"),
+      "removed = True\n",
+    );
+    writeFileSync(join(repository, "src", "entry.py"), "handler.py");
+    writeFileSync(join(nested, "linked.py"), "value = 1\n");
+    git(repository, "add", ".");
+    const originalLink = git(repository, "hash-object", "src/entry.py");
+    git(
+      repository,
+      "update-index",
+      "--cacheinfo",
+      `120000,${originalLink},src/entry.py`,
+    );
+    git(repository, "commit", "-qm", "base");
+    const base = git(repository, "rev-parse", "HEAD");
 
-  writeFileSync(join(repository, "src", "handler.py"), "value = 2\n");
-  writeFileSync(join(repository, "src", "entry.py"), "nested/linked.py");
-  writeFileSync(join(nested, "linked.py"), "value = 2\n");
-  rmSync(join(repository, "removed"), { recursive: true });
-  git(repository, "add", ".");
-  const updatedLink = git(repository, "hash-object", "src/entry.py");
-  git(
-    repository,
-    "update-index",
-    "--cacheinfo",
-    `120000,${updatedLink},src/entry.py`,
-  );
-  git(repository, "commit", "-qm", "selected changes");
-  const head = git(repository, "rev-parse", "HEAD");
-  const vanished = join(repository, "vanished");
-  mkdirSync(vanished);
-  writeFileSync(join(vanished, "added.py"), "vanished = True\n");
-  git(repository, "add", "vanished/added.py");
-  rmSync(vanished, { recursive: true });
+    writeFileSync(join(repository, "src", "handler.py"), "value = 2\n");
+    writeFileSync(join(repository, "src", "entry.py"), "nested/linked.py");
+    writeFileSync(join(nested, "linked.py"), "value = 2\n");
+    rmSync(join(repository, "removed"), { recursive: true });
+    git(repository, "add", ".");
+    const updatedLink = git(repository, "hash-object", "src/entry.py");
+    git(
+      repository,
+      "update-index",
+      "--cacheinfo",
+      `120000,${updatedLink},src/entry.py`,
+    );
+    git(repository, "commit", "-qm", "selected changes");
+    const head = git(repository, "rev-parse", "HEAD");
+    const vanished = join(repository, "vanished");
+    mkdirSync(vanished);
+    writeFileSync(join(vanished, "added.py"), "vanished = True\n");
+    git(repository, "add", "vanished/added.py");
+    rmSync(vanished, { recursive: true });
 
-  const python = pythonExecutable();
-  expect(python).not.toBeNull();
-  const output = join(root, "rank-input.jsonl");
-  const args = [
-    "-B",
-    join(installedPluginRoot, "scripts", "generate_rank_input.py"),
-    "make-diff-rank-input",
-    "--repo",
-    repository,
-    "--base",
-    base,
-    "--head",
-    head,
-    "--mode",
-    "local-patch",
-    "--out",
-    output,
-  ];
-  const inventoryOutput = join(root, "in-scope-files.txt");
-  const inventoryArgs = [
-    "-B",
-    join(installedPluginRoot, "scripts", "generate_in_scope_files.py"),
-    "--repo",
-    repository,
-    "--scope",
-    ".",
-    "--out",
-    inventoryOutput,
-    "--diff-base",
-    base,
-    "--diff-head",
-    head,
-    "--diff-mode",
-    "local-patch",
-  ];
-  const result = spawnSync(python!, args, { encoding: "utf8" });
-  const safeInventory = spawnSync(python!, inventoryArgs, {
-    encoding: "utf8",
-  });
+    const python = pythonExecutable();
+    expect(python).not.toBeNull();
+    const output = join(root, "rank-input.jsonl");
+    const args = [
+      "-B",
+      join(installedPluginRoot, "scripts", "generate_rank_input.py"),
+      "make-diff-rank-input",
+      "--repo",
+      repository,
+      "--base",
+      base,
+      "--head",
+      head,
+      "--mode",
+      "local-patch",
+      "--out",
+      output,
+    ];
+    const inventoryOutput = join(root, "in-scope-files.txt");
+    const inventoryArgs = [
+      "-B",
+      join(installedPluginRoot, "scripts", "generate_in_scope_files.py"),
+      "--repo",
+      repository,
+      "--scope",
+      ".",
+      "--out",
+      inventoryOutput,
+      "--diff-base",
+      base,
+      "--diff-head",
+      head,
+      "--diff-mode",
+      "local-patch",
+    ];
+    const result = spawnSync(python!, args, { encoding: "utf8" });
+    const safeInventory = spawnSync(python!, inventoryArgs, {
+      encoding: "utf8",
+    });
 
-  expect(result.status, result.stderr).toBe(0);
-  expect(safeInventory.status, safeInventory.stderr).toBe(0);
-  expect(readFileSync(inventoryOutput, "utf8")).toContain(
-    "removed/deleted.py\n",
-  );
-  const rows = readFileSync(output, "utf8")
-    .trim()
-    .split("\n")
-    .map((row) => JSON.parse(row) as { path: string; preview: string });
-  expect(rows.map((row) => row.path)).toEqual([
-    "removed/deleted.py",
-    "src/entry.py",
-    "src/handler.py",
-    "src/nested/linked.py",
-  ]);
-  expect(rows.find((row) => row.path === "src/handler.py")?.preview).toBe(
-    "value = 2",
-  );
-  expect(rows.find((row) => row.path === "src/nested/linked.py")?.preview).toBe(
-    "value = 2",
-  );
+    expect(result.status, result.stderr).toBe(0);
+    expect(safeInventory.status, safeInventory.stderr).toBe(0);
+    expect(readFileSync(inventoryOutput, "utf8")).toContain(
+      "removed/deleted.py\n",
+    );
+    const rows = readFileSync(output, "utf8")
+      .trim()
+      .split("\n")
+      .map((row) => JSON.parse(row) as { path: string; preview: string });
+    expect(rows.map((row) => row.path)).toEqual([
+      "removed/deleted.py",
+      "src/entry.py",
+      "src/handler.py",
+      "src/nested/linked.py",
+    ]);
+    expect(rows.find((row) => row.path === "src/handler.py")?.preview).toBe(
+      "value = 2",
+    );
+    expect(
+      rows.find((row) => row.path === "src/nested/linked.py")?.preview,
+    ).toBe("value = 2");
 
-  const externalFixture = join(root, "synthetic-fixture");
-  mkdirSync(externalFixture);
-  writeFileSync(join(externalFixture, "linked.py"), "synthetic = True\n");
-  rmSync(nested, { recursive: true });
-  symlinkSync(externalFixture, nested, "junction");
+    const externalFixture = join(root, "synthetic-fixture");
+    mkdirSync(externalFixture);
+    writeFileSync(join(externalFixture, "linked.py"), "synthetic = True\n");
+    rmSync(nested, { recursive: true });
+    symlinkSync(externalFixture, nested, "junction");
 
-  const escaped = spawnSync(python!, args, { encoding: "utf8" });
-  const inventory = spawnSync(python!, inventoryArgs, { encoding: "utf8" });
-  expect([escaped.status, inventory.status]).toEqual([1, 2]);
-  expect(escaped.stderr).toContain(
-    "Changed Git working-tree paths must stay inside the selected target.",
-  );
-  expect(inventory.stderr).toContain(
-    "changed Git working-tree paths must stay inside the selected target",
-  );
-});
+    const escaped = spawnSync(python!, args, { encoding: "utf8" });
+    const inventory = spawnSync(python!, inventoryArgs, { encoding: "utf8" });
+    expect([escaped.status, inventory.status]).toEqual([1, 2]);
+    expect(escaped.stderr).toContain(
+      "Changed Git working-tree paths must stay inside the selected target.",
+    );
+    expect(inventory.stderr).toContain(
+      "changed Git working-tree paths must stay inside the selected target",
+    );
+  },
+);
 
 test("preserves Unicode Git paths and legacy-encoded commit metadata", () => {
   const root = realpathSync(

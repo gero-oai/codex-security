@@ -133,42 +133,37 @@ describe("bundled workbench canonical paths", () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
     const outside = join(root, "outside");
-    await mkdir(repository);
-    await mkdir(outside);
-    await mkdir(join(repository, "selected"));
-    await writeFile(
-      join(repository, "selected", "public.py"),
-      "public = True\n",
-    );
+    for (const directory of [
+      outside,
+      join(repository, "cyclic"),
+      join(repository, "nested-checkout"),
+      join(repository, "internal-source"),
+      join(repository, "selected", "nested-checkout"),
+    ]) {
+      await mkdir(directory, { recursive: true });
+    }
+    for (const directory of ["selected", "internal-source"]) {
+      await writeFile(
+        join(repository, directory, "public.py"),
+        "public = True\n",
+      );
+    }
     await writeFile(join(outside, "private.py"), "private = True\n");
-    await symlink(
-      outside,
-      join(repository, "linked"),
-      process.platform === "win32" ? "junction" : "dir",
-    );
-    await mkdir(join(repository, "cyclic"));
-    await mkdir(join(repository, "nested-checkout"));
-    await mkdir(join(repository, "internal-source"));
-    await writeFile(
-      join(repository, "internal-source", "public.py"),
-      "public = True\n",
-    );
-    await symlink(
-      outside,
-      join(repository, "nested-checkout", "linked"),
-      process.platform === "win32" ? "junction" : "dir",
-    );
-    await symlink(
-      join(repository, "internal-source"),
-      join(repository, "nested-checkout", "safe-linked"),
-      process.platform === "win32" ? "junction" : "dir",
-    );
-    await mkdir(join(repository, "selected", "nested-checkout"));
-    await symlink(
-      join(repository, "internal-source"),
-      join(repository, "selected", "nested-checkout", "sibling-linked"),
-      process.platform === "win32" ? "junction" : "dir",
-    );
+    for (const [target, link] of [
+      [outside, "linked"],
+      [outside, "nested-checkout/linked"],
+      [join(repository, "internal-source"), "nested-checkout/safe-linked"],
+      [
+        join(repository, "internal-source"),
+        "selected/nested-checkout/sibling-linked",
+      ],
+    ] as const) {
+      await symlink(
+        target,
+        join(repository, link),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    }
 
     const result = runPythonProbe(
       [

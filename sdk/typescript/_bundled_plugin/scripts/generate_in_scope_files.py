@@ -230,13 +230,12 @@ def generate_diff_in_scope_files(
                         )
                     if is_binary_sample(contents):
                         continue
-                else:
-                    if (
-                        path.is_symlink()
-                        or not path.is_file()
-                        or preview_for(path, DEFAULT_PREVIEW_BYTES)[1]
-                    ):
-                        continue
+                elif (
+                    path.is_symlink()
+                    or not path.is_file()
+                    or preview_for(path, DEFAULT_PREVIEW_BYTES)[1]
+                ):
+                    continue
             relative_path = relative.as_posix()
             if "\n" in relative_path or "\r" in relative_path:
                 raise InventoryError(
