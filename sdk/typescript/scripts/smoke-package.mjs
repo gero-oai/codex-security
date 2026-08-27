@@ -160,18 +160,28 @@ async function pluginFiles(directory) {
   return files.sort();
 }
 
-async function smokeCliMcp(launcher, consumer) {
+async function smokeCliMcp(launcher, consumer, completedScan) {
   const repository = join(consumer, "mcp-repository");
   await mkdir(repository);
   await writeFile(
     join(repository, "example.js"),
     "export const example = 1;\n",
   );
+  run("git", ["-c", "init.templateDir=", "init", "--quiet", repository], {
+    cwd: consumer,
+  });
+  const manifest = JSON.parse(
+    run(process.execPath, [launcher, "--llms", "--format", "json"], {
+      cwd: consumer,
+      capture: true,
+    }),
+  );
   const child = spawn(process.execPath, [launcher, "--mcp"], {
     cwd: consumer,
     env: {
       ...process.env,
       CODEX_SECURITY_STATE_DIR: join(consumer, "mcp-state"),
+      CODEX_SECURITY_LINEAR_PROJECT: "",
     },
     stdio: "pipe",
     timeout: PACKAGE_SMOKE_TIMEOUT_MS,
@@ -203,10 +213,12 @@ async function smokeCliMcp(launcher, consumer) {
     });
     send({ jsonrpc: "2.0", method: "notifications/initialized" });
     const tools = await request(2, "tools/list", {});
-    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
-      "info",
-      "scan",
-    ]);
+    assert.deepEqual(
+      tools.tools.map((tool) => tool.name).sort(),
+      manifest.commands
+        .map((command) => command.name.replaceAll(" ", "_"))
+        .sort(),
+    );
     const info = await request(3, "tools/call", {
       name: "info",
       arguments: {},
@@ -219,6 +231,58 @@ async function smokeCliMcp(launcher, consumer) {
     assert.notEqual(scan.isError, true, JSON.stringify(scan));
     assert.equal(scan.structuredContent.exitCode, 0);
     assert.equal(scan.structuredContent.data.dryRun, true);
+    const call = async (id, name, args) => {
+      const result = await request(id, "tools/call", { name, arguments: args });
+      assert.notEqual(result.isError, true, JSON.stringify(result));
+      assert.equal(
+        result.structuredContent.exitCode,
+        0,
+        JSON.stringify(result),
+      );
+      return result.structuredContent;
+    };
+    const history = await call(5, "scans_list", { args: { repository } });
+    assert.deepEqual(history.data.scans, []);
+    const findings = await call(6, "findings_list", { args: { repository } });
+    assert.deepEqual(findings.data.findings, []);
+    const exported = await call(7, "export", {
+      args: { scanDir: completedScan },
+      options: { exportFormat: "csv", output: "-" },
+    });
+    assert.equal(
+      exported.output,
+      run(
+        process.execPath,
+        [
+          launcher,
+          "export",
+          completedScan,
+          "--export-format",
+          "csv",
+          "--output",
+          "-",
+        ],
+        {
+          cwd: consumer,
+          capture: true,
+        },
+      ),
+    );
+    const publication = await call(8, "publish_scan", {
+      args: { scanDir: completedScan },
+      options: { to: "linear", linearTeam: "team-example", dryRun: true },
+    });
+    assert.equal(publication.data.dryRun, true);
+    assert.equal(publication.data.scanId, "scan_example_001");
+    assert.equal(publication.data.counts.created, 0);
+    const installedHook = await call(9, "install-hook", {
+      args: { repository },
+    });
+    assert.equal(installedHook.data.failOnSeverity, "high");
+    assert.match(
+      await readFile(installedHook.data.hook, "utf8"),
+      /scan \. --working-tree/u,
+    );
     child.stdin.end();
     assert.equal((await closed)[0], 0, stderr);
   } finally {
@@ -542,8 +606,6 @@ try {
   assert.match(help, /Usage: codex-security\b/u);
   assert.match(help, /\bpublish\b/u);
 
-  await smokeCliMcp(launcher, consumer);
-
   const publicationScan = join(consumer, "publication-scan");
   await cp(
     join(installedRoot, "_bundled_plugin", "examples", "completed-scan"),
@@ -551,6 +613,7 @@ try {
     { recursive: true },
   );
   if (process.platform !== "win32") await chmod(publicationScan, 0o700);
+  await smokeCliMcp(launcher, consumer, publicationScan);
   const publication = JSON.parse(
     run(
       process.execPath,
@@ -685,7 +748,7 @@ try {
   await smokeNestedDeepScanWorker(installedRoot, consumer);
 
   console.log(
-    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, NodeNext types, CLI, credential locking, ${expectedPluginFiles.length} bundled plugin files, MCP initialization, bundled Codex version, and a nested worker without global codex.`,
+    `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, NodeNext types, CLI, credential locking, ${expectedPluginFiles.length} bundled plugin files, MCP scan/history/export/publication/hook calls, bundled Codex version, and a nested worker without global codex.`,
   );
 } finally {
   await rm(consumer, {
