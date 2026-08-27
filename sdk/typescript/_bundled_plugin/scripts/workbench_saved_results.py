@@ -255,6 +255,11 @@ def merge_saved_results(
             }
             if not isinstance(parent["findings"], list):
                 raise ContractError("Saved parent draft has no findings array")
+            if (
+                parent_scan.get("complete", True) is not True
+                and _UNVERIFIED_COVERAGE_WARNING not in warnings
+            ):
+                warnings.append(_UNVERIFIED_COVERAGE_WARNING)
             if not parent_scan.get("sealedAt"):
                 payload = _encoded(parent)
                 write_scan_local_bytes(

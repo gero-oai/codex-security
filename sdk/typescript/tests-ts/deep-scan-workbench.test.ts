@@ -75,7 +75,6 @@ interface CoverageProbeResult {
 
 function runPythonProbe<T>(script: string, root: string, probe: unknown): T {
   const python = Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
-  expect(python).not.toBeNull();
   if (python === null) {
     throw new Error("A Python interpreter is required for deep-scan tests.");
   }
@@ -383,6 +382,11 @@ describe("deep scan workbench ownership", () => {
 
   test("preserves worker and parent coverage provenance during recovery", () => {
     const cases = [
+      ...[null, 0, "false", false].flatMap((parentComplete) => [
+        { parentComplete },
+        { parent: "complete", parentComplete, retry: true },
+        { parentComplete, kind: "dedup" },
+      ]),
       { parent: "complete", complete: false },
       { complete: false },
       { complete: null },
@@ -444,7 +448,7 @@ describe("deep scan workbench ownership", () => {
         "    worker_coverage = {'surfaces': [], 'explicitExclusions': [], 'deferred': []}",
         "    if worker_status is not None: worker_coverage['completeness'] = worker_status",
         "    if malformed is not None: worker_coverage[malformed] = 'unverified review'",
-        "    parent_scan = dict(id='synthetic-scan', complete=True, scope=binding['scope'],",
+        "    parent_scan = dict(id='synthetic-scan', complete=case.get('parentComplete', True), scope=binding['scope'],",
         "        target={'kind': 'directory_snapshot', **binding['target']})",
         "    drafts = {'scan-manifest.json': {'scan': parent_scan},",
         "        'findings.json': {'findings': []}, 'coverage.json': parent_coverage}",
