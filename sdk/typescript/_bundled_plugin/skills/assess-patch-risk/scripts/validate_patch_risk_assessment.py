@@ -169,8 +169,14 @@ def validate_schema_value(
         if isinstance(minimum, int) and len(value) < minimum:
             errors.append(f"{path}: expected at least {minimum} characters")
         pattern = schema.get("pattern")
-        if isinstance(pattern, str) and re.search(pattern, value) is None:
-            errors.append(f"{path}: value does not match pattern")
+        if isinstance(pattern, str):
+            match = re.search(pattern, value)
+            if match is None or (
+                pattern.startswith("^")
+                and pattern.endswith("$")
+                and match.span() != (0, len(value))
+            ):
+                errors.append(f"{path}: value does not match pattern")
     return errors
 
 
@@ -214,6 +220,15 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             errors.append("no_op requires an established non-applicable disposition")
         if any(item["decisionCritical"] for item in unknowns):
             errors.append("no_op cannot retain a decision-critical unknown")
+
+    if recommendation == "block":
+        affirmative_failure = (
+            value["regressionLikelihood"]["rating"] == "critical"
+            or any(item["result"] == "contradicted" for item in boundaries)
+            or any(item["status"] == "failed" for item in value["validation"])
+        )
+        if not affirmative_failure:
+            errors.append("block requires affirmative failure evidence")
 
     if workflow_label == "auto_merge_candidate":
         auto_merge_requirements = {
