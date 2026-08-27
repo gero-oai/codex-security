@@ -1120,6 +1120,7 @@ interface CliDependencies {
   publishScan?: typeof publishScan;
   publishFindingsCsvToCloud?: typeof publishFindingsCsvToCloud;
   publishScanToCloud?: typeof publishScanToCloud;
+  cloudFetch?: (url: string, options: RequestInit) => Promise<Response>;
   confirmPatchReview?: (question: string) => Promise<boolean>;
   patchEditor?: (
     repository: string,
@@ -2107,9 +2108,17 @@ export async function main(
     output: z.record(z.string(), z.unknown()).optional(),
     async run({ args, format, formatExplicit, options }) {
       const controller = new AbortController();
-      let publishingToCloud = false;
+      let cloudRequestStarted = false;
+      const cloudFetch = (
+        url: string,
+        options: RequestInit,
+      ): Promise<Response> => {
+        options.signal?.throwIfAborted();
+        cloudRequestStarted = true;
+        return (dependencies.cloudFetch ?? globalThis.fetch)(url, options);
+      };
       const publicationErrorMessage = (error: unknown): string =>
-        publishingToCloud &&
+        cloudRequestStarted &&
         controller.signal.aborted &&
         error === controller.signal.reason
           ? "Any upload already in flight may have been accepted. Check Cloud before retrying."
@@ -2157,7 +2166,7 @@ export async function main(
             ? "Publication canceled by Ctrl-C."
             : "Publication terminated by SIGTERM.";
         const recovery =
-          error === undefined || (error === signal && !publishingToCloud)
+          error === undefined || (error === signal && !cloudRequestStarted)
             ? ""
             : ` ${diagnosticValue(publicationErrorMessage(error))}`;
         errorOutput.write(`codex-security: ${reason}${recovery}\n`);
@@ -2244,13 +2253,13 @@ export async function main(
           observingSignals = true;
         }
         if (csvPath !== undefined) {
-          publishingToCloud = !options.dryRun;
           const result = await (
             dependencies.publishFindingsCsvToCloud ?? publishFindingsCsvToCloud
           )(csvPath, {
             environment: dependencies.environment,
             dryRun: options.dryRun,
             signal: controller.signal,
+            fetch: cloudFetch,
           });
           return { ...result };
         }
@@ -2473,7 +2482,6 @@ export async function main(
           }
           scanDir = selectedScans[0]!.scanDir;
           controller.signal.throwIfAborted();
-          publishingToCloud = !options.dryRun;
           if (selectedScans.length > 1) {
             cloudBatch = {
               results: [],
@@ -2490,6 +2498,7 @@ export async function main(
                 break;
               }
               cloudBatch.notAttempted.shift();
+              cloudRequestStarted = false;
               try {
                 const result = await (
                   dependencies.publishScanToCloud ?? publishScanToCloud
@@ -2497,6 +2506,7 @@ export async function main(
                   environment: dependencies.environment,
                   dryRun: options.dryRun,
                   signal: controller.signal,
+                  fetch: cloudFetch,
                   ...(scanId === undefined ? {} : { expectedScanId: scanId }),
                 });
                 cloudBatch.results.push({ scanDir: directory, ...result });
@@ -2522,6 +2532,7 @@ export async function main(
             environment: dependencies.environment,
             dryRun: options.dryRun,
             signal: controller.signal,
+            fetch: cloudFetch,
             ...(selectedScans[0]?.scanId === undefined
               ? {}
               : { expectedScanId: selectedScans[0].scanId }),

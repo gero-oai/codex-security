@@ -12,7 +12,10 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { main } from "../src/cli.js";
-import { publishScanToCloud } from "../src/cloud-publish.js";
+import {
+  publishFindingsCsvToCloud,
+  publishScanToCloud,
+} from "../src/cloud-publish.js";
 import type { JsonObject } from "../src/index.js";
 import {
   capture,
@@ -488,6 +491,7 @@ describe("publish scan to Cloud", () => {
           environment: deps.environment,
           dryRun,
           signal: expect.any(AbortSignal),
+          fetch: expect.any(Function),
         });
         const { scanDir: _, ...result } = results[calls.length]!;
         calls.push(directory);
@@ -646,12 +650,14 @@ describe("publish scan to Cloud", () => {
   );
 
   test.each([
+    ["single preflight", "preflight", false],
     ["single request", "request", false],
     ["single receipt", "receipt", false],
+    ["batch preflight", "preflight", true],
     ["batch request", "request", true],
     ["batch receipt", "receipt", true],
   ] as const)(
-    "keeps recovery guidance from the real Cloud publisher: %s",
+    "handles cancellation from the real Cloud publisher: %s",
     async (_scenario, stage, batch) => {
       for (const [signal, code] of [
         ["SIGINT", 130],
@@ -705,34 +711,39 @@ describe("publish scan to Cloud", () => {
           },
         });
         let requests = 0;
-        deps.publishScanToCloud = (directory, options) =>
-          publishScanToCloud(directory, {
-            ...options,
-            fetch: async (_url, request) => {
-              requests++;
-              if (batch && requests === 1) {
-                return Response.json({
-                  status: "accepted",
-                  finding_ids: ["accepted-finding"],
-                  finding_count: 1,
-                });
-              }
-              expect(request.signal).toBeInstanceOf(AbortSignal);
-              if (stage === "request") {
+        deps.cloudFetch = async (_url, request) => {
+          requests++;
+          if (batch && requests === 1) {
+            return Response.json({
+              status: "accepted",
+              finding_ids: ["accepted-finding"],
+              finding_count: 1,
+            });
+          }
+          expect(request.signal).toBeInstanceOf(AbortSignal);
+          if (stage === "request") {
+            signals.emit(signal);
+            throw request.signal!.reason;
+          }
+          return new Response(
+            new ReadableStream({
+              pull(body) {
                 signals.emit(signal);
-                throw request.signal!.reason;
-              }
-              return new Response(
-                new ReadableStream({
-                  pull(body) {
-                    signals.emit(signal);
-                    body.error(request.signal!.reason);
-                  },
-                }),
-                { status: 201 },
-              );
-            },
-          });
+                body.error(request.signal!.reason);
+              },
+            }),
+            { status: 201 },
+          );
+        };
+        let publications = 0;
+        deps.publishScanToCloud = (directory, options) => {
+          const result = publishScanToCloud(directory, options);
+          publications++;
+          if (stage === "preflight" && publications === (batch ? 2 : 1)) {
+            signals.emit(signal);
+          }
+          return result;
+        };
         const stdout = capture();
         const stderr = capture();
         expect(
@@ -750,7 +761,9 @@ describe("publish scan to Cloud", () => {
             deps,
           ),
         ).toBe(code);
-        expect(requests).toBe(batch ? 2 : 1);
+        expect(requests).toBe(
+          (batch ? 1 : 0) + (stage === "preflight" ? 0 : 1),
+        );
         if (batch) {
           expect(JSON.parse(stdout.text())).toEqual({
             results: [
@@ -762,7 +775,10 @@ describe("publish scan to Cloud", () => {
             failed: [
               {
                 scanDir: directories[1],
-                error: expect.stringMatching(/accepted.*check.*retry/i),
+                error:
+                  stage === "preflight"
+                    ? signal
+                    : expect.stringMatching(/accepted.*check.*retry/i),
               },
             ],
             notAttempted: [directories[2]],
@@ -770,10 +786,53 @@ describe("publish scan to Cloud", () => {
         } else {
           expect(stdout.text()).toBe("");
         }
-        expect(stderr.text()).toMatch(/accepted.*check.*retry/i);
+        if (stage === "preflight") {
+          expect(stderr.text()).not.toMatch(/accepted|retry/i);
+        } else {
+          expect(stderr.text()).toMatch(/accepted.*check.*retry/i);
+        }
       }
     },
   );
+
+  test("cancels during CSV reading without suggesting an upload was accepted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cloud-csv-cancel-"));
+    temporaryDirectories.push(root);
+    const csv = join(root, "findings.csv");
+    await writeFile(csv, "");
+    const signals = new FakeSignals();
+    const deps = dependencies({
+      signals,
+      currentDirectory: root,
+      environment: {
+        CODEX_HOME: join(root, "credentials"),
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      },
+    });
+    let requests = 0;
+    deps.cloudFetch = async () => {
+      requests++;
+      throw new Error("unexpected upload");
+    };
+    deps.publishFindingsCsvToCloud = (path, options) => {
+      const result = publishFindingsCsvToCloud(path, options);
+      signals.emit("SIGINT");
+      return result;
+    };
+    const stdout = capture();
+    const stderr = capture();
+    expect(
+      await main(
+        ["publish", "scan", "--csv", csv, "--to", "cloud"],
+        stdout.stream,
+        stderr.stream,
+        deps,
+      ),
+    ).toBe(130);
+    expect(requests).toBe(0);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).not.toMatch(/accepted|retry/i);
+  });
 
   test("rejects multiple scans for Linear before publishing any findings", async () => {
     const deps = dependencies();
@@ -843,6 +902,7 @@ describe("publish scan to Cloud", () => {
               environment: deps.environment,
               dryRun,
               signal: expect.any(AbortSignal),
+              fetch: expect.any(Function),
             });
             return result;
           };
