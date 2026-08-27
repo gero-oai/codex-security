@@ -93,6 +93,28 @@ def json_value_key(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def json_values_equal(left: Any, right: Any) -> bool:
+    if (
+        isinstance(left, (int, float))
+        and not isinstance(left, bool)
+        and isinstance(right, (int, float))
+        and not isinstance(right, bool)
+    ):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            json_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    return left == right
+
+
 def matches_type(value: Any, expected: str) -> bool:
     return {
         "array": isinstance(value, list),
@@ -125,10 +147,10 @@ def validate_schema_value(
     expected_type = schema.get("type")
     if isinstance(expected_type, str) and not matches_type(value, expected_type):
         return [f"{path}: expected {expected_type}"]
-    if "const" in schema and json_value_key(value) != json_value_key(schema["const"]):
+    if "const" in schema and not json_values_equal(value, schema["const"]):
         errors.append(f"{path}: value does not match const")
     if "enum" in schema and all(
-        json_value_key(value) != json_value_key(candidate) for candidate in schema["enum"]
+        not json_values_equal(value, candidate) for candidate in schema["enum"]
     ):
         errors.append(f"{path}: value is not in enum")
 
