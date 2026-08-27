@@ -109,10 +109,6 @@ function patchRiskAssessment(
       rating: "low",
       rationale: "The changed path and its caller are covered.",
     },
-    materialSafetyFailure: {
-      established: false,
-      evidence: "No material safety failure was established.",
-    },
     regressionProtection: {
       rating: "strong",
       rationale: "Focused checks exercise the changed behavior.",
@@ -145,9 +141,7 @@ function patchRiskAssessment(
         invariant: "Supported requests retain their contract.",
         runtimeRoot: "service.request",
         counterexample: "A supported request takes the changed branch.",
-        counterexamplePath: "src/request.ts",
         legitimateControl: "The same request succeeds at the base tree.",
-        legitimateControlPath: "src/request.ts",
         result: "supported",
       },
     ],
@@ -156,25 +150,19 @@ function patchRiskAssessment(
         name: "focused request tests",
         status: "passed",
         protects: "The changed behavior through its production caller.",
-        requiredForMerge: true,
       },
     ] as Array<{
       name: string;
       status: string;
-      failureAttribution?: "patch_caused";
       protects: string;
-      requiredForMerge: boolean;
     }>,
     unknowns: [] as Array<{
-      id: string;
       summary: string;
       decisionCritical: boolean;
     }>,
     evidencePlan: [] as Array<{
       question: string;
       action: string;
-      resolvesUnknowns: string[];
-      applicabilityOutcomes?: Record<string, string>;
       outcomes: Record<string, string>;
     }>,
   };
@@ -182,7 +170,6 @@ function patchRiskAssessment(
     assessment.regressionLikelihood.rating = "high";
     assessment.materialBoundaries[0]!.result = "contradicted";
     assessment.validation[0]!.status = "failed";
-    assessment.validation[0]!.failureAttribution = "patch_caused";
   } else if (recommendation === "no_op") {
     assessment.applicability = {
       status: "superseded",
@@ -190,13 +177,8 @@ function patchRiskAssessment(
     };
   } else if (recommendation === "block") {
     assessment.regressionLikelihood.rating = "critical";
-    assessment.materialSafetyFailure = {
-      established: true,
-      evidence: "The affected boundary permits a cross-subject decision.",
-    };
     assessment.materialBoundaries[0]!.result = "contradicted";
     assessment.validation[0]!.status = "failed";
-    assessment.validation[0]!.failureAttribution = "patch_caused";
   } else if (recommendation === "hold_for_evidence") {
     assessment.impact.rating = "unknown";
     assessment.regressionLikelihood.rating = "unknown";
@@ -211,7 +193,6 @@ function patchRiskAssessment(
     assessment.validation[0]!.status = "unavailable";
     assessment.unknowns = [
       {
-        id: "rollout-target",
         summary: "The rollout target is unavailable.",
         decisionCritical: true,
       },
@@ -220,12 +201,7 @@ function patchRiskAssessment(
       {
         question: "Does the changed path own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
-        resolvesUnknowns: ["rollout-target"],
         outcomes: { supported: "merge", contradicted: "no_op" },
-        applicabilityOutcomes: {
-          supported: "confirmed",
-          contradicted: "wrong_owner",
-        },
       },
     ];
   }
@@ -498,7 +474,7 @@ describe("CLI skill commands", () => {
           expect(prompt).toContain("# Assess Patch Risk");
           expect(prompt).toContain("# Patch risk rubric");
           expect(prompt).toContain('"title": "Patch risk assessment"');
-          expect(prompt).toContain("class DuplicateJsonKeyError");
+          expect(prompt).toContain("load_scan_contract_validator");
           expect(prompt).toContain("candidate.patch");
           expect(prompt).toContain("diff --git");
         }
@@ -714,6 +690,7 @@ describe("CLI skill commands", () => {
   });
 
   test("validates patch-risk output with the bundled contract validator", async () => {
+    const stderr = capture();
     const current = dependencies({
       environment: process.env,
       onCodex: (_args, output) => {
@@ -732,9 +709,10 @@ describe("CLI skill commands", () => {
       await main(
         ["patch", "Synthetic security issue", "--assess-patch-risk"],
         capture().stream,
-        capture().stream,
+        stderr.stream,
         current,
       ),
+      stderr.text(),
     ).toBe(0);
   });
 

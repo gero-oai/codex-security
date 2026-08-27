@@ -6531,6 +6531,9 @@ describe("scan and patch workflow", () => {
         );
 
         expect(outcome.exitCode, outcome.stderr).toBe(0);
+        expect(git("branch", "--show-current")).toBe(
+          "codex-security/patch-scan",
+        );
         expect(
           await readFile(invoked, "utf8").catch(
             (error: NodeJS.ErrnoException) => {
