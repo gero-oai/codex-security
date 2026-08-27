@@ -91,17 +91,7 @@ async function writeSession(
         },
       }),
       ...(completed ? [taskEvent("task_started")] : []),
-      ...(usage === null
-        ? []
-        : [
-            JSON.stringify({
-              type: "event_msg",
-              payload: {
-                type: "token_count",
-                info: { total_token_usage: usage },
-              },
-            }),
-          ]),
+      ...(usage === null ? [] : [JSON.stringify(accountingEvent(usage))]),
       ...(completed ? [taskEvent("task_complete")] : []),
       "",
     ].join("\n"),
@@ -194,18 +184,14 @@ async function withMockAccountingSessions(
   const files = new Map<string, Buffer>();
   const omittedFiles = new Set<string>();
   const opens = new Map<string, number>();
-  const events = new Map<string, MockAccountingEvent>();
   const append = (
     threadId: string,
     next: readonly MockAccountingEvent[],
   ): void => {
     const path = join(directory, `rollout-${threadId}.jsonl`);
-    const lines = next.map((event) => {
-      // The reader sees valid markers; decoded events and errors stay in memory.
-      const marker = JSON.stringify({ mockSessionEvent: events.size });
-      events.set(marker, event);
-      return `${marker}\n`;
-    });
+    const lines = next.map((event) =>
+      event instanceof Error ? "{\n" : `${JSON.stringify(event)}\n`,
+    );
     files.set(
       path,
       Buffer.concat([
@@ -219,7 +205,6 @@ async function withMockAccountingSessions(
   }
   const originalOpen = fsPromises.open;
   const originalReaddir = fsPromises.readdir;
-  const originalParse = JSON.parse;
   mock.module("node:fs/promises", () => ({
     ...fsPromises,
     readdir: async (path: unknown) => {
@@ -257,11 +242,6 @@ async function withMockAccountingSessions(
       };
     },
   }));
-  const parse = spyOn(JSON, "parse").mockImplementation((text, reviver) => {
-    const event = events.get(text);
-    if (event instanceof Error) throw event;
-    return event ?? originalParse(text, reviver);
-  });
   const tracker = new ScanCostTracker({ ...options, codexHome: home });
   tracker.start("scan-thread");
   try {
@@ -270,7 +250,6 @@ async function withMockAccountingSessions(
     });
   } finally {
     await tracker.stop().catch(() => {});
-    parse.mockRestore();
     mock.module("node:fs/promises", () => ({
       ...fsPromises,
       open: originalOpen,
@@ -329,15 +308,9 @@ async function appendSessionItem(
 }
 
 async function appendIncompleteTokenUsage(path: string): Promise<void> {
-  const event = JSON.stringify({
-    type: "event_msg",
-    payload: {
-      type: "token_count",
-      info: {
-        total_token_usage: { input_tokens: 10_000, output_tokens: 1_000 },
-      },
-    },
-  });
+  const event = JSON.stringify(
+    accountingEvent({ input_tokens: 10_000, output_tokens: 1_000 }),
+  );
   await appendFile(path, event.slice(0, -1));
 }
 
@@ -2585,15 +2558,7 @@ describe("live scan cost tracking", () => {
     expect((await tracker.refresh()).cost?.estimatedUsd).toBe(0.0032);
     await appendFile(
       root,
-      `${JSON.stringify({
-        type: "event_msg",
-        payload: {
-          type: "token_count",
-          info: {
-            total_token_usage: { input_tokens: 500, output_tokens: 50 },
-          },
-        },
-      })}\n`,
+      `${JSON.stringify(accountingEvent({ input_tokens: 500, output_tokens: 50 }))}\n`,
     );
 
     expect((await tracker.stop()).cost?.estimatedUsd).toBe(0.0048);
@@ -2618,21 +2583,15 @@ describe("live scan cost tracking", () => {
     });
     tracker.start("scan-thread");
     expect((await tracker.refresh()).cost?.estimatedUsd).toBe(0.01333);
-    const reset = JSON.stringify({
-      type: "event_msg",
-      payload: {
-        type: "token_count",
-        info: {
-          total_token_usage: {
-            input_tokens: 1_500,
-            cached_input_tokens: 600,
-            cache_write_input_tokens: 200,
-            output_tokens: 500,
-            reasoning_output_tokens: 50,
-          },
-        },
-      },
-    });
+    const reset = JSON.stringify(
+      accountingEvent({
+        input_tokens: 1_500,
+        cached_input_tokens: 600,
+        cache_write_input_tokens: 200,
+        output_tokens: 500,
+        reasoning_output_tokens: 50,
+      }),
+    );
     await appendFile(root, `${reset}\n${reset}\n`);
 
     expect((await tracker.stop()).cost).toMatchObject({
@@ -2765,7 +2724,8 @@ describe("live scan cost tracking", () => {
       "        events.append(task_event(fork['pendingTurnId']))",
       "    events.append(token_event(sample))",
       "session = usage.RolloutSession(thread, parent, Path('fixture-rollout'))",
-      "with patch.object(Path, 'open', return_value=io.BytesIO(b'{}\\n' * len(events))), patch.object(usage.json, 'loads', side_effect=events):",
+      "rollout = ''.join(json.dumps(event) + '\\n' for event in events).encode('utf-8')",
+      "with patch.object(Path, 'open', return_value=io.BytesIO(rollout)):",
       "    measured, warnings = usage._read_rollout_usage(session, started_at=datetime(2026, 7, 26, 12, tzinfo=timezone.utc), completed_at=None)",
       "parse_scan_cost(usage.measured_scan_cost_json({'coverage': 'complete', 'source': 'codex_rollout', 'threadCount': 1, **measured}))",
       "print(json.dumps({'usage': measured, 'warnings': sorted(warnings)}))",

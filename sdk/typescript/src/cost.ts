@@ -245,10 +245,7 @@ export class ScanCostTracker {
       rootUsage === suppliedRoot ? fallbackUsage : rootUsage;
     const workerUsage = observed.workers;
     if (workerUsage !== null) {
-      completedUsage =
-        rootUsage === null
-          ? workerUsage
-          : addTokenUsage(workerUsage, rootUsage);
+      completedUsage = addTokenUsage(rootUsage, workerUsage);
     }
     const cost = estimateScanCost(this.#options.model, completedUsage);
     const snapshot =
@@ -552,11 +549,9 @@ export class ScanCostTracker {
     }
     this.#observedUsage = observed;
     const usage =
-      observed.root === null
-        ? observed.workers
-        : observed.workers === null
-          ? observed.root
-          : addTokenUsage(observed.root, observed.workers);
+      observed.workers === null
+        ? observed.root
+        : addTokenUsage(observed.root, observed.workers);
     if (usage !== null) {
       const cost = estimateScanCost(this.#options.model, usage);
       if (
