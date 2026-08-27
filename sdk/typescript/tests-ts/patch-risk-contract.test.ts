@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Ajv2020 from "ajv/dist/2020.js";
 import { describe, expect, test } from "bun:test";
@@ -67,7 +68,6 @@ const validatorPath = join(
   "scripts",
   "validate_patch_risk_assessment.py",
 );
-const skillPath = join(PLUGIN_ROOT, "skills", "assess-patch-risk", "SKILL.md");
 const python =
   process.env["PYTHON"] ??
   Bun.which("python3") ??
@@ -132,11 +132,11 @@ function assessment(): Assessment {
   };
 }
 
-function validateText(input: string) {
+function validateText(input: string, cwd = PLUGIN_ROOT) {
   expect(python).toBeDefined();
   expect(python).not.toBeNull();
   return spawnSync(python!, ["-I", "-S", validatorPath, "-"], {
-    cwd: PLUGIN_ROOT,
+    cwd,
     encoding: "utf8",
     input,
   });
@@ -148,17 +148,13 @@ function validate(payload: Assessment) {
 
 describe("patch risk assessment contract", () => {
   test("resolves the validator from the installed skill", async () => {
-    const skill = await readFile(skillPath, "utf8");
-
-    expect(skill).toContain(
-      "This skill lives at `<plugin-root>/skills/assess-patch-risk/SKILL.md`",
-    );
-    expect(skill).toContain(
-      "<python_command> <plugin-root>/skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py <assessment.json>",
-    );
-    expect(skill).not.toContain(
-      "python skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py",
-    );
+    const outside = await mkdtemp(join(tmpdir(), "patch-risk-contract-"));
+    try {
+      const result = validateText(JSON.stringify(assessment()), outside);
+      expect(result.status, result.stderr).toBe(0);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   test("publishes a valid draft 2020-12 schema", async () => {
@@ -301,6 +297,53 @@ describe("patch risk assessment contract", () => {
     payload.materialBoundaries[0]!.result = "contradicted";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
+  });
+
+  test("requires affirmative failure evidence for a revision", () => {
+    const payload = assessment();
+    payload.recommendation = "revise";
+    payload.workflowLabel = "revise";
+
+    expect(validate(payload).status).not.toBe(0);
+
+    payload.validation[0]!.status = "failed";
+    const accepted = validate(payload);
+    expect(accepted.status, accepted.stderr).toBe(0);
+  });
+
+  test("keeps failed validation and established defects out of merge and hold", () => {
+    const merge = assessment();
+    merge.validation[0]!.status = "failed";
+    expect(validate(merge).status).not.toBe(0);
+
+    const hold = assessment();
+    hold.recommendation = "hold_for_evidence";
+    hold.workflowLabel = "hold_for_evidence";
+    hold.materialBoundaries[0]!.result = "contradicted";
+    hold.unknowns = [
+      {
+        summary: "A separate rollout detail is unavailable.",
+        decisionCritical: true,
+      },
+    ];
+    hold.evidencePlan = [
+      {
+        question: "Which rollout target is selected?",
+        action: "Inspect the checked-in deployment mapping.",
+        outcomes: { found: "revise", unavailable: "hold_for_evidence" },
+      },
+    ];
+    expect(validate(hold).status).not.toBe(0);
+  });
+
+  test("requires no-op for an established non-applicable disposition", () => {
+    const payload = assessment();
+    payload.recommendation = "block";
+    payload.workflowLabel = "block";
+    payload.applicability.status = "wrong_owner";
+    payload.materialBoundaries[0]!.result = "contradicted";
+
+    expect(validate(payload).status).not.toBe(0);
   });
 
   test("rejects duplicate JSON object keys", () => {
