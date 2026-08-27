@@ -681,7 +681,7 @@ export class CodexSecurity {
       checkOpen();
 
       const session = await this.#prepareSession(
-        { protectedRoot, stateDirectory },
+        { protectedRoot },
         options,
         signal,
         temporaryRoot,
@@ -1877,10 +1877,7 @@ export class CodexSecurity {
   }
 
   async #prepareSession(
-    {
-      protectedRoot,
-      stateDirectory,
-    }: { protectedRoot: string; stateDirectory: string },
+    { protectedRoot }: { protectedRoot: string },
     options: Pick<
       ScanOptions,
       | "auth"
@@ -1965,7 +1962,6 @@ export class CodexSecurity {
       requireOutputOutsideRepository(protectedRoot, runtimeHome, "runtime");
       const sessionConfig = scanRuntimeCodexConfig(
         effectiveConfig,
-        stateDirectory,
         runtimeHome,
       );
       if (
@@ -2141,11 +2137,7 @@ export class CodexSecurity {
     throwIfAborted(signal);
     const config = await preserveCodexSecurityPluginRegistration(
       runtime.codexHome,
-      sharedCredentialCodexConfig(
-        mergedConfig,
-        codexSecurityStateDirectory(environment),
-        runtime.codexHome,
-      ),
+      sharedCredentialCodexConfig(mergedConfig, runtime.codexHome),
     );
     await writeCodexConfig(join(runtime.codexHome, "config.toml"), config);
     runtime.plugin = await bootstrapPlugin(
@@ -2299,11 +2291,7 @@ export class CodexSecurity {
         requestedConfig ?? (await mergedCodexConfig(this.config));
       const codexConfig = await preserveCodexSecurityPluginRegistration(
         codexHome,
-        sharedCredentialCodexConfig(
-          mergedConfig,
-          codexSecurityStateDirectory(processEnvironment),
-          codexHome,
-        ),
+        sharedCredentialCodexConfig(mergedConfig, codexHome),
       );
       await writeCodexConfig(join(codexHome, "config.toml"), codexConfig);
       const configPath = join(bootstrapWorkspace, "config-preflight.toml");
@@ -3322,7 +3310,6 @@ export function classifyConnectionFailure(
 
 export function scanRuntimeCodexConfig(
   config: JsonObject,
-  stateDirectory: string,
   protectedCredentialHome?: string,
 ): JsonObject {
   const approvalPolicy = scanApprovalPolicy(config);
@@ -3355,7 +3342,6 @@ export function scanRuntimeCodexConfig(
         filesystem: {
           ":root": "read",
           ":workspace_roots": "write",
-          [stateDirectory]: "write",
           ...(protectedCredentialHome === undefined
             ? {}
             : { [protectedCredentialHome]: "read" }),
@@ -3367,7 +3353,6 @@ export function scanRuntimeCodexConfig(
 
 function sharedCredentialCodexConfig(
   config: JsonObject,
-  stateDirectory: string,
   credentialHome: string,
 ): JsonObject {
   const shared: JsonObject = {
@@ -3391,7 +3376,7 @@ function sharedCredentialCodexConfig(
       };
     }
   }
-  return scanRuntimeCodexConfig(shared, stateDirectory, credentialHome);
+  return scanRuntimeCodexConfig(shared, credentialHome);
 }
 
 export function scanPreflightCodexConfig(config: JsonObject): JsonObject {
