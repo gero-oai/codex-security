@@ -1,19 +1,20 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   createReadStream,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   readlinkSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { EOL, homedir } from "node:os";
 import {
   dirname,
   isAbsolute,
@@ -23,7 +24,7 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const CWE = /^CWE-(\d+)$/iu;
 const ROLES = new Map([
@@ -88,6 +89,7 @@ interface CliArguments {
 }
 
 const LONG_OPTIONS = [
+  "--help",
   "--input",
   "--out",
   "--repo-root",
@@ -323,16 +325,13 @@ function normalizeLocations(
   });
 }
 
-function decodeUtf8(contents: Uint8Array): string {
-  return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
-    contents,
-  );
-}
-
 function resolveAllowMissing(value: string): string {
-  const absolute = isAbsolute(value)
-    ? value
-    : `${process.cwd()}${process.cwd().endsWith(sep) ? "" : sep}${value}`;
+  const absolute =
+    process.platform === "win32"
+      ? resolve(value)
+      : isAbsolute(value)
+        ? value
+        : `${process.cwd()}${process.cwd().endsWith(sep) ? "" : sep}${value}`;
   const splitPath = (path: string): { parts: string[]; root: string } => {
     const root = parse(path).root;
     const remainder = path.slice(root.length);
@@ -391,7 +390,10 @@ export function readScope(
   repoRoot: string,
   allowMissing = false,
 ): Set<string> {
-  const contents = decodeUtf8(readFileSync(scopePath));
+  const contents = new TextDecoder("utf-8", {
+    fatal: true,
+    ignoreBOM: true,
+  }).decode(readFileSync(scopePath));
   const lines = contents.split("\n");
   const listedRows = new Set(lines);
   const isScopeFile = (value: string): boolean => {
@@ -563,16 +565,19 @@ export function combine(rows: NormalizedCandidate[]): CombinedCandidate[] {
 
 async function* lines(source: string): AsyncGenerator<[number, string]> {
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  // Keep a trailing carriage return until the next chunk so CRLF stays together.
+  const newline = /\r\n|\n|\r(?!$)/u;
   let remainder = "";
   let number = 0;
   for await (const chunk of createReadStream(source)) {
     remainder += decoder.decode(chunk as Buffer, { stream: true });
-    let newline = remainder.indexOf("\n");
-    while (newline !== -1) {
+    let boundary = newline.exec(remainder);
+    while (boundary !== null) {
+      const end = boundary.index + boundary[0].length;
       number += 1;
-      yield [number, remainder.slice(0, newline + 1)];
-      remainder = remainder.slice(newline + 1);
-      newline = remainder.indexOf("\n");
+      yield [number, remainder.slice(0, end)];
+      remainder = remainder.slice(end);
+      boundary = newline.exec(remainder);
     }
   }
   remainder += decoder.decode();
@@ -591,6 +596,7 @@ function resolveLongOption(argument: string): {
   attachedValue?: string;
   option: string;
 } {
+  if (argument === "-h") return { option: "--help" };
   if (!argument.startsWith("--")) return { option: argument };
   const equals = argument.indexOf("=");
   const spelling = equals === -1 ? argument : argument.slice(0, equals);
@@ -609,21 +615,13 @@ function resolveLongOption(argument: string): {
   };
 }
 
-function isHelpArgument(argument: string): boolean {
-  if (argument === "-h" || argument === "--help") return true;
-  if (!argument.startsWith("--") || argument.includes("=")) return false;
-  const matches = [...LONG_OPTIONS, "--help"].filter((option) =>
-    option.startsWith(argument),
-  );
-  return matches.length === 1 && matches[0] === "--help";
-}
-
-function parseArguments(argv: string[]): CliArguments {
+function parseArguments(argv: string[]): CliArguments | undefined {
   let inputs: string[] | undefined;
   let output: string | undefined;
   let repoRoot: string | undefined;
   let scopePath: string | undefined;
   let allowMissingInScope = false;
+  const unrecognized: string[] = [];
   const takeValue = (
     index: number,
     option: string,
@@ -660,15 +658,18 @@ function parseArguments(argv: string[]): CliArguments {
     } else if (option === "--in-scope-files") {
       scopePath = takeValue(index, option, attachedValue);
       if (attachedValue === undefined) index += 1;
-    } else if (option === "--allow-missing-in-scope") {
+    } else if (option === "--allow-missing-in-scope" || option === "--help") {
       if (attachedValue !== undefined) {
         throw new Error(`${option}: does not take a value`);
       }
+      if (option === "--help") return undefined;
       allowMissingInScope = true;
     } else {
-      throw new Error(`unrecognized argument ${argument}`);
+      unrecognized.push(argument);
     }
   }
+  if (unrecognized.length > 0)
+    throw new Error(`unrecognized arguments ${unrecognized.join(" ")}`);
   if (inputs === undefined) throw new Error("--input is required");
   if (output === undefined) throw new Error("--out is required");
   if (repoRoot === undefined) throw new Error("--repo-root is required");
@@ -678,40 +679,24 @@ function parseArguments(argv: string[]): CliArguments {
 
 function writeCombined(output: string, rows: CombinedCandidate[]): void {
   mkdirSync(dirname(output), { recursive: true });
-  let temporary: string | undefined;
-  let descriptor: number | undefined;
+  const directory = mkdtempSync(
+    join(dirname(output), `.${parse(output).base}.`),
+  );
+  const temporary = join(directory, "output");
   try {
-    while (descriptor === undefined) {
-      temporary = join(
-        dirname(output),
-        `.${parse(output).base}.${randomBytes(8).toString("hex")}.tmp`,
-      );
-      try {
-        descriptor = openSync(temporary, "wx", 0o600);
-      } catch (error) {
-        if (errorCode(error) !== "EEXIST") throw error;
-      }
-    }
+    const descriptor = openSync(temporary, "wx", 0o600);
     try {
       for (const row of rows) {
-        writeFileSync(descriptor, `${canonicalJson(row)}\n`, {
+        writeFileSync(descriptor, `${canonicalJson(row)}${EOL}`, {
           encoding: "utf8",
         });
       }
     } finally {
       closeSync(descriptor);
-      descriptor = undefined;
     }
-    renameSync(temporary!, output);
+    renameSync(temporary, output);
   } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
-    if (temporary !== undefined) {
-      try {
-        unlinkSync(temporary);
-      } catch (error) {
-        if (errorCode(error) !== "ENOENT") throw error;
-      }
-    }
+    rmSync(directory, { recursive: true, force: true });
   }
 }
 
@@ -729,9 +714,9 @@ async function normalizeCandidates(
       args.inputs.map((value) => realpathSync(resolve(expandUser(value)))),
     ),
   ].sort(comparePythonStrings);
-  if (inputs.includes(output))
+  if (inputs.some((input) => relative(input, output) === ""))
     throw new Error("--out: must not also be an input");
-  if (output === scopePath) {
+  if (relative(scopePath, output) === "") {
     throw new Error("--out: must not replace --in-scope-files");
   }
   const scope = readScope(scopePath, repoRoot, args.allowMissingInScope);
@@ -741,7 +726,19 @@ async function normalizeCandidates(
     for await (const [number, line] of lines(source)) {
       if (!pythonStrip(line)) continue;
       try {
-        const value: unknown = JSON.parse(line);
+        const value: unknown = JSON.parse(
+          line,
+          (key, value: unknown, context?: { source?: string }) => {
+            if (
+              (key === "start_line" || key === "end_line") &&
+              typeof value === "number" &&
+              /[.eE]/u.test(context?.source ?? "")
+            ) {
+              throw new Error(`${key}: expected a positive integer`);
+            }
+            return value;
+          },
+        );
         if (!isObject(value)) throw new Error("expected a JSON object");
         rows.push(normalizeCandidate(value, repoRoot, scope, lineCounts));
       } catch (error) {
@@ -760,20 +757,19 @@ const HELP = `Validate and combine security-scan candidates into deterministic J
 Usage: normalize_candidates.mjs --input <path> [path ...] --out <path> --repo-root <path> --in-scope-files <path> [--allow-missing-in-scope]`;
 
 async function runCli(): Promise<void> {
-  if (process.argv.slice(2).some(isHelpArgument)) {
-    console.log(HELP);
-    return;
-  }
   try {
-    const [rows, combined, output] = await normalizeCandidates(
-      parseArguments(process.argv.slice(2)),
-    );
-    console.log(
-      `Combined ${rows} candidate rows into ${combined} rows in ${output}`,
+    const args = parseArguments(process.argv.slice(2));
+    if (args === undefined) {
+      process.stdout.write(`${HELP.replaceAll("\n", EOL)}${EOL}`);
+      return;
+    }
+    const [rows, combined, output] = await normalizeCandidates(args);
+    process.stdout.write(
+      `Combined ${rows} candidate rows into ${combined} rows in ${output}${EOL}`,
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`normalize_candidates: ${message}`);
+    process.stderr.write(`normalize_candidates: ${message}${EOL}`);
     process.exitCode = 2;
   }
 }
@@ -781,7 +777,7 @@ async function runCli(): Promise<void> {
 const entrypoint = process.argv[1];
 if (
   entrypoint !== undefined &&
-  import.meta.url === pathToFileURL(resolve(entrypoint)).href
+  realpathSync(fileURLToPath(import.meta.url)) === realpathSync(entrypoint)
 ) {
   await runCli();
 }

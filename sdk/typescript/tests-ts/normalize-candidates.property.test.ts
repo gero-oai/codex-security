@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
 import {
@@ -56,23 +56,7 @@ interface CandidateRow {
   summary: string;
 }
 
-type InvalidKind =
-  | "bad-cwe"
-  | "bad-role"
-  | "candidate-id"
-  | "empty-locations"
-  | "empty-summary"
-  | "end-before-start"
-  | "line-beyond-file"
-  | "malformed-json"
-  | "non-object"
-  | "out-of-scope"
-  | "path-traversal"
-  | "start-line-boolean"
-  | "unknown-candidate-field"
-  | "unknown-location-field";
-
-const INVALID_KINDS: InvalidKind[] = [
+const INVALID_KINDS = [
   "bad-cwe",
   "bad-role",
   "candidate-id",
@@ -87,7 +71,8 @@ const INVALID_KINDS: InvalidKind[] = [
   "start-line-boolean",
   "unknown-candidate-field",
   "unknown-location-field",
-];
+] as const;
+type InvalidKind = (typeof INVALID_KINDS)[number];
 const VALID_EXAMPLE_ROWS: CandidateRow[] = [
   {
     cwe_ids: ["CWE-79"],
@@ -391,13 +376,6 @@ function expectedError(kind: InvalidKind): string | undefined {
   return messages[kind];
 }
 
-function temporaryOutputs(root: string, output: string): string[] {
-  const prefix = `.${basename(output)}.`;
-  return readdirSync(root).filter(
-    (entry) => entry.startsWith(prefix) && entry.endsWith(".tmp"),
-  );
-}
-
 function normalizedStdout(stdout: string, output: string): string {
   return stdout.replace(output, "<output>");
 }
@@ -662,6 +640,7 @@ describe("candidate normalizer differential properties", () => {
             const typescriptOutput = join(root, "typescript.jsonl");
             writeFileSync(pythonOutput, sentinel);
             writeFileSync(typescriptOutput, sentinel);
+            const before = readdirSync(root).sort();
             const pythonResult = runPythonNormalizer(
               normalizerArguments([input], pythonOutput, repository, inventory),
             );
@@ -688,8 +667,7 @@ describe("candidate normalizer differential properties", () => {
             expect(
               readFileSync(typescriptOutput).equals(Buffer.from(sentinel)),
             ).toBe(true);
-            expect(temporaryOutputs(root, pythonOutput)).toEqual([]);
-            expect(temporaryOutputs(root, typescriptOutput)).toEqual([]);
+            expect(readdirSync(root).sort()).toEqual(before);
           } finally {
             rmSync(root, { recursive: true, force: true });
           }

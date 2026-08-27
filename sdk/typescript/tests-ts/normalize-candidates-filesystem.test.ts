@@ -12,8 +12,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
+import { PLUGIN_ROOT } from "./plugin-root.js";
 import {
   normalizerArguments,
   runPythonNormalizer,
@@ -60,14 +61,69 @@ function writeCandidate(root: string, row = candidate()): string {
   return input;
 }
 
-function temporaryOutputs(root: string, output: string): string[] {
-  const prefix = `.${basename(output)}.`;
-  return readdirSync(root).filter(
-    (entry) => entry.startsWith(prefix) && entry.endsWith(".tmp"),
-  );
-}
-
 describe("candidate normalizer filesystem parity", () => {
+  test.each(["1.0", "1e0"])(
+    "rejects floating line tokens %s without replacing output",
+    (token) => {
+      const { inventory, repository, root } = fixture();
+      const input = join(root, "candidates.jsonl");
+      for (const field of ["start_line", "end_line"]) {
+        const row = {
+          ...candidate(),
+          locations: [
+            {
+              path: "src/in-scope.ts",
+              start_line: 1,
+              end_line: 1,
+              role: "source",
+            },
+          ],
+        };
+        writeFileSync(
+          input,
+          JSON.stringify(row).replace(`"${field}":1`, `"${field}":${token}`) +
+            "\n",
+        );
+        for (const [name, run] of [
+          ["python", runPythonNormalizer],
+          ["typescript", runTypeScriptNormalizer],
+        ] as const) {
+          const output = join(root, `${name}.jsonl`);
+          writeFileSync(output, "existing output\n");
+          const result = run(
+            normalizerArguments([input], output, repository, inventory),
+          );
+          expect(result.status, `${name} ${field}=${token}`).toBe(2);
+          expect(result.stderr).toContain(
+            `${field}: expected a positive integer`,
+          );
+          expect(readFileSync(output, "utf8")).toBe("existing output\n");
+        }
+      }
+    },
+  );
+
+  test("runs through a linked helper directory", () => {
+    const { inventory, repository, root } = fixture();
+    const input = writeCandidate(root);
+    const linked = join(root, "linked-helpers");
+    symlinkSync(join(PLUGIN_ROOT, "scripts"), linked, directoryLinkType);
+    const outputs: Buffer[] = [];
+    for (const [name, script, run] of [
+      ["python", "normalize_candidates.py", runPythonNormalizer],
+      ["typescript", "normalize_candidates.mjs", runTypeScriptNormalizer],
+    ] as const) {
+      const output = join(root, `${name}.jsonl`);
+      const result = run(
+        normalizerArguments([input], output, repository, inventory),
+        join(linked, script),
+      );
+      expect(result.status, result.stderr).toBe(0);
+      outputs.push(readFileSync(output));
+    }
+    expect(outputs[1]).toEqual(outputs[0]);
+  });
+
   test("canonicalizes in-repository directory links and preserves hard-link names", () => {
     const { inventory, repository, root } = fixture();
     writeSource(repository, "real/target.ts", "target\n");
@@ -257,6 +313,7 @@ describe("candidate normalizer filesystem parity", () => {
     writeFileSync(typescriptOutput, "old TypeScript output\n", {
       mode: 0o644,
     });
+    const before = readdirSync(root).sort();
 
     const pythonResult = runPythonNormalizer(
       normalizerArguments([input], pythonOutput, repository, inventory),
@@ -274,13 +331,13 @@ describe("candidate normalizer filesystem parity", () => {
       expect(statSync(pythonOutput).mode & 0o777).toBe(0o600);
       expect(statSync(typescriptOutput).mode & 0o777).toBe(0o600);
     }
-    expect(temporaryOutputs(root, pythonOutput)).toEqual([]);
-    expect(temporaryOutputs(root, typescriptOutput)).toEqual([]);
+    expect(readdirSync(root).sort()).toEqual(before);
 
     const blockedPythonOutput = join(root, "blocked-python.jsonl");
     const blockedTypeScriptOutput = join(root, "blocked-typescript.jsonl");
     mkdirSync(blockedPythonOutput);
     mkdirSync(blockedTypeScriptOutput);
+    const beforeFailure = readdirSync(root).sort();
     const blockedPython = runPythonNormalizer(
       normalizerArguments([input], blockedPythonOutput, repository, inventory),
     );
@@ -296,8 +353,7 @@ describe("candidate normalizer filesystem parity", () => {
     expect(blockedTypeScript.status).toBe(2);
     expect(statSync(blockedPythonOutput).isDirectory()).toBe(true);
     expect(statSync(blockedTypeScriptOutput).isDirectory()).toBe(true);
-    expect(temporaryOutputs(root, blockedPythonOutput)).toEqual([]);
-    expect(temporaryOutputs(root, blockedTypeScriptOutput)).toEqual([]);
+    expect(readdirSync(root).sort()).toEqual(beforeFailure);
   });
 
   testWindows("matches Python for Windows separators and drive paths", () => {
@@ -329,5 +385,25 @@ describe("candidate normalizer filesystem parity", () => {
         normalizerArguments([input], typescriptOutput, repository, inventory),
       ).status,
     ).toBe(2);
+  });
+
+  testWindows("protects differently cased input and scope paths", () => {
+    const { inventory, repository, root } = fixture();
+    const input = writeCandidate(root);
+    for (const output of [input, inventory]) {
+      const before = readFileSync(output);
+      for (const run of [runPythonNormalizer, runTypeScriptNormalizer]) {
+        const result = run(
+          normalizerArguments(
+            [input],
+            output.toUpperCase(),
+            repository,
+            inventory,
+          ),
+        );
+        expect(result.status, result.stderr).toBe(2);
+        expect(readFileSync(output)).toEqual(before);
+      }
+    }
   });
 });

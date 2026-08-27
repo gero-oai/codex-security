@@ -37,124 +37,112 @@ function fixture(): { root: string; repository: string } {
 }
 
 describe("TypeScript candidate normalizer prototype", () => {
-  test("matches Python output for normalization, merging, and deleted scope entries", () => {
-    const { root, repository } = fixture();
-    writeSource(repository, "src/alpha.ts", "alpha\rsecond\r");
-    writeSource(repository, "src/é-handler.ts", "one\ntwo\nthree\n");
-    const inventory = join(root, "in-scope.txt");
-    writeFileSync(
-      inventory,
-      "src/alpha.ts\r\nsrc/é-handler.ts\r\nsrc/deleted.ts\r\n",
-    );
-    const sharedLocations = [
-      {
-        path: "src/é-handler.ts",
-        start_line: 2,
-        end_line: 2,
-        role: "sink",
-      },
-      { path: "src/alpha.ts", start_line: 1, role: "source" },
-      { path: "src/alpha.ts", start_line: 1, role: "source" },
-    ];
-    const firstInput = join(root, "a-candidates.jsonl");
-    const secondInput = join(root, "z-candidates.jsonl");
-    writeFileSync(
-      firstInput,
-      `${JSON.stringify({
-        candidate_id: " ignored-upstream-id ",
-        cwe_ids: ["CWE-89", "cwe-079"],
-        locations: sharedLocations.slice().reverse(),
-        summary: " Résumé: missing guard ",
-        evidence: "earlier evidence",
-        context: "first context",
-        instance: " route:a ",
-      })}\n`,
-    );
-    writeFileSync(
-      secondInput,
-      [
-        "",
-        JSON.stringify({
-          cwe_ids: [" CWE-089 ", "CWE-79", "CWE-89"],
-          locations: sharedLocations,
-          summary: "Zeta summary",
-          evidence: "later evidence",
-          context: "second context",
-          instance: "route:a",
-        }),
-        JSON.stringify({
-          cwe_ids: ["CWE-79", "CWE-89"],
-          locations: sharedLocations,
-          summary: "\ue000 private-use summary",
-          evidence: "later evidence",
-          instance: "route:a",
-        }),
-        JSON.stringify({
-          cwe_ids: ["CWE-89", "CWE-79"],
-          locations: sharedLocations,
-          summary: "😀 non-BMP summary",
+  test.each(["\n", "\r\n", "\r"])(
+    "matches Python normalization with JSONL separator %j",
+    (inputNewline) => {
+      const { root, repository } = fixture();
+      writeSource(repository, "src/alpha.ts", "alpha\rsecond\r");
+      writeSource(repository, "src/é-handler.ts", "one\ntwo\nthree\n");
+      const inventory = join(root, "in-scope.txt");
+      writeFileSync(
+        inventory,
+        "src/alpha.ts\r\nsrc/é-handler.ts\r\nsrc/deleted.ts\r\n",
+      );
+      const sharedLocations = [
+        {
+          path: "src/é-handler.ts",
+          start_line: 2,
+          end_line: 2,
+          role: "sink",
+        },
+        { path: "src/alpha.ts", start_line: 1, role: "source" },
+        { path: "src/alpha.ts", start_line: 1, role: "source" },
+      ];
+      const firstInput = join(root, "a-candidates.jsonl");
+      const secondInput = join(root, "z-candidates.jsonl");
+      writeFileSync(
+        firstInput,
+        `${JSON.stringify({
+          candidate_id: " ignored-upstream-id ",
+          cwe_ids: ["CWE-89", "cwe-079"],
+          locations: sharedLocations.slice().reverse(),
+          summary: " Résumé: missing guard ",
           evidence: "earlier evidence",
-          instance: "route:a",
-        }),
-        JSON.stringify({
-          cwe_ids: [],
-          locations: [
-            { path: "src/alpha.ts", start_line: 2, role: "evidence" },
-          ],
-          summary: "Independent candidate",
-          evidence: "Separate identity",
-        }),
-        "",
-      ].join("\n"),
-    );
-    const pythonOutput = join(root, "python.jsonl");
-    const typescriptOutput = join(root, "typescript.jsonl");
-    writeFileSync(pythonOutput, "stale\n");
-    writeFileSync(typescriptOutput, "stale\n");
+          context: "first context",
+          instance: " route:a ",
+        })}${inputNewline}`,
+      );
+      writeFileSync(
+        secondInput,
+        [
+          "",
+          JSON.stringify({
+            cwe_ids: [" CWE-089 ", "CWE-79", "CWE-89"],
+            locations: sharedLocations,
+            summary: "Zeta summary",
+            evidence: "later evidence",
+            context: "second context",
+            instance: "route:a",
+          }),
+          JSON.stringify({
+            cwe_ids: ["CWE-79", "CWE-89"],
+            locations: sharedLocations,
+            summary: "\ue000 private-use summary",
+            evidence: "later evidence",
+            instance: "route:a",
+          }),
+          JSON.stringify({
+            cwe_ids: ["CWE-89", "CWE-79"],
+            locations: sharedLocations,
+            summary: "😀 non-BMP summary",
+            evidence: "earlier evidence",
+            instance: "route:a",
+          }),
+          JSON.stringify({
+            cwe_ids: [],
+            locations: [
+              { path: "src/alpha.ts", start_line: 2, role: "evidence" },
+            ],
+            summary: "Independent candidate",
+            evidence: "Separate identity",
+          }),
+          "",
+        ].join(inputNewline),
+      );
+      const pythonOutput = join(root, "python.jsonl");
+      const typescriptOutput = join(root, "typescript.jsonl");
+      writeFileSync(pythonOutput, "stale\n");
+      writeFileSync(typescriptOutput, "stale\n");
 
-    const pythonResult = runPython(
-      argumentsFor(
-        [secondInput, firstInput],
-        pythonOutput,
-        repository,
-        inventory,
-        true,
-      ),
-    );
-    const typescriptResult = runTypeScript(
-      argumentsFor(
-        [secondInput, firstInput],
-        typescriptOutput,
-        repository,
-        inventory,
-        true,
-      ),
-    );
+      const pythonResult = runPython(
+        argumentsFor(
+          [secondInput, firstInput],
+          pythonOutput,
+          repository,
+          inventory,
+          true,
+        ),
+      );
+      const typescriptResult = runTypeScript(
+        argumentsFor(
+          [secondInput, firstInput],
+          typescriptOutput,
+          repository,
+          inventory,
+          true,
+        ),
+      );
 
-    expect(pythonResult.status, pythonResult.stderr).toBe(0);
-    expect(typescriptResult.status, typescriptResult.stderr).toBe(0);
-    const expected = readFileSync(pythonOutput);
-    expect(readFileSync(typescriptOutput).equals(expected)).toBe(true);
-    expect(expected.toString("utf8")).toBe(
-      '{"candidate_id":"candidate-b61c9dbdc94bb668","context":"first context\\nsecond context","cwe_ids":["CWE-79","CWE-89"],"evidence":"earlier evidence\\nlater evidence","instance":"route:a","locations":[{"end_line":1,"path":"src/alpha.ts","role":"source","start_line":1},{"end_line":2,"path":"src/é-handler.ts","role":"sink","start_line":2}],"summary":"Résumé: missing guard\\nZeta summary\\n\ue000 private-use summary\\n😀 non-BMP summary"}\n' +
-        '{"candidate_id":"candidate-cc6760fcb9e3a98d","cwe_ids":[],"evidence":"Separate identity","locations":[{"end_line":2,"path":"src/alpha.ts","role":"evidence","start_line":2}],"summary":"Independent candidate"}\n',
-    );
-    const rows = expected
-      .toString("utf8")
-      .trimEnd()
-      .split("\n")
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
-    expect(rows).toHaveLength(2);
-    expect(rows).toContainEqual(
-      expect.objectContaining({
-        cwe_ids: ["CWE-79", "CWE-89"],
-        context: "first context\nsecond context",
-        evidence: "earlier evidence\nlater evidence",
-        summary:
-          "Résumé: missing guard\nZeta summary\n\ue000 private-use summary\n😀 non-BMP summary",
-      }),
-    );
-  });
+      expect(pythonResult.status, pythonResult.stderr).toBe(0);
+      expect(typescriptResult.status, typescriptResult.stderr).toBe(0);
+      const expected = readFileSync(pythonOutput);
+      expect(readFileSync(typescriptOutput).equals(expected)).toBe(true);
+      expect(expected.toString("utf8").replaceAll("\r\n", "\n")).toBe(
+        '{"candidate_id":"candidate-b61c9dbdc94bb668","context":"first context\\nsecond context","cwe_ids":["CWE-79","CWE-89"],"evidence":"earlier evidence\\nlater evidence","instance":"route:a","locations":[{"end_line":1,"path":"src/alpha.ts","role":"source","start_line":1},{"end_line":2,"path":"src/é-handler.ts","role":"sink","start_line":2}],"summary":"Résumé: missing guard\\nZeta summary\\n\ue000 private-use summary\\n😀 non-BMP summary"}\n' +
+          '{"candidate_id":"candidate-cc6760fcb9e3a98d","cwe_ids":[],"evidence":"Separate identity","locations":[{"end_line":2,"path":"src/alpha.ts","role":"evidence","start_line":2}],"summary":"Independent candidate"}\n',
+      );
+    },
+  );
 
   test("rejects the same semantic contract violations as Python", () => {
     const { root, repository } = fixture();
@@ -294,6 +282,26 @@ describe("TypeScript candidate normalizer prototype", () => {
     }
   });
 
+  test("validates option values before processing help", () => {
+    for (const args of [
+      ["--help"],
+      ["-h"],
+      ["--he"],
+      ["--help", "--out"],
+      ["--unknown", "--help"],
+      ["--out", "--help"],
+      ["--input", "--help"],
+      ["--repo-root", "-h"],
+      ["--in-scope-files", "--help"],
+      ["--help=value"],
+    ]) {
+      const expected = runPython(args);
+      const actual = runTypeScript(args);
+      expect(actual.status, args.join(" ")).toBe(expected.status);
+      if (expected.status === 2) expect(actual.stdout).toBe("");
+    }
+  });
+
   test("rejects a deleted scope path through an escaping directory link", () => {
     const { root, repository } = fixture();
     const outside = join(root, "outside");
@@ -356,8 +364,10 @@ describe("TypeScript candidate normalizer prototype", () => {
     mkdirSync(nestedOutput, { recursive: true });
     const outputLink = join(root, "output-link");
     symlinkSync(nestedOutput, outputLink, directoryLinkType);
-    const pythonOutput = join(root, "output", "python.jsonl");
-    const typescriptOutput = join(root, "output", "typescript.jsonl");
+    const outputParent =
+      process.platform === "win32" ? root : join(root, "output");
+    const pythonOutput = join(outputParent, "python.jsonl");
+    const typescriptOutput = join(outputParent, "typescript.jsonl");
 
     const pythonResult = runPython(
       argumentsFor(

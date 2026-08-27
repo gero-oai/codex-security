@@ -33,25 +33,20 @@ export function writeSource(
   writeFileSync(output, contents);
 }
 
-export function runPythonNormalizer(args: string[]) {
-  return spawnSync(
-    executable(python, "Python"),
-    ["-B", pythonNormalizer, ...args],
-    {
-      encoding: "utf8",
-      env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
-    },
-  );
+export function runPythonNormalizer(args: string[], script = pythonNormalizer) {
+  return spawnSync(executable(python, "Python"), ["-B", script, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+  });
 }
 
-export function runTypeScriptNormalizer(args: string[]) {
-  return spawnSync(
-    executable(node, "Node.js"),
-    [typescriptNormalizer, ...args],
-    {
-      encoding: "utf8",
-    },
-  );
+export function runTypeScriptNormalizer(
+  args: string[],
+  script = typescriptNormalizer,
+) {
+  return spawnSync(executable(node, "Node.js"), [script, ...args], {
+    encoding: "utf8",
+  });
 }
 
 export function normalizerArguments(
