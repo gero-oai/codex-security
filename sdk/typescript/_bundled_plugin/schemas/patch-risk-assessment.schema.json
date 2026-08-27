@@ -48,7 +48,8 @@
         "changedFiles": {"$ref": "#/$defs/stringList"},
         "sha256": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "maxLength": 64,
+          "pattern": "^[0-9a-fA-F]{64}$"
         }
       }
     },
@@ -141,7 +142,7 @@
           "result"
         ],
         "properties": {
-          "id": {"$ref": "#/$defs/identifier"},
+          "id": {"$ref": "#/$defs/nonEmptyString"},
           "invariant": {"$ref": "#/$defs/nonEmptyString"},
           "runtimeRoot": {"$ref": "#/$defs/nonEmptyString"},
           "counterexample": {"$ref": "#/$defs/nonEmptyString"},
@@ -199,10 +200,6 @@
     "nonEmptyString": {
       "type": "string",
       "minLength": 1
-    },
-    "identifier": {
-      "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9_-]*$"
     },
     "stringList": {
       "type": "array",
