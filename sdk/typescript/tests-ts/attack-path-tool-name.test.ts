@@ -22,6 +22,7 @@ test("keeps model-visible attack-path tool names within the Codex limit", () => 
       ].join("\n"),
       timeout: 30_000,
     });
+    expect(server.error).toBeUndefined();
     expect(server.status, server.stderr).toBe(0);
 
     const tools = server.stdout
