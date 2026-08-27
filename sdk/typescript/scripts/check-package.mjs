@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
+import { packageDistFiles } from "./package-dist-files.mjs";
 import { assertNoInternalReferences } from "./package-internal-references.mjs";
 import { assertExpectedGitHead } from "./package-provenance.mjs";
 import { packageSmokeTimeouts } from "./package-smoke-timeouts.mjs";
@@ -134,54 +135,7 @@ const allowedRoot = new Set([
   "package/LICENSE",
   "package/bin/codex-security.mjs",
 ]);
-const distFiles = new Set(
-  [
-    "api",
-    "auth",
-    "bulk-scan-discovery",
-    "cli",
-    "cloud-publish",
-    "codex-prompt",
-    "component-plan",
-    "component-scan",
-    "config",
-    "contract",
-    "cost",
-    "cost-model",
-    "custom-validation",
-    "custom-validation-prompt",
-    "errors",
-    "github",
-    "index",
-    "knowledge-base",
-    "linear",
-    "models",
-    "multiscan",
-    "patch-tui",
-    "publication",
-    "publication-events",
-    "publication-store",
-    "publish",
-    "result",
-    "runtime",
-    "scan-activity",
-    "scan-comparison",
-    "scan-dashboard",
-    "scan-history-renderer",
-    "scan-logs",
-    "scan-sessions",
-    "targets",
-    "thread-source",
-    "trusted-executable",
-    "version",
-    "windows-path",
-    "worker-progress",
-  ].flatMap((module) =>
-    ["js", "js.map", "d.ts", "d.ts.map"].map(
-      (extension) => `package/dist/${module}.${extension}`,
-    ),
-  ),
-);
+const distFiles = new Set(packageDistFiles);
 for (const file of distFiles) {
   if (!files.has(file)) throw new Error(`npm tarball is missing ${file}.`);
 }

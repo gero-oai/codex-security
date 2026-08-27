@@ -19,47 +19,11 @@ import { describe, expect, test } from "bun:test";
 const { regularTarListingLines } = (await import(
   new URL("../scripts/package-tar-listing.mjs", import.meta.url).href
 )) as { regularTarListingLines: (listing: string) => string[] };
+const { packageDistFiles } = (await import(
+  new URL("../scripts/package-dist-files.mjs", import.meta.url).href
+)) as { packageDistFiles: readonly string[] };
 
 const blockSize = 512;
-const distModules = [
-  "api",
-  "auth",
-  "bulk-scan-discovery",
-  "cli",
-  "codex-prompt",
-  "component-plan",
-  "component-scan",
-  "config",
-  "contract",
-  "cost",
-  "cost-model",
-  "custom-validation",
-  "custom-validation-prompt",
-  "errors",
-  "index",
-  "knowledge-base",
-  "linear",
-  "models",
-  "multiscan",
-  "patch-tui",
-  "publication",
-  "publication-events",
-  "publication-store",
-  "publish",
-  "result",
-  "runtime",
-  "scan-activity",
-  "scan-comparison",
-  "scan-dashboard",
-  "scan-history-renderer",
-  "scan-logs",
-  "scan-sessions",
-  "targets",
-  "trusted-executable",
-  "version",
-  "windows-path",
-  "worker-progress",
-];
 
 function octal(value: number, width: number, terminator = "\0"): Buffer {
   return Buffer.from(
@@ -96,11 +60,7 @@ function packageTar(trailingZeroBytes = 0): Buffer {
     "package/README.md",
     "package/LICENSE",
     "package/bin/codex-security.mjs",
-    ...distModules.flatMap((module) =>
-      ["js", "js.map", "d.ts", "d.ts.map"].map(
-        (extension) => `package/dist/${module}.${extension}`,
-      ),
-    ),
+    ...packageDistFiles,
     "package/_bundled_plugin/.codex-plugin/plugin.json",
   ];
   const records = paths.map((path) => {
