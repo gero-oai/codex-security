@@ -821,6 +821,44 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("invalidates accepted patches after a later author is interrupted", async () => {
+    const result = resultWithFindings(["high", "high"]);
+    let authors = 0;
+    const outcome = await runWorkflow(
+      ["patch", "--scan", "scan-1", "--review-minimality", "--json"],
+      {
+        result,
+        onWorkbench: () => savedScan(result),
+        onCodex: (args, output) => {
+          if (output!.appServer!.sandbox === "read-only") {
+            output!.stdout.write(
+              JSON.stringify({ status: "approved", findings: [] }),
+            );
+            return 0;
+          }
+          authors += 1;
+          if (authors === 1) {
+            completePatches(args, output);
+            return 0;
+          }
+          return 130;
+        },
+      },
+    );
+
+    expect(outcome.exitCode).toBe(130);
+    expect(JSON.parse(outcome.stdout)).toMatchObject({
+      patches: [
+        {
+          occurrenceId: "occ_1",
+          status: "failed",
+          reason:
+            "A later interrupted patch turn may have changed the worktree, so this fix requires verification again.",
+        },
+      ],
+    });
+  });
+
   test("stops and cleans interrupted baseline and candidate capture", async () => {
     for (const entrypoint of ["scan", "patch"] as const) {
       for (const phase of ["baseline", "candidate"] as const) {

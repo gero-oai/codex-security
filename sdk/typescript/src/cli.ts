@@ -7229,6 +7229,8 @@ async function snapshotPatchReviewWorktree(
         [
           ...gitPrefix,
           "diff",
+          "-O",
+          "/dev/null",
           "--ignore-submodules=all",
           "HEAD",
           "--name-only",
@@ -8233,6 +8235,8 @@ async function snapshotPatchReviewWorktree(
         repository,
         [
           "diff",
+          "-O",
+          "/dev/null",
           "--cached",
           "--ita-invisible-in-index",
           "--raw",
@@ -8651,6 +8655,17 @@ async function runFindingPatches(
     `\nPatching ${selected.findings.length} confirmed finding${selected.findings.length === 1 ? "" : "s"}...\n`,
   );
   const patches: FindingPatch[] = [];
+  const invalidateVerifiedPatches = (reason: string): void => {
+    for (const [index, patch] of patches.entries()) {
+      if (patch.status !== "verified") continue;
+      patches[index] = {
+        occurrenceId: patch.occurrenceId,
+        status: "failed",
+        files: patch.files,
+        reason,
+      };
+    }
+  };
   let reviewRepository: string | undefined;
   const reviewUnsafePublicationPaths = new Set<string>();
   const reviewPublicationPaths = new Set<string>();
@@ -8759,15 +8774,24 @@ async function runFindingPatches(
     } catch (error) {
       const interrupted = interruptedPatchExitCode(options.signal);
       if (interrupted !== undefined) {
+        invalidateVerifiedPatches(
+          "A later interrupted patch turn may have changed the worktree, so this fix requires verification again.",
+        );
         return { patches, interruptedExitCode: interrupted };
       }
       throw error;
     }
     if (status === 130 || status === 143) {
+      invalidateVerifiedPatches(
+        "A later interrupted patch turn may have changed the worktree, so this fix requires verification again.",
+      );
       return { patches, interruptedExitCode: status };
     }
     const interruptedAfterFinding = interruptedPatchExitCode(options.signal);
     if (interruptedAfterFinding !== undefined) {
+      invalidateVerifiedPatches(
+        "A later interrupted patch turn may have changed the worktree, so this fix requires verification again.",
+      );
       return { patches, interruptedExitCode: interruptedAfterFinding };
     }
 
@@ -8865,6 +8889,9 @@ async function runFindingPatches(
       },
     );
     if (isInterruptedPatchReview(status)) {
+      invalidateVerifiedPatches(
+        "Final combined verification was interrupted, so the complete patch no longer has verified results.",
+      );
       return { patches, interruptedExitCode: status };
     }
     let results: FindingVerification[] | undefined;
