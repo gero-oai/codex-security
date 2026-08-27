@@ -35,6 +35,7 @@ customer data, and security findings before posting.
 
 Open an issue describing the problem and the workflow you want to support.
 Documentation corrections and safe examples are welcome.
+Use synthetic examples when documenting expected behavior.
 
 ## Report a security issue
 
