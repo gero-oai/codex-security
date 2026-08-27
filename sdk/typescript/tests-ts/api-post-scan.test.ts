@@ -140,9 +140,8 @@ const ordinaryRestorationCases: ReadonlyArray<
     "partial report",
     {
       artifact: "report.md",
-      mutate: async ({ artifactPath }) => {
-        await writeFile(artifactPath, "# Incomplete draft\n");
-      },
+      mutate: ({ artifactPath }) =>
+        writeFile(artifactPath, "# Incomplete draft\n"),
     },
   ],
   [
@@ -159,9 +158,7 @@ const ordinaryRestorationCases: ReadonlyArray<
     "invalid findings",
     {
       artifact: "findings.json",
-      mutate: async ({ artifactPath }) => {
-        await writeFile(artifactPath, "{invalid");
-      },
+      mutate: ({ artifactPath }) => writeFile(artifactPath, "{invalid"),
     },
   ],
   [
@@ -169,9 +166,7 @@ const ordinaryRestorationCases: ReadonlyArray<
     {
       artifact: "artifacts/worker.json",
       initialContents: '{"complete":true}\n',
-      mutate: async ({ artifactPath }) => {
-        await writeFile(artifactPath, '{"partial":true}');
-      },
+      mutate: ({ artifactPath }) => writeFile(artifactPath, '{"partial":true}'),
     },
   ],
   [
@@ -179,9 +174,8 @@ const ordinaryRestorationCases: ReadonlyArray<
     {
       artifact: "artifacts/worker.bin",
       initialContents: Buffer.from([0, 255, 10, 1]),
-      mutate: async ({ artifactPath }) => {
-        await writeFile(artifactPath, Buffer.from([9, 0, 8]));
-      },
+      mutate: ({ artifactPath }) =>
+        writeFile(artifactPath, Buffer.from([9, 0, 8])),
     },
   ],
 ];
@@ -201,9 +195,8 @@ describe("completed scan follow-up instructions", () => {
     const fixture = await startFailedPostScan({
       artifact: "artifacts/worker.json",
       initialContents: '{"complete":true}\n',
-      mutate: async ({ artifactPath }) => {
-        await rm(dirname(artifactPath), { recursive: true });
-      },
+      mutate: ({ artifactPath }) =>
+        rm(dirname(artifactPath), { recursive: true }),
     });
 
     expect(await fixture.scan).toMatchObject({ scanDir: fixture.scanDir });
@@ -216,21 +209,16 @@ describe("completed scan follow-up instructions", () => {
     const fixture = await startFailedPostScan({
       artifact: "report.md",
       mutate: async ({ artifactPath }) => {
-        const metadata = await stat(artifactPath);
-        before = {
-          dev: Number(metadata.dev),
-          ino: Number(metadata.ino),
-          mtimeMs: Number(metadata.mtimeMs),
-        };
+        before = await stat(artifactPath);
       },
     });
 
     expect(await fixture.scan).toMatchObject({ scanDir: fixture.scanDir });
     const after = await stat(fixture.artifactPath);
     expect(before).not.toBeNull();
-    expect(Number(after.dev)).toBe(before!.dev);
-    expect(Number(after.ino)).toBe(before!.ino);
-    expect(Number(after.mtimeMs)).toBe(before!.mtimeMs);
+    expect(after.dev).toBe(before!.dev);
+    expect(after.ino).toBe(before!.ino);
+    expect(after.mtimeMs).toBe(before!.mtimeMs);
     await fixture.client.close();
   });
 
