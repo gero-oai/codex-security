@@ -495,7 +495,7 @@ describe("reviewed release note helpers", () => {
     );
   });
 
-  test("rejects NUL bytes before shell composition", () => {
+  test("rejects NUL bytes before shell composition", async () => {
     const workspace = mkdtempSync(join(tmpdir(), "release-notes-nul-"));
     try {
       const taggedNotes = join(workspace, "tagged-notes.md");
@@ -503,9 +503,9 @@ describe("reviewed release note helpers", () => {
       writeFileSync(taggedNotes, "<!-- release-version: 1.2.3 -->\n\0\n");
       writeFileSync(generatedNotes, "Generated release notes\n");
 
-      const result = spawnSync(
-        bash,
-        [
+      const child = Bun.spawn({
+        cmd: [
+          bash,
           "-c",
           [
             "set -euo pipefail",
@@ -513,22 +513,25 @@ describe("reviewed release note helpers", () => {
             'printf "%s" "$published_notes"',
           ].join("\n"),
         ],
-        {
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            AUTOMATION_SCRIPT: fileURLToPath(automationScript),
-            GENERATED_NOTES: generatedNotes,
-            TAGGED_NOTES: taggedNotes,
-          },
-          timeout: 10_000,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          AUTOMATION_SCRIPT: fileURLToPath(automationScript),
+          GENERATED_NOTES: generatedNotes,
+          TAGGED_NOTES: taggedNotes,
         },
-      );
+        timeout: 10_000,
+      });
+      const [status, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stderr).text(),
+      ]);
 
-      expect(result.error).toBeUndefined();
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("include a reviewed summary");
-      expect(result.stderr).not.toContain("ignored null byte");
+      expect(status, stderr).toBe(1);
+      expect(stderr).toContain("include a reviewed summary");
+      expect(stderr).not.toContain("ignored null byte");
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }

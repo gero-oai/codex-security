@@ -34,7 +34,6 @@ import {
 import {
   cleanupSdkDirectory,
   createIsolatedHome,
-  installFileNoClobber,
   requireOutputOutsideRepositories,
   resolvePluginPath,
   resolvePluginPython,
@@ -1295,7 +1294,7 @@ export async function applySecurityPolicy(
             await installPolicyFile(temporary, target.targetPath);
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-              // A failed copy fallback can leave a partial destination.
+              // A failed copy can leave a partial destination.
               written =
                 (await lstat(target.targetPath).catch(
                   (inspectError: NodeJS.ErrnoException) => {
@@ -1460,11 +1459,9 @@ async function installPolicyFile(
     else await moveUnixPolicyFileNoClobber(temporary, targetPath, python!);
     return;
   }
-  // Windows may make a read-only file writable before removing it. Keep the
-  // temporary inode separate so cleanup cannot change the installed mode.
-  if (((await stat(temporary)).mode & 0o200) === 0)
-    await copyFile(temporary, targetPath, constants.COPYFILE_EXCL);
-  else await installFileNoClobber(temporary, targetPath);
+  // Create the inode under its final name for filename-based SELinux labels.
+  // A separate inode also keeps Windows temp cleanup from changing its mode.
+  await copyFile(temporary, targetPath, constants.COPYFILE_EXCL);
 }
 
 async function moveUnixPolicyFileNoClobber(

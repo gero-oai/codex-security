@@ -735,6 +735,39 @@ describe("security policy review and application", () => {
     expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
   });
 
+  test("creates new policies as a distinct destination inode", async () => {
+    const name = "creates new policies as a distinct destination inode";
+    if (runTestInSubprocess(import.meta.path, name)) return;
+    const f = await fixture();
+    const draft = await f.generate();
+    const originalOpen = fsPromises.open;
+    let stagedIdentity: string | undefined;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      open: async (...args: Parameters<typeof originalOpen>) => {
+        const handle = await originalOpen(...args);
+        if (String(args[0]).startsWith(join(f.repository, ".SECURITY.md."))) {
+          const metadata = await handle.stat({ bigint: true });
+          stagedIdentity = `${metadata.dev}:${metadata.ino}`;
+        }
+        return handle;
+      },
+    }));
+    try {
+      await applySecurityPolicy(draft);
+      const installed = await stat(draft.targetPath, { bigint: true });
+      expect(stagedIdentity).toBeDefined();
+      expect(`${installed.dev}:${installed.ino}`).not.toBe(stagedIdentity);
+      expect(await readFile(draft.targetPath, "utf8")).toBe(POLICY);
+      expect(await readdir(f.repository)).toEqual(["SECURITY.md"]);
+    } finally {
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        open: originalOpen,
+      }));
+    }
+  });
+
   test("allows edits to a saved draft and writes the exact reviewed bytes", async () => {
     const f = await fixture();
     const original = "# Security Policy\n\nOriginal guidance.\n";
@@ -1214,9 +1247,8 @@ describe("security policy review and application", () => {
     }
   });
 
-  test("handles unavailable hard links without clobbering policy files", async () => {
-    const name =
-      "handles unavailable hard links without clobbering policy files";
+  test("preserves policies across hard-link and copy failures", async () => {
+    const name = "preserves policies across hard-link and copy failures";
     if (runTestInSubprocess(import.meta.path, name)) return;
     const originalLink = fsPromises.link;
     const originalCopyFile = fsPromises.copyFile;
@@ -1225,13 +1257,13 @@ describe("security policy review and application", () => {
     let copyFailure = false;
     mock.module("node:fs/promises", () => ({
       ...fsPromises,
-      link: async (_source: string, destination: string) => {
-        if (collision) await writeFile(destination, "# Concurrent policy\n");
+      link: async () => {
         throw Object.assign(new Error("hard links are unsupported"), {
           code: linkErrorCode,
         });
       },
       copyFile: async (source: string, destination: string, mode?: number) => {
+        if (collision) await writeFile(destination, "# Concurrent policy\n");
         if (copyFailure) {
           await writeFile(destination, "# Partial policy\n", { flag: "wx" });
           throw Object.assign(new Error("synthetic copy failure"), {
@@ -1243,10 +1275,6 @@ describe("security policy review and application", () => {
     }));
     try {
       for (linkErrorCode of ["ENOTSUP", "EISDIR"]) {
-        const f = await fixture();
-        const draft = await f.generate();
-        await applySecurityPolicy(draft);
-        expect(await readFile(draft.targetPath, "utf8")).toBe(POLICY);
         const existing = await fixture();
         await writeFile(
           join(existing.repository, "SECURITY.md"),
@@ -2995,7 +3023,7 @@ describe("security policy review and application", () => {
       "preserves read-only mode when temporary cleanup changes permissions";
     if (runTestInSubprocess(import.meta.path, name)) return;
     const originalRm = fsPromises.rm;
-    const originalStat = fsPromises.stat;
+    const originalCopyFile = fsPromises.copyFile;
     for (const existing of [false, true]) {
       const f = await fixture();
       const target = join(f.repository, "SECURITY.md");
@@ -3006,11 +3034,9 @@ describe("security policy review and application", () => {
       const draft = await f.generate();
       mock.module("node:fs/promises", () => ({
         ...fsPromises,
-        stat: async (...args: Parameters<typeof originalStat>) => {
-          const path = args[0];
-          if (!existing && typeof path === "string" && path.endsWith(".tmp"))
-            await chmod(path, 0o444);
-          return originalStat(...args);
+        copyFile: async (...args: Parameters<typeof originalCopyFile>) => {
+          if (!existing) await chmod(args[0], 0o444);
+          return originalCopyFile(...args);
         },
         rm: async (path: string, options: Parameters<typeof originalRm>[1]) => {
           if (path.endsWith(".tmp")) await chmod(path, 0o666);
@@ -3026,7 +3052,7 @@ describe("security policy review and application", () => {
         mock.module("node:fs/promises", () => ({
           ...fsPromises,
           rm: originalRm,
-          stat: originalStat,
+          copyFile: originalCopyFile,
         }));
         await chmod(target, 0o644).catch(() => undefined);
       }
@@ -3039,6 +3065,7 @@ describe("security policy review and application", () => {
     if (runTestInSubprocess(import.meta.path, name)) return;
     const originalLink = fsPromises.link;
     const originalRename = fsPromises.rename;
+    const originalCopyFile = fsPromises.copyFile;
     for (const existing of [false, true]) {
       const f = await fixture();
       if (existing)
@@ -3050,6 +3077,11 @@ describe("security policy review and application", () => {
       const controller = new AbortController();
       mock.module("node:fs/promises", () => ({
         ...fsPromises,
+        copyFile: async (...args: Parameters<typeof originalCopyFile>) => {
+          await originalCopyFile(...args);
+          if (args[1] === draft.targetPath)
+            controller.abort(new Error("cancel after commit"));
+        },
         link: async (source: string, destination: string) => {
           await originalLink(source, destination);
           if (destination === draft.targetPath)
@@ -3075,6 +3107,7 @@ describe("security policy review and application", () => {
           ...fsPromises,
           link: originalLink,
           rename: originalRename,
+          copyFile: originalCopyFile,
         }));
       }
     }

@@ -3680,7 +3680,12 @@ describe("runtime directories and plugin Python boundary", () => {
           "-NoProfile",
           "-NonInteractive",
           "-Command",
-          "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+          [
+            "$ErrorActionPreference = 'Stop'",
+            "$sddl = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_TEST_ACL_PATH | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
+            "$localAdministrator = Microsoft.PowerShell.Utility\\ConvertFrom-SddlString -Sddl 'O:LAG:SYD:(A;;GA;;;SY)' | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty RawDescriptor | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Owner | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Value",
+            "Microsoft.PowerShell.Utility\\ConvertTo-Json -InputObject @($sddl, $localAdministrator) -Compress",
+          ].join("; "),
         ],
         {
           encoding: "utf8",
@@ -3702,10 +3707,14 @@ describe("runtime directories and plugin Python boundary", () => {
         },
       );
       expect(descriptor.status, descriptor.stderr).toBe(0);
+      const [sddl, localAdministrator] = JSON.parse(descriptor.stdout) as [
+        string,
+        string,
+      ];
       expect(
-        inspectWindowsCredentialAcl(descriptor.stdout, sid!, {
+        inspectWindowsCredentialAcl(sddl, sid!, {
           scope: "file",
-          resolvedAliases: { LA: sid! },
+          resolvedAliases: { LA: localAdministrator },
         }),
       ).toMatchObject({
         grantsCurrentUserAccess: true,
