@@ -170,6 +170,13 @@ async function smokeCliMcp(launcher, consumer, completedScan) {
   run("git", ["-c", "init.templateDir=", "init", "--quiet", repository], {
     cwd: consumer,
   });
+  run(
+    "git",
+    ["config", "--local", "core.hooksPath", join(repository, ".git", "hooks")],
+    {
+      cwd: repository,
+    },
+  );
   const manifest = JSON.parse(
     run(process.execPath, [launcher, "--llms", "--format", "json"], {
       cwd: consumer,
