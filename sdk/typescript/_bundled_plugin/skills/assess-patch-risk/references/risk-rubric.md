@@ -11,7 +11,7 @@ Rate each dimension from evidence, not from diff size or test count.
 
 ## Regression likelihood
 
-- `low`: narrow semantics, supported controls preserved, material counterexamples rejected, and directly relevant protection passes.
+- `low`: narrow semantics, the governing contract is respected, material counterexamples are rejected, and directly relevant protection passes.
 - `moderate`: some coupling, partial protection, or bounded uncertainty remains but no source-visible defect is established.
 - `high`: complex or weakly protected behavior, important untested paths, contract ambiguity, or substantial unresolved coupling.
 - `critical`: evidence already demonstrates a serious regression, bypass, unsupported control break, or failed required safety property.
@@ -48,11 +48,9 @@ For each material changed boundary, record:
 
 When a decision depends on a complete enum, allowlist, routing table, protocol matrix, identity class, state transition, or similar bounded domain, derive the partitions from an independent contract or an exhaustive self-contained new contract. Representative tests are not proof of completeness.
 
-For confirmed applicability, when a patch newly rejects inputs or narrows an existing contract, derive at least one legitimate control from exact-base source or callers outside the patch's own tests. Mark the boundary contradicted when the head rejects an independently evidenced supported control.
+For confirmed applicability, challenge newly rejected inputs using exact-base source, affected callers, or an authoritative replacement contract outside the patch's own tests. Mark the boundary contradicted only if the governing contract still requires the rejected behavior. Prior support alone does not invalidate an authorized breaking change. For complete retirement, use the contract-required rejection as the legitimate control and cite that contract; do not invent an accepted input.
 
-When behavior derives a new target or reuses saved authority, independently classify the derived URL, callback, nested resource, cached principal, historical object, retry, replay, or re-execution at the consuming policy decision. Inherited trust is not evidence of safety.
-
-When an authentication or authorization patch claims complete or unconditional enforcement, trace saved, cached, historical, and versioned authority through every applicable refresh, reconnect, replay, retry, and re-execution. At each consuming decision, reclassify the current principal, resource, and policy or prove from source that their binding cannot change.
+When behavior derives a target or reuses authority, trace URLs, callbacks, nested resources, and saved, cached, historical, or versioned state through applicable refresh, reconnect, replay, retry, and re-execution paths. At the consuming decision, reevaluate every authorization-relevant input and the resulting decision, or prove from source that they cannot change. If an authoritative replay contract requires a recorded policy snapshot, verify all inputs against that contract instead of substituting current policy. Inherited trust or an unchanged principal/resource binding alone is insufficient.
 
 Apply these challenges when the patch contains the corresponding structure:
 
@@ -60,7 +58,7 @@ Apply these challenges when the patch contains the corresponding structure:
 - after validation, trace mutation, interpretation, callbacks, retries, lazy initialization, and re-resolution to the first sensitive sink; and
 - for UI, discovery, prompt, instruction, or visibility changes, require capability removal or independent downstream enforcement before assigning authorization or isolation impact.
 
-A trigger alone is not a defect. Mark the boundary contradicted only when source or an authoritative contract establishes a concrete cross-subject decision, post-validation bypass, or capability-preserving enforcement gap.
+A trigger alone is not a defect. A contradiction needs source or authoritative-contract evidence of an unsupported contract change, cross-subject decision, post-validation bypass, or capability-preserving enforcement gap.
 
 ## Strict auto-merge gate
 

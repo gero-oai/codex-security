@@ -790,6 +790,16 @@ describe("CLI skill commands", () => {
           "SYNTHETIC-MULTILINE-KEY-BODY",
           "-----END PRIVATE KEY-----",
           "",
+          "**API key:**",
+          "SYNTHETIC-EMPHASIZED-CREDENTIAL",
+          "",
+          "`Token`:",
+          "SYNTHETIC-INLINE-CODE-CREDENTIAL",
+          "",
+          "**Authorization:**",
+          "contradicted because the guard is absent",
+          "",
+          'Validation: reject "-----BEGIN PRIVATE KEY-----" uploads',
           "Recoverability: easy",
         ].join("\n");
         output!.stdout.write(JSON.stringify(verdict));
@@ -830,23 +840,11 @@ describe("CLI skill commands", () => {
       "Token handling: changed via the response parser",
     );
     expect(stderr.text()).toContain("Recoverability: easy");
-    expect(stderr.text()).not.toContain("SYNTHETIC-MULTILINE-KEY-BODY");
-    expect(stderr.text()).not.toContain("SYNTHETIC_REPORT_CREDENTIAL");
+    expect(stderr.text()).toContain("contradicted because the guard is absent");
+    expect(stderr.text()).not.toContain("SYNTHETIC");
     expect(stderr.text()).not.toContain("dXNlcjpwYXNz");
     expect(stderr.text()).not.toContain("YWJjZGVmZ2hpag");
     expect(stderr.text()).not.toContain("__79_Pv6-fj39vX0");
-    expect(stderr.text()).not.toContain("SYNTHETIC_ADVERSE_CREDENTIAL");
-    expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-CREDENTIAL");
-    expect(stderr.text()).not.toContain("SYNTHETIC-WRAPPED-CREDENTIAL");
-    expect(stderr.text()).not.toContain("SYNTHETIC-SINGLE-CREDENTIAL");
-    expect(stderr.text()).not.toContain("SYNTHETIC-HEADING-CREDENTIAL");
-    expect(stderr.text()).not.toContain("SYNTHETIC-BULLETED-CREDENTIAL");
-    expect(stderr.text()).not.toContain("SYNTHETIC-NUMBERED-CREDENTIAL");
-    expect(stderr.text()).not.toContain("SYNTHETIC-FENCED-CREDENTIAL");
-    expect(stderr.text()).not.toContain("SYNTHETIC-LONG-FENCE-CREDENTIAL");
-    expect(stderr.text()).not.toContain("SYNTHETIC-AFTER-SHORT-FENCE");
-    expect(stderr.text()).not.toContain("SYNTHETIC-AFTER-SUFFIXED-FENCE");
-    expect(stderr.text()).not.toContain("SYNTHETIC-CONTINUED-AUTHORIZATION");
     expect(stderr.text()).not.toContain("-----END PRIVATE KEY-----");
   });
 

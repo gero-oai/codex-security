@@ -1952,62 +1952,84 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
-  test("upgrades a cached 0.1.37 plugin with the real bundled Codex executable", async () => {
-    const root = await temporaryDirectory();
-    const previous = await plugin(join(root, "previous"), "0.1.37");
-    await writeFile(
-      join(previous, ".mcp.json"),
-      JSON.stringify({ mcpServers: { "codex-security": { env_vars: [] } } }),
-    );
-    const home = join(root, "home");
-    await mkdir(home, { mode: 0o700 });
-    await writeFile(
-      join(home, "config.toml"),
-      'cli_auth_credentials_store = "file"\n\n[features]\nplugins = true\n',
-    );
+  test.each(["0.1.37", "0.1.60", "0.1.81", "0.1.82"])(
+    "upgrades a cached %s plugin with the real bundled Codex executable",
+    async (previousVersion) => {
+      const root = await temporaryDirectory();
+      const previous = await plugin(join(root, "previous"), previousVersion);
+      const validator = "scripts/finalize_scan_contract.py";
+      await writeFile(
+        join(previous, validator),
+        "# stale synthetic validator\n",
+      );
+      await writeFile(
+        join(previous, ".mcp.json"),
+        JSON.stringify({ mcpServers: { "codex-security": { env_vars: [] } } }),
+      );
+      const home = join(root, "home");
+      await mkdir(home, { mode: 0o700 });
+      await writeFile(
+        join(home, "config.toml"),
+        'cli_auth_credentials_store = "file"\n\n[features]\nplugins = true\n',
+      );
 
-    const command = resolveCodexCommand();
-    const environment = {
-      ...process.env,
-      CODEX_HOME: home,
-      OPENAI_API_KEY: undefined,
-      CODEX_API_KEY: undefined,
-    };
-    const login = spawnSync(command.command, ["login", "--with-api-key"], {
-      env: environment,
-      input: "synthetic-key\n",
-      encoding: "utf8",
-      windowsHide: true,
-    });
-    expect(login.status).toBe(0);
-    const credentials = await readFile(join(home, "auth.json"), "utf8");
-
-    const options = { codexCommand: command, environment };
-    const first = await bootstrapPlugin(home, previous, options);
-    expect(first.version).toBe("0.1.37");
-    const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
-    const configuration = JSON.parse(
-      await readFile(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
-    ) as {
-      mcpServers: Record<string, { command: string; env_vars: string[] }>;
-    };
-    const server = configuration.mcpServers["codex-security"];
-
-    expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
-    expect(upgraded.version).not.toBe(first.version);
-    expect(upgraded.installedRoot).not.toBe(first.installedRoot);
-    expect(server?.command).toBe("./scripts/launch_codex_security_mcp");
-    expect(server?.env_vars).toContain("CODEX_MANAGED_PACKAGE_ROOT");
-    expect(server?.env_vars).toContain("CODEX_MCP_NODE_PATH");
-    expect(await readFile(join(home, "auth.json"), "utf8")).toBe(credentials);
-    expect(
-      spawnSync(command.command, ["login", "status"], {
+      const command = resolveCodexCommand();
+      const environment = {
+        ...process.env,
+        CODEX_HOME: home,
+        OPENAI_API_KEY: undefined,
+        CODEX_API_KEY: undefined,
+      };
+      const login = spawnSync(command.command, ["login", "--with-api-key"], {
         env: environment,
+        input: "synthetic-key\n",
         encoding: "utf8",
         windowsHide: true,
-      }).status,
-    ).toBe(0);
-  });
+      });
+      expect(login.status).toBe(0);
+      const credentials = await readFile(join(home, "auth.json"), "utf8");
+
+      const options = { codexCommand: command, environment };
+      const first = await bootstrapPlugin(home, previous, options);
+      expect(first.version).toBe(previousVersion);
+      expect(await readFile(join(first.installedRoot, validator), "utf8")).toBe(
+        "# stale synthetic validator\n",
+      );
+      const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
+      const configuration = JSON.parse(
+        await readFile(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
+      ) as {
+        mcpServers: Record<string, { command: string; env_vars: string[] }>;
+      };
+      const server = configuration.mcpServers["codex-security"];
+
+      expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
+      expect(upgraded.version).not.toBe(first.version);
+      expect(upgraded.installedRoot).not.toBe(first.installedRoot);
+      for (const path of [
+        validator,
+        "schemas/patch-risk-assessment.schema.json",
+        "skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py",
+        "skills/assess-patch-risk/SKILL.md",
+        "skills/assess-patch-risk/references/risk-rubric.md",
+      ]) {
+        expect(await readFile(join(upgraded.installedRoot, path))).toEqual(
+          await readFile(join(PLUGIN_ROOT, path)),
+        );
+      }
+      expect(server?.command).toBe("./scripts/launch_codex_security_mcp");
+      expect(server?.env_vars).toContain("CODEX_MANAGED_PACKAGE_ROOT");
+      expect(server?.env_vars).toContain("CODEX_MCP_NODE_PATH");
+      expect(await readFile(join(home, "auth.json"), "utf8")).toBe(credentials);
+      expect(
+        spawnSync(command.command, ["login", "status"], {
+          env: environment,
+          encoding: "utf8",
+          windowsHide: true,
+        }).status,
+      ).toBe(0);
+    },
+  );
 
   test("resolves the exact npm Codex executable", () => {
     const command = resolveCodexCommand();

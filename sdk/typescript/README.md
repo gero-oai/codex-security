@@ -847,12 +847,19 @@ Use the SDK loop for a disposition per alert.
 files or literal text and work in the current directory. Pass a saved finding
 or occurrence ID to `patch` to use its original repository.
 
+`--assess-patch-risk` prints the validated review report and returns it as
+`patchRisk.report` in saved-finding and scan JSON output. With `--create-pr`,
+only the report's marked, public-safe Markdown summary enters the draft PR
+body; detailed analysis stays in the command output.
+
 ```bash
 npx @openai/codex-security validate "Possible SQL injection" --effort high
 npx @openai/codex-security patch OCCURRENCE_ID
 npx @openai/codex-security patch --scan SCAN_ID --severity high --json
 npx @openai/codex-security patch --scan SCAN_ID --severity high --create-pr
 npx @openai/codex-security patch --scan SCAN_ID --review-minimality --review-style --assess-patch-risk
+npx @openai/codex-security patch --scan SCAN_ID --assess-patch-risk --create-pr
+npx @openai/codex-security patch --linear-issue SEC-123 --assess-patch-risk --create-pr
 ```
 
 `--scan latest` selects the current repository's latest scan. Saved-finding
@@ -866,15 +873,18 @@ to select findings and add patch instructions. Results include a `patches`
 entry per finding with status `verified`, `no_change`, `blocked`, or `failed`.
 Verified and already-fixed findings no longer fail `--fail-on-severity`.
 
-`--create-pr` commits verified patch files and opens a draft PR with `gh`.
-If publication fails, run the printed `patch --resume-pr BRANCH` command in
-the same repository. It reuses the saved commit without rerunning Codex,
-but refuses to publish if the branch changed.
+`--create-pr` commits generated patch files and opens a draft PR with `gh`.
+Supplied-issue pull requests require a clean working tree before patching so
+existing work is never included. If publication fails, run the printed
+`patch --resume-pr BRANCH` command in the same repository. It reuses the saved
+commit without rerunning Codex, but refuses to publish if the branch changed.
 
 Add `--review-minimality`, `--review-style`, or `--assess-patch-risk` to `patch`
 or `scan --patch` for independent, read-only review stages. They run in that
 order. Patch-risk assessment evaluates applicability, blast radius, regression
-protection, and merge risk without publishing or merging the patch.
+protection, and merge risk. Unlike advisory reporting, a non-merge recommendation
+fails the selected review and prevents automatic publication. The assessment
+never merges the patch.
 
 The CLI derives each review from the candidate-only delta against a snapshot of
 the containing worktree, including after revisions, and excludes pre-existing

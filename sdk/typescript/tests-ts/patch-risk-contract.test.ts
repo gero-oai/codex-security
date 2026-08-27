@@ -479,15 +479,21 @@ describe("patch risk assessment contract", () => {
     expect(accepted.status, accepted.stderr).toBe(0);
   });
 
-  test("requires affirmative failure evidence for a revision", () => {
+  test("accepts a scope-only revision with affirmative validation evidence", () => {
     const payload = assessment();
     payload.recommendation = "revise";
     payload.workflowLabel = "revise";
 
     expect(validate(payload).status).not.toBe(0);
 
-    payload.validation[0]!.status = "failed";
-    payload.regressionLikelihood.rating = "high";
+    payload.validation.push({
+      name: "comparison scope review",
+      status: "failed",
+      protects:
+        "The bound patch includes unrelated runtime changes in src/other.ts.",
+      relevant: true,
+    });
+    payload.regressionLikelihood.rating = "moderate";
     payload.regressionProtection.rating = "partial";
     const accepted = validate(payload);
     expect(accepted.status, accepted.stderr).toBe(0);
