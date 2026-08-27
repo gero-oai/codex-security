@@ -1489,6 +1489,31 @@ def _schema_values_equal(left: Any, right: Any) -> bool:
     return left == right
 
 
+def _schema_value_key(value: Any) -> Any:
+    """Return a hashable key with the equality used by JSON Schema."""
+    if isinstance(value, bool):
+        return ("boolean", value)
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            # NaN is never equal, including to itself.
+            return ("number", object())
+        return ("number", value)
+    if value is None:
+        return ("null",)
+    if isinstance(value, str):
+        return ("string", value)
+    if isinstance(value, list):
+        return ("array", tuple(_schema_value_key(item) for item in value))
+    if isinstance(value, dict):
+        return (
+            "object",
+            frozenset(
+                (key, _schema_value_key(item)) for key, item in value.items()
+            ),
+        )
+    return ("value", type(value), value)
+
+
 def _resolve_schema_reference(
     root_schema: dict[str, Any], reference: str, context: str
 ) -> dict[str, Any]:
@@ -1556,12 +1581,12 @@ def _validate_schema_node(
         if "maxItems" in schema and len(value) > schema["maxItems"]:
             raise ContractError(f"{context}: array has too many items")
         if schema.get("uniqueItems") is True:
-            for index, item in enumerate(value):
-                if any(
-                    _schema_values_equal(item, candidate)
-                    for candidate in value[:index]
-                ):
+            seen_items: set[Any] = set()
+            for item in value:
+                key = _schema_value_key(item)
+                if key in seen_items:
                     raise ContractError(f"{context}: array items must be unique")
+                seen_items.add(key)
         contains = schema.get("contains")
         if isinstance(contains, dict):
             matches = 0
