@@ -102,7 +102,7 @@ function patchRiskAssessment(
     workflowLabel:
       recommendation === "merge" ? "human_review_required" : recommendation,
     impact: {
-      rating: "moderate",
+      rating: "high",
       rationale: "A bounded supported caller can fail.",
     },
     regressionLikelihood: {
@@ -141,7 +141,9 @@ function patchRiskAssessment(
         invariant: "Supported requests retain their contract.",
         runtimeRoot: "service.request",
         counterexample: "A supported request takes the changed branch.",
+        counterexampleSource: "src/request.ts:20",
         legitimateControl: "The same request succeeds at the base tree.",
+        legitimateControlSource: "src/request.ts:12",
         result: "supported",
       },
     ],
@@ -150,24 +152,29 @@ function patchRiskAssessment(
         name: "focused request tests",
         status: "passed",
         protects: "The changed behavior through its production caller.",
+        relevant: true,
       },
     ] as Array<{
       name: string;
       status: string;
       protects: string;
+      relevant: boolean;
     }>,
     unknowns: [] as Array<{
+      id: string;
       summary: string;
       decisionCritical: boolean;
     }>,
     evidencePlan: [] as Array<{
       question: string;
       action: string;
+      resolvesUnknowns: string[];
       outcomes: Record<string, string>;
     }>,
   };
   if (recommendation === "revise") {
     assessment.regressionLikelihood.rating = "high";
+    assessment.regressionProtection.rating = "partial";
     assessment.materialBoundaries[0]!.result = "contradicted";
     assessment.validation[0]!.status = "failed";
   } else if (recommendation === "no_op") {
@@ -177,11 +184,11 @@ function patchRiskAssessment(
     };
   } else if (recommendation === "block") {
     assessment.regressionLikelihood.rating = "critical";
+    assessment.regressionProtection.rating = "partial";
     assessment.materialBoundaries[0]!.result = "contradicted";
     assessment.validation[0]!.status = "failed";
   } else if (recommendation === "hold_for_evidence") {
-    assessment.impact.rating = "unknown";
-    assessment.regressionLikelihood.rating = "unknown";
+    assessment.regressionLikelihood.rating = "high";
     assessment.regressionProtection.rating = "unknown";
     assessment.regressionProtection.exactHeadChecksPassed = false;
     assessment.confidence.rating = "low";
@@ -193,6 +200,7 @@ function patchRiskAssessment(
     assessment.validation[0]!.status = "unavailable";
     assessment.unknowns = [
       {
+        id: "rollout-target",
         summary: "The rollout target is unavailable.",
         decisionCritical: true,
       },
@@ -201,6 +209,7 @@ function patchRiskAssessment(
       {
         question: "Does the changed path own the rollout target?",
         action: "Inspect the checked-in deployment mapping.",
+        resolvesUnknowns: ["rollout-target"],
         outcomes: { supported: "merge", contradicted: "no_op" },
       },
     ];
