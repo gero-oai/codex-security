@@ -72,6 +72,9 @@ describe("error messages", () => {
   test("omits credential-bearing messages at output boundaries", () => {
     for (const message of [
       "request failed: token=SYNTHETIC_TOKEN",
+      "token SYNTHETIC_TOKEN",
+      "request failed: token SYNTHETIC_TOKEN",
+      '{"message":"token SYNTHETIC_TOKEN"}',
       "Authorization: Bearer sk-proj-SYNTHETIC_KEY_123",
       'upstream failed: {"clientSecret":"correct horse battery staple"}',
       JSON.stringify(JSON.stringify({ clientSecret: "SYNTHETIC_SECRET" })),
@@ -98,6 +101,9 @@ describe("error messages", () => {
     );
     expect(safeErrorMessage("author=Michael")).toBe("author=Michael");
     expect(safeErrorMessage("signal=active")).toBe("signal=active");
+    expect(safeErrorMessage("Synthetic token cache unavailable")).toBe(
+      "Synthetic token cache unavailable",
+    );
     expect(safeErrorMessage("design=complete")).toBe("design=complete");
     expect(safeErrorMessage('worker 1: rg -n "password" src/login.ts')).toBe(
       'worker 1: rg -n "password" src/login.ts',

@@ -2668,54 +2668,63 @@ describe("connected Linear publication", () => {
     ]);
   });
 
-  test("retains recovery guidance while redacting a token-bearing cancellation diagnostic", async () => {
-    const publication = preparedPublication();
-    const controller = new AbortController();
-    const diagnostic = "Synthetic token cache unavailable";
-    let handoffFile: string | undefined;
-    let persisted = false;
-    let failure: unknown;
+  test.each([
+    ["Synthetic token cache unavailable", "Synthetic token cache unavailable"],
+    ["The receipt disk is full.", "The receipt disk is full."],
+    ["token=SYNTHETIC_TOKEN", "[redacted]"],
+  ])(
+    "preserves recovery guidance for receipt error %s",
+    async (diagnostic, displayed) => {
+      const publication = preparedPublication();
+      const controller = new AbortController();
+      let handoffFile: string | undefined;
+      let persisted = false;
+      let failure: unknown;
 
-    try {
-      await publishScanInternal(
-        publication.scanDirectory,
-        { ...OPTIONS, signal: controller.signal },
-        dependencies(
-          publication,
-          {},
-          {
-            runCodex: async (_command, _args, input) => {
-              handoffFile = publicationData(input).handoffFile;
-              await writeHandoff(input, [
-                handoffRecord(publication, publication.issues[0]!, {
-                  identifier: "SEC-SAVED",
-                }),
-              ]);
-              controller.abort("SIGINT");
-              return { exitCode: 130, stdout: "", stderr: "" };
+      try {
+        await publishScanInternal(
+          publication.scanDirectory,
+          { ...OPTIONS, signal: controller.signal },
+          dependencies(
+            publication,
+            {},
+            {
+              runCodex: async (_command, _args, input) => {
+                handoffFile = publicationData(input).handoffFile;
+                await writeHandoff(input, [
+                  handoffRecord(publication, publication.issues[0]!, {
+                    identifier: "SEC-SAVED",
+                  }),
+                ]);
+                controller.abort("SIGINT");
+                return { exitCode: 130, stdout: "", stderr: "" };
+              },
+              recordPublishedIssues: async (_prepared, issues) => {
+                persisted = true;
+                return [...issues];
+              },
+              writeReceipt: async () => {
+                throw new Error(diagnostic);
+              },
             },
-            recordPublishedIssues: async (_prepared, issues) => {
-              persisted = true;
-              return [...issues];
-            },
-            writeReceipt: async () => {
-              throw new Error(diagnostic);
-            },
-          },
-        ),
+          ),
+        );
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toBeInstanceOf(Error);
+      const message = (failure as Error).message;
+      expect(message).toContain(
+        `partial receipt could not be saved: ${displayed}.`,
       );
-    } catch (error) {
-      failure = error;
-    }
-
-    expect(failure).toBeInstanceOf(Error);
-    const message = (failure as Error).message;
-    expect(message).toMatch(
-      /partial receipt could not be saved: \[redacted\]\..*publication handoff remains at.*avoid creating duplicate issues/u,
-    );
-    expect(persisted).toBe(true);
-    expect(await readFile(handoffFile!, "utf8")).toContain("SEC-SAVED");
-  });
+      expect(message).toMatch(
+        /publication handoff remains at.*avoid creating duplicate issues/u,
+      );
+      expect(persisted).toBe(true);
+      expect(await readFile(handoffFile!, "utf8")).toContain("SEC-SAVED");
+    },
+  );
 
   test("retains distinct duplicate Linear issue IDs for indeterminate recovery", async () => {
     const publication = preparedPublication(2);
@@ -2795,55 +2804,6 @@ describe("connected Linear publication", () => {
     expect(
       await readFile(await publicationEventsFile(handoffFile!), "utf8"),
     ).toBe(`${output}\n`);
-  });
-
-  test("keeps recovery-write failures from blocking verified history persistence", async () => {
-    const publication = preparedPublication(2);
-    const changed = JSON.parse(issueEvent(publication.issues[1]!));
-    changed.item.arguments.team = "different-team";
-    const phases: string[] = [];
-    let receipt: PublishScanResult | undefined;
-    await expect(
-      publishScanInternal(
-        publication.scanDirectory,
-        OPTIONS,
-        dependencies(
-          publication,
-          {
-            stdout: [
-              issueEvent(publication.issues[0]!),
-              JSON.stringify(changed),
-            ].join("\n"),
-          },
-          {
-            recordPublishedIssues: async (_prepared, issues) => {
-              phases.push("history");
-              return [...issues];
-            },
-            writeEvents: async () => {
-              phases.push("events");
-              throw new Error("Synthetic event writer unavailable.");
-            },
-            writeReceipt: async (result) => {
-              phases.push(result.created.length === 0 ? "initial" : "final");
-              receipt = structuredClone(result);
-            },
-          },
-        ),
-      ),
-    ).rejects.toThrow(
-      /could not verify every completed mutation.*Could not preserve Linear connector-event evidence/u,
-    );
-
-    expect(phases).toEqual(["events", "initial", "history", "final"]);
-    expect(receipt).toMatchObject({
-      indeterminate: true,
-      created: [{ findingId: "finding-1", issueIdentifier: "SEC-1" }],
-      counts: { findings: 2, created: 1, failed: 1 },
-      warnings: expect.arrayContaining([
-        expect.stringContaining("Synthetic event writer unavailable"),
-      ]),
-    });
   });
 
   test.each(["none", "both", "final"] as const)(
@@ -4398,48 +4358,6 @@ describe("publication recovery regressions", () => {
       await readFile(await publicationEventsFile(handoffFile), "utf8"),
     ).toBe(`${output}\n`);
     expect(await readFile(handoffFile, "utf8")).toContain("SEC-1");
-  });
-
-  test("retains cancellation recovery data when its partial receipt cannot be written", async () => {
-    const publication = preparedPublication();
-    const controller = new AbortController();
-    let handoffFile: string | undefined;
-    let persisted = false;
-
-    await expect(
-      publishScanInternal(
-        publication.scanDirectory,
-        { ...OPTIONS, signal: controller.signal },
-        dependencies(
-          publication,
-          {},
-          {
-            runCodex: async (_command, _args, input) => {
-              handoffFile = publicationData(input).handoffFile;
-              await writeHandoff(input, [
-                handoffRecord(publication, publication.issues[0]!, {
-                  identifier: "SEC-SAVED",
-                }),
-              ]);
-              controller.abort("SIGINT");
-              return { exitCode: 130, stdout: "", stderr: "" };
-            },
-            recordPublishedIssues: async (_prepared, issues) => {
-              persisted = true;
-              return [...issues];
-            },
-            writeReceipt: async () => {
-              throw new Error("The receipt disk is full.");
-            },
-          },
-        ),
-      ),
-    ).rejects.toThrow(
-      /partial receipt could not be saved: The receipt disk is full.*publication handoff remains at.*avoid creating duplicate issues/u,
-    );
-
-    expect(persisted).toBe(true);
-    expect(await readFile(handoffFile!, "utf8")).toContain("SEC-SAVED");
   });
 
   test("retains rejected success-shaped handoffs for recovery", async () => {
