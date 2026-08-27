@@ -237,31 +237,6 @@ async function disabledMcpServers(
   environment: Record<string, string>,
   options: ReadOnlyCodexOptions,
 ): Promise<JsonObject> {
-  const inherited = await configuredMcpServerNames(
-    command,
-    environment,
-    options,
-  );
-  const configured = (config?.["mcp_servers"] ?? {}) as JsonObject;
-  const names = new Set([...Object.keys(configured), ...inherited]);
-  if ([...names].some((name) => name.length === 0 || /[.=]/u.test(name))) {
-    throw new CodexSecurityError(
-      "Could not safely disable configured MCP servers for a read-only helper.",
-    );
-  }
-  return Object.fromEntries(
-    [...names].map((name) => [
-      name,
-      { ...(configured[name] as JsonObject), enabled: false },
-    ]),
-  );
-}
-
-async function configuredMcpServerNames(
-  command: CodexCommand,
-  environment: Record<string, string>,
-  options: ReadOnlyCodexOptions,
-): Promise<string[]> {
   const directory = resolve(options.workingDirectory ?? process.cwd());
   const allowedEnvironmentVariables = new Set([
     "APPDATA",
@@ -386,17 +361,32 @@ async function configuredMcpServerNames(
   const inherited = (effectiveConfiguration.config as Record<string, unknown>)[
     "mcp_servers"
   ];
-  if (inherited === undefined) return [];
   if (
-    typeof inherited !== "object" ||
-    inherited === null ||
-    Array.isArray(inherited)
+    inherited !== undefined &&
+    (typeof inherited !== "object" ||
+      inherited === null ||
+      Array.isArray(inherited))
   ) {
     throw new CodexSecurityError(
       "Could not read MCP configuration for a read-only helper.",
     );
   }
-  return Object.keys(inherited);
+  const configured = (config?.["mcp_servers"] ?? {}) as JsonObject;
+  const names = new Set([
+    ...Object.keys(configured),
+    ...Object.keys(inherited ?? {}),
+  ]);
+  if ([...names].some((name) => name.length === 0 || /[.=]/u.test(name))) {
+    throw new CodexSecurityError(
+      "Could not safely disable configured MCP servers for a read-only helper.",
+    );
+  }
+  return Object.fromEntries(
+    [...names].map((name) => [
+      name,
+      { ...(configured[name] as JsonObject), enabled: false },
+    ]),
+  );
 }
 
 export async function matchCompletedScan(

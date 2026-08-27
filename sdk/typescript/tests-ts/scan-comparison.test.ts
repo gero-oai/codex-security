@@ -584,16 +584,7 @@ describe("semantic scan comparison", () => {
     try {
       const unrestricted = Bun.spawnSync(
         [
-          node!,
-          join(
-            import.meta.dir,
-            "..",
-            "node_modules",
-            "@openai",
-            "codex",
-            "bin",
-            "codex.js",
-          ),
+          resolveCodexCommand(environment).command,
           "--cd",
           root,
           "--config",
