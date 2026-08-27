@@ -18,6 +18,9 @@
     "statusQuoRisk",
     "autoMergeExclusions",
     "affectedRuntimeRoots",
+    "importantCallers",
+    "riskDrivers",
+    "protectiveFactors",
     "materialBoundaries",
     "validation",
     "unknowns",
@@ -199,7 +202,8 @@
   "$defs": {
     "nonEmptyString": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
     },
     "stringList": {
       "type": "array",
