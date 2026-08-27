@@ -6342,6 +6342,64 @@ describe("scan and patch workflow", () => {
     }
   });
 
+  test("ignores repository-selected diff order files", async () => {
+    const repository = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-diff-order-")),
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repository,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    let observed: { diff: string } | undefined;
+    try {
+      git("init", "--initial-branch=main");
+      git("config", "user.name", "Synthetic User");
+      git("config", "user.email", "synthetic@example.test");
+      git("config", "commit.gpgsign", "false");
+      await writeFile(join(repository, "value.ts"), "unsafe\n");
+      git("add", "--", "value.ts");
+      git("commit", "-m", "Initial synthetic checkout");
+      git("config", "diff.orderFile", join(repository, "missing-order-file"));
+
+      const outcome = await runWorkflow(
+        ["patch", "Synthetic security issue", "--review-minimality"],
+        {
+          currentDirectory: repository,
+          onCodex: async (_args, output) => {
+            const server = output!.appServer!;
+            if (server.sandbox === "read-only") {
+              const lines = server.prompt.split("\n");
+              const marker = lines.findIndex((line) =>
+                line.startsWith("Review scope is exactly"),
+              );
+              observed = JSON.parse(lines[marker + 1]!);
+              output!.stdout.write(
+                JSON.stringify({ status: "approved", findings: [] }),
+              );
+            } else {
+              await writeFile(join(repository, "value.ts"), "fixed\n");
+              output!.stdout.write("Verified synthetic patch.");
+            }
+            return 0;
+          },
+        },
+        {
+          configure: (current) => {
+            delete current.snapshotPatchReviewWorktree;
+          },
+        },
+      );
+
+      expect(outcome.exitCode, outcome.stderr).toBe(0);
+      expect(observed?.diff).toContain("-unsafe");
+      expect(observed?.diff).toContain("+fixed");
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
+  });
+
   test.skipIf(process.platform === "win32")(
     "does not invoke repository clean filters while capturing review snapshots",
     async () => {
