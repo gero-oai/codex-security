@@ -7,7 +7,7 @@ describe("bundled scan report and source limits", () => {
     const python = Bun.which("python3") ?? Bun.which("python");
     expect(python).not.toBeNull();
     const program = [
-      "import json, os, pathlib, stat, sys",
+      "import os, pathlib, stat, sys",
       "from contextlib import ExitStack",
       "from unittest.mock import Mock, patch",
       "sys.path.insert(0, sys.argv[1])",
@@ -61,7 +61,7 @@ describe("bundled scan report and source limits", () => {
       "with patch.object(finalizer, '_derived_finding_identity_rows', return_value=[('finding', finding, 'finding', 'occurrence', fingerprints)]):",
       "    finalizer._validate_derived_finding_identities({}, {})",
       "    assert finding['fingerprints']['future'] == 'preserved'",
-      "print(json.dumps({'reportOnly': True, 'sealedReportPreserved': True, 'sealedAliasPreserved': True, 'distinctEntriesRegenerated': True, 'ambiguousAliasRejected': True, 'knownFingerprintsOnly': True}))",
+      "print('report projection checks passed')",
     ].join("\n");
     const result = Bun.spawnSync(
       [python!, "-I", "-B", "-c", program, join(PLUGIN_ROOT, "scripts")],
@@ -69,14 +69,9 @@ describe("bundled scan report and source limits", () => {
     );
 
     expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
-    expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual({
-      reportOnly: true,
-      sealedReportPreserved: true,
-      sealedAliasPreserved: true,
-      distinctEntriesRegenerated: true,
-      ambiguousAliasRejected: true,
-      knownFingerprintsOnly: true,
-    });
+    expect(new TextDecoder().decode(result.stdout).trim()).toBe(
+      "report projection checks passed",
+    );
   });
 
   test("accepts large reports, schemas, source files, and late source lines", () => {
