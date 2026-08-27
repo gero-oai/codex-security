@@ -11,8 +11,8 @@ already-validated ancestor from being renamed or replaced during a read,
 write, or delete.  Writes rename the exact temporary-file handle into place so
 an attacker cannot substitute another file at the temporary name.
 
-Importing this module is safe on non-Windows hosts.  Its public operations
-raise ``WindowsScanLocalFileError`` when called anywhere other than Windows.
+Importing this module and comparing streams work on every platform. Filesystem
+operations raise ``WindowsScanLocalFileError`` outside Windows.
 """
 
 from __future__ import annotations
@@ -458,11 +458,22 @@ def scan_root_identity(scan_dir: Path) -> tuple[Path, tuple[int, int]]:
         return root_path, (metadata.st_dev, metadata.st_ino)
 
 
-def open_read_fd(scan_dir: Path, relative_path: str, context: str) -> int:
+def open_read_fd(
+    scan_dir: Path,
+    relative_path: str,
+    context: str,
+    *,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> int:
     """Open a verified regular file and return an owned binary read descriptor."""
 
     try:
-        with _locked_parent(scan_dir, relative_path, create=False) as (parent_path, leaf_name):
+        with _locked_parent(
+            scan_dir,
+            relative_path,
+            create=False,
+            expected_root_identity=expected_root_identity,
+        ) as (parent_path, leaf_name):
             path = parent_path / leaf_name
             handle = _create_file(
                 path,

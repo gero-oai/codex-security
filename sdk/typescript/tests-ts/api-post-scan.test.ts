@@ -204,6 +204,25 @@ const ordinaryRestorationCases: ReadonlyArray<
       },
     },
   ],
+  [
+    "selected custom plugin",
+    {
+      artifact: "report.md",
+      selectedPluginFinalizer:
+        "raise RuntimeError('selected plugin helper must not run')\n",
+      mutate: ({ artifactPath }) =>
+        writeFile(artifactPath, "# Incomplete draft\n"),
+    },
+  ],
+  [
+    "nested artifact with a missing parent",
+    {
+      artifact: "artifacts/worker.json",
+      initialContents: '{"complete":true}\n',
+      mutate: ({ artifactPath }) =>
+        rm(dirname(artifactPath), { recursive: true }),
+    },
+  ],
 ];
 
 describe("completed scan follow-up instructions", () => {
@@ -212,40 +231,11 @@ describe("completed scan follow-up instructions", () => {
     async (_name, scenario) => {
       const fixture = await startFailedPostScan(scenario);
       expect(await fixture.scan).toMatchObject({ scanDir: fixture.scanDir });
+      expect(fixture.turns).toBe(2);
       expect(await readFile(fixture.artifactPath)).toEqual(fixture.original);
       await fixture.client.close();
     },
   );
-
-  test("uses the SDK-owned restorer with a selected custom plugin", async () => {
-    const fixture = await startFailedPostScan({
-      artifact: "report.md",
-      selectedPluginFinalizer:
-        "raise RuntimeError('selected plugin helper must not run')\n",
-      mutate: async ({ artifactPath }) => {
-        await writeFile(artifactPath, "# Incomplete draft\n");
-      },
-    });
-
-    expect(await fixture.scan).toMatchObject({ scanDir: fixture.scanDir });
-    expect(fixture.turns).toBe(2);
-    expect(await readFile(fixture.artifactPath)).toEqual(fixture.original);
-    await fixture.client.close();
-  });
-
-  test("restores a nested artifact and its missing parent", async () => {
-    const fixture = await startFailedPostScan({
-      artifact: "artifacts/worker.json",
-      initialContents: '{"complete":true}\n',
-      mutate: async ({ artifactPath }) => {
-        await rm(dirname(artifactPath), { recursive: true });
-      },
-    });
-
-    expect(await fixture.scan).toMatchObject({ scanDir: fixture.scanDir });
-    expect(await readFile(fixture.artifactPath)).toEqual(fixture.original);
-    await fixture.client.close();
-  });
 
   test("does not rewrite artifacts unchanged by a failed follow-up", async () => {
     let before: { dev: number; ino: number; mtimeMs: number } | null = null;

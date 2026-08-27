@@ -167,6 +167,7 @@ def generate_diff_in_scope_files(
 ) -> int:
     """Reuse the existing diff selection without generating previews or duplicate worklists."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from finalize_scan_contract import scan_root_identity
     from generate_rank_input import (
         changed_path_parent_is_within_target,
         git_changed_paths,
@@ -182,6 +183,7 @@ def generate_diff_in_scope_files(
 
     rows: list[bytes] = []
     try:
+        root_identity = scan_root_identity(repository)[1] if mode != "revisions" else None
         changed = (
             committed_changed_paths(repository, base, head)
             if mode == "revisions"
@@ -237,7 +239,10 @@ def generate_diff_in_scope_files(
                 else:
                     try:
                         _, is_binary = preview_for_changed_path(
-                            path, repository, DEFAULT_PREVIEW_BYTES
+                            path,
+                            repository,
+                            DEFAULT_PREVIEW_BYTES,
+                            expected_root_identity=root_identity,
                         )
                     except (FileNotFoundError, PermissionError):
                         continue

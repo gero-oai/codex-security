@@ -123,30 +123,6 @@ function workbenchState(root: string): {
   };
 }
 
-function workspaceDiffDigest(root: string, workspaceId: string): string {
-  const command =
-    Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
-  expect(command).not.toBeNull();
-  const result = spawnSync(
-    command!,
-    [
-      "-I",
-      "-B",
-      "-c",
-      [
-        "import sqlite3, sys",
-        "with sqlite3.connect(sys.argv[1]) as connection:",
-        "    print(connection.execute('SELECT diff_content_digest FROM workspaces WHERE id = ?', (sys.argv[2],)).fetchone()[0])",
-      ].join("\n"),
-      join(root, "state", "workbench.sqlite3"),
-      workspaceId,
-    ],
-    { encoding: "utf8" },
-  );
-  expect(result.status, result.stderr).toBe(0);
-  return result.stdout.trim();
-}
-
 function workspaceDiffSelection(
   root: string,
   workspaceId: string,
@@ -1143,7 +1119,7 @@ describe("compact diff scan", () => {
         expect(submittedDiffTarget["contentDigest"]).toMatch(
           /^codex-security-snapshot\/v1:sha256:[a-f0-9]{64}$/u,
         );
-        expect(workspaceDiffDigest(root, sessionId)).toBe(
+        expect(workspaceDiffSelection(root, sessionId).contentDigest).toBe(
           submittedDiffTarget["contentDigest"] as string,
         );
         expect(workbenchState(root)).toEqual({
@@ -1392,7 +1368,7 @@ describe("compact diff scan", () => {
             submitted: 0,
             scans: 0,
           });
-          expect(workspaceDiffDigest(root, sessionId)).toBe(
+          expect(workspaceDiffSelection(root, sessionId).contentDigest).toBe(
             selectedDiffTarget["contentDigest"] as string,
           );
         }
@@ -1430,9 +1406,9 @@ describe("compact diff scan", () => {
           },
           owner,
         );
-        expect(workspaceDiffDigest(root, replacementSessionId)).toBe(
-          currentDiffTarget["contentDigest"] as string,
-        );
+        expect(
+          workspaceDiffSelection(root, replacementSessionId).contentDigest,
+        ).toBe(currentDiffTarget["contentDigest"] as string);
         expect(workbenchState(root)).toEqual({
           workspaces: 2,
           submitted: 1,
