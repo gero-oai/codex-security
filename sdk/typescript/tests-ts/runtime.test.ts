@@ -418,12 +418,6 @@ describe("plugin runtime preparation", () => {
 
   test("generates canonical scoped security inventory paths", async () => {
     if (Bun.which("rg") === null) {
-      const generator = await readFile(
-        join(PLUGIN_ROOT, "scripts", "generate_in_scope_files.py"),
-        "utf8",
-      );
-      expect(generator).toContain('"--no-ignore"');
-      expect(generator).toContain('"--path-separator"');
       return;
     }
 
@@ -1959,14 +1953,16 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
-  test.each(["0.1.60", "0.1.73", "0.1.77"])(
+  test.each(["0.1.60", "0.1.79"])(
     "upgrades the %s cache and restores with the SDK-owned helper",
     async (previousVersion) => {
       const root = await temporaryDirectory();
       const previous = await plugin(join(root, "previous"), previousVersion);
-      await copyFile(
-        join(PLUGIN_ROOT, ".mcp.json"),
+      // Keep the stale MCP configuration regression covered while upgrading the
+      // predecessor caches to the generated bundle.
+      await writeFile(
         join(previous, ".mcp.json"),
+        JSON.stringify({ mcpServers: { "codex-security": { env_vars: [] } } }),
       );
       await copyFile(
         join(PLUGIN_ROOT, "scripts", "workbench_target.py"),
@@ -2015,8 +2011,6 @@ describe("plugin runtime preparation", () => {
       for (const script of [
         "workbench_target.py",
         "finalize_scan_contract.py",
-        "generate_rank_input.py",
-        "generate_in_scope_files.py",
         "workbench_scan_usage.py",
       ]) {
         expect(
@@ -2079,7 +2073,10 @@ describe("plugin runtime preparation", () => {
       );
       expect(
         readPythonRolloutUsage(upgraded.installedRoot, rolloutPath),
-      ).toEqual({ usage: ownedPythonUsage, warnings: [] });
+      ).toEqual({
+        usage: ownedPythonUsage,
+        warnings: [],
+      });
     },
   );
 

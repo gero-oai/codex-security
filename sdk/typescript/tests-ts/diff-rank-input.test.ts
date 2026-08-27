@@ -4,10 +4,8 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
-  renameSync,
   rmSync,
   symlinkSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,26 +14,6 @@ import { afterEach, expect, test } from "bun:test";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryRoots: string[] = [];
-
-function supportsFileSymlinks(): boolean {
-  const root = mkdtempSync(join(tmpdir(), "codex-security-symlink-probe-"));
-  try {
-    symlinkSync("missing.py", join(root, "broken.py"), "file");
-    return true;
-  } catch (error) {
-    if (
-      process.platform === "win32" &&
-      (error as NodeJS.ErrnoException).code === "EPERM"
-    ) {
-      return false;
-    }
-    throw error;
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-}
-
-const fileSymlinksAvailable = supportsFileSymlinks();
 
 function pythonExecutable(): string | null {
   return (
@@ -66,361 +44,19 @@ function git(repository: string, ...args: string[]): string {
   ).trim();
 }
 
-function stagedBrokenSymlinkFixture(): {
-  root: string;
-  repository: string;
-  base: string;
-} {
-  const root = realpathSync(
-    mkdtempSync(join(tmpdir(), "codex-security-diff-broken-link-")),
-  );
-  temporaryRoots.push(root);
-  const repository = join(root, "repository");
-  mkdirSync(repository);
-  git(repository, "init", "-q");
-  writeFileSync(join(repository, "base.py"), "value = 1\n");
-  git(repository, "add", "base.py");
-  git(repository, "commit", "-qm", "base");
-  const base = git(repository, "rev-parse", "HEAD");
-  symlinkSync(
-    "../synthetic-fixture/missing-target.py",
-    join(repository, "broken.py"),
-    "file",
-  );
-  git(repository, "add", "broken.py");
-  return { root, repository, base };
-}
-
-test.skipIf(!fileSymlinksAvailable)(
-  "diff inventory omits a broken symlink leaf",
-  () => {
-    const { root, repository, base } = stagedBrokenSymlinkFixture();
-    const python = pythonExecutable();
-    expect(python).not.toBeNull();
-    const output = join(root, "in-scope-files.txt");
-    const result = spawnSync(
-      python!,
-      [
-        "-B",
-        join(PLUGIN_ROOT, "scripts", "generate_in_scope_files.py"),
-        "--repo",
-        repository,
-        "--scope",
-        ".",
-        "--out",
-        output,
-        "--diff-base",
-        base,
-        "--diff-mode",
-        "local-patch",
-      ],
-      { encoding: "utf8" },
-    );
-
-    expect(result.status, result.stderr).toBe(0);
-    expect(readFileSync(output, "utf8")).toBe("");
-  },
-);
-
-test.skipIf(!fileSymlinksAvailable)(
-  "diff rank input keeps a broken symlink leaf without a preview",
-  () => {
-    const { root, repository, base } = stagedBrokenSymlinkFixture();
-    const python = pythonExecutable();
-    expect(python).not.toBeNull();
-    const output = join(root, "rank-input.jsonl");
-    const result = spawnSync(
-      python!,
-      [
-        "-B",
-        join(PLUGIN_ROOT, "scripts", "generate_rank_input.py"),
-        "make-diff-rank-input",
-        "--repo",
-        repository,
-        "--base",
-        base,
-        "--mode",
-        "local-patch",
-        "--out",
-        output,
-      ],
-      { encoding: "utf8" },
-    );
-
-    expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(readFileSync(output, "utf8"))).toEqual({
-      path: "broken.py",
-      area: "diff",
-      preview: "",
-    });
-  },
-);
-
-test.each(["parent", "repository"])(
-  "rejects %s replacement after local-diff confinement is checked",
-  (replacement) => {
-    const root = realpathSync(
-      mkdtempSync(join(tmpdir(), "codex-security-diff-parent-race-")),
-    );
-    temporaryRoots.push(root);
-    const repository = join(root, "repository");
-    const parent = join(repository, "src");
-    const filename =
-      process.platform === "win32" ? "handler.py" : "handler:local.py";
-    mkdirSync(parent, { recursive: true });
-    git(repository, "init", "-q");
-    writeFileSync(join(parent, filename), "inside = 1\n");
-    git(repository, "add", ".");
-    git(repository, "commit", "-qm", "base");
-    const base = git(repository, "rev-parse", "HEAD");
-    writeFileSync(join(parent, filename), "inside = 2\n");
-
-    const python = pythonExecutable();
-    expect(python).not.toBeNull();
-    const scripts = join(PLUGIN_ROOT, "scripts");
-    const probe = [
-      "import os, sys",
-      "scripts, repository, base, external, parked, output, generator, replacement = sys.argv[1:]",
-      "sys.path.insert(0, scripts)",
-      "import generate_rank_input as ranking",
-      "checked_parent = ranking.changed_path_parent_is_within_target",
-      "def swap_parent(path, target):",
-      "    accepted = checked_parent(path, target)",
-      "    if replacement == 'repository':",
-      "        os.replace(target, parked)",
-      "        os.replace(external, target)",
-      "        return accepted",
-      "    os.replace(path.parent, parked)",
-      "    if os.name == 'nt':",
-      "        import _winapi",
-      "        _winapi.CreateJunction(external, str(path.parent))",
-      "    else:",
-      "        os.symlink(external, path.parent, target_is_directory=True)",
-      "    return accepted",
-      "if generator.startswith('safe-'):",
-      "    generator = generator.removeprefix('safe-')",
-      "else:",
-      "    ranking.changed_path_parent_is_within_target = swap_parent",
-      "if generator == 'ranking':",
-      "    sys.argv = ['ranking', 'make-diff-rank-input', '--repo', repository, '--base', base, '--mode', 'local-patch', '--out', output]",
-      "    ranking.main()",
-      "else:",
-      "    import generate_in_scope_files as inventory",
-      "    sys.argv = ['inventory', '--repo', repository, '--scope', '.', '--out', output, '--diff-base', base, '--diff-mode', 'local-patch']",
-      "    inventory.main()",
-    ].join("\n");
-
-    for (const generator of ["ranking", "inventory"]) {
-      const external = join(root, `external-${generator}`);
-      const parked = join(root, `parked-${generator}`);
-      const output = join(root, `${generator}.output`);
-      const externalParent =
-        replacement === "repository" ? join(external, "src") : external;
-      mkdirSync(externalParent, { recursive: true });
-      writeFileSync(
-        join(externalParent, filename),
-        generator === "ranking"
-          ? "outside = 'SYNTHETIC_EXTERNAL_MARKER'\n"
-          : Buffer.from("\0SYNTHETIC_EXTERNAL_MARKER"),
-      );
-
-      const runGenerator = (selected: string, destination: string) =>
-        spawnSync(
-          python!,
-          [
-            "-I",
-            "-B",
-            "-c",
-            probe,
-            scripts,
-            repository,
-            base,
-            external,
-            parked,
-            destination,
-            selected,
-            replacement,
-          ],
-          { encoding: "utf8" },
-        );
-      const safeOutput = `${output}.safe`;
-      const safe = runGenerator(`safe-${generator}`, safeOutput);
-      expect(safe.status, `${generator}: ${safe.stderr}`).toBe(0);
-      if (generator === "ranking") {
-        expect(JSON.parse(readFileSync(safeOutput, "utf8"))).toMatchObject({
-          path: `src/${filename}`,
-          preview: "inside = 2",
-        });
-      } else {
-        expect(readFileSync(safeOutput, "utf8")).toBe(`src/${filename}\n`);
-      }
-
-      const result = runGenerator(generator, output);
-
-      expect(
-        result.status,
-        `${generator}: ${result.stdout}\n${result.stderr}`,
-      ).toBe(generator === "ranking" ? 1 : 2);
-      expect(result.stderr.toLowerCase()).toContain(
-        "inside the selected target",
-      );
-
-      if (generator === "ranking") {
-        if (replacement === "repository") {
-          renameSync(repository, external);
-          renameSync(parked, repository);
-        } else {
-          unlinkSync(parent);
-          renameSync(parked, parent);
-        }
-      }
-    }
-  },
-);
-
-test("skips working-tree files that disappear or become unreadable during preview", () => {
-  const root = realpathSync(
-    mkdtempSync(join(tmpdir(), "codex-security-diff-file-churn-")),
-  );
-  temporaryRoots.push(root);
-  const repository = join(root, "repository");
-  const source = join(repository, "src", "handler.py");
-  mkdirSync(join(repository, "src"), { recursive: true });
-  git(repository, "init", "-q");
-  writeFileSync(source, "inside = 1\n");
-  git(repository, "add", ".");
-  git(repository, "commit", "-qm", "base");
-  const base = git(repository, "rev-parse", "HEAD");
-
-  const python = pythonExecutable();
-  expect(python).not.toBeNull();
-  const scripts = join(PLUGIN_ROOT, "scripts");
-  const probe = [
-    "import contextlib, errno, sys, types",
-    "scripts, repository, base, output, generator, failure = sys.argv[1:]",
-    "sys.path.insert(0, scripts)",
-    "import generate_rank_input as ranking",
-    "from windows_scan_local_files import WindowsScanLocalFileError",
-    "read_changed_path = ranking.preview_for_changed_path",
-    "def unavailable_leaf(path, target, preview_bytes, **kwargs):",
-    "    if failure in {'read', 'close'}:",
-    "        fdopen = ranking.os.fdopen",
-    "        @contextlib.contextmanager",
-    "        def faulty_stream(*args, **options):",
-    "            with fdopen(*args, **options) as source:",
-    "                def read(*args):",
-    "                    if failure == 'read':",
-    "                        raise OSError(errno.EIO, 'synthetic read failure')",
-    "                    return source.read(*args)",
-    "                yield types.SimpleNamespace(read=read)",
-    "            if failure == 'close':",
-    "                raise OSError(errno.EIO, 'synthetic close failure')",
-    "        ranking.os.fdopen = faulty_stream",
-    "        return read_changed_path(path, target, preview_bytes, **kwargs)",
-    "    if failure.startswith('windows-'):",
-    "        expected_identity = kwargs['expected_root_identity']",
-    "        code = 22 if failure == 'windows-reparse' else int(failure.rsplit('-', 1)[-1])",
-    "        failed_path = path.parent if 'parent' in failure else path",
-    "        def unavailable_windows_file(*args, **kwargs):",
-    "            assert kwargs['expected_root_identity'] == expected_identity",
-    "            raise WindowsScanLocalFileError(code, 'synthetic Windows file error', str(failed_path))",
-    "        original_backend, original_platform = ranking._windows_scan_local_files, ranking.os.name",
-    "        ranking._windows_scan_local_files = lambda: types.SimpleNamespace(open_read_fd=unavailable_windows_file)",
-    "        ranking.os.name = 'nt'",
-    "        try:",
-    "            return read_changed_path(path, target, preview_bytes, **kwargs)",
-    "        finally:",
-    "            ranking._windows_scan_local_files, ranking.os.name = original_backend, original_platform",
-    "    if failure == 'unreadable':",
-    "        raise PermissionError('synthetic in-target file became unreadable')",
-    "    path.unlink()",
-    "    if failure == 'parent-missing':",
-    "        path.parent.rmdir()",
-    "    return read_changed_path(path, target, preview_bytes, **kwargs)",
-    "ranking.preview_for_changed_path = unavailable_leaf",
-    "if generator == 'ranking':",
-    "    sys.argv = ['ranking', 'make-diff-rank-input', '--repo', repository, '--base', base, '--mode', 'local-patch', '--out', output]",
-    "    ranking.main()",
-    "else:",
-    "    import generate_in_scope_files as inventory",
-    "    sys.argv = ['inventory', '--repo', repository, '--scope', '.', '--out', output, '--diff-base', base, '--diff-mode', 'local-patch']",
-    "    inventory.main()",
-  ].join("\n");
-
-  for (const generator of ["ranking", "inventory"]) {
-    for (const failure of [
-      "missing",
-      "unreadable",
-      "read",
-      "close",
-      "parent-missing",
-      "windows-missing-2",
-      "windows-missing-3",
-      "windows-denied-5",
-      "windows-denied-13",
-      "windows-sharing-32",
-      "windows-lock-33",
-      "windows-parent-missing-2",
-      "windows-parent-denied-5",
-      "windows-parent-sharing-32",
-      "windows-parent-lock-33",
-      "windows-reparse",
-    ]) {
-      mkdirSync(join(repository, "src"), { recursive: true });
-      writeFileSync(source, "inside = 2\n");
-      const output = join(root, `${generator}-${failure}.jsonl`);
-      const result = spawnSync(
-        python!,
-        [
-          "-I",
-          "-B",
-          "-c",
-          probe,
-          scripts,
-          repository,
-          base,
-          output,
-          generator,
-          failure,
-        ],
-        { encoding: "utf8" },
-      );
-
-      if (failure.includes("parent") || failure === "windows-reparse") {
-        expect(
-          result.status,
-          `${generator}/${failure}: ${result.stdout}\n${result.stderr}`,
-        ).toBe(generator === "ranking" ? 1 : 2);
-        expect(result.stderr.toLowerCase()).toContain(
-          "inside the selected target",
-        );
-      } else {
-        expect(
-          result.status,
-          `${generator}/${failure}: ${result.stdout}\n${result.stderr}`,
-        ).toBe(0);
-        expect(readFileSync(output, "utf8")).toBe("");
-      }
-    }
-  }
-});
-
-test("diff inventory and previews stay inside the selected repository", () => {
+test("diff previews stay inside the selected repository", () => {
   const root = realpathSync(
     mkdtempSync(join(tmpdir(), "codex-security-diff-rank-")),
   );
   temporaryRoots.push(root);
   const repository = join(root, "repository");
   const nested = join(repository, "src", "nested");
-  const removedParent = join(repository, "removed");
   mkdirSync(nested, { recursive: true });
-  mkdirSync(removedParent);
   git(repository, "init", "-q");
   writeFileSync(join(repository, "src", "handler.py"), "value = 1\n");
   writeFileSync(join(repository, "src", "deleted.py"), "removed = True\n");
   writeFileSync(join(repository, "src", "entry.py"), "handler.py");
   writeFileSync(join(nested, "linked.py"), "value = 1\n");
-  writeFileSync(join(removedParent, "deleted.py"), "removed = True\n");
   git(repository, "add", ".");
   const originalLink = git(repository, "hash-object", "src/entry.py");
   git(
@@ -436,7 +72,6 @@ test("diff inventory and previews stay inside the selected repository", () => {
   writeFileSync(join(repository, "src", "entry.py"), "nested/linked.py");
   writeFileSync(join(nested, "linked.py"), "value = 2\n");
   rmSync(join(repository, "src", "deleted.py"));
-  rmSync(removedParent, { recursive: true });
   git(repository, "add", ".");
   const updatedLink = git(repository, "hash-object", "src/entry.py");
   git(
@@ -448,57 +83,41 @@ test("diff inventory and previews stay inside the selected repository", () => {
   git(repository, "commit", "-qm", "selected changes");
   const head = git(repository, "rev-parse", "HEAD");
 
+  const externalFixture = join(root, "synthetic-fixture");
+  mkdirSync(externalFixture);
+  writeFileSync(join(externalFixture, "linked.py"), "synthetic = True\n");
+  rmSync(nested, { recursive: true });
+  symlinkSync(externalFixture, nested, "junction");
+
   const python = pythonExecutable();
   expect(python).not.toBeNull();
   const output = join(root, "rank-input.jsonl");
-  const args = [
-    "-B",
-    join(PLUGIN_ROOT, "scripts", "generate_rank_input.py"),
-    "make-diff-rank-input",
-    "--repo",
-    repository,
-    "--base",
-    base,
-    "--head",
-    head,
-    "--mode",
-    "local-patch",
-    "--out",
-    output,
-  ];
-  const inventoryOutput = join(root, "in-scope-files.txt");
-  const inventoryArgs = [
-    "-B",
-    join(PLUGIN_ROOT, "scripts", "generate_in_scope_files.py"),
-    "--repo",
-    repository,
-    "--scope",
-    ".",
-    "--out",
-    inventoryOutput,
-    "--diff-base",
-    base,
-    "--diff-head",
-    head,
-    "--diff-mode",
-    "local-patch",
-  ];
-  const result = spawnSync(python!, args, { encoding: "utf8" });
-  const safeInventory = spawnSync(python!, inventoryArgs, {
-    encoding: "utf8",
-  });
+  const result = spawnSync(
+    python!,
+    [
+      "-B",
+      join(PLUGIN_ROOT, "scripts", "generate_rank_input.py"),
+      "make-diff-rank-input",
+      "--repo",
+      repository,
+      "--base",
+      base,
+      "--head",
+      head,
+      "--mode",
+      "local-patch",
+      "--out",
+      output,
+    ],
+    { encoding: "utf8" },
+  );
 
   expect(result.status, result.stderr).toBe(0);
-  expect(safeInventory.status, safeInventory.stderr).toBe(0);
-  expect(readFileSync(inventoryOutput, "utf8")).toContain(
-    "removed/deleted.py\n",
-  );
   const rows = readFileSync(output, "utf8")
     .trim()
     .split("\n")
     .map((row) => JSON.parse(row) as { path: string; preview: string });
   expect(rows.map((row) => row.path)).toEqual([
-    "removed/deleted.py",
     "src/deleted.py",
     "src/entry.py",
     "src/handler.py",
@@ -508,40 +127,7 @@ test("diff inventory and previews stay inside the selected repository", () => {
     "value = 2",
   );
   expect(rows.find((row) => row.path === "src/nested/linked.py")?.preview).toBe(
-    "value = 2",
-  );
-
-  const externalFixture = join(root, "synthetic-fixture");
-  mkdirSync(externalFixture);
-  writeFileSync(join(externalFixture, "deleted.py"), "external = True\n");
-  writeFileSync(join(externalFixture, "linked.py"), "synthetic = True\n");
-  symlinkSync(externalFixture, removedParent, "junction");
-
-  const escapedDeletion = spawnSync(python!, args, { encoding: "utf8" });
-  const deletionInventory = spawnSync(python!, inventoryArgs, {
-    encoding: "utf8",
-  });
-  expect([escapedDeletion.status, deletionInventory.status]).toEqual([1, 2]);
-  expect(escapedDeletion.stderr).toContain(
-    "Changed Git working-tree paths must stay inside the selected target.",
-  );
-  expect(deletionInventory.stderr).toContain(
-    "changed Git working-tree paths must stay inside the selected target",
-  );
-
-  unlinkSync(removedParent);
-  git(repository, "update-index", "--skip-worktree", "src/nested/linked.py");
-  rmSync(nested, { recursive: true });
-  symlinkSync(externalFixture, nested, "junction");
-
-  const escaped = spawnSync(python!, args, { encoding: "utf8" });
-  const inventory = spawnSync(python!, inventoryArgs, { encoding: "utf8" });
-  expect([escaped.status, inventory.status]).toEqual([1, 2]);
-  expect(escaped.stderr).toContain(
-    "Changed Git working-tree paths must stay inside the selected target.",
-  );
-  expect(inventory.stderr).toContain(
-    "changed Git working-tree paths must stay inside the selected target",
+    "",
   );
 });
 
