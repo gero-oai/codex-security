@@ -358,7 +358,6 @@ describe("CodexSecurity preflight configuration", () => {
   });
 
   test("separates writable scans from repository-scoped policy reads", () => {
-    const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
     const original = {
       approval_policy: "on-request",
       approvals_reviewer: "user",
@@ -374,7 +373,7 @@ describe("CodexSecurity preflight configuration", () => {
       },
     };
 
-    expect(scanRuntimeCodexConfig(original, stateDirectory)).toEqual({
+    expect(scanRuntimeCodexConfig(original)).toEqual({
       approval_policy: "on-request",
       approvals_reviewer: "auto_review",
       allow_login_shell: false,
@@ -385,7 +384,6 @@ describe("CodexSecurity preflight configuration", () => {
           filesystem: {
             ":root": "read",
             ":workspace_roots": "write",
-            [stateDirectory]: "write",
           },
         },
         codex_security_policy: {
@@ -406,28 +404,25 @@ describe("CodexSecurity preflight configuration", () => {
     });
   });
 
-  test("keeps persistent credentials read-only within writable scan state", () => {
+  test("keeps persistent credentials and their ancestry read-only", () => {
     const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
     const credentialHome = join(stateDirectory, "codex-home");
-    const config = scanRuntimeCodexConfig({}, stateDirectory, credentialHome);
+    const config = scanRuntimeCodexConfig({}, credentialHome);
 
-    expect(config).toMatchObject({
-      permissions: {
-        codex_security_scan: {
-          filesystem: {
-            ":root": "read",
-            ":workspace_roots": "write",
-            [stateDirectory]: "write",
-            [credentialHome]: "read",
-          },
+    expect(config["permissions"]).toEqual({
+      codex_security_scan: {
+        filesystem: {
+          ":root": "read",
+          ":workspace_roots": "write",
+          [credentialHome]: "read",
         },
-        codex_security_policy: {
-          filesystem: {
-            ":minimal": "read",
-            ":workspace_roots": "read",
-          },
-          network: { enabled: false },
+      },
+      codex_security_policy: {
+        filesystem: {
+          ":minimal": "read",
+          ":workspace_roots": "read",
         },
+        network: { enabled: false },
       },
     });
     const policyFilesystem = (
@@ -440,13 +435,11 @@ describe("CodexSecurity preflight configuration", () => {
   });
 
   test("preserves an explicitly requested strict approval policy", () => {
-    const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
-
     expect(
-      scanRuntimeCodexConfig(
-        { approval_policy: "never", approvals_reviewer: "user" },
-        stateDirectory,
-      ),
+      scanRuntimeCodexConfig({
+        approval_policy: "never",
+        approvals_reviewer: "user",
+      }),
     ).toMatchObject({
       approval_policy: "never",
       approvals_reviewer: "auto_review",
@@ -455,7 +448,6 @@ describe("CodexSecurity preflight configuration", () => {
   });
 
   test("preserves a strict approval policy from the selected profile", () => {
-    const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
     const config = {
       approval_policy: "on-request",
       profile: "strict",
@@ -465,7 +457,7 @@ describe("CodexSecurity preflight configuration", () => {
       },
     };
 
-    expect(scanRuntimeCodexConfig(config, stateDirectory)).toMatchObject({
+    expect(scanRuntimeCodexConfig(config)).toMatchObject({
       approval_policy: "never",
       approvals_reviewer: "auto_review",
       profiles: { strict: { model: "profile-model" }, other: {} },
@@ -474,7 +466,6 @@ describe("CodexSecurity preflight configuration", () => {
   });
 
   test("removes execution and permission overrides from every configured profile", () => {
-    const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
     const original = {
       profile: "selected",
       profiles: {
@@ -497,7 +488,7 @@ describe("CodexSecurity preflight configuration", () => {
       },
     };
 
-    const hardened = scanRuntimeCodexConfig(original, stateDirectory);
+    const hardened = scanRuntimeCodexConfig(original);
     expect(hardened).toMatchObject({
       approval_policy: "on-request",
       approvals_reviewer: "auto_review",
@@ -526,7 +517,6 @@ describe("CodexSecurity preflight configuration", () => {
           request_trace: "preserve-configured-metadata",
         },
       },
-      stateDirectory,
       credentialHome,
     );
 

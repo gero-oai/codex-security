@@ -14,7 +14,7 @@ const shardSeeds = [
   ["api-credentials.test.ts"],
   ["api.test.ts"],
   ["runtime.test.ts"],
-  ["cli-authentication.test.ts"],
+  ["cli-authentication.test.ts", "security-policy.test.ts"],
   ["scan-recovery.test.ts"],
   [],
   [],

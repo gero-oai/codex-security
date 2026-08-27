@@ -525,6 +525,7 @@ describe("reviewed release note helpers", () => {
         },
       );
 
+      expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("include a reviewed summary");
       expect(result.stderr).not.toContain("ignored null byte");

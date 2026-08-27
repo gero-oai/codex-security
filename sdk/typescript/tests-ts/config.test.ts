@@ -7,7 +7,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { parse } from "smol-toml";
 import { scanRuntimeCodexConfig } from "../src/api.js";
@@ -22,6 +22,11 @@ import {
   mergedCodexConfig,
   writeCodexConfig,
 } from "../src/index.js";
+import {
+  prepareCodexSecurityCredentialHome,
+  requireSecureCredentialHome,
+} from "../src/runtime.js";
+import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -42,7 +47,7 @@ async function temporaryDirectory(): Promise<string> {
 function runPinnedCodex(
   codexHome: string,
   arguments_: readonly string[],
-  environmentOverrides: NodeJS.ProcessEnv = {},
+  overrides: NodeJS.ProcessEnv = {},
 ) {
   const node = Bun.which("node");
   if (node === null) {
@@ -50,7 +55,7 @@ function runPinnedCodex(
   }
   const environment: NodeJS.ProcessEnv = {
     ...process.env,
-    ...environmentOverrides,
+    ...overrides,
     CODEX_HOME: codexHome,
   };
   delete environment["OPENAI_API_KEY"];
@@ -99,21 +104,27 @@ function macOsSandboxUnavailable(): boolean {
 
 async function scanSandboxFixture() {
   const root = await temporaryDirectory();
-  const codexHome = join(root, "codex-home");
-  const workspace = join(root, "workspace");
   const stateDirectory = join(root, "state");
+  const codexHome = await prepareCodexSecurityCredentialHome({
+    CODEX_SECURITY_STATE_DIR: stateDirectory,
+  });
+  const workspace = join(stateDirectory, "scans", "workspace");
+  const temporary = join(root, "temp");
   await Promise.all(
-    [codexHome, workspace, stateDirectory].map((path) => mkdir(path)),
+    [workspace, temporary].map((path) => mkdir(path, { recursive: true })),
   );
   await writeCodexConfig(
     join(codexHome, "config.toml"),
-    scanRuntimeCodexConfig(
-      await mergedCodexConfig({}),
-      stateDirectory,
-      codexHome,
-    ),
+    scanRuntimeCodexConfig(await mergedCodexConfig({}), codexHome),
   );
-  return { root, codexHome, workspace, stateDirectory };
+  return {
+    root,
+    codexHome,
+    stateDirectory,
+    workspace,
+    // Native sandbox temp grants must not cover the credential-home ancestry.
+    environment: { TEMP: temporary, TMP: temporary, TMPDIR: temporary },
+  };
 }
 
 describe("Codex configuration", () => {
@@ -369,10 +380,9 @@ describe("Codex configuration", () => {
   });
 
   test("retains the Windows sandbox in the hardened scan profile", async () => {
-    const stateDirectory = join(tmpdir(), "codex-security-windows-state");
     const merged = await mergedCodexConfig({});
 
-    expect(scanRuntimeCodexConfig(merged, stateDirectory)).toMatchObject({
+    expect(scanRuntimeCodexConfig(merged)).toMatchObject({
       windows: { sandbox: "unelevated" },
       default_permissions: "codex_security_scan",
       permissions: {
@@ -380,7 +390,6 @@ describe("Codex configuration", () => {
           filesystem: {
             ":root": "read",
             ":workspace_roots": "write",
-            [stateDirectory]: "write",
           },
         },
       },
@@ -388,119 +397,188 @@ describe("Codex configuration", () => {
   });
 
   test("writes scan permissions accepted by the pinned Codex CLI", async () => {
-    const { codexHome, workspace } = await scanSandboxFixture();
-    const result = runPinnedCodex(codexHome, [
-      "--cd",
-      workspace,
-      "features",
-      "list",
-    ]);
+    const { codexHome, workspace, environment } = await scanSandboxFixture();
+    const result = runPinnedCodex(
+      codexHome,
+      ["--cd", workspace, "features", "list"],
+      environment,
+    );
     expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
     expect(result.stdout.length).toBeGreaterThan(0);
   });
 
-  for (const [purpose, profile, workspaceWritable, stateWritable] of [
-    ["scan", "codex_security_scan", true, true],
-    ["policy", "codex_security_policy", false, false],
-  ] as const) {
-    test.skipIf(macOsSandboxUnavailable())(
-      `enforces the ${purpose} filesystem permissions`,
-      async () => {
-        const { root, codexHome, workspace, stateDirectory } =
-          await scanSandboxFixture();
-        const node = Bun.which("node");
-        expect(node).not.toBeNull();
-        const sandboxEnvironment =
-          process.platform === "darwin"
-            ? { OPENSSL_CONF: join(workspace, "openssl.cnf") }
-            : undefined;
-        if (sandboxEnvironment !== undefined)
-          await writeFile(sandboxEnvironment.OPENSSL_CONF, "");
-        const sandbox = (arguments_: readonly string[]) =>
-          runPinnedCodex(
-            codexHome,
-            [
-              "sandbox",
-              "--config",
-              `permissions.${profile}.network.enabled=true`,
-              "--permission-profile",
-              profile,
-              "--cd",
-              workspace,
-              node!,
-              ...arguments_,
-            ],
-            sandboxEnvironment,
-          );
-        const attemptWrite = (path: string) =>
-          sandbox([
+  test.skipIf(macOsSandboxUnavailable())(
+    "allows scan helpers to write workspace files without writable credential ancestry",
+    async () => {
+      const { root, codexHome, stateDirectory, workspace, environment } =
+        await scanSandboxFixture();
+      const node = Bun.which("node");
+      expect(node).not.toBeNull();
+      const attemptWrite = (path: string) =>
+        runPinnedCodex(
+          codexHome,
+          [
+            "sandbox",
+            "--config",
+            "permissions.codex_security_scan.network.enabled=true",
+            "--permission-profile",
+            "codex_security_scan",
+            "--cd",
+            workspace,
+            node!,
             "-e",
             "require('node:fs').writeFileSync(process.argv[1], 'probe')",
             path,
-          ]);
-        const evidence = join(workspace, "previous-SECURITY.md");
-        await writeFile(evidence, "original");
-        const read = sandbox([
-          "-e",
-          "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))",
-          evidence,
-        ]);
-        if (read.exitCode !== 0) {
-          const details = new TextDecoder().decode(read.stderr);
-          if (
-            (process.platform === "linux" &&
-              /bwrap: (?:setting up uid map: Permission denied|loopback: Failed RTM_NEWADDR: Operation not permitted)/u.test(
-                details,
-              )) ||
-            (process.platform === "win32" &&
-              purpose === "policy" &&
-              details.includes(
-                "Restricted read-only access requires the elevated Windows sandbox backend",
-              ))
-          ) {
-            expect(
-              runPinnedCodex(codexHome, ["features", "list"]).exitCode,
-            ).toBe(0);
-            return;
-          }
-          throw new Error(
-            `The pinned Codex CLI rejected an allowed ${purpose} read: ${details}`,
+          ],
+          environment,
+        );
+
+      const allowed = join(workspace, "inside.txt");
+      const permitted = attemptWrite(allowed);
+      const outside = join(root, "outside.txt");
+      expect(attemptWrite(outside).exitCode).not.toBe(0);
+      await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
+      const stateFile = join(stateDirectory, "outside.txt");
+      expect(attemptWrite(stateFile).exitCode).not.toBe(0);
+      await expect(stat(stateFile)).rejects.toMatchObject({ code: "ENOENT" });
+      if (permitted.exitCode !== 0) {
+        const details = new TextDecoder().decode(permitted.stderr);
+        if (
+          process.platform === "linux" &&
+          /bwrap: (?:setting up uid map: Permission denied|loopback: Failed RTM_NEWADDR: Operation not permitted)/u.test(
+            details,
+          )
+        ) {
+          expect(runPinnedCodex(codexHome, ["features", "list"]).exitCode).toBe(
+            0,
           );
+          return;
         }
-        expect(new TextDecoder().decode(read.stdout)).toBe("original");
-        const workspaceFile = join(workspace, "inside.txt");
-        expect(attemptWrite(workspaceFile).exitCode === 0).toBe(
-          workspaceWritable,
+        throw new Error(
+          `The pinned Codex CLI rejected an allowed scan write: ${details}`,
         );
-        if (workspaceWritable)
-          expect(await readFile(workspaceFile, "utf8")).toBe("probe");
-        else
-          await expect(stat(workspaceFile)).rejects.toMatchObject({
-            code: "ENOENT",
-          });
-        expect(attemptWrite(evidence).exitCode === 0).toBe(workspaceWritable);
-        expect(await readFile(evidence, "utf8")).toBe(
-          workspaceWritable ? "probe" : "original",
+      }
+      expect(await readFile(allowed, "utf8")).toBe("probe");
+
+      const repository = join(root, "repository");
+      await mkdir(repository);
+      await writeFile(join(repository, "fixture.txt"), "synthetic source\n");
+      const inventory = join(workspace, "in-scope-files.txt");
+      const python =
+        Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
+      expect(python).not.toBeNull();
+      const helper = runPinnedCodex(
+        codexHome,
+        [
+          "sandbox",
+          "--config",
+          "permissions.codex_security_scan.network.enabled=true",
+          "--permission-profile",
+          "codex_security_scan",
+          "--cd",
+          workspace,
+          python!,
+          join(PLUGIN_ROOT, "scripts", "generate_in_scope_files.py"),
+          "--repo",
+          repository,
+          "--scope",
+          ".",
+          "--out",
+          inventory,
+        ],
+        environment,
+      );
+      expect(helper.exitCode, new TextDecoder().decode(helper.stderr)).toBe(0);
+      const inventoryPaths = (await readFile(inventory, "utf8"))
+        .trim()
+        .split(/\r?\n/u)
+        .map((path) => resolve(repository, path));
+      expect(inventoryPaths).toEqual([join(repository, "fixture.txt")]);
+      await requireSecureCredentialHome(codexHome);
+      expect(
+        await prepareCodexSecurityCredentialHome({
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+        }),
+      ).toBe(codexHome);
+    },
+  );
+
+  test.skipIf(macOsSandboxUnavailable())(
+    "keeps policy workspace, state and credentials read-only",
+    async () => {
+      const { root, codexHome, workspace, stateDirectory, environment } =
+        await scanSandboxFixture();
+      const node = Bun.which("node");
+      expect(node).not.toBeNull();
+      const sandboxEnvironment: NodeJS.ProcessEnv = { ...environment };
+      if (process.platform === "darwin") {
+        sandboxEnvironment["OPENSSL_CONF"] = join(workspace, "openssl.cnf");
+        await writeFile(sandboxEnvironment["OPENSSL_CONF"], "");
+      }
+      const sandbox = (arguments_: readonly string[]) =>
+        runPinnedCodex(
+          codexHome,
+          [
+            "sandbox",
+            "--config",
+            "permissions.codex_security_policy.network.enabled=true",
+            "--permission-profile",
+            "codex_security_policy",
+            "--cd",
+            workspace,
+            node!,
+            ...arguments_,
+          ],
+          sandboxEnvironment,
         );
-        const outside = join(root, "outside.txt");
-        expect(attemptWrite(outside).exitCode).not.toBe(0);
-        await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
-        const stateFile = join(stateDirectory, `${purpose}.txt`);
-        expect(attemptWrite(stateFile).exitCode === 0).toBe(stateWritable);
-        if (stateWritable)
-          expect(await readFile(stateFile, "utf8")).toBe("probe");
-        else
-          await expect(stat(stateFile)).rejects.toMatchObject({
-            code: "ENOENT",
-          });
-        const credentialFile = join(codexHome, `${purpose}.txt`);
-        expect(attemptWrite(credentialFile).exitCode).not.toBe(0);
-        await expect(stat(credentialFile)).rejects.toMatchObject({
-          code: "ENOENT",
-        });
-      },
-    );
-  }
+      const evidence = join(workspace, "previous-SECURITY.md");
+      await writeFile(evidence, "original");
+      const read = sandbox([
+        "-e",
+        "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))",
+        evidence,
+      ]);
+      if (read.exitCode !== 0) {
+        const details = new TextDecoder().decode(read.stderr);
+        if (
+          (process.platform === "linux" &&
+            /bwrap: (?:setting up uid map: Permission denied|loopback: Failed RTM_NEWADDR: Operation not permitted)/u.test(
+              details,
+            )) ||
+          (process.platform === "win32" &&
+            details.includes(
+              "Restricted read-only access requires the elevated Windows sandbox backend",
+            ))
+        ) {
+          expect(runPinnedCodex(codexHome, ["features", "list"]).exitCode).toBe(
+            0,
+          );
+          return;
+        }
+        throw new Error(
+          `The pinned Codex CLI rejected an allowed policy read: ${details}`,
+        );
+      }
+      expect(new TextDecoder().decode(read.stdout)).toBe("original");
+      for (const path of [
+        join(workspace, "inside.txt"),
+        join(root, "outside.txt"),
+        join(stateDirectory, "policy.txt"),
+        join(codexHome, "policy.txt"),
+        evidence,
+      ]) {
+        const write = sandbox([
+          "-e",
+          "require('node:fs').writeFileSync(process.argv[1], 'probe')",
+          path,
+        ]);
+        expect(write.exitCode).not.toBe(0);
+        if (path === evidence)
+          expect(await readFile(path, "utf8")).toBe("original");
+        else await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+    },
+  );
 
   test("writes Windows sandbox settings accepted by the pinned Codex CLI", async () => {
     const root = await temporaryDirectory();

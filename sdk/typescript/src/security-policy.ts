@@ -488,11 +488,11 @@ interface SecurityPolicyPath {
   isSymbolicLink: boolean;
 }
 
-async function* securityPolicyPaths(
+async function securityPolicyPaths(
   root: string,
   repositories: readonly string[],
   signal?: AbortSignal,
-): AsyncGenerator<SecurityPolicyPath> {
+): Promise<SecurityPolicyPath[]> {
   const knownRoots = new Set<string>();
   const gitDirectories = new Set<string>();
   const policies: SecurityPolicyPath[] = [];
@@ -594,20 +594,20 @@ async function* securityPolicyPaths(
     }
   }
   // A nested checkout can register a Git directory visited earlier in the walk.
-  for (const policy of policies) if (!isGitData(policy.path)) yield policy;
   for (const [path, repository] of reportingPaths) {
     if (isGitData(path)) continue;
     const metadata = await lstat(path).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
       throw error;
     });
-    yield {
+    policies.push({
       path,
       repository,
       reportingPolicy: true,
       isSymbolicLink: metadata?.isSymbolicLink() ?? false,
-    };
+    });
   }
+  return policies.filter((entry) => !isGitData(entry.path));
 }
 
 export async function inspectSecurityPolicyPaths(
@@ -615,7 +615,7 @@ export async function inspectSecurityPolicyPaths(
   signal?: AbortSignal,
 ): Promise<string[]> {
   const paths: string[] = [];
-  for await (const entry of securityPolicyPaths(
+  for (const entry of await securityPolicyPaths(
     dirname(target.targetPath),
     [target.repository],
     signal,
@@ -1067,7 +1067,7 @@ async function validatePolicyLinks(
       throw error;
     },
   );
-  for await (const entry of securityPolicyPaths(
+  for (const entry of await securityPolicyPaths(
     protectedRoot,
     repositories,
     signal,
@@ -1431,32 +1431,13 @@ async function installPolicyFile(
   preserveExistingSecurity = false,
   python?: string,
 ): Promise<void> {
-  if (preserveExistingSecurity && process.platform !== "win32") {
-    try {
-      await link(temporary, targetPath);
-    } catch (error) {
-      if (
-        ![
-          "EPERM",
-          "ENOTSUP",
-          "EOPNOTSUPP",
-          "EXDEV",
-          "EMLINK",
-          "EISDIR",
-        ].includes((error as NodeJS.ErrnoException).code ?? "")
-      )
-        throw error;
-      await moveUnixPolicyFileNoClobber(temporary, targetPath, python!);
-      return;
-    }
-    await unlink(temporary);
-    return;
-  }
-  if (preserveExistingSecurity && process.platform === "win32") {
-    if (((await stat(temporary)).mode & 0o200) !== 0) {
+  if (preserveExistingSecurity) {
+    const windows = process.platform === "win32";
+    let linked = false;
+    if (!windows || ((await stat(temporary)).mode & 0o200) !== 0) {
       try {
         await link(temporary, targetPath);
-        return;
+        linked = true;
       } catch (error) {
         if (
           ![
@@ -1472,7 +1453,11 @@ async function installPolicyFile(
         }
       }
     }
-    await moveWindowsPolicyFileNoClobber(temporary, targetPath);
+    if (linked) {
+      if (!windows) await unlink(temporary);
+    } else if (windows)
+      await moveWindowsPolicyFileNoClobber(temporary, targetPath);
+    else await moveUnixPolicyFileNoClobber(temporary, targetPath, python!);
     return;
   }
   // Windows may make a read-only file writable before removing it. Keep the
@@ -1959,81 +1944,29 @@ async function replaceExistingPolicy(
           "The recovery path is not a regular file.",
         );
       }
-      if (process.platform !== "win32") {
+      try {
+        await link(recoveryPath, targetPath);
+      } catch (restoreError) {
+        if (
+          ![
+            "EPERM",
+            "ENOTSUP",
+            "EOPNOTSUPP",
+            "EXDEV",
+            "EMLINK",
+            "EISDIR",
+          ].includes((restoreError as NodeJS.ErrnoException).code ?? "")
+        )
+          throw restoreError;
+        const windows = process.platform === "win32";
+        const restoreTemporary = `${recoveryPath}.restore`;
         try {
-          await link(recoveryPath, targetPath);
-        } catch (restoreError) {
-          if (
-            ![
-              "EPERM",
-              "ENOTSUP",
-              "EOPNOTSUPP",
-              "EXDEV",
-              "EMLINK",
-              "EISDIR",
-            ].includes((restoreError as NodeJS.ErrnoException).code ?? "")
-          )
-            throw restoreError;
-          const restoreTemporary = `${recoveryPath}.restore`;
-          try {
-            await writeFile(restoreTemporary, "", {
-              flag: "wx",
-              mode: 0o600,
-            });
-            const recoveryContent = await readSecurityPolicy(recoveryPath);
-            await copyUnixPolicyFile(recoveryPath, restoreTemporary, python);
-            const recoveryGeneration =
-              await securityPolicyRecoveryGeneration(recoveryPath);
-            const restoreGeneration =
-              await securityPolicyRecoveryGeneration(restoreTemporary);
-            await verifyUnixSecurityMetadata(
-              recoveryPath,
-              restoreTemporary,
-              python,
-            );
-            if (
-              recoveryContent === null ||
-              (await readSecurityPolicy(restoreTemporary)) !==
-                recoveryContent ||
-              (await readSecurityPolicy(recoveryPath)) !== recoveryContent ||
-              (await securityPolicyRecoveryGeneration(restoreTemporary)) !==
-                restoreGeneration ||
-              (await securityPolicyRecoveryGeneration(recoveryPath)) !==
-                recoveryGeneration
-            ) {
-              throw new CodexSecurityError(
-                "SECURITY.md changed while its recovery snapshot was being copied.",
-              );
-            }
-            await moveUnixPolicyFileNoClobber(
-              restoreTemporary,
-              targetPath,
-              python,
-            );
-          } finally {
-            await rm(restoreTemporary, { force: true }).catch(() => undefined);
-          }
-        }
-      } else {
-        try {
-          await link(recoveryPath, targetPath);
-        } catch (restoreError) {
-          if (
-            ![
-              "EPERM",
-              "ENOTSUP",
-              "EOPNOTSUPP",
-              "EXDEV",
-              "EMLINK",
-              "EISDIR",
-            ].includes((restoreError as NodeJS.ErrnoException).code ?? "")
-          ) {
-            throw restoreError;
-          }
-          const restoreTemporary = `${recoveryPath}.restore`;
-          try {
-            const recoveryContent = await readSecurityPolicy(recoveryPath);
-            const recoveryMode = (await stat(recoveryPath)).mode & 0o777;
+          if (!windows)
+            await writeFile(restoreTemporary, "", { flag: "wx", mode: 0o600 });
+          const recoveryContent = await readSecurityPolicy(recoveryPath);
+          let recoveryMode: number | undefined;
+          if (windows) {
+            recoveryMode = (await stat(recoveryPath)).mode & 0o777;
             await copyFile(
               recoveryPath,
               restoreTemporary,
@@ -2041,36 +1974,52 @@ async function replaceExistingPolicy(
             );
             await chmod(restoreTemporary, recoveryMode);
             await copyWindowsSecurityDescriptor(recoveryPath, restoreTemporary);
-            const recoveryGeneration =
-              await securityPolicyRecoveryGeneration(recoveryPath);
-            const restoreGeneration =
-              await securityPolicyRecoveryGeneration(restoreTemporary);
+          } else
+            await copyUnixPolicyFile(recoveryPath, restoreTemporary, python);
+          const recoveryGeneration =
+            await securityPolicyRecoveryGeneration(recoveryPath);
+          const restoreGeneration =
+            await securityPolicyRecoveryGeneration(restoreTemporary);
+          if (windows)
             await copyWindowsSecurityDescriptor(
               recoveryPath,
               restoreTemporary,
               undefined,
               true,
             );
-            if (
-              recoveryContent === null ||
-              ((await stat(recoveryPath)).mode & 0o777) !== recoveryMode ||
-              ((await stat(restoreTemporary)).mode & 0o777) !== recoveryMode ||
-              (await readSecurityPolicy(restoreTemporary)) !==
-                recoveryContent ||
-              (await readSecurityPolicy(recoveryPath)) !== recoveryContent ||
-              (await securityPolicyRecoveryGeneration(restoreTemporary)) !==
-                restoreGeneration ||
-              (await securityPolicyRecoveryGeneration(recoveryPath)) !==
-                recoveryGeneration
-            ) {
-              throw new CodexSecurityError(
-                "SECURITY.md changed while its recovery snapshot was being copied.",
-              );
-            }
-            await moveWindowsPolicyFileNoClobber(restoreTemporary, targetPath);
-          } finally {
-            await rm(restoreTemporary, { force: true }).catch(() => undefined);
+          else
+            await verifyUnixSecurityMetadata(
+              recoveryPath,
+              restoreTemporary,
+              python,
+            );
+          if (
+            recoveryContent === null ||
+            (windows &&
+              (((await stat(recoveryPath)).mode & 0o777) !== recoveryMode ||
+                ((await stat(restoreTemporary)).mode & 0o777) !==
+                  recoveryMode)) ||
+            (await readSecurityPolicy(restoreTemporary)) !== recoveryContent ||
+            (await readSecurityPolicy(recoveryPath)) !== recoveryContent ||
+            (await securityPolicyRecoveryGeneration(restoreTemporary)) !==
+              restoreGeneration ||
+            (await securityPolicyRecoveryGeneration(recoveryPath)) !==
+              recoveryGeneration
+          ) {
+            throw new CodexSecurityError(
+              "SECURITY.md changed while its recovery snapshot was being copied.",
+            );
           }
+          if (windows)
+            await moveWindowsPolicyFileNoClobber(restoreTemporary, targetPath);
+          else
+            await moveUnixPolicyFileNoClobber(
+              restoreTemporary,
+              targetPath,
+              python,
+            );
+        } finally {
+          await rm(restoreTemporary, { force: true }).catch(() => undefined);
         }
       }
     } catch (restoreError) {
