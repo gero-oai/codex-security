@@ -58,10 +58,16 @@ Return both a concise Markdown report and a JSON object conforming to [`../../sc
 7. top risk drivers, protective factors, and status-quo risk; and
 8. unknowns plus the bounded evidence plan when held.
 
-Before returning the result, validate the JSON with:
+This skill lives at `<plugin-root>/skills/assess-patch-risk/SKILL.md`, so
+`<plugin-root>` is two directories up. Resolve `<python_command>` to the
+configured Python interpreter (`"$PYTHON"` in POSIX shells or
+`& "$env:PYTHON"` in PowerShell), otherwise use `python` on Windows and
+`python3` on Unix-like hosts.
 
-```bash
-python skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py <assessment.json>
+Before returning the result, validate the JSON from any working directory with:
+
+```text
+<python_command> <plugin-root>/skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py <assessment.json>
 ```
 
 Correct structural or invariant errors by revisiting the evidence; never change a recommendation merely to make validation pass. Return the validated JSON in the response. Write it to disk only when the caller requests an artifact, and keep every assessment-created file outside the subject checkout and its Git directories.
