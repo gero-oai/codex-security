@@ -55,10 +55,10 @@ Return both a concise Markdown report and a JSON object conforming to [`../../sc
 2. recommendation and workflow label;
 3. impact, likelihood, regression protection, recoverability, and confidence ratings with evidence, plus any strict auto-merge exclusions;
 4. affected production roots, important callers, contracts, and state;
-5. strongest counterexample and legitimate control for each material boundary;
-6. relevant tests and checks, including whether they ran and what they actually protect;
+5. strongest counterexample and legitimate control for each material boundary, with `counterexampleSource` and `legitimateControlSource` locations;
+6. tests and checks, including whether they ran, what they protect, and an explicit `relevant` classification;
 7. top risk drivers, protective factors, and status-quo risk; and
-8. unknowns plus the bounded evidence plan when held.
+8. stable ids for unknowns plus the bounded evidence plan when held; each plan action lists the unknown ids it resolves in `resolvesUnknowns`.
 
 This skill lives at `<plugin-root>/skills/assess-patch-risk/SKILL.md`, so
 `<plugin-root>` is two directories up. Resolve `<python_command>` to the
