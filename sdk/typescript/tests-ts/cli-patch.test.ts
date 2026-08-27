@@ -6466,6 +6466,7 @@ describe("scan and patch workflow", () => {
       const invoked = join(root, "invoked.txt");
       const armed = join(root, "armed");
       const result = resultWithFindings(["high"]);
+      let writeTreeDisabledFilter = false;
       result.findings.findings[0]!.locations[0]!.path = "value.ts";
       try {
         await mkdir(repository);
@@ -6516,8 +6517,14 @@ describe("scan and patch workflow", () => {
               return 0;
             },
             onRepositoryCommand: (command, args, _repository, options) => {
-              if (command === "git")
+              if (command === "git") {
+                if (args.includes("write-tree")) {
+                  writeTreeDisabledFilter = args.includes(
+                    "filter.capture.clean=",
+                  );
+                }
                 return runRepositoryGit(repository, args, options);
+              }
               return args[1] === "list"
                 ? ""
                 : "https://github.example.test/example/repository/pull/22";
@@ -6531,9 +6538,7 @@ describe("scan and patch workflow", () => {
         );
 
         expect(outcome.exitCode, outcome.stderr).toBe(0);
-        expect(git("branch", "--show-current")).toBe(
-          "codex-security/patch-scan",
-        );
+        expect(writeTreeDisabledFilter).toBe(true);
         expect(
           await readFile(invoked, "utf8").catch(
             (error: NodeJS.ErrnoException) => {
