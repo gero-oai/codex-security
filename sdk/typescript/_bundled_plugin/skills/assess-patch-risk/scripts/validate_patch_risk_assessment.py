@@ -139,6 +139,11 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
         and value["impact"]["rating"] not in {"high", "critical"}
     ):
         errors.append("the reported boundary requires high or critical impact")
+    if (
+        value["recoverability"]["rating"] == "hard"
+        and value["impact"]["rating"] not in {"high", "critical"}
+    ):
+        errors.append("hard recovery requires high or critical impact")
 
     if recommendation == "merge":
         if workflow_label not in {"auto_merge_candidate", "human_review_required"}:
@@ -222,7 +227,11 @@ def semantic_errors(value: dict[str, Any]) -> list[str]:
             "autoMergeExclusions": not value["autoMergeExclusions"],
             "unknowns": not unknowns,
             "validation": passed_relevant_validation
-            and all(item["status"] == "passed" for item in validation),
+            and all(
+                item["status"] == "passed"
+                for item in validation
+                if item["relevant"]
+            ),
         }
         for field, passed in auto_merge_requirements.items():
             if not passed:
