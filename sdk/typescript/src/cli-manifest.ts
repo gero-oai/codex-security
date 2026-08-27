@@ -470,6 +470,7 @@ function staticInputConstraints(
   const constraints: z.core.JSONSchema.JSONSchema = {
     type: property.type,
     ...(values === undefined ? {} : { enum: values }),
+    ...(property.pattern === undefined ? {} : { pattern: property.pattern }),
   };
   for (const [key] of CONSTRAINT_LABELS) {
     const value = property[key];
@@ -495,6 +496,9 @@ function describeConstraints(
   }
   if (property.type === "integer" && !includeType) {
     details.push("Must be an integer.");
+  }
+  if (property.pattern !== undefined) {
+    details.push(`Pattern: ${renderValue(property.pattern)}.`);
   }
   for (const [key, label] of CONSTRAINT_LABELS) {
     if (property[key] !== undefined) {

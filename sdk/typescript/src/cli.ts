@@ -340,6 +340,19 @@ const PUBLICATION_DESTINATION_OPTIONS = z.object({
     ),
 });
 
+const PUBLICATION_DESTINATION_REQUIREMENTS = {
+  team: "--linear-team or CODEX_SECURITY_LINEAR_TEAM is required.",
+  assignee:
+    "--linear-assignee requires --linear-api-key or CODEX_SECURITY_LINEAR_API_KEY.",
+  project: "--linear-project and --project must select the same project.",
+};
+const PUBLICATION_SOURCE_REQUIREMENTS = {
+  scan: "Use --scan or scan directory inputs, not both.",
+  csv: "Use --csv or scan directory and ID inputs, not both.",
+};
+const COMPONENT_SELECTION_REQUIREMENT =
+  "Choose exactly one of --component, --components-file, or --auto.";
+
 function publicationDestination(
   options: z.infer<typeof PUBLICATION_DESTINATION_OPTIONS>,
   environment: NodeJS.ProcessEnv,
@@ -350,26 +363,20 @@ function publicationDestination(
     throw new CodexSecurityError("--linear-assignee must not be empty.");
   }
   if (assigneeId !== undefined && linearApiKey === undefined) {
-    throw new CodexSecurityError(
-      "--linear-assignee requires --linear-api-key or CODEX_SECURITY_LINEAR_API_KEY.",
-    );
+    throw new CodexSecurityError(PUBLICATION_DESTINATION_REQUIREMENTS.assignee);
   }
   const teamId =
     options.linearTeam?.trim() ||
     environment["CODEX_SECURITY_LINEAR_TEAM"]?.trim();
   if (!teamId) {
-    throw new CodexSecurityError(
-      "--linear-team or CODEX_SECURITY_LINEAR_TEAM is required.",
-    );
+    throw new CodexSecurityError(PUBLICATION_DESTINATION_REQUIREMENTS.team);
   }
   if (
     options.linearProject !== undefined &&
     options.project !== undefined &&
     options.linearProject.trim() !== options.project.trim()
   ) {
-    throw new CodexSecurityError(
-      "--linear-project and --project must select the same project.",
-    );
+    throw new CodexSecurityError(PUBLICATION_DESTINATION_REQUIREMENTS.project);
   }
   const projectOption = options.linearProject ?? options.project;
   const selectedProject = projectOption?.trim();
@@ -2102,10 +2109,10 @@ export async function main(
           "Skip findings already recorded for this exact Linear destination.",
         ),
     }),
-    hint:
-      "--linear-team or CODEX_SECURITY_LINEAR_TEAM is required. " +
-      "--linear-assignee requires --linear-api-key or CODEX_SECURITY_LINEAR_API_KEY. " +
-      "If both --linear-project and --project are set, they must select the same project.",
+    hint: [
+      ...Object.values(PUBLICATION_SOURCE_REQUIREMENTS),
+      ...Object.values(PUBLICATION_DESTINATION_REQUIREMENTS),
+    ].join(" "),
     output: z.record(z.string(), z.unknown()).optional(),
     async run({ args, format, formatExplicit, options }) {
       const controller = new AbortController();
@@ -2187,9 +2194,7 @@ export async function main(
           );
         }
         if (options.scan.length > 0 && directories.length > 0) {
-          throw new CodexSecurityError(
-            "Use --scan or scan directory inputs, not both.",
-          );
+          throw new CodexSecurityError(PUBLICATION_SOURCE_REQUIREMENTS.scan);
         }
         if (
           csvPath !== undefined &&
@@ -2197,9 +2202,7 @@ export async function main(
             options.scan.length > 0 ||
             options.scanDir.length > 0)
         ) {
-          throw new CodexSecurityError(
-            "Use --csv or scan directory and ID inputs, not both.",
-          );
+          throw new CodexSecurityError(PUBLICATION_SOURCE_REQUIREMENTS.csv);
         }
         if (csvPath !== undefined && options.to !== "cloud") {
           throw new CodexSecurityError(
@@ -2602,6 +2605,7 @@ export async function main(
       scanDir: z.string().describe("Completed scan directory."),
     }),
     options: PUBLICATION_DESTINATION_OPTIONS,
+    hint: Object.values(PUBLICATION_DESTINATION_REQUIREMENTS).join(" "),
     output: z.record(z.string(), z.unknown()).optional(),
     async run({ args, options }) {
       const controller = new AbortController();
@@ -3154,10 +3158,10 @@ export async function main(
               Number(options.auto) ===
             1,
           {
-            message:
-              "Choose exactly one of --component, --components-file, or --auto.",
+            message: COMPONENT_SELECTION_REQUIREMENT,
           },
         ),
+      hint: COMPONENT_SELECTION_REQUIREMENT,
       output: z.record(z.string(), z.unknown()).optional(),
       async run({ args, options }) {
         const controller = new AbortController();
@@ -4471,38 +4475,6 @@ function validateCliArguments(
     command === "publish" ||
     command === "import";
   const subcommand = nestedCommand ? commandArguments[1] : undefined;
-  if (command === "info") {
-    const metadataFields = new Set([
-      "sdkVersion",
-      "bundledPluginVersion",
-      "scanMcp",
-      "cancellationNote",
-      "cliVersion",
-      "codexVersion",
-      "codexSdkVersion",
-      "model",
-      "reasoningEffort",
-      "nextStep",
-    ]);
-    for (let index = 0; index < argv.length; index += 1) {
-      const argument = argv[index]!;
-      if (
-        argument !== "--filter-output" &&
-        !argument.startsWith("--filter-output=")
-      ) {
-        continue;
-      }
-      const selector = argument.includes("=")
-        ? argument.slice(argument.indexOf("=") + 1)
-        : argv[index + 1];
-      if (
-        selector !== undefined &&
-        !selector.split(",").every((field) => metadataFields.has(field))
-      ) {
-        return "--filter-output must select an info metadata field.";
-      }
-    }
-  }
   for (
     let index = nestedCommand ? 2 : 1;
     index < commandArguments.length;

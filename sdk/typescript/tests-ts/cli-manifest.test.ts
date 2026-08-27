@@ -147,6 +147,9 @@ describe("full CLI manifest", () => {
             (schema.const === undefined ? [] : [schema.const])) {
             expect(details).toContain(`\`${String(value)}\``);
           }
+          if (schema.pattern !== undefined) {
+            expect(details).toContain(`\`${schema.pattern}\``);
+          }
           for (const constraint of [
             "minimum",
             "exclusiveMinimum",
@@ -319,6 +322,85 @@ describe("full CLI manifest", () => {
     expect(restriction).toContain("repository CSV");
     expect(await invoke(["bulk-scan", "--llms-full"])).toContain(restriction);
   });
+
+  test.each([
+    ["scan-components", ["--output-dir", "synthetic-output"]],
+    [
+      "scan-components",
+      ["--output-dir", "synthetic-output", "--auto", "--component", "src"],
+    ],
+    ["publish check", ["synthetic-scan", "--to", "linear"]],
+    [
+      "publish check",
+      [
+        "synthetic-scan",
+        "--to",
+        "linear",
+        "--linear-assignee",
+        "synthetic-user",
+      ],
+    ],
+    [
+      "publish check",
+      [
+        "synthetic-scan",
+        "--to",
+        "linear",
+        "--linear-team",
+        "synthetic-team",
+        "--linear-project",
+        "first",
+        "--project",
+        "second",
+      ],
+    ],
+    [
+      "publish scan",
+      ["synthetic-scan", "--to", "linear", "--scan", "synthetic-id"],
+    ],
+    [
+      "publish scan",
+      [
+        "--scan-dir",
+        "synthetic-scan",
+        "--to",
+        "linear",
+        "--scan",
+        "synthetic-id",
+      ],
+    ],
+    [
+      "publish scan",
+      ["synthetic-scan", "--to", "linear", "--csv", "synthetic.csv"],
+    ],
+    [
+      "publish scan",
+      ["--scan", "synthetic-id", "--to", "linear", "--csv", "synthetic.csv"],
+    ],
+  ] as const)(
+    "documents the runtime requirement for %s %j",
+    async (command, args) => {
+      const stderr = capture();
+      expect(
+        await main(
+          [...command.split(" "), ...args],
+          capture().stream,
+          stderr.stream,
+          dependencies({ environment: {} }),
+        ),
+      ).toBe(2);
+      const restriction = stderr
+        .text()
+        .split("\n", 1)[0]!
+        .replace(/^codex-security:\s*/u, "")
+        .trim();
+      expect(restriction).not.toBe("");
+      expect(restriction).not.toContain("[redacted]");
+      expect(await invoke([...command.split(" "), "--llms-full"])).toContain(
+        restriction,
+      );
+    },
+  );
 
   test("keeps built-in operands out of the shared command-argument view", () => {
     for (const [option, value] of [
