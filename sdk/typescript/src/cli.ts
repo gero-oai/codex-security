@@ -1725,10 +1725,7 @@ export async function main(
         }
         const repository = options.allRepositories
           ? undefined
-          : resolve(
-              dependencies.currentDirectory(),
-              args.repository ?? dependencies.currentDirectory(),
-            );
+          : resolve(dependencies.currentDirectory(), args.repository ?? ".");
         if (
           repository !== undefined &&
           format === "toon" &&
@@ -1827,12 +1824,14 @@ export async function main(
           await history(
             ["get-finding", "--occurrence-id", args.occurrenceId],
             ({ scan }) => {
-              const result = scan as JsonObject;
-              const scanDir = result["scanDir"];
-              const scanId = result["scanId"];
-              const targetPath = result["targetPath"];
-              const currentTargetPath = result["currentTargetPath"];
-              const finding = (result["findings"] as JsonObject[]).find(
+              const {
+                findings,
+                scanDir,
+                scanId,
+                targetPath,
+                currentTargetPath,
+              } = scan as JsonObject;
+              const finding = (findings as JsonObject[]).find(
                 (entry) => entry["occurrenceId"] === args.occurrenceId,
               );
               if (

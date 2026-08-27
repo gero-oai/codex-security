@@ -309,39 +309,7 @@ function runFindingsIndex(
 
 function probeFindingsIndex(
   targetId: string | null,
-  settings: {
-    targetIds?: string[];
-    targetPath?: string;
-    targetPaths?: string[];
-    query?: string;
-    closeAfterRediscovery?: boolean;
-    clockRollback?: boolean;
-    closedBeforeRollback?: boolean;
-    coverageFailure?: "pruned";
-    includeResolved?: boolean;
-    incompatibleSibling?: boolean;
-    inactiveRepresentative?: boolean;
-    indexedAliases?: boolean;
-    lateCompletion?: boolean;
-    legacyDescendant?: boolean;
-    legacyPriority?: boolean;
-    linkedWorktree?: boolean;
-    matchedTriage?: "already_fixed" | "false_positive";
-    missingCheckout?: boolean;
-    missingOwnershipCheckout?: boolean;
-    mixedLegacyOwnership?: boolean;
-    ownershipReuse?: boolean;
-    ownershipTransition?: boolean;
-    pendingMatchedRemediation?: boolean;
-    previousOwnerHistory?: boolean;
-    repeatedStableFinding?: boolean;
-    replacedCheckout?: boolean;
-    repositories?: boolean;
-    scopedLegacyDescendant?: boolean;
-    targetlessHistory?: "stable" | "matched";
-    triageClockRollback?: boolean;
-    unsealedScans?: boolean;
-  } = {},
+  settings: Parameters<typeof runFindingsIndex>[1] = {},
 ): {
   findings: Array<{
     occurrenceId: string;

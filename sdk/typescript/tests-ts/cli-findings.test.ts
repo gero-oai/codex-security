@@ -410,21 +410,10 @@ describe("CLI findings history", () => {
                 ? {
                     scans: [
                       {
-                        scanId: "running",
-                        targetPath: "/current/repository",
-                        progress: { status: "running" },
-                      },
-                      {
                         scanId: "latest",
                         targetPath: "/current/repository",
                         progress: { status: "complete" },
                         completedAt: "2025-12-01T00:00:00Z",
-                      },
-                      {
-                        scanId: "older",
-                        targetPath: "/current/repository",
-                        progress: { status: "complete" },
-                        completedAt: "2026-01-01T00:00:00Z",
                       },
                     ],
                   }
@@ -434,7 +423,15 @@ describe("CLI findings history", () => {
         ),
       ).toBe(0);
       expect(calls).toEqual([
-        ["list-scans", "--repository", "/current/repository"],
+        [
+          "list-scans",
+          "--repository",
+          "/current/repository",
+          "--status",
+          "complete",
+          "--limit",
+          "1",
+        ],
         ["get-scan", "--scan-id", "latest"],
       ]);
       expect(JSON.parse(stdout.text())).toEqual({
@@ -452,14 +449,11 @@ describe("CLI findings history", () => {
         capture().stream,
         stderr.stream,
         dependencies({
-          onWorkbench: () => ({
-            scans: [{ scanId: "running", progress: { status: "running" } }],
-          }),
+          onWorkbench: () => ({ scans: [] }),
         }),
       ),
     ).toBe(2);
     expect(stderr.text()).toContain("No completed scans found");
-    expect(stderr.text()).toContain("codex-security scan .");
   });
 
   test("rejects invalid filters before querying saved findings", async () => {
