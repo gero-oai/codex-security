@@ -546,6 +546,10 @@ describe("patch risk assessment contract", () => {
     privilegedLowImpact.autoMergeExclusions = ["privileged_boundary"];
     expect(validate(privilegedLowImpact).status).not.toBe(0);
 
+    const publicContractModerateImpact = assessment();
+    publicContractModerateImpact.autoMergeExclusions = ["public_contract"];
+    expect(validate(publicContractModerateImpact).status).not.toBe(0);
+
     const criticalRegression = assessment();
     criticalRegression.regressionLikelihood.rating = "critical";
     expect(validate(criticalRegression).status).not.toBe(0);
