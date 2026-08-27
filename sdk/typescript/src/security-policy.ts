@@ -452,11 +452,11 @@ function policyPathsMatch(
   );
 }
 
-async function* securityPolicyPaths(
+async function securityPolicyPaths(
   root: string,
   repositories: readonly string[],
   signal?: AbortSignal,
-): AsyncGenerator<string> {
+): Promise<string[]> {
   const knownRoots = new Set<string>();
   const gitDirectories = new Set<string>();
   const policies: string[] = [];
@@ -553,8 +553,7 @@ async function* securityPolicyPaths(
     }
   }
   // A nested checkout can register a Git directory visited earlier in the walk.
-  for (const path of policies) if (!isGitData(path)) yield path;
-  for (const path of reportingPaths) if (!isGitData(path)) yield path;
+  return [...policies, ...reportingPaths].filter((path) => !isGitData(path));
 }
 
 export async function inspectSecurityPolicyPaths(
@@ -562,7 +561,7 @@ export async function inspectSecurityPolicyPaths(
   signal?: AbortSignal,
 ): Promise<string[]> {
   const paths: string[] = [];
-  for await (const path of securityPolicyPaths(
+  for (const path of await securityPolicyPaths(
     dirname(target.targetPath),
     [target.repository],
     signal,
