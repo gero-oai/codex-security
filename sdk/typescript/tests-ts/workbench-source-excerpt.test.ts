@@ -14,7 +14,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { BUNDLED_PLUGIN_VERSION, bootstrapPlugin } from "../src/index.js";
+import {
+  BUNDLED_PLUGIN_VERSION,
+  bootstrapPlugin,
+  resolveCodexCommand,
+} from "../src/index.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryRoots: string[] = [];
@@ -84,7 +88,7 @@ function collisionRepository(root: string): {
   const sourceTree = tree([
     ["100644", "blob", blob("allowed = True\n"), "allowed.py"],
     ["100644", "blob", blob("another = True\n"), "another.py"],
-    ["100644", "blob", blob("x".repeat(256 * 1024)), "large.py"],
+    ["100644", "blob", blob("x".repeat(2 * 1024 * 1024)), "large.py"],
     ["100644", "blob", blob("case_upper = True\n"), "LOWER.py"],
     ["100644", "blob", blob("case_lower = True\n"), "lower.py"],
     ["100644", "blob", blob("unicode_composed = True\n"), "é.py"],
@@ -188,58 +192,53 @@ function ordinaryRepository(root: string): {
   return { repository, revision: git(repository, ["rev-parse", "HEAD"]) };
 }
 
-async function upgradedPlugin(root: string) {
-  expect(BUNDLED_PLUGIN_VERSION).toBe("0.1.74");
+async function upgradedPlugin(root: string, previousVersion: string) {
   const previous = join(root, "previous-plugin");
   cpSync(PLUGIN_ROOT, previous, { recursive: true });
   const manifestPath = join(previous, ".codex-plugin", "plugin.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
     version: string;
   };
-  manifest.version = "0.1.73";
+  manifest.version = previousVersion;
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+  writeFileSync(
+    join(previous, "scripts", "workbench_source_excerpt.py"),
+    "raise RuntimeError('stale excerpt helper must be replaced')\n",
+  );
 
   const home = join(root, "codex-home");
-  const marketplace = join(home, "sdk-marketplace");
   mkdirSync(home, { mode: 0o700 });
-  const runCodex = async (_command: unknown, args: readonly string[]) => {
-    if (args[1] === "marketplace") {
-      writeFileSync(
-        join(home, "config.toml"),
-        `[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(marketplace)}\n`,
-      );
-      return "";
-    }
-    const selected = join(marketplace, "plugins", "codex-security");
-    const selectedManifest = JSON.parse(
-      readFileSync(join(selected, ".codex-plugin", "plugin.json"), "utf8"),
-    ) as { version: string };
-    const installed = join(home, "installed", selectedManifest.version);
-    rmSync(installed, { recursive: true, force: true });
-    mkdirSync(join(home, "installed"), { recursive: true });
-    cpSync(selected, installed, { recursive: true });
-    return JSON.stringify({
-      installedPath: installed,
-      version: selectedManifest.version,
-    });
+  writeFileSync(
+    join(home, "config.toml"),
+    'cli_auth_credentials_store = "file"\n\n[features]\nplugins = true\n',
+  );
+  const command = resolveCodexCommand();
+  const environment = {
+    ...process.env,
+    CODEX_HOME: home,
+    OPENAI_API_KEY: undefined,
+    CODEX_API_KEY: undefined,
   };
-  const options = {
-    codexCommand: { command: "/synthetic-codex" },
-    runCodex,
-  };
+  const login = spawnSync(command.command, ["login", "--with-api-key"], {
+    env: environment,
+    input: "synthetic-key\n",
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  expect(login.error).toBeUndefined();
+  expect(login.status, login.stderr).toBe(0);
+  const options = { codexCommand: command, environment };
   const predecessor = await bootstrapPlugin(home, previous, options);
   const upgraded = await bootstrapPlugin(home, PLUGIN_ROOT, options);
   const installedMcp = JSON.parse(
     readFileSync(join(upgraded.installedRoot, ".mcp.json"), "utf8"),
   ) as { mcpServers: Record<string, { env_vars?: string[] }> };
-  expect(predecessor.version).toBe("0.1.73");
-  expect(upgraded.version).toBe("0.1.74");
+  expect(predecessor.version).toBe(previousVersion);
+  expect(upgraded.version).toBe(BUNDLED_PLUGIN_VERSION);
   expect(upgraded.installedRoot).not.toBe(predecessor.installedRoot);
-  expect(
-    installedMcp.mcpServers["codex-security"]?.env_vars?.find(
-      (name) => name === "CODEX_SAFETY_IDENTIFIER",
-    ),
-  ).toBe("CODEX_SAFETY_IDENTIFIER");
+  expect(installedMcp.mcpServers["codex-security"]?.env_vars).toContain(
+    "CODEX_SAFETY_IDENTIFIER",
+  );
   expect(
     readFileSync(
       join(upgraded.installedRoot, "scripts", "workbench_source_excerpt.py"),
@@ -247,7 +246,7 @@ async function upgradedPlugin(root: string) {
   ).toEqual(
     readFileSync(join(PLUGIN_ROOT, "scripts", "workbench_source_excerpt.py")),
   );
-  return { predecessor, upgraded };
+  return upgraded.installedRoot;
 }
 
 function collisionProbe(
@@ -499,12 +498,28 @@ subprocess.run(
 before = len(blob_reads)
 try:
     replaced = excerpt("src/allowed.py")
+    replacement_blob_reads = blob_reads[before:]
+    previous_no_replace = os.environ.get("GIT_NO_REPLACE_OBJECTS")
+    try:
+        os.environ["GIT_NO_REPLACE_OBJECTS"] = "1"
+        environment_disabled_excerpt = excerpt("src/allowed.py")
+        environment_disabled_paths = excerpts.capture_source_scopes(repository, identity, ["src"])["paths"]
+    finally:
+        if previous_no_replace is None:
+            os.environ.pop("GIT_NO_REPLACE_OBJECTS", None)
+        else:
+            os.environ["GIT_NO_REPLACE_OBJECTS"] = previous_no_replace
+    subprocess.run(["git", "-C", str(repository), "config", "core.useReplaceRefs", "false"], check=True)
+    try:
+        config_disabled_excerpt = excerpt("src/allowed.py")
+        config_disabled_paths = excerpts.capture_source_scopes(repository, identity, ["src"])["paths"]
+    finally:
+        subprocess.run(["git", "-C", str(repository), "config", "--unset", "core.useReplaceRefs"], check=True)
 finally:
     subprocess.run(
         ["git", "-C", str(repository), "update-ref", "-d", f"refs/replace/{revision}"],
         check=True,
     )
-replacement_blob_reads = blob_reads[before:]
 custom_replacement_base = "refs/synthetic-replacements/"
 custom_replacement_ref = f"{custom_replacement_base}{revision}"
 subprocess.run(
@@ -612,57 +627,40 @@ try:
 finally:
     excerpts.local_git_bytes = original_git
     subprocess.Popen = original_popen
-page_context = excerpts.source_excerpt_context(scan, repository, ["src"])
-page_batch_processes = 0
-page_tree_reads = 0
-original_matching_tree_entries = excerpts.matching_tree_entries
-def watched_page_popen(arguments, *positional, **keywords):
-    global page_batch_processes
-    if "cat-file" in arguments and "--batch" in arguments:
-        page_batch_processes += 1
-    return original_popen(arguments, *positional, **keywords)
-def counted_page_tree(*arguments, **keywords):
-    global page_tree_reads
-    page_tree_reads += 1
-    return original_matching_tree_entries(*arguments, **keywords)
-subprocess.Popen = watched_page_popen
-excerpts.matching_tree_entries = counted_page_tree
-try:
-    page_excerpts = {
-        path: excerpts.finding_source_excerpt_from_context(
-            page_context,
-            [{"path": f"src/{path}", "startLine": 1, "role": "root_control"}],
-        )
-        for path in ("allowed.py", "another.py", "third.py")
-    }
-finally:
-    excerpts.matching_tree_entries = original_matching_tree_entries
-    subprocess.Popen = original_popen
-missing_context = excerpts.source_excerpt_context(scan, repository, ["src"])
-missing_batch_processes = 0
-missing_tree_reads = 0
-def watched_missing_popen(arguments, *positional, **keywords):
-    global missing_batch_processes
-    if "cat-file" in arguments and "--batch" in arguments:
-        missing_batch_processes += 1
-    return original_popen(arguments, *positional, **keywords)
-def counted_missing_tree(*arguments, **keywords):
-    global missing_tree_reads
-    missing_tree_reads += 1
-    return original_matching_tree_entries(*arguments, **keywords)
-subprocess.Popen = watched_missing_popen
-excerpts.matching_tree_entries = counted_missing_tree
-try:
-    missing_excerpts = [
-        excerpts.finding_source_excerpt_from_context(
-            missing_context,
-            [{"path": f"src/missing-{index}.py", "startLine": 1}],
-        )
-        for index in range(3)
-    ]
-finally:
-    excerpts.matching_tree_entries = original_matching_tree_entries
-    subprocess.Popen = original_popen
+def read_excerpt_page(paths):
+    context = excerpts.source_excerpt_context(scan, repository, ["src"])
+    batch_processes = 0
+    tree_reads = 0
+    original_matching_tree_entries = excerpts.matching_tree_entries
+    def watched_page_popen(arguments, *positional, **keywords):
+        nonlocal batch_processes
+        if "cat-file" in arguments and "--batch" in arguments:
+            batch_processes += 1
+        return original_popen(arguments, *positional, **keywords)
+    def counted_page_tree(*arguments, **keywords):
+        nonlocal tree_reads
+        tree_reads += 1
+        return original_matching_tree_entries(*arguments, **keywords)
+    subprocess.Popen = watched_page_popen
+    excerpts.matching_tree_entries = counted_page_tree
+    try:
+        results = {
+            path: excerpts.finding_source_excerpt_from_context(
+                context, [{"path": f"src/{path}", "startLine": 1}]
+            )
+            for path in paths
+        }
+    finally:
+        excerpts.matching_tree_entries = original_matching_tree_entries
+        subprocess.Popen = original_popen
+    return results, batch_processes, tree_reads
+page_excerpts, page_batch_processes, page_tree_reads = read_excerpt_page(
+    ("allowed.py", "another.py", "third.py")
+)
+missing_page, missing_batch_processes, missing_tree_reads = read_excerpt_page(
+    (f"missing-{index}.py" for index in range(3))
+)
+missing_excerpts = list(missing_page.values())
 batch_object = "1" * 40
 entry_object = b"\1" * 20
 wide_tree = b"".join(
@@ -790,6 +788,8 @@ print(json.dumps({
     "broadenedBlobReads": broadened_blob_reads,
     "collisionBlobReads": collision_blob_reads,
     "collisions": collisions,
+    "configDisabledExcerpt": config_disabled_excerpt,
+    "configDisabledPaths": config_disabled_paths,
     "customReplaced": custom_replaced,
     "customReplacementBlobReads": custom_replacement_blob_reads,
     "customReplacementPaths": custom_replacement_paths,
@@ -800,6 +800,8 @@ print(json.dumps({
     "distinctCaseBlobReads": distinct_case_blob_reads,
     "distinctCaseExcerpts": distinct_case_excerpts,
     "duplicatePaths": len(authority["paths"]),
+    "environmentDisabledExcerpt": environment_disabled_excerpt,
+    "environmentDisabledPaths": environment_disabled_paths,
     "fileAuthorityPaths": file_authority["paths"],
     "fileDescendantBlobReads": file_descendant_blob_reads,
     "fileDescendantExcerpt": file_descendant_excerpt,
@@ -868,106 +870,114 @@ print(json.dumps({
 }
 
 describe("workbench source excerpts", () => {
-  test("fails closed on normalized collisions after a cached upgrade", async () => {
-    const root = realpathSync(
-      mkdtempSync(join(tmpdir(), "codex-security-source-collision-")),
-    );
-    temporaryRoots.push(root);
-    const fixture = collisionRepository(root);
-    const installation = await upgradedPlugin(root);
-    const fixed = collisionProbe(installation.upgraded.installedRoot, fixture);
+  test.each(["0.1.60", "0.1.74", "0.1.78"])(
+    "fails closed on normalized collisions after upgrading cache %s",
+    async (previousVersion) => {
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "codex-security-source-collision-")),
+      );
+      temporaryRoots.push(root);
+      const fixture = collisionRepository(root);
+      const installedRoot = await upgradedPlugin(root, previousVersion);
+      const fixed = collisionProbe(installedRoot, fixture);
 
-    expect(fixed).toEqual({
-      allowed: expect.stringContaining("allowed = True"),
-      broadened: null,
-      broadenedBlobReads: [],
-      collisionBlobReads: fixture.caseSensitive
-        ? [expect.any(String), expect.any(String)]
-        : [],
-      collisions: {
-        "src/LOWER.py": fixture.caseSensitive
-          ? expect.stringContaining("case_upper = True")
-          : null,
-        "src/lower.py": fixture.caseSensitive
-          ? expect.stringContaining("case_lower = True")
-          : null,
-        "src/é.py": null,
-        "src/é.py": null,
-        "src/trailing.py": null,
-        "src/trailing.py.": null,
-      },
-      customReplaced: null,
-      customReplacementBlobReads: [],
-      customReplacementPaths: [],
-      deepBatchProcesses: 1,
-      deepExcerpt: expect.stringContaining("deep = True"),
-      deepPathParses: 1,
-      deepTreeReads: 0,
-      distinctCaseBlobReads: [expect.any(String), expect.any(String)],
-      distinctCaseExcerpts: {
-        "src/LOWER.py": expect.stringContaining("case_upper = True"),
-        "src/lower.py": expect.stringContaining("case_lower = True"),
-      },
-      duplicatePaths: 1,
-      fileAuthorityPaths: [{ kind: "file", path: "mismatch" }],
-      fileDescendantBlobReads: [],
-      fileDescendantExcerpt: null,
-      historicalAuthorityPaths: [{ kind: "file", path: "historical" }],
-      historicalExcerpt: expect.stringContaining("historical_file = True"),
-      invalidReplacementBasePaths: [],
-      immutable: {
-        commit: expect.stringContaining("allowed = True"),
-        range: expect.stringContaining("allowed = True"),
-      },
-      largeExcerpt: null,
-      largeBlobStreamed: true,
-      blobMemoryError: null,
-      largeRecipeFits: true,
-      largeTreePathChecks: 0,
-      linkedAuthorityPaths: [],
-      linkedBlobReads: [],
-      linkedExcerpt: null,
-      malformedReplacementPaths: [],
-      invalid: null,
-      legacy: null,
-      malformedRevision: null,
-      missingBatchProcesses: 1,
-      missingExcerpts: [null, null, null],
-      missingTreeReads: 2,
-      mutable: {
-        excerpts: { working_tree: null, None: null },
-        gitCalls: 0,
-      },
-      nestedBlobReads: [],
-      nestedExcerpt: null,
-      orderedExcerpt: expect.stringContaining("allowed = True"),
-      pageBatchProcesses: 1,
-      pageExcerpts: {
-        "allowed.py": expect.stringContaining("allowed = True"),
-        "another.py": expect.stringContaining("another = True"),
-        "third.py": expect.stringContaining("third = True"),
-      },
-      pageTreeReads: 2,
-      subtargetCaseExcerpts: {
-        "LOWER.py": expect.stringContaining("case_upper = True"),
-        "lower.py": expect.stringContaining("case_lower = True"),
-      },
-      subtargetPaths: [{ kind: "directory", path: "." }],
-      subtargetUnicodeAlias: null,
-      outside: null,
-      pathCollisionBlobReads: [],
-      pathCollisionExcerpt: null,
-      pathCollisionPaths: 1,
-      replaced: null,
-      replacementBlobReads: [],
-      replacementMemoryPaths: [],
-      replacementProbeCommands: [
-        ["for-each-ref", "--count=1", "--format=", "refs/replace/*"],
-      ],
-      replacementProbeReadSizes: [1],
-      streamedWideTree: true,
-    });
-  }, 60_000);
+      expect(fixed).toEqual({
+        allowed: expect.stringContaining("allowed = True"),
+        broadened: null,
+        broadenedBlobReads: [],
+        collisionBlobReads: fixture.caseSensitive
+          ? [expect.any(String), expect.any(String)]
+          : [],
+        collisions: {
+          "src/LOWER.py": fixture.caseSensitive
+            ? expect.stringContaining("case_upper = True")
+            : null,
+          "src/lower.py": fixture.caseSensitive
+            ? expect.stringContaining("case_lower = True")
+            : null,
+          "src/é.py": null,
+          "src/é.py": null,
+          "src/trailing.py": null,
+          "src/trailing.py.": null,
+        },
+        customReplaced: null,
+        configDisabledExcerpt: expect.stringContaining("allowed = True"),
+        configDisabledPaths: [{ kind: "directory", path: "src" }],
+        customReplacementBlobReads: [],
+        customReplacementPaths: [],
+        deepBatchProcesses: 1,
+        deepExcerpt: expect.stringContaining("deep = True"),
+        deepPathParses: 1,
+        deepTreeReads: 0,
+        distinctCaseBlobReads: [expect.any(String), expect.any(String)],
+        distinctCaseExcerpts: {
+          "src/LOWER.py": expect.stringContaining("case_upper = True"),
+          "src/lower.py": expect.stringContaining("case_lower = True"),
+        },
+        duplicatePaths: 1,
+        environmentDisabledExcerpt: expect.stringContaining("allowed = True"),
+        environmentDisabledPaths: [{ kind: "directory", path: "src" }],
+        fileAuthorityPaths: [{ kind: "file", path: "mismatch" }],
+        fileDescendantBlobReads: [],
+        fileDescendantExcerpt: null,
+        historicalAuthorityPaths: [{ kind: "file", path: "historical" }],
+        historicalExcerpt: expect.stringContaining("historical_file = True"),
+        invalidReplacementBasePaths: [],
+        immutable: {
+          commit: expect.stringContaining("allowed = True"),
+          range: expect.stringContaining("allowed = True"),
+        },
+        largeExcerpt: null,
+        largeBlobStreamed: true,
+        blobMemoryError: null,
+        largeRecipeFits: true,
+        largeTreePathChecks: 0,
+        linkedAuthorityPaths: [],
+        linkedBlobReads: [],
+        linkedExcerpt: null,
+        malformedReplacementPaths: [],
+        invalid: null,
+        legacy: null,
+        malformedRevision: null,
+        missingBatchProcesses: 1,
+        missingExcerpts: [null, null, null],
+        missingTreeReads: 2,
+        mutable: {
+          excerpts: { working_tree: null, None: null },
+          gitCalls: 0,
+        },
+        nestedBlobReads: [],
+        nestedExcerpt: null,
+        orderedExcerpt: expect.stringContaining("allowed = True"),
+        pageBatchProcesses: 1,
+        pageExcerpts: {
+          "allowed.py": expect.stringContaining("allowed = True"),
+          "another.py": expect.stringContaining("another = True"),
+          "third.py": expect.stringContaining("third = True"),
+        },
+        pageTreeReads: 2,
+        subtargetCaseExcerpts: {
+          "LOWER.py": expect.stringContaining("case_upper = True"),
+          "lower.py": expect.stringContaining("case_lower = True"),
+        },
+        subtargetPaths: [{ kind: "directory", path: "." }],
+        subtargetUnicodeAlias: null,
+        outside: null,
+        pathCollisionBlobReads: [],
+        pathCollisionExcerpt: null,
+        pathCollisionPaths: 1,
+        replaced: null,
+        replacementBlobReads: [],
+        replacementMemoryPaths: [],
+        replacementProbeCommands: [
+          ["for-each-ref", "--count=1", "--format=", "refs/replace/*"],
+        ],
+        replacementProbeReadSizes: [1],
+        streamedWideTree: true,
+      });
+    },
+    60_000,
+  );
 
   test("persists source authority outside every writer transaction", () => {
     const root = realpathSync(
@@ -1075,7 +1085,14 @@ finally:
     replacement.with_name(f"{replacement.name}-original").rename(replacement)
 with sqlite3.connect(workbench_db.database_path()) as connection:
     authorities = {row[0]: json.loads(row[1]) for row in connection.execute("SELECT id, source_scopes_json FROM scans")}
-print(json.dumps({"authorities": authorities, "availableDigestWriters": available_digest_writers, "blockedDigestWriters": blocked_digest_writers, "cli": cli, "deep": deep, "digestTransactionStates": digest_transaction_states, "headless": headless, "prompt": prompt, "raceError": race_error, "replacementError": replacement_error, "transactionStates": transaction_states, "workspace": workspace}))
+scan_ids = {
+    "workspace": workspace["results"]["scanId"],
+    "prompt": prompt["scan"]["scanId"],
+    "headless": headless["scan"]["scanId"],
+    "CLI": cli["scanId"],
+    "deep": deep["deepScan"]["scanId"],
+}
+print(json.dumps({"authorities": authorities, "availableDigestWriters": available_digest_writers, "blockedDigestWriters": blocked_digest_writers, "digestTransactionStates": digest_transaction_states, "raceError": race_error, "replacementError": replacement_error, "transactionStates": transaction_states, "scanIds": scan_ids}))
 `;
     const result = spawnSync(
       python(),
@@ -1104,14 +1121,9 @@ print(json.dumps({"authorities": authorities, "availableDigestWriters": availabl
       ["begin-deep-scan", false],
       ["begin-deep-scan", false],
     ]);
-    expect(writers["digestTransactionStates"]).toEqual([
-      ["begin-deep-scan", false],
-      ["begin-deep-scan", false],
-      ["begin-deep-scan", false],
-      ["begin-deep-scan", false],
-      ["begin-deep-scan", false],
-      ["begin-deep-scan", false],
-    ]);
+    expect(writers["digestTransactionStates"]).toEqual(
+      Array.from({ length: 6 }, () => ["begin-deep-scan", false]),
+    );
     expect(writers["availableDigestWriters"]).toEqual(
       Array.from({ length: 6 }, () => "begin-deep-scan"),
     );
@@ -1130,48 +1142,33 @@ print(json.dumps({"authorities": authorities, "availableDigestWriters": availabl
         version: number;
       }
     >;
-    const workspace = writers["workspace"] as Record<string, unknown>;
-    const prompt = writers["prompt"] as Record<string, unknown>;
-    const headless = writers["headless"] as Record<string, unknown>;
-    const cli = writers["cli"] as Record<string, unknown>;
-    const deep = writers["deep"] as Record<string, unknown>;
-    const workspaceResults = workspace["results"] as Record<string, unknown>;
-    const promptScan = prompt["scan"] as Record<string, unknown>;
-    const headlessScan = headless["scan"] as Record<string, unknown>;
-    const deepScan = deep["deepScan"] as Record<string, unknown>;
+    const scanIds = writers["scanIds"] as Record<string, string>;
     const expected = [
-      [
-        "workspace",
-        workspaceResults["scanId"],
-        [{ kind: "directory", path: "src" }],
-      ],
-      ["prompt", promptScan["scanId"], [{ kind: "directory", path: "src" }]],
-      [
-        "headless",
-        headlessScan["scanId"],
-        [{ kind: "directory", path: "src" }],
-      ],
+      ["workspace", [{ kind: "directory", path: "src" }]],
+      ["prompt", [{ kind: "directory", path: "src" }]],
+      ["headless", [{ kind: "directory", path: "src" }]],
       [
         "CLI",
-        cli["scanId"],
         [
           { kind: "file", path: "src/allowed.py" },
           { kind: "directory", path: "other" },
         ],
       ],
-      ["deep", deepScan["scanId"], [{ kind: "directory", path: "." }]],
+      ["deep", [{ kind: "directory", path: "." }]],
     ] as const;
     expect(Object.keys(authorities)).toHaveLength(expected.length);
-    for (const [writer, scanId, paths] of expected) {
-      const authority = authorities[String(scanId)];
+    for (const [writer, paths] of expected) {
+      const authority = authorities[String(scanIds[writer])];
       expect(authority?.version, writer).toBe(1);
       expect(authority?.targetTree, writer).toMatch(/^[0-9a-f]{40,64}$/);
       expect(authority?.paths, writer).toEqual([...paths]);
     }
   }, 60_000);
 
-  test("migration 33 appends once over the exact predecessor", () => {
-    const program = String.raw`
+  test.each([false, true])(
+    "migration 33 appends once with a preexisting source column: %s",
+    (preexistingColumn) => {
+      const program = String.raw`
 import json, sqlite3, sys
 sys.path.insert(0, sys.argv[1])
 from workbench_schema import MIGRATIONS, apply_migrations
@@ -1190,6 +1187,9 @@ def rows():
 
 predecessor = MIGRATIONS[:-1]
 apply_migrations(connection, predecessor, now, lambda database: None)
+if sys.argv[2] == "true":
+    connection.execute("ALTER TABLE scans ADD COLUMN source_scopes_json TEXT")
+    connection.execute("INSERT INTO schema_migrations VALUES (34, 'persist authorized source excerpt scopes', ?)", (now(),))
 before = rows()
 apply_migrations(connection, MIGRATIONS, now, lambda database: None)
 once = rows()
@@ -1203,28 +1203,40 @@ print(json.dumps({
     "predecessorMax": predecessor[-1][0],
     "beforeVersions": [row[0] for row in before],
     "onceVersions": [row[0] for row in once],
-    "oldRowsPreserved": once[:-1] == before,
+    "oldRowsPreserved": [row for row in once if row[0] != 33] == before,
     "secondApplyUnchanged": twice == once,
     "columnCount": column_count,
-    "newName": once[-1][1],
+    "newName": next(row[1] for row in once if row[0] == 33),
 }))
 `;
-    const result = spawnSync(
-      python(),
-      ["-I", "-B", "-c", program, join(PLUGIN_ROOT, "scripts")],
-      { encoding: "utf8" },
-    );
-    expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({
-      predecessorMax: 32,
-      beforeVersions: [29, 30, 31, 32],
-      onceVersions: [29, 30, 31, 32, 33],
-      oldRowsPreserved: true,
-      secondApplyUnchanged: true,
-      columnCount: 1,
-      newName: "persist selected source excerpt authority",
-    });
-  });
+      const result = spawnSync(
+        python(),
+        [
+          "-I",
+          "-B",
+          "-c",
+          program,
+          join(PLUGIN_ROOT, "scripts"),
+          String(preexistingColumn),
+        ],
+        { encoding: "utf8" },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        predecessorMax: 32,
+        beforeVersions: preexistingColumn
+          ? [29, 30, 31, 32, 34]
+          : [29, 30, 31, 32],
+        onceVersions: preexistingColumn
+          ? [29, 30, 31, 32, 33, 34]
+          : [29, 30, 31, 32, 33],
+        oldRowsPreserved: true,
+        secondApplyUnchanged: true,
+        columnCount: 1,
+        newName: "persist selected source excerpt authority",
+      });
+    },
+  );
 
   test("authorizes raw finding paths before bounding display output", () => {
     const program = String.raw`

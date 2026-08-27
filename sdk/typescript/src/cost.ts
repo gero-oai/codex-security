@@ -477,6 +477,7 @@ function readSessionEvent(
       if (usage !== null) session.inheritedUsage = usage;
     }
     if (payload["type"] === "task_started") {
+      // Fresh Codex worker thread/turn IDs share a same-process monotonic UUIDv7 generator.
       const threadOrder = uuid7Order(session.threadId);
       const turnOrder = uuid7Order(payload["turn_id"]);
       const owned =

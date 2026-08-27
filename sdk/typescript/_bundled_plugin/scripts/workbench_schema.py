@@ -784,6 +784,8 @@ def apply_migrations(
                 repair_thread_scoped_workspaces_migration(connection)
             elif version == 16:
                 should_backfill_targets = repair_stable_targets_migration(connection)
+            elif version == 33:
+                add_column_if_missing(connection, "scans", "source_scopes_json", "TEXT")
             else:
                 for statement in sql_statements(sql):
                     connection.execute(statement)

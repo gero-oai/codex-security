@@ -21,6 +21,7 @@ from unicodedata import normalize
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workbench_constants import GIT_REPOSITORY_ENVIRONMENT
 from workbench_target import (
+    _replacement_refs_enabled,
     clean_worktree_content_digest,
     git_bytes,
     git_worktree_context,
@@ -315,6 +316,8 @@ def tree_path(
 
 
 def replacement_refs_absent(repository: Path) -> bool:
+    if not _replacement_refs_enabled(repository):
+        return True
     replacement_ref_base = os.environ.get("GIT_REPLACE_REF_BASE", "refs/replace/")
     environment = os.environ.copy()
     for variable in GIT_REPOSITORY_ENVIRONMENT:
@@ -574,10 +577,9 @@ def source_excerpt_context(
     if snapshot is not None and snapshot != clean_worktree_content_digest():
         return None
     try:
-        context = load_source_scopes(scan, target, selected_paths)
+        return load_source_scopes(scan, target, selected_paths)
     except (OSError, RuntimeError, SystemExit, UnicodeError, ValueError):
         return None
-    return context
 
 
 def finding_source_excerpt_from_context(
@@ -607,18 +609,13 @@ def finding_source_excerpt_from_context(
             if selected_kinds is not None
             else None
         )
-        object_id = (
-            selected[2]
-            if selected is not None and selected[1] == "file"
-            else None
-        )
-        if object_id is None:
+        if selected is None or selected[1] != "file":
             return None
         end_line = location.get("endLine")
         last_affected_line = end_line if isinstance(end_line, int) else start_line
         return scanned_source_excerpt(
             repository,
-            object_id,
+            selected[2],
             start_line,
             last_affected_line,
         )

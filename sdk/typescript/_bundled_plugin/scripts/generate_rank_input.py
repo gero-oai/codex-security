@@ -44,6 +44,7 @@ from finalize_scan_contract import (
     _open_scan_local_directory,
     _open_verified_scan_directory,
     _windows_scan_local_files,
+    scan_root_identity,
 )
 from rank_preview import (
     DEFAULT_PREVIEW_BYTES,
@@ -329,13 +330,18 @@ def changed_path_parent_is_within_target(path: Path, target: Path) -> bool:
     return False
 
 
-def _open_windows_changed_path_descriptor(target: Path, relative_path: Path) -> int:
+def _open_windows_changed_path_descriptor(
+    target: Path, relative_path: Path, expected_root_identity: tuple[int, int] | None
+) -> int:
     """Preserve ordinary missing-leaf behavior without relaxing parent checks."""
 
     expected_path = target / relative_path
     try:
         return _windows_scan_local_files().open_read_fd(
-            target, relative_path.as_posix(), "changed Git working-tree path"
+            target,
+            relative_path.as_posix(),
+            "changed Git working-tree path",
+            expected_root_identity=expected_root_identity,
         )
     except OSError as error:
         if error.filename is None or os.path.normcase(
@@ -352,7 +358,11 @@ def _open_windows_changed_path_descriptor(target: Path, relative_path: Path) -> 
 
 
 def preview_for_changed_path(
-    path: Path, target: Path, preview_bytes: int
+    path: Path,
+    target: Path,
+    preview_bytes: int,
+    *,
+    expected_root_identity: tuple[int, int] | None,
 ) -> tuple[str, bool]:
     """Bind working-tree reads to the checked repository and parent identities."""
 
@@ -364,10 +374,10 @@ def preview_for_changed_path(
     try:
         if os.name == "nt":
             descriptor = _open_windows_changed_path_descriptor(
-                target, relative_parent / path.name
+                target, relative_parent / path.name, expected_root_identity
             )
         elif _descriptor_relative_reads_available():
-            root_descriptor = _open_verified_scan_directory(target)
+            root_descriptor = _open_verified_scan_directory(target, expected_root_identity)
             try:
                 try:
                     parent_descriptor = _open_scan_local_directory(
@@ -393,12 +403,15 @@ def preview_for_changed_path(
         else:
             raise OSError("changed Git working-tree input requires secure file operations")
 
-        with os.fdopen(descriptor, "rb") as source:
-            descriptor = None
-            sample = source.read(4096)
-            if is_binary_sample(sample):
-                return "", True
-            data = sample + source.read()
+        try:
+            with os.fdopen(descriptor, "rb") as source:
+                descriptor = None
+                sample = source.read(4096)
+                if is_binary_sample(sample):
+                    return "", True
+                data = sample + source.read()
+        except OSError:
+            return "", True
         return preview_for_bytes(path, data, preview_bytes)
     finally:
         if descriptor is not None:
@@ -796,6 +809,7 @@ def make_diff_rank_input(args: argparse.Namespace) -> None:
     if not repo.is_dir():
         raise SystemExit(f"Repo path not found: {repo}")
 
+    root_identity = scan_root_identity(repo)[1] if args.mode != "revisions" else None
     changed = [
         (path, status)
         for path, status in git_changed_paths(repo, args.base, args.head, args.mode)
@@ -848,7 +862,7 @@ def make_diff_rank_input(args: argparse.Namespace) -> None:
         elif path.is_file():
             try:
                 preview, is_binary = preview_for_changed_path(
-                    path, repo, args.preview_bytes
+                    path, repo, args.preview_bytes, expected_root_identity=root_identity
                 )
             except (FileNotFoundError, PermissionError):
                 continue
