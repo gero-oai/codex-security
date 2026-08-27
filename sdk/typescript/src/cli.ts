@@ -5278,7 +5278,23 @@ async function createPatchPullRequest(
         "The repository HEAD changed after independent review. Review the patch again before publishing.",
       );
     }
-    await run("git", [...filterArguments, "switch", "-c", branch]);
+    const branchReference = `refs/heads/${branch}`;
+    if (head === undefined) {
+      const existingBranch = await run("git", [
+        "rev-parse",
+        "--verify",
+        branchReference,
+      ]).catch(() => undefined);
+      if (existingBranch !== undefined) {
+        throw new CodexSecurityError(
+          "The patch branch already exists. Review it before publishing.",
+        );
+      }
+      await run("git", ["symbolic-ref", "HEAD", branchReference]);
+    } else {
+      await run("git", ["branch", "--no-track", branch, head]);
+      await run("git", ["symbolic-ref", "HEAD", branchReference]);
+    }
     await runWithTemporaryIndex([
       ...filterArguments,
       "commit",
