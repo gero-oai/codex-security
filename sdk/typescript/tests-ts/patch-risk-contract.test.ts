@@ -226,6 +226,16 @@ describe("patch risk assessment contract", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
+  test("compares JSON numeric constants by value", () => {
+    const serialized = JSON.stringify(assessment()).replace(
+      '"schemaVersion":1',
+      '"schemaVersion":1.0',
+    );
+
+    const result = validateText(serialized);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
   test("enforces strict auto-merge gates", () => {
     const payload = assessment();
     payload.workflowLabel = "auto_merge_candidate";
