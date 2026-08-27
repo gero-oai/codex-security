@@ -48,7 +48,7 @@ For each material changed boundary, record:
 
 When a decision depends on a complete enum, allowlist, routing table, protocol matrix, identity class, state transition, or similar bounded domain, derive the partitions from an independent contract or an exhaustive self-contained new contract. Representative tests are not proof of completeness.
 
-When a patch newly rejects inputs or narrows an existing contract, derive at least one legitimate control from exact-base source or callers outside the patch's own tests. Mark the boundary contradicted when the head rejects an independently evidenced supported control.
+For confirmed applicability, when a patch newly rejects inputs or narrows an existing contract, derive at least one legitimate control from exact-base source or callers outside the patch's own tests. Mark the boundary contradicted when the head rejects an independently evidenced supported control.
 
 When behavior derives a new target or reuses saved authority, independently classify the derived URL, callback, nested resource, cached principal, historical object, retry, replay, or re-execution at the consuming policy decision. Inherited trust is not evidence of safety.
 
