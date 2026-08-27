@@ -2107,7 +2107,7 @@ export async function main(
     output: z.record(z.string(), z.unknown()).optional(),
     async run({ args, format, formatExplicit, options }) {
       const controller = new AbortController();
-      const publishingToCloud = options.to === "cloud" && !options.dryRun;
+      let publishingToCloud = false;
       const publicationErrorMessage = (error: unknown): string =>
         publishingToCloud &&
         controller.signal.aborted &&
@@ -2244,6 +2244,7 @@ export async function main(
           observingSignals = true;
         }
         if (csvPath !== undefined) {
+          publishingToCloud = !options.dryRun;
           const result = await (
             dependencies.publishFindingsCsvToCloud ?? publishFindingsCsvToCloud
           )(csvPath, {
@@ -2472,6 +2473,7 @@ export async function main(
           }
           scanDir = selectedScans[0]!.scanDir;
           controller.signal.throwIfAborted();
+          publishingToCloud = !options.dryRun;
           if (selectedScans.length > 1) {
             cloudBatch = {
               results: [],
