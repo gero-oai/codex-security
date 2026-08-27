@@ -12,14 +12,12 @@ function headerText(header, start, end) {
 }
 
 function canonicalSize(header) {
-  const field = header.subarray(124, 136);
-  if (
-    !field.subarray(0, 11).every((byte) => byte >= 0x30 && byte <= 0x37) ||
-    field[11] !== 0x20
-  ) {
+  const field = header.subarray(124, 136).toString("latin1");
+  // pnpm and npm use different space/NUL terminators for their octal sizes.
+  if (!/^(?:[0-7]{11} |[0-7]{10} \0)$/u.test(field)) {
     invalidTarEntry();
   }
-  return Number.parseInt(field.subarray(0, 11).toString("ascii"), 8);
+  return Number.parseInt(field, 8);
 }
 
 export function plainTarEntries(archiveBytes) {

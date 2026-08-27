@@ -15,6 +15,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { describe, expect, test } from "bun:test";
+import { archive, octal, tarRecord } from "./package-tar-fixtures.js";
 
 const { regularTarListingLines } = (await import(
   new URL("../scripts/package-tar-listing.mjs", import.meta.url).href
@@ -23,38 +24,7 @@ const { packageDistFiles } = (await import(
   new URL("../scripts/package-dist-files.mjs", import.meta.url).href
 )) as { packageDistFiles: readonly string[] };
 
-const blockSize = 512;
-
-function octal(value: number, width: number, terminator = "\0"): Buffer {
-  return Buffer.from(
-    value.toString(8).padStart(width - terminator.length, "0") + terminator,
-  );
-}
-
-function tarRecord(path: string, contents: Buffer, mode = 0o644): Buffer {
-  const header = Buffer.alloc(blockSize);
-  header.write(path, 0, 100, "utf8");
-  octal(mode, 8).copy(header, 100);
-  octal(0, 8).copy(header, 108);
-  octal(0, 8).copy(header, 116);
-  octal(contents.length, 12, " ").copy(header, 124);
-  octal(0, 12).copy(header, 136);
-  header.fill(0x20, 148, 156);
-  header[156] = 0x30;
-  header.write("ustar\0", 257, "binary");
-  header.write("00", 263, "binary");
-  const checksum = header.reduce((sum, byte) => sum + byte, 0);
-  Buffer.from(checksum.toString(8).padStart(6, "0") + "\0 ").copy(header, 148);
-  return Buffer.concat([
-    header,
-    contents,
-    Buffer.alloc(
-      Math.ceil(contents.length / blockSize) * blockSize - contents.length,
-    ),
-  ]);
-}
-
-function packageTar(trailingZeroBytes = 0): Buffer {
+function packageTar(trailingZeroBytes = 0, sizeTerminator = " "): Buffer {
   const paths = [
     "package/package.json",
     "package/README.md",
@@ -75,16 +45,13 @@ function packageTar(trailingZeroBytes = 0): Buffer {
         : path.endsWith(".json") || path.endsWith(".map")
           ? Buffer.from("{}\n")
           : Buffer.from("fixture\n");
-    return tarRecord(
-      path,
-      contents,
-      path === "package/bin/codex-security.mjs" ? 0o755 : 0o644,
-    );
+    return tarRecord(contents, {
+      name: path,
+      mode: path === "package/bin/codex-security.mjs" ? 0o755 : 0o644,
+      sizeField: octal(contents.length, 12, sizeTerminator),
+    });
   });
-  return Buffer.concat([
-    ...records,
-    Buffer.alloc(blockSize * 2 + trailingZeroBytes),
-  ]);
+  return archive(...records, Buffer.alloc(trailingZeroBytes));
 }
 
 function commandPath(command: string): string {
@@ -129,6 +96,7 @@ describe("npm package tar listings", () => {
       const archives = [
         ["default", gzipSync(tarBytes)],
         ["level-0", gzipSync(tarBytes, { level: 0 })],
+        ["npm-size-field", gzipSync(packageTar(0, " \0"))],
       ] as const;
       expect(archives[0][1].length).toBeLessThan(1024 * 1024);
       expect(archives[1][1].length).toBeGreaterThan(31 * 1024 * 1024);
