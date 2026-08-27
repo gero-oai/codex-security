@@ -27,19 +27,15 @@ function pythonExecutable(): string | null {
   );
 }
 
-function trustedGit(): string {
-  const executable = Bun.which("git");
-  expect(executable).not.toBeNull();
-  if (executable === null) throw new Error("Git is required for diff tests.");
-  return realpathSync(executable);
-}
-
 function pythonEnvironment(
   overrides: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
+  const executable = Bun.which("git");
+  expect(executable).not.toBeNull();
+  if (executable === null) throw new Error("Git is required for diff tests.");
   return {
     ...process.env,
-    CODEX_SECURITY_GIT: trustedGit(),
+    CODEX_SECURITY_GIT: realpathSync(executable),
     ...overrides,
   };
 }

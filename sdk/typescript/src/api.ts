@@ -717,11 +717,10 @@ export class CodexSecurity {
         options.auth,
         modelProvider,
       );
-      const gitProtectedRoot = await outermostGitMarkerRoot(repo, signal);
       let git = await inspectTrustedExecutable(
         "git",
         pluginEnvironment,
-        gitProtectedRoot,
+        await outermostGitMarkerRoot(repo, signal),
       );
       for (const source of knowledgeBase?.sources ?? []) {
         const sourceDirectory = (await lstat(source)).isDirectory()
