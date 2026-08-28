@@ -133,6 +133,7 @@ import {
   canonicalizeModelSafePath,
   codexSecurityCredentialHome,
   codexSecurityStateDirectory,
+  executablePathForSpawn,
   expandHome,
   prepareCodexSecurityCredentialHome,
   pythonUtf8Environment,
@@ -1352,7 +1353,7 @@ export async function runCodexSkillCommand(
       expandHome(configuredHome, processEnvironment),
     );
   }
-  const invocation = spawn(command.command, [...args], {
+  const invocation = spawn(executablePathForSpawn(command.command), [...args], {
     env: environment,
     cwd: output?.appServer?.directory ?? parse(process.execPath).root,
     stdio:

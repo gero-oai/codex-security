@@ -2,10 +2,11 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
 import { CodexReviewRunner } from "../src/deduplication/codex-review.js";
+import { resolveCodexCommand } from "../src/runtime.js";
 
 const fixture = fileURLToPath(
   new URL("fixtures/codex-review.mjs", import.meta.url),
@@ -40,7 +41,13 @@ for (const scenario of [
           CODEX_HOME: modelHome,
           OPENAI_API_KEY: "synthetic-review-key",
         },
-        (_command, commandArgs, options) => {
+        (command, commandArgs, options) => {
+          const selected = resolveCodexCommand({}).command;
+          expect(command).toBe(
+            process.platform === "win32"
+              ? win32.toNamespacedPath(selected)
+              : selected,
+          );
           args = commandArgs;
           directory = options.env!["CODEX_SQLITE_HOME"];
           expect(options.cwd).toBe(checkout);
