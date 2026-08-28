@@ -1,12 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import { CodexReviewRunner } from "../src/deduplication/codex-review.js";
 import { environmentEntry } from "../src/scan-comparison.js";
+import { runTestInSubprocess } from "./support/test-subprocess.js";
 
 const fixture = fileURLToPath(
   new URL("fixtures/codex-review.mjs", import.meta.url),
@@ -16,8 +17,8 @@ const transportCases: {
   scenario: string;
   name?: string;
   environmentNames?: readonly [string, string, string];
+  extraEnvironment?: Record<string, string>;
   windowsOnly?: boolean;
-  windowsSandbox?: "elevated";
 }[] = [
   ...["correction", "text-only", "failed-turn", "exit", "cancel"].map(
     (scenario) => ({ scenario }),
@@ -34,10 +35,18 @@ const transportCases: {
     environmentNames: ["Codex_Home", "Codex_Api_Key", "Gh_Config_Dir"],
     windowsOnly: true,
   },
+  ...["", " \t"].map((value) => ({
+    scenario: "correction",
+    name: `${value === "" ? "empty" : "blank"} OpenAI key uses Codex key`,
+    environmentNames: ["CODEX_HOME", "CODEX_API_KEY", "GH_CONFIG_DIR"] as const,
+    extraEnvironment: { OPENAI_API_KEY: value },
+  })),
   {
     scenario: "correction",
-    name: "configured Windows sandbox",
-    windowsSandbox: "elevated",
+    name: "empty Windows OpenAI alias uses Codex key",
+    environmentNames: ["Codex_Home", "Codex_Api_Key", "Gh_Config_Dir"],
+    extraEnvironment: { openai_api_key: "" },
+    windowsOnly: true,
   },
 ];
 
@@ -45,8 +54,8 @@ for (const {
   scenario,
   name = scenario,
   environmentNames = ["CODEX_HOME", "OPENAI_API_KEY", "GH_CONFIG_DIR"],
+  extraEnvironment,
   windowsOnly = false,
-  windowsSandbox,
 } of transportCases) {
   const runCase = test.skipIf(windowsOnly && process.platform !== "win32");
   runCase(`Codex review transport: ${name}`, async () => {
@@ -60,9 +69,6 @@ for (const {
     const controller = new AbortController();
     try {
       const configuration =
-        (windowsSandbox === undefined
-          ? ""
-          : `[windows]\nsandbox = "${windowsSandbox}"\n\n`) +
         '[mcp_servers.synthetic]\ncommand = "synthetic-unused-command"\n';
       await writeFile(join(modelHome, "config.toml"), configuration);
       const [homeName, keyName, ghName] = environmentNames;
@@ -75,6 +81,7 @@ for (const {
           [homeName]: modelHome,
           [keyName]: "synthetic-review-key",
           [ghName]: ghConfig,
+          ...extraEnvironment,
         },
         (_command, commandArgs, options) => {
           args = commandArgs;
@@ -140,18 +147,20 @@ for (const {
       expect(permissions).toContain(
         `${JSON.stringify(resolve(ghConfig))}="deny"`,
       );
-      if (windowsSandbox !== undefined) {
-        expect(
-          args.some((argument) => /^windows\.sandbox\s*=/u.test(argument)),
-        ).toBe(false);
-        expect(await readFile(join(modelHome, "config.toml"), "utf8")).toBe(
-          configuration,
-        );
+      if (scenario !== "cancel") {
+        const loginRequest = (await readFile(transcript, "utf8"))
+          .trim()
+          .split("\n")
+          .map(
+            (line) =>
+              JSON.parse(line) as {
+                method?: string;
+                params?: { apiKey?: string };
+              },
+          )
+          .find((message) => message.method === "account/login/start");
+        expect(loginRequest?.params?.apiKey).toBe("synthetic-review-key");
       }
-      if (scenario !== "cancel")
-        expect(await readFile(transcript, "utf8")).toContain(
-          '"method":"account/login/start"',
-        );
       expect(existsSync(join(modelHome, "auth.json"))).toBe(false);
       expect(child!.exitCode !== null || child!.signalCode !== null).toBe(true);
       expect(existsSync(directory!)).toBe(false);
@@ -163,6 +172,77 @@ for (const {
     }
   });
 }
+
+test("empty credential paths use default directories without denying cwd", async () => {
+  if (
+    runTestInSubprocess(
+      import.meta.path,
+      "empty credential paths use default directories without denying cwd",
+    )
+  ) {
+    return;
+  }
+  const comparison = { ...(await import("../src/scan-comparison.js")) };
+  const root = await mkdtemp(join(tmpdir(), "codex-review-empty-paths-"));
+  const checkout = await mkdtemp(join(tmpdir(), "codex-review-source-"));
+  // An empty CODEX_HOME makes native Codex use the real user profile.
+  mock.module("../src/scan-comparison.js", () => ({
+    ...comparison,
+    disabledMcpServers: async () => ({}),
+  }));
+  try {
+    const names: [string, string][] = [["CODEX_HOME", "GH_CONFIG_DIR"]];
+    if (process.platform === "win32")
+      names.push(["codex_home", "Gh_Config_Dir"]);
+    for (const [homeName, ghName] of names) {
+      let args: readonly string[] = [];
+      const runner = new CodexReviewRunner(
+        {
+          CODEX_CLI_PATH: process.execPath,
+          CODEX_SECURITY_STATE_DIR: join(root, "state"),
+          OPENAI_API_KEY: "synthetic-review-key",
+          [homeName]: "",
+          [ghName]: "",
+        },
+        (_command, commandArgs) => {
+          args = commandArgs;
+          throw new Error("Synthetic stop after permission configuration");
+        },
+        undefined,
+        checkout,
+      );
+      await expect(
+        runner.run({
+          model: "gpt-5.6-sol",
+          effort: "ultra",
+          prompt: "Review the supplied synthetic reports.",
+          schema: {},
+          validate: (value) => value,
+        }),
+      ).rejects.toThrow(
+        "Codex did not complete a validated deduplication review",
+      );
+      const permissions = args.find((argument) =>
+        argument.startsWith("permissions.codex_security_review="),
+      );
+      for (const path of [
+        join(homedir(), ".codex"),
+        join(homedir(), ".config", "gh"),
+      ]) {
+        expect(permissions).toContain(
+          `${JSON.stringify(resolve(path))}="deny"`,
+        );
+      }
+      expect(permissions).not.toContain(
+        `${JSON.stringify(resolve(""))}="deny"`,
+      );
+    }
+  } finally {
+    mock.module("../src/scan-comparison.js", () => comparison);
+    await rm(root, { recursive: true, force: true });
+    await rm(checkout, { recursive: true, force: true });
+  }
+});
 
 test("environment lookups preserve platform case rules and exact-key precedence", () => {
   const aliases = { codex_home: "synthetic-alias" };

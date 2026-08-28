@@ -82,9 +82,10 @@ export class CodexReviewRunner {
         environment,
         { workingDirectory: this.workingDirectory, signal: this.signal },
       );
-      const apiKey =
-        environmentEntry(environment, "OPENAI_API_KEY") ??
-        environmentEntry(environment, "CODEX_API_KEY");
+      const apiKey = [
+        environmentEntry(environment, "OPENAI_API_KEY"),
+        environmentEntry(environment, "CODEX_API_KEY"),
+      ].find((value) => value?.trim());
       const args = ["app-server", "--stdio", "--disable", "plugins"];
       const stateDatabase = join(
         codexSecurityStateDirectory(environment),
@@ -92,11 +93,11 @@ export class CodexReviewRunner {
       );
       const privatePaths = new Set(
         [
-          environmentEntry(environment, "CODEX_HOME") ??
+          environmentEntry(environment, "CODEX_HOME") ||
             join(homedir(), ".codex"),
           codexSecurityCredentialHome(environment),
           join(homedir(), ".ssh"),
-          environmentEntry(environment, "GH_CONFIG_DIR") ??
+          environmentEntry(environment, "GH_CONFIG_DIR") ||
             join(homedir(), ".config", "gh"),
           stateDatabase,
           `${stateDatabase}-wal`,
@@ -111,6 +112,8 @@ export class CodexReviewRunner {
         `permissions.codex_security_review={extends=":read-only",filesystem={${[...privatePaths].map((path) => `${JSON.stringify(path)}="deny"`).join(",")}}}`,
         "--config",
         `sqlite_home=${JSON.stringify(directory)}`,
+        "--config",
+        'windows.sandbox="unelevated"',
       );
       if (apiKey)
         args.push("--config", 'cli_auth_credentials_store="ephemeral"');
