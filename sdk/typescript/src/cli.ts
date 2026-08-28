@@ -239,6 +239,7 @@ const EXPORT_DEFAULT_OUTPUTS = {
   sarif: "results.sarif",
 } as const;
 const VALUE_OPTIONS = new Set([
+  "--port",
   "--workflow-id",
   "--auth",
   "--safety-identifier",
@@ -4360,10 +4361,26 @@ export async function main(
         "Start the findings HTTP service (HOST=127.0.0.1, PORT=3000).",
       destructive: true,
       mcp: false,
-      async run() {
+      options: z.object({
+        port: z
+          .number()
+          .int()
+          .min(0)
+          .max(65535)
+          .optional()
+          .describe(
+            "Listen port (default: PORT or 3000; 0 picks a free port).",
+          ),
+      }),
+      async run({ options }) {
         try {
           const { serveFindings } = await import("./server/serve.js");
-          await serveFindings(dependencies.environment, output);
+          await serveFindings(
+            options.port === undefined
+              ? dependencies.environment
+              : { ...dependencies.environment, PORT: String(options.port) },
+            output,
+          );
         } catch (error) {
           errorOutput.write(`codex-security: ${errorMessage(error)}\n`);
           exitCode = 1;

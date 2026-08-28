@@ -11,9 +11,15 @@ import { capture, dependencies } from "./cli-fixtures.js";
 const packageRoot = join(import.meta.dir, "..");
 const cli = join(packageRoot, "src", "cli.ts");
 
-for (const [name, args] of [
-  ["CLI", [cli, "serve"]],
-  ["standalone entrypoint", [join(packageRoot, "src", "server", "index.ts")]],
+for (const [name, args, port] of [
+  ["CLI", [cli, "serve"], "0"],
+  ["CLI --port overrides PORT", [cli, "serve", "--port", "0"], "invalid"],
+  ["CLI --port=0 overrides PORT", [cli, "serve", "--port=0"], "invalid"],
+  [
+    "standalone entrypoint",
+    [join(packageRoot, "src", "server", "index.ts")],
+    "0",
+  ],
 ] as const) {
   test(`${name} serves findings with isolated state and shuts down`, async () => {
     const root = await mkdtemp(join(tmpdir(), "codex-security-serve-"));
@@ -23,7 +29,7 @@ for (const [name, args] of [
         ...process.env,
         CODEX_SECURITY_STATE_DIR: state,
         HOST: "127.0.0.1",
-        PORT: "0",
+        PORT: port,
         OPENAI_API_KEY: "",
         CODEX_API_KEY: "",
       },
@@ -99,7 +105,13 @@ test("serve exposes help and schema without starting the service", async () => {
       0,
     );
     if (args.includes("--schema")) {
-      expect(JSON.parse(stdout.text())).toEqual({});
+      expect(JSON.parse(stdout.text())).toMatchObject({
+        options: {
+          properties: {
+            port: { type: "integer", minimum: 0, maximum: 65535 },
+          },
+        },
+      });
     } else {
       expect(stdout.text()).toContain("serve");
     }
@@ -119,5 +131,18 @@ test("serve rejects positional arguments and JSON output", async () => {
     );
     expect(stdout.text()).toBe("");
     expect(stderr.text()).toContain("serve");
+  }
+});
+
+test("serve rejects missing or invalid ports", async () => {
+  for (const value of [undefined, "invalid", "-1", "65536", "1.5"]) {
+    const stdout = capture();
+    const stderr = capture();
+    const args = ["serve", "--port", ...(value === undefined ? [] : [value])];
+    expect(await main(args, stdout.stream, stderr.stream, dependencies())).toBe(
+      2,
+    );
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain("port");
   }
 });
