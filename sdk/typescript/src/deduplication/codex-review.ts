@@ -10,6 +10,7 @@ import { createInterface } from "node:readline";
 import {
   comparisonEnvironment,
   disabledMcpServers,
+  environmentEntry,
 } from "../scan-comparison.js";
 import {
   codexSecurityCredentialHome,
@@ -82,7 +83,8 @@ export class CodexReviewRunner {
         { workingDirectory: this.workingDirectory, signal: this.signal },
       );
       const apiKey =
-        environment["OPENAI_API_KEY"] ?? environment["CODEX_API_KEY"];
+        environmentEntry(environment, "OPENAI_API_KEY") ??
+        environmentEntry(environment, "CODEX_API_KEY");
       const args = ["app-server", "--stdio", "--disable", "plugins"];
       const stateDatabase = join(
         codexSecurityStateDirectory(environment),
@@ -90,10 +92,12 @@ export class CodexReviewRunner {
       );
       const privatePaths = new Set(
         [
-          environment["CODEX_HOME"] ?? join(homedir(), ".codex"),
+          environmentEntry(environment, "CODEX_HOME") ??
+            join(homedir(), ".codex"),
           codexSecurityCredentialHome(environment),
           join(homedir(), ".ssh"),
-          environment["GH_CONFIG_DIR"] ?? join(homedir(), ".config", "gh"),
+          environmentEntry(environment, "GH_CONFIG_DIR") ??
+            join(homedir(), ".config", "gh"),
           stateDatabase,
           `${stateDatabase}-wal`,
           `${stateDatabase}-shm`,
@@ -107,8 +111,6 @@ export class CodexReviewRunner {
         `permissions.codex_security_review={extends=":read-only",filesystem={${[...privatePaths].map((path) => `${JSON.stringify(path)}="deny"`).join(",")}}}`,
         "--config",
         `sqlite_home=${JSON.stringify(directory)}`,
-        "--config",
-        'windows.sandbox="unelevated"',
       );
       if (apiKey)
         args.push("--config", 'cli_auth_credentials_store="ephemeral"');
