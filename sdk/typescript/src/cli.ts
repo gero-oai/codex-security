@@ -4355,6 +4355,21 @@ export async function main(
         }
       },
     })
+    .command("serve", {
+      description:
+        "Start the findings HTTP service (HOST=127.0.0.1, PORT=3000).",
+      destructive: true,
+      mcp: false,
+      async run() {
+        try {
+          const { serveFindings } = await import("./server/serve.js");
+          await serveFindings(dependencies.environment, output);
+        } catch (error) {
+          errorOutput.write(`codex-security: ${errorMessage(error)}\n`);
+          exitCode = 1;
+        }
+      },
+    })
     .command("info", {
       description: "Show read-only SDK and bundled-plugin metadata.",
       mcp: {
@@ -4634,6 +4649,7 @@ function validateCliArguments(
       "patch",
       "login",
       "logout",
+      "serve",
       "info",
     ].includes(value),
   );
@@ -4652,7 +4668,7 @@ function validateCliArguments(
   );
   if (
     structuredOutput &&
-    ["validate", "login", "logout"].includes(command) &&
+    ["validate", "login", "logout", "serve"].includes(command) &&
     !argv.includes("--schema")
   ) {
     return `${command} does not support noninteractive JSON output; run it without --json, --format json, or --format jsonl.`;
@@ -4765,7 +4781,7 @@ function validateCliArguments(
     command !== "verify-fix" &&
     command !== "patch" &&
     positionals.length >
-      (command === "logout" || command === "info"
+      (command === "logout" || command === "info" || command === "serve"
         ? 0
         : subcommand === "compare" || subcommand === "match"
           ? 2
