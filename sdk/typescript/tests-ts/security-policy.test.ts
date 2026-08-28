@@ -512,7 +512,7 @@ describe("security policy generation", () => {
     expect(await readdir(f.outputDir)).not.toContain("policy-draft.json");
   });
 
-  test("rejects empty or oversized policy documents", async () => {
+  test("retains completed evidence without saving invalid policy documents", async () => {
     for (const markdown of [
       "",
       " \n\t",
@@ -529,6 +529,11 @@ describe("security policy generation", () => {
         }),
       ).rejects.toThrow();
       expect(await readdir(f.repository)).toEqual([]);
+      expect((await readdir(f.outputDir)).sort()).toEqual([
+        "THREAT_MODEL.md",
+        "previous-SECURITY.md",
+        "project-spec.md",
+      ]);
     }
   });
 

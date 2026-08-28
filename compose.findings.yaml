@@ -1,0 +1,14 @@
+services:
+  findings:
+    image: ${CODEX_SECURITY_FINDINGS_IMAGE:-ghcr.io/openai/codex-security-findings:latest}
+    init: true
+    environment:
+      OPENAI_API_KEY:
+      CODEX_API_KEY:
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - findings-state:/state
+
+volumes:
+  findings-state:
