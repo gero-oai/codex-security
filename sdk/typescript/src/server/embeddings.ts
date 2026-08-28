@@ -14,6 +14,20 @@ export interface FindingEmbedder {
   embed(findings: readonly Finding[]): Promise<FindingEmbedding[]>;
 }
 
+export interface OpenAiFindingEmbedderOptions {
+  /** Resolve a fresh credential before each HTTP batch, or supply a static key. */
+  apiKey: string | (() => Promise<string>);
+  /** Complete API base, including any path prefix. Defaults to https://api.openai.com/v1. */
+  baseUrl?: string;
+  /** Additional headers. Authorization and Content-Type are set by the embedder. */
+  headers?: Record<string, string>;
+}
+
+export type EmbeddingRequest = (
+  url: string,
+  init: RequestInit,
+) => Promise<Response>;
+
 interface Chunk {
   findingIndex: number;
   tokens: number[];
@@ -21,14 +35,25 @@ interface Chunk {
 
 export class OpenAiFindingEmbedder implements FindingEmbedder {
   private readonly encoding = new Tiktoken(cl100kBase);
+  private readonly apiKey: OpenAiFindingEmbedderOptions["apiKey"] | undefined;
+  private readonly endpoint: string;
+  private readonly headers: Record<string, string> | undefined;
 
+  constructor(apiKey: string | undefined, request?: EmbeddingRequest);
   constructor(
-    private readonly apiKey: string | undefined,
-    private readonly request: (
-      url: string,
-      init: RequestInit,
-    ) => Promise<Response> = fetch,
-  ) {}
+    options: OpenAiFindingEmbedderOptions,
+    request?: EmbeddingRequest,
+  );
+  constructor(
+    options: string | undefined | OpenAiFindingEmbedderOptions,
+    private readonly request: EmbeddingRequest = fetch,
+  ) {
+    const configured: Partial<OpenAiFindingEmbedderOptions> =
+      typeof options === "object" ? options : { apiKey: options };
+    this.apiKey = configured.apiKey;
+    this.endpoint = `${(configured.baseUrl ?? "https://api.openai.com/v1").replace(/\/+$/u, "")}/embeddings`;
+    this.headers = configured.headers;
+  }
 
   async embed(findings: readonly Finding[]): Promise<FindingEmbedding[]> {
     if (findings.length === 0) return [];
@@ -79,18 +104,22 @@ export class OpenAiFindingEmbedder implements FindingEmbedder {
   ): Promise<void> {
     let response: Response;
     try {
-      response = await this.request("https://api.openai.com/v1/embeddings", {
+      const body = JSON.stringify({
+        model: EMBEDDING_MODEL,
+        dimensions: EMBEDDING_DIMENSIONS,
+        encoding_format: "float",
+        input: chunks.map(({ tokens }) => tokens),
+      });
+      const apiKey =
+        typeof this.apiKey === "function" ? await this.apiKey() : this.apiKey;
+      if (!apiKey?.trim()) throw new Error("Missing embedding credential");
+      const headers = new Headers(this.headers);
+      headers.set("Authorization", `Bearer ${apiKey}`);
+      headers.set("Content-Type", "application/json");
+      response = await this.request(this.endpoint, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: EMBEDDING_MODEL,
-          dimensions: EMBEDDING_DIMENSIONS,
-          encoding_format: "float",
-          input: chunks.map(({ tokens }) => tokens),
-        }),
+        headers,
+        body,
       });
     } catch {
       throw new FindingsError(

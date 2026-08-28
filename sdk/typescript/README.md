@@ -1357,6 +1357,8 @@ their vectors are combined by token weight and normalized. Requests respect
 the provider's 8,192-token input, 300,000-token request, and 2,048-input limits.
 See the [embedding API contract](https://developers.openai.com/api/reference/resources/embeddings/methods/create).
 
+`@openai/codex-security/server` exposes the findings server and an embedder with configurable `baseUrl`, headers, and an API-key callback resolved before each batch.
+
 Storage initializes before the server listens. The SQLite adapter reuses the
 bundled workbench's schema and migrations at
 `$CODEX_SECURITY_STATE_DIR/workbench.sqlite3`. An append-only migration adds

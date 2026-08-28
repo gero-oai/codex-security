@@ -10,6 +10,30 @@ import {
 
 const LOGIN_CHILD_TERMINATION_GRACE_MS = 1_000;
 
+/** @internal */
+export function environmentEntry(
+  environment: ProcessEnvironment,
+  requested: string,
+): string | undefined {
+  const exact = environment[requested];
+  if (exact !== undefined || process.platform !== "win32") return exact;
+  const upper = requested.toUpperCase();
+  return Object.entries(environment).find(
+    ([name]) => name.toUpperCase() === upper,
+  )?.[1];
+}
+
+/** @internal */
+export function openAiApiKey(
+  environment: ProcessEnvironment,
+): string | undefined {
+  for (const name of ["OPENAI_API_KEY", "CODEX_API_KEY"]) {
+    const value = environmentEntry(environment, name)?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
 export interface LoginResult {
   success: boolean;
   exitCode: number | null;

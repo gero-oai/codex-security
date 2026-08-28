@@ -6,12 +6,16 @@ import { handleFindingsRequest } from "./routes.js";
 import type { FindingsStore } from "./storage.js";
 import { findingsRequestValidator } from "./validation.js";
 
-export async function startFindingsServer(options: {
+export interface FindingsServerOptions {
   store: FindingsStore;
   embeddings: FindingEmbedder;
   host: string;
   port: number;
-}): Promise<Server> {
+}
+
+export async function startFindingsServer(
+  options: FindingsServerOptions,
+): Promise<Server> {
   await options.store.initialize();
   const validate = await findingsRequestValidator();
   const service = new FindingsService(options.store, options.embeddings);

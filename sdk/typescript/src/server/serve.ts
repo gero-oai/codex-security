@@ -1,6 +1,7 @@
 import { startFindingsServer } from "./server.js";
 import { SqliteFindingsStore } from "./sqlite-store.js";
 import { OpenAiFindingEmbedder } from "./embeddings.js";
+import { openAiApiKey } from "../auth.js";
 
 export async function serveFindings(
   environment: NodeJS.ProcessEnv = process.env,
@@ -10,9 +11,7 @@ export async function serveFindings(
   const port = Number(environment["PORT"] ?? 3000);
   const server = await startFindingsServer({
     store: new SqliteFindingsStore(environment),
-    embeddings: new OpenAiFindingEmbedder(
-      environment["OPENAI_API_KEY"] ?? environment["CODEX_API_KEY"],
-    ),
+    embeddings: new OpenAiFindingEmbedder(openAiApiKey(environment)),
     host,
     port,
   });

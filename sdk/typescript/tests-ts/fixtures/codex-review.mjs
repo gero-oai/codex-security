@@ -33,13 +33,17 @@ for await (const line of createInterface({ input: process.stdin })) {
     assert.equal(message.params.capabilities.experimentalApi, true);
     send({ id: message.id, result: {} });
   } else if (message.method === "account/login/start") {
+    assert.equal(scenario.startsWith("command-auth"), false);
     assert.equal(message.params.type, "apiKey");
     assert.equal(message.params.apiKey, "synthetic-review-key");
     send({ id: message.id, result: { type: "apiKey" } });
   } else if (message.method === "thread/start") {
     assert.equal(message.params.ephemeral, true);
     assert.equal(message.params.permissions, "codex_security_review");
-    assert.equal(message.params.approvalPolicy, "on-request");
+    assert.equal(
+      message.params.approvalPolicy,
+      scenario === "command-auth-luna" ? "never" : "on-request",
+    );
     assert.equal(message.params.approvalsReviewer, "auto_review");
     assert.equal(message.params.config.mcp_servers.synthetic.enabled, false);
     assert.deepEqual(
@@ -93,7 +97,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     submit("valid", { decision: "SAME" });
   } else if (message.id === "valid") {
     assert.equal(message.result.success, true);
-    if (scenario === "failed-turn") {
+    if (["failed-turn", "command-auth-failed"].includes(scenario)) {
       process.stderr.write("Synthetic provider failure with private details\n");
       complete("failed");
     } else complete();

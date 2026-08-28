@@ -16,6 +16,7 @@ import {
   type TurnOptions,
 } from "@openai/codex-sdk";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { stringify } from "smol-toml";
 import { resolveCodexCommand, runCodexCommand } from "../src/runtime.js";
 import {
   comparisonEnvironment,
@@ -81,6 +82,122 @@ function fakeCodex(response: unknown) {
 }
 
 describe("semantic scan comparison", () => {
+  test.each([false, true])(
+    "retains explicit command authentication with profile=%j",
+    async (profile) => {
+      const root = await mkdtemp(
+        join(tmpdir(), "codex-security-command-auth-"),
+      );
+      temporaryDirectories.push(root);
+      const home = join(root, "private-home");
+      const state = join(root, "state");
+      await mkdir(home);
+      await mkdir(join(state, "codex-home"), { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(home, "config.toml"),
+        stringify({
+          model_provider: profile ? "openai" : "synthetic",
+          ...(profile
+            ? {
+                profile: "review",
+                profiles: { review: { model_provider: "synthetic" } },
+              }
+            : {}),
+          model_providers: {
+            synthetic: {
+              name: "Synthetic",
+              auth: { command: "synthetic-unused-helper" },
+            },
+          },
+        }),
+      );
+      const source = {
+        CODEX_HOME: home,
+        CODEX_SECURITY_STATE_DIR: state,
+        OPENAI_API_KEY: "synthetic-ambient-primary",
+        CODEX_API_KEY: "synthetic-ambient-secondary",
+        unrelated: "preserved",
+      };
+      const account = async () => {
+        throw new Error("Must not probe another login");
+      };
+      for (const scan of [false, true]) {
+        const environment = await comparisonEnvironment(
+          {
+            ...source,
+            ...(scan ? { CODEX_SECURITY_SCAN_ID: "synthetic-scan" } : {}),
+          },
+          account,
+        );
+        expect(environment["CODEX_HOME"]).toBe(home);
+        expect(environment["OPENAI_API_KEY"]).toBeUndefined();
+        expect(environment["CODEX_API_KEY"]).toBeUndefined();
+        expect(environment["unrelated"]).toBe("preserved");
+      }
+      expect(source.OPENAI_API_KEY).toBe("synthetic-ambient-primary");
+    },
+  );
+
+  test("does not select an unused command-auth provider", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-unused-auth-"));
+    temporaryDirectories.push(root);
+    await writeFile(
+      join(root, "config.toml"),
+      stringify({
+        model_provider: "openai",
+        model_providers: {
+          synthetic: { auth: { command: "synthetic-unused-helper" } },
+        },
+      }),
+    );
+    const source = { CODEX_HOME: root, OPENAI_API_KEY: "synthetic-key" };
+    expect(await comparisonEnvironment(source)).toEqual(source);
+  });
+
+  test("rejects unreadable provider configuration without exposing contents or selecting another login", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-invalid-auth-"));
+    temporaryDirectories.push(root);
+    await writeFile(
+      join(root, "config.toml"),
+      'model_provider = "synthetic-private-value',
+    );
+    const failure = comparisonEnvironment(
+      { CODEX_HOME: root, OPENAI_API_KEY: "synthetic-key" },
+      async () => {
+        throw new Error("Must not probe another login");
+      },
+    );
+    await expect(failure).rejects.toMatchObject({
+      message: "Could not read the configured Codex provider.",
+    });
+    await expect(failure).rejects.not.toHaveProperty("cause");
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "retains command-auth homes and removes keys with Windows casing",
+    async () => {
+      const root = await mkdtemp(
+        join(tmpdir(), "codex-security-command-auth-"),
+      );
+      temporaryDirectories.push(root);
+      await writeFile(
+        join(root, "config.toml"),
+        stringify({
+          model_provider: "synthetic",
+          model_providers: {
+            synthetic: { auth: { command: "synthetic-unused-helper" } },
+          },
+        }),
+      );
+      const environment = await comparisonEnvironment({
+        codex_home: root,
+        openai_api_key: "synthetic-key",
+        Codex_Api_Key: "synthetic-key",
+      });
+      expect(environment).toEqual({ codex_home: root });
+    },
+  );
+
   test("uses comparison attribution for CLI comparison turns", async () => {
     const { codex, calls } = fakeCodex({ matches: [], uncertain: [] });
     await matchScanFindingsInternal(

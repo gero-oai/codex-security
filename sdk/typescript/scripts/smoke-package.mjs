@@ -411,6 +411,20 @@ try {
   run(
     process.execPath,
     [
+      "--input-type=module",
+      "--eval",
+      `import assert from "node:assert/strict";
+       import { Server } from "node:net";
+       Server.prototype.listen = () => { throw new Error("Import must not start a server"); };
+       const sdk = await import("@openai/codex-security/server");
+       for (const name of ["OpenAiFindingEmbedder", "SqliteFindingsStore", "startFindingsServer"])
+         assert.equal(typeof sdk[name], "function");`,
+    ],
+    { cwd: consumer },
+  );
+  run(
+    process.execPath,
+    [
       join(consumer, "node_modules", "typescript", "bin", "tsc"),
       "--strict",
       "--noEmit",

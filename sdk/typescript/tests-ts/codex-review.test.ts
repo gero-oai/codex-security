@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, mock, test } from "bun:test";
+import { stringify } from "smol-toml";
 import { CodexReviewRunner } from "../src/deduplication/codex-review.js";
 import { resolveCodexCommand } from "../src/runtime.js";
 import { environmentEntry } from "../src/scan-comparison.js";
@@ -21,9 +22,17 @@ const transportCases: {
   extraEnvironment?: Record<string, string>;
   windowsOnly?: boolean;
 }[] = [
-  ...["correction", "text-only", "failed-turn", "exit", "cancel"].map(
-    (scenario) => ({ scenario }),
-  ),
+  ...[
+    "correction",
+    "text-only",
+    "failed-turn",
+    "exit",
+    "cancel",
+    "secondary-key",
+    "command-auth",
+    "command-auth-luna",
+    "command-auth-failed",
+  ].map((scenario) => ({ scenario })),
   {
     scenario: "correction",
     name: "lowercase Windows environment",
@@ -68,10 +77,27 @@ for (const {
     let directory: string | undefined;
     let args: readonly string[] = [];
     const controller = new AbortController();
+    const commandAuth = scenario.startsWith("command-auth");
     try {
-      const configuration =
-        '[mcp_servers.synthetic]\ncommand = "synthetic-unused-command"\n';
-      await writeFile(join(modelHome, "config.toml"), configuration);
+      await writeFile(
+        join(modelHome, "config.toml"),
+        stringify({
+          mcp_servers: { synthetic: { command: "synthetic-unused-command" } },
+          ...(commandAuth
+            ? {
+                model_provider: "synthetic",
+                model_providers: {
+                  synthetic: {
+                    name: "Synthetic",
+                    base_url: "https://provider.example.test/v1",
+                    wire_api: "responses",
+                    auth: { command: "synthetic-unused-helper" },
+                  },
+                },
+              }
+            : {}),
+        }),
+      );
       const [homeName, keyName, ghName] = environmentNames;
       const runner = new CodexReviewRunner(
         {
@@ -80,7 +106,10 @@ for (const {
           TEMP: process.env["TEMP"],
           TMP: process.env["TMP"],
           [homeName]: modelHome,
-          [keyName]: "synthetic-review-key",
+          [keyName]: scenario === "secondary-key" ? "" : "synthetic-review-key",
+          ...(scenario === "secondary-key" || commandAuth
+            ? { CODEX_API_KEY: "synthetic-review-key" }
+            : {}),
           [ghName]: ghConfig,
           ...extraEnvironment,
         },
@@ -94,6 +123,11 @@ for (const {
           args = commandArgs;
           directory = options.env!["CODEX_SQLITE_HOME"];
           expect(options.cwd).toBe(checkout);
+          expect(options.env![homeName]).toBe(modelHome);
+          if (commandAuth) {
+            expect(options.env!["OPENAI_API_KEY"]).toBeUndefined();
+            expect(options.env!["CODEX_API_KEY"]).toBeUndefined();
+          }
           child = spawn(
             process.execPath,
             [fixture, scenario, transcript],
@@ -110,7 +144,8 @@ for (const {
       );
       let validations = 0;
       const result = runner.run({
-        model: "gpt-5.6-sol",
+        model:
+          scenario === "command-auth-luna" ? "gpt-5.6-luna" : "gpt-5.6-sol",
         effort: "ultra",
         prompt: "Review the supplied synthetic reports.",
         schema: {
@@ -134,6 +169,13 @@ for (const {
       if (scenario === "correction") {
         expect(await result).toEqual({ decision: "SAME" });
         expect(validations).toBe(2);
+      } else if (
+        ["secondary-key", "command-auth", "command-auth-luna"].includes(
+          scenario,
+        )
+      ) {
+        expect(await result).toEqual({ decision: "SAME" });
+        expect(validations).toBe(1);
       } else if (scenario === "cancel") {
         await expect(result).rejects.toBe("synthetic cancellation");
       } else {
@@ -141,9 +183,13 @@ for (const {
           message:
             "Codex did not complete a validated deduplication review. Findings are unchanged; retry the command.",
         });
-        expect(validations).toBe(scenario === "failed-turn" ? 1 : 0);
+        expect(validations).toBe(
+          ["failed-turn", "command-auth-failed"].includes(scenario) ? 1 : 0,
+        );
       }
-      expect(args).toContain('cli_auth_credentials_store="ephemeral"');
+      expect(args.includes('cli_auth_credentials_store="ephemeral"')).toBe(
+        !commandAuth,
+      );
       expect(args.join(" ")).not.toContain("synthetic-review-key");
       const permissions = args.find((argument) =>
         argument.startsWith("permissions.codex_security_review="),
@@ -166,7 +212,13 @@ for (const {
               },
           )
           .find((message) => message.method === "account/login/start");
-        expect(loginRequest?.params?.apiKey).toBe("synthetic-review-key");
+        if (commandAuth) {
+          expect(loginRequest).toBeUndefined();
+          expect(await readFile(transcript, "utf8")).not.toContain(
+            "synthetic-review-key",
+          );
+        } else
+          expect(loginRequest?.params?.apiKey).toBe("synthetic-review-key");
       }
       expect(existsSync(join(modelHome, "auth.json"))).toBe(false);
       expect(child!.exitCode !== null || child!.signalCode !== null).toBe(true);

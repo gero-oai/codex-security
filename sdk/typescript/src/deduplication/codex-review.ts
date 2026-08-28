@@ -22,6 +22,7 @@ import {
 import { CODEX_SECURITY_THREAD_SOURCES } from "../thread-source.js";
 import { VERSION } from "../version.js";
 import { CodexSecurityError } from "../errors.js";
+import { openAiApiKey } from "../auth.js";
 import {
   reviewSubmissionInstructions,
   sourceReviewInstructions,
@@ -83,10 +84,7 @@ export class CodexReviewRunner {
         environment,
         { workingDirectory: this.workingDirectory, signal: this.signal },
       );
-      const apiKey = [
-        environmentEntry(environment, "OPENAI_API_KEY"),
-        environmentEntry(environment, "CODEX_API_KEY"),
-      ].find((value) => value?.trim());
+      const apiKey = openAiApiKey(environment);
       const args = ["app-server", "--stdio", "--disable", "plugins"];
       const stateDatabase = join(
         codexSecurityStateDirectory(environment),

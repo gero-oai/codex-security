@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,11 +10,13 @@ import {
   type TurnOptions,
 } from "@openai/codex-sdk";
 import { z } from "incur";
+import { parse } from "smol-toml";
 import type { CodexSecuritySurface } from "./api.js";
-import { accountStatus } from "./auth.js";
+import { accountStatus, environmentEntry, openAiApiKey } from "./auth.js";
 import {
   mergedCodexConfig,
   scanModelConfiguration,
+  scanModelProvider,
   type CodexSecurityConfig,
   type JsonObject,
 } from "./config.js";
@@ -31,6 +34,8 @@ import {
   CODEX_SECURITY_THREAD_SOURCES,
   type CodexSecurityThreadSource,
 } from "./thread-source.js";
+
+export { environmentEntry } from "./auth.js";
 
 type Finding = { occurrenceId: string } & Record<string, unknown>;
 type ReadOnlyCodexThreadSource = Extract<
@@ -412,16 +417,18 @@ export async function comparisonEnvironment(
       (entry): entry is [string, string] => entry[1] !== undefined,
     ),
   );
+  if (await hasConfiguredCommandAuth(environment, signal)) {
+    for (const key of Object.keys(environment)) {
+      if (["OPENAI_API_KEY", "CODEX_API_KEY"].includes(key.toUpperCase())) {
+        delete environment[key];
+      }
+    }
+    return environment;
+  }
   if (environmentEntry(environment, "CODEX_SECURITY_SCAN_ID") !== undefined) {
     return environment;
   }
-  if (
-    Object.entries(environment).some(
-      ([name, value]) =>
-        ["OPENAI_API_KEY", "CODEX_API_KEY"].includes(name.toUpperCase()) &&
-        value.trim().length > 0,
-    )
-  ) {
+  if (openAiApiKey(environment)) {
     return environment;
   }
   const credentialHome = codexSecurityCredentialHome(source);
@@ -460,16 +467,34 @@ export async function comparisonEnvironment(
   return environment;
 }
 
-export function environmentEntry(
+async function hasConfiguredCommandAuth(
   environment: Record<string, string>,
-  requested: string,
-): string | undefined {
-  const exact = environment[requested];
-  if (exact !== undefined || process.platform !== "win32") return exact;
-  const upper = requested.toUpperCase();
-  return Object.entries(environment).find(
-    ([name]) => name.toUpperCase() === upper,
-  )?.[1];
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const home = environmentEntry(environment, "CODEX_HOME")?.trim();
+  if (!home) return false;
+  let config: JsonObject;
+  try {
+    config = parse(
+      await readFile(join(expandHome(home, environment), "config.toml"), {
+        encoding: "utf8",
+        signal,
+      }),
+    ) as JsonObject;
+  } catch (error) {
+    signal?.throwIfAborted();
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new CodexSecurityError(
+      "Could not read the configured Codex provider.",
+    );
+  }
+  const selected = scanModelProvider(config);
+  if (typeof selected !== "string") return false;
+  const providers = config["model_providers"] as JsonObject | undefined;
+  const provider = providers?.[selected] as JsonObject | undefined;
+  // Codex validates the auth table. Do not replace an explicitly configured
+  // command provider with another login even if its configuration is invalid.
+  return provider?.["auth"] !== undefined;
 }
 
 function validateComparison(

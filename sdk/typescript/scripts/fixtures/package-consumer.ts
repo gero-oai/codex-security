@@ -17,6 +17,32 @@ import {
   type ValidationOptions,
   type ValidationResult,
 } from "@openai/codex-security";
+import {
+  OpenAiFindingEmbedder,
+  SqliteFindingsStore,
+  startFindingsServer,
+  type OpenAiFindingEmbedderOptions,
+  type FindingsServerOptions,
+  type FindingEmbedder,
+  type FindingsStore,
+} from "@openai/codex-security/server";
+
+export async function findingsServer(getApiKey: () => Promise<string>) {
+  const options: OpenAiFindingEmbedderOptions = {
+    apiKey: getApiKey,
+    baseUrl: "https://provider.example.test/llm/v1",
+    headers: { "X-Model-Route": "default" },
+  };
+  const embeddings: FindingEmbedder = new OpenAiFindingEmbedder(options);
+  const store: FindingsStore = new SqliteFindingsStore();
+  const server: FindingsServerOptions = {
+    store,
+    embeddings,
+    host: "127.0.0.1",
+    port: 0,
+  };
+  return await startFindingsServer(server);
+}
 
 export async function publishCustom(
   scanDir: string,

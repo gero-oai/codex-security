@@ -10,12 +10,55 @@ import {
   CodexLoginHandle,
   loginApiKey,
   logout,
+  openAiApiKey,
 } from "../src/auth.js";
 import { PluginBootstrapError } from "../src/index.js";
 import { runCodexCommand } from "../src/runtime.js";
 import type { CodexCommand } from "../src/index.js";
 
 const temporaryDirectories: string[] = [];
+
+test.each([
+  [{}, undefined],
+  [
+    { OPENAI_API_KEY: "", CODEX_API_KEY: "synthetic-secondary" },
+    "synthetic-secondary",
+  ],
+  [
+    { OPENAI_API_KEY: " \n ", CODEX_API_KEY: " synthetic-secondary " },
+    "synthetic-secondary",
+  ],
+  [
+    {
+      OPENAI_API_KEY: "synthetic-primary",
+      CODEX_API_KEY: "synthetic-secondary",
+    },
+    "synthetic-primary",
+  ],
+] as const)(
+  "selects the first nonempty model key: %j",
+  (environment, expected) => {
+    expect(openAiApiKey(environment)).toBe(expected);
+  },
+);
+
+test.skipIf(process.platform !== "win32")(
+  "selects model keys with Windows environment casing",
+  () => {
+    expect(
+      openAiApiKey({
+        openai_api_key: "",
+        Codex_Api_Key: "synthetic-secondary",
+      }),
+    ).toBe("synthetic-secondary");
+    expect(
+      openAiApiKey({
+        openai_api_key: "synthetic-primary",
+        CODEX_API_KEY: "synthetic-secondary",
+      }),
+    ).toBe("synthetic-primary");
+  },
+);
 
 afterEach(async () => {
   await Promise.all(
