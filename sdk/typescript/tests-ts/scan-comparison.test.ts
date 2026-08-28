@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   Codex,
   type CodexOptions,
@@ -29,11 +30,27 @@ import {
 
 const temporaryDirectories: string[] = [];
 
+async function removeTemporaryDirectory(path: string): Promise<void> {
+  // Bun 1.3.14 does not implement fs.rm's recursive retry options.
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rm(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (
+        process.platform !== "win32" ||
+        (error as NodeJS.ErrnoException).code !== "EBUSY" ||
+        attempt >= 10
+      )
+        throw error;
+      await delay(100 * (attempt + 1));
+    }
+  }
+}
+
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories
-      .splice(0)
-      .map((path) => rm(path, { recursive: true, force: true })),
+    temporaryDirectories.splice(0).map(removeTemporaryDirectory),
   );
 });
 
