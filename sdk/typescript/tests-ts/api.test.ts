@@ -5319,8 +5319,10 @@ describe("CodexSecurity orchestration", () => {
     const scopedSourceInput = join(scanDir, "scoped-source-input.jsonl");
     const runScopedHelper = (command: string, args: string[]): void => {
       if (process.platform === "win32") {
+        const powershell = Bun.which("powershell.exe");
+        expect(powershell).not.toBeNull();
         execFileSync(
-          "powershell.exe",
+          powershell!,
           ["-NoProfile", "-NonInteractive", "-Command", command],
           {
             cwd: root,
