@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve, win32 } from "node:path";
+import { join, relative, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, mock, test } from "bun:test";
 import { stringify } from "smol-toml";
@@ -32,6 +32,7 @@ const transportCases: {
     "command-auth",
     "command-auth-luna",
     "command-auth-failed",
+    "command-auth-relative-home",
   ].map((scenario) => ({ scenario })),
   {
     scenario: "correction",
@@ -69,7 +70,10 @@ for (const {
 } of transportCases) {
   const runCase = test.skipIf(windowsOnly && process.platform !== "win32");
   runCase(`Codex review transport: ${name}`, async () => {
-    const modelHome = await mkdtemp(join(tmpdir(), "codex-review-test-"));
+    const relativeHome = scenario === "command-auth-relative-home";
+    const modelHome = await mkdtemp(
+      join(relativeHome ? process.cwd() : tmpdir(), "codex-review-test-"),
+    );
     const checkout = await mkdtemp(join(tmpdir(), "codex-review-source-"));
     const ghConfig = await mkdtemp(join(tmpdir(), "codex-review-gh-"));
     const transcript = join(modelHome, "messages.jsonl");
@@ -98,14 +102,19 @@ for (const {
             : {}),
         }),
       );
-      const [homeName, keyName, ghName] = environmentNames;
+      const [homeName, keyName, ghName] =
+        relativeHome && process.platform === "win32"
+          ? (["codex_home", "OPENAI_API_KEY", "GH_CONFIG_DIR"] as const)
+          : environmentNames;
       const runner = new CodexReviewRunner(
         {
           PATH: process.env["PATH"],
           SystemRoot: process.env["SystemRoot"],
           TEMP: process.env["TEMP"],
           TMP: process.env["TMP"],
-          [homeName]: modelHome,
+          [homeName]: relativeHome
+            ? relative(process.cwd(), modelHome)
+            : modelHome,
           [keyName]: scenario === "secondary-key" ? "" : "synthetic-review-key",
           ...(scenario === "secondary-key" || commandAuth
             ? { CODEX_API_KEY: "synthetic-review-key" }
@@ -122,7 +131,8 @@ for (const {
           );
           args = commandArgs;
           directory = options.env!["CODEX_SQLITE_HOME"];
-          expect(options.cwd).toBe(checkout);
+          expect(options.cwd).toBe(directory);
+          expect(options.cwd).not.toBe(checkout);
           expect(options.env![homeName]).toBe(modelHome);
           if (commandAuth) {
             expect(options.env!["OPENAI_API_KEY"]).toBeUndefined();
@@ -130,7 +140,7 @@ for (const {
           }
           child = spawn(
             process.execPath,
-            [fixture, scenario, transcript],
+            [fixture, scenario, transcript, checkout],
             options,
           );
           if (scenario === "cancel")
@@ -140,7 +150,7 @@ for (const {
           return child;
         },
         controller.signal,
-        checkout,
+        relativeHome ? relative(process.cwd(), checkout) : checkout,
       );
       let validations = 0;
       const result = runner.run({
@@ -170,9 +180,12 @@ for (const {
         expect(await result).toEqual({ decision: "SAME" });
         expect(validations).toBe(2);
       } else if (
-        ["secondary-key", "command-auth", "command-auth-luna"].includes(
-          scenario,
-        )
+        [
+          "secondary-key",
+          "command-auth",
+          "command-auth-luna",
+          "command-auth-relative-home",
+        ].includes(scenario)
       ) {
         expect(await result).toEqual({ decision: "SAME" });
         expect(validations).toBe(1);
