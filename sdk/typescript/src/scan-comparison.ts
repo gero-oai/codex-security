@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   Codex,
   type CodexOptions,
@@ -10,7 +10,7 @@ import {
   type TurnOptions,
 } from "@openai/codex-sdk";
 import { z } from "incur";
-import { parse } from "smol-toml";
+import { parse, stringify } from "smol-toml";
 import type { CodexSecuritySurface } from "./api.js";
 import { accountStatus, environmentEntry, openAiApiKey } from "./auth.js";
 import {
@@ -19,6 +19,7 @@ import {
   scanModelProvider,
   type CodexSecurityConfig,
   type JsonObject,
+  type JsonValue,
 } from "./config.js";
 import { CodexSecurityError } from "./errors.js";
 import {
@@ -187,6 +188,11 @@ export async function runReadOnlyCodex(
     new Codex({
       codexPathOverride: executablePathForSpawn(command!.command),
       env: environment,
+      configOverrides: await commandAuthConfigOverrides(
+        environment!,
+        config,
+        options.signal,
+      ),
       config: {
         ...config,
         mcp_servers: await disabledMcpServers(
@@ -471,23 +477,8 @@ async function hasConfiguredCommandAuth(
   environment: Record<string, string>,
   signal?: AbortSignal,
 ): Promise<boolean> {
-  const home = environmentEntry(environment, "CODEX_HOME")?.trim();
-  if (!home) return false;
-  let config: JsonObject;
-  try {
-    config = parse(
-      await readFile(join(expandHome(home, environment), "config.toml"), {
-        encoding: "utf8",
-        signal,
-      }),
-    ) as JsonObject;
-  } catch (error) {
-    signal?.throwIfAborted();
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw new CodexSecurityError(
-      "Could not read the configured Codex provider.",
-    );
-  }
+  const config = await readCodexHomeConfig(environment, signal);
+  if (config === undefined) return false;
   const selected = scanModelProvider(config);
   if (typeof selected !== "string") return false;
   const providers = config["model_providers"] as JsonObject | undefined;
@@ -495,6 +486,81 @@ async function hasConfiguredCommandAuth(
   // Codex validates the auth table. Do not replace an explicitly configured
   // command provider with another login even if its configuration is invalid.
   return provider?.["auth"] !== undefined;
+}
+
+async function commandAuthConfigOverrides(
+  environment: Record<string, string>,
+  overrides: JsonObject | undefined,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const config = await readCodexHomeConfig(environment, signal);
+  if (config === undefined) return [];
+  const home = resolve(
+    expandHome(
+      environmentEntry(environment, "CODEX_HOME")!.trim(),
+      environment,
+    ),
+  );
+  const providers = config["model_providers"] as JsonObject | undefined;
+  const providerOverrides = {
+    ...(overrides?.["model_providers"] as JsonObject | undefined),
+  };
+  let changed = false;
+  for (const [name, provider] of Object.entries(providers ?? {})) {
+    const auth = (provider as JsonObject)?.["auth"] as JsonObject | undefined;
+    const overrideAuth = (
+      providerOverrides?.[name] as JsonObject | undefined
+    )?.["auth"] as JsonObject | undefined;
+    if (
+      typeof auth !== "object" ||
+      auth === null ||
+      Array.isArray(auth) ||
+      auth["cwd"] !== undefined ||
+      overrideAuth?.["cwd"] !== undefined
+    )
+      continue;
+    // The SDK inherits the caller's cwd. Resolve implicit auth helpers from
+    // the supplied home instead of allowing the checkout to supply them.
+    providerOverrides[name] = {
+      ...(providerOverrides[name] as JsonObject | undefined),
+      auth: { ...overrideAuth, cwd: home },
+    };
+    changed = true;
+  }
+  // Override the table as a value: CLI dotted paths cannot quote provider IDs.
+  return changed ? [`model_providers=${inlineToml(providerOverrides)}`] : [];
+}
+
+function inlineToml(value: JsonValue): string {
+  if (Array.isArray(value)) return `[${value.map(inlineToml).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.entries(value)
+      .map(([key, item]) => `${JSON.stringify(key)}=${inlineToml(item)}`)
+      .join(",")}}`;
+  }
+  return stringify({ value }).slice("value = ".length).trim();
+}
+
+async function readCodexHomeConfig(
+  environment: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<JsonObject | undefined> {
+  const home = environmentEntry(environment, "CODEX_HOME")?.trim();
+  if (!home) return undefined;
+  try {
+    return parse(
+      await readFile(join(expandHome(home, environment), "config.toml"), {
+        encoding: "utf8",
+        signal,
+      }),
+    ) as JsonObject;
+  } catch (error) {
+    signal?.throwIfAborted();
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new CodexSecurityError(
+      "Could not read the configured Codex provider.",
+    );
+  }
 }
 
 function validateComparison(

@@ -2,13 +2,14 @@ import {
   copyFile,
   mkdir,
   mkdtemp,
+  readFile,
   realpath,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, win32 } from "node:path";
+import { join, relative, win32 } from "node:path";
 import {
   Codex,
   type CodexOptions,
@@ -16,7 +17,7 @@ import {
   type TurnOptions,
 } from "@openai/codex-sdk";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { stringify } from "smol-toml";
+import { parse, stringify } from "smol-toml";
 import { resolveCodexCommand, runCodexCommand } from "../src/runtime.js";
 import {
   comparisonEnvironment,
@@ -207,6 +208,101 @@ describe("semantic scan comparison", () => {
     );
     expect(calls.threadOptions?.threadSource).toBe("security_scan_comparison");
   });
+
+  test.each(["implicit", "home", "override"])(
+    "anchors command authentication without replacing an explicit cwd (%s)",
+    async (cwdSource) => {
+      const root = await mkdtemp(join(tmpdir(), "codex-security-auth-cwd-"));
+      temporaryDirectories.push(root);
+      const home = join(root, "private home");
+      const checkout = join(root, "checkout");
+      const explicitCwd = join(root, "trusted helpers");
+      await mkdir(home);
+      await mkdir(checkout);
+      await mkdir(explicitCwd);
+      const configuration = stringify({
+        model_provider: "synthetic.provider",
+        model_providers: {
+          "synthetic.provider": {
+            name: "Synthetic",
+            auth: {
+              command: "./synthetic-helper",
+              ...(cwdSource === "home" ? { cwd: explicitCwd } : {}),
+            },
+          },
+        },
+      });
+      await writeFile(join(home, "config.toml"), configuration);
+      const homeKey =
+        process.platform === "win32" ? "codex_home" : "CODEX_HOME";
+      const providerOverride = {
+        http_headers: { "X-Synthetic": 'synthetic "value"' },
+        request_max_retries: 0,
+        auth: {
+          args: ["--synthetic"],
+          ...(cwdSource === "override" ? { cwd: explicitCwd } : {}),
+        },
+      };
+      const { codex, calls } = fakeCodex({ matches: [], uncertain: [] });
+      let actual: CodexOptions | undefined;
+      const startThread = spyOn(
+        Codex.prototype,
+        "startThread",
+      ).mockImplementation(function (this: Codex, options) {
+        actual = (this as unknown as { options: CodexOptions }).options;
+        return codex.startThread(options!) as ReturnType<Codex["startThread"]>;
+      });
+      try {
+        await matchScanFindingsInternal(
+          { before: [], after: [] },
+          {
+            environment: {
+              PATH: process.env["PATH"],
+              SystemRoot: process.env["SystemRoot"],
+              [homeKey]: relative(process.cwd(), home),
+              OPENAI_API_KEY: "synthetic-ambient-key",
+            },
+            workingDirectory: checkout,
+            config: {
+              codexOverrides: {
+                model_providers: {
+                  "synthetic.provider": providerOverride,
+                },
+              },
+            },
+          },
+          { surface: "cli" },
+        );
+        expect(actual?.configOverrides?.map((value) => parse(value))).toEqual(
+          cwdSource === "implicit"
+            ? [
+                {
+                  model_providers: {
+                    "synthetic.provider": {
+                      ...providerOverride,
+                      auth: { ...providerOverride.auth, cwd: home },
+                    },
+                  },
+                },
+              ]
+            : [],
+        );
+        expect(actual?.env?.["OPENAI_API_KEY"]).toBeUndefined();
+        expect(calls.threadOptions).toMatchObject({
+          workingDirectory: checkout,
+          sandboxMode: "read-only",
+          approvalPolicy: "never",
+          networkAccessEnabled: false,
+          webSearchMode: "disabled",
+        });
+        expect(await readFile(join(home, "config.toml"), "utf8")).toBe(
+          configuration,
+        );
+      } finally {
+        startThread.mockRestore();
+      }
+    },
+  );
 
   test("disables explicit and inherited MCP servers for read-only helper turns", async () => {
     const home = await mkdtemp(join(tmpdir(), "codex-security-comparison-"));
